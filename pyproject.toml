@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "napari-compare-xenium-merscope"
+version = "0.1.0"
+description = "Standalone Napari viewer for comparing Xenium and MERSCOPE SpatialData outputs"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "Napari Compare contributors" }
+]
+dependencies = [
+  "dask[dataframe]",
+  "geopandas",
+  "napari[pyqt5]>=0.7.0",
+  "numpy",
+  "ome-zarr",
+  "packaging",
+  "pandas",
+  "psutil",
+  "qtpy",
+  "shapely",
+  "spatialdata>=0.7.3a1",
+  "xarray",
+  "zarr>=3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+]
+
+[project.scripts]
+napari-compare-xenium-merscope = "napari_compare_xenium_merscope.viewer:main"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]
