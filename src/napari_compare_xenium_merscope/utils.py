@@ -6,6 +6,8 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import dataclass
+from hashlib import blake2s
 from pathlib import Path
 from typing import Iterable
 
@@ -19,6 +21,42 @@ except Exception:  # pragma: no cover - import error depends on runtime env
     draw_polygon = None
 
 log = logging.getLogger("napari_compare_utils")
+
+DERIVED_CACHE_PREFIX = "_napari_compare_"
+DERIVED_CACHE_ATTR = "napari_compare_derived_cache"
+
+
+def _safe_cache_token(value: str, max_len: int = 96) -> str:
+    """Return a zarr-element-safe token that stays readable for common keys."""
+    token = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("_")
+    if not token:
+        token = "cache"
+    if token == str(value) and len(token) <= max_len:
+        return token
+
+    digest = blake2s(str(value).encode("utf-8"), digest_size=5).hexdigest()
+    token = token[: max(1, max_len - len(digest) - 3)].strip("_")
+    return f"{token}__h{digest}" if token else f"h{digest}"
+
+
+def is_derived_cache_key(key: str) -> bool:
+    """Return True for private viewer-derived zarr elements."""
+    return str(key).startswith(DERIVED_CACHE_PREFIX)
+
+
+def derived_outline_cache_key(label_key: str, width: int) -> str:
+    """Build the private labels cache key for a precomputed outline pyramid."""
+    return f"{DERIVED_CACHE_PREFIX}outline__{_safe_cache_token(label_key)}__w{int(width)}"
+
+
+def _format_float_token(value: float) -> str:
+    text = f"{float(value):g}"
+    return text.replace("-", "m").replace(".", "p")
+
+
+def derived_transcript_density_cache_key(points_key: str, bin_um: float) -> str:
+    """Build the private images cache key for transcript density."""
+    return f"{DERIVED_CACHE_PREFIX}tx_density__{_safe_cache_token(points_key)}__bin{_format_float_token(bin_um)}"
 
 
 def first_existing_col(df_like, candidates: Iterable[str]) -> str | None:
@@ -289,6 +327,383 @@ def load_points_dataframe(
     if len(pdf) > max_points:
         pdf = pdf.sample(n=max_points, random_state=random_state)
     return pdf
+
+
+def load_viewport_points_dataframe(
+    points_obj,
+    x_col: str,
+    y_col: str,
+    assignment_col: str | None = None,
+    bounds: tuple[float, float, float, float] | None = None,
+    sample_percent: float | None = None,
+    max_points: int | None = None,
+    random_state: int = 42,
+) -> tuple[pd.DataFrame, int, float]:
+    """Load a sampled point table for the current viewport.
+
+    ``bounds`` are global (min_x, min_y, max_x, max_y). When ``sample_percent``
+    is ``None`` this loads as many viewport points as possible up to
+    ``max_points``. Otherwise it loads that percentage, still respecting
+    ``max_points`` as a hard display cap.
+    """
+    cols = [x_col, y_col] + ([assignment_col] if assignment_col is not None else [])
+    work = points_obj[cols]
+
+    if bounds is not None:
+        min_x, min_y, max_x, max_y = (float(v) for v in bounds)
+        work = work[
+            (work[x_col] >= min_x)
+            & (work[x_col] <= max_x)
+            & (work[y_col] >= min_y)
+            & (work[y_col] <= max_y)
+        ]
+
+    if max_points is not None:
+        max_points = max(0, int(max_points))
+    if sample_percent is not None:
+        sample_percent = min(100.0, max(0.0, float(sample_percent)))
+
+    if hasattr(work, "npartitions") and hasattr(work, "compute"):
+        total = int(work.map_partitions(len, meta=("n", "i8")).sum().compute())
+        if total == 0 or max_points == 0 or sample_percent == 0:
+            return pd.DataFrame(columns=cols), total, 0.0
+
+        if sample_percent is None:
+            frac = 1.0 if max_points is None else min(1.0, float(max_points) / float(total))
+        else:
+            frac = sample_percent / 100.0
+            if max_points is not None:
+                frac = min(frac, float(max_points) / float(total))
+            frac = min(1.0, max(0.0, frac))
+
+        if frac < 1.0:
+            pdf = work.sample(frac=frac, random_state=random_state).compute()
+        else:
+            pdf = work.compute()
+
+        if len(pdf) == 0 and total > 0 and frac > 0:
+            try:
+                pdf = work.head(1, npartitions=-1, compute=True)
+            except Exception:
+                pass
+
+        if max_points is not None and len(pdf) > max_points:
+            pdf = pdf.sample(n=max_points, random_state=random_state)
+        loaded_fraction = 0.0 if total == 0 else float(len(pdf)) / float(total)
+        return pdf, total, loaded_fraction
+
+    pdf = to_pandas(work)
+    total = int(len(pdf))
+    if total == 0 or max_points == 0 or sample_percent == 0:
+        return pdf.iloc[:0].copy(), total, 0.0
+
+    if sample_percent is None:
+        n = total if max_points is None else min(total, max_points)
+    else:
+        n = int(np.ceil(total * (sample_percent / 100.0)))
+        if max_points is not None:
+            n = min(n, max_points)
+        n = min(total, max(1, n))
+
+    if n < total:
+        pdf = pdf.sample(n=n, random_state=random_state)
+    loaded_fraction = 0.0 if total == 0 else float(len(pdf)) / float(total)
+    return pdf, total, loaded_fraction
+
+
+def _point_columns(x_col: str, y_col: str, assignment_col: str | None = None) -> list[str]:
+    return [x_col, y_col] + ([assignment_col] if assignment_col is not None else [])
+
+
+def _iter_point_partitions(points_obj, cols: list[str]):
+    work = points_obj[cols]
+    if hasattr(work, "to_delayed"):
+        for part in work.to_delayed():
+            pdf = part.compute()
+            if len(pdf) > 0:
+                yield pdf
+        return
+
+    pdf = to_pandas(work)
+    if len(pdf) > 0:
+        yield pdf
+
+
+def _point_bounds(points_obj, x_col: str, y_col: str) -> tuple[float, float, float, float]:
+    work = points_obj[[x_col, y_col]]
+    if hasattr(work, "compute") and hasattr(work, "npartitions"):
+        min_x = float(work[x_col].min().compute())
+        min_y = float(work[y_col].min().compute())
+        max_x = float(work[x_col].max().compute())
+        max_y = float(work[y_col].max().compute())
+    else:
+        pdf = to_pandas(work)
+        min_x = float(pdf[x_col].min())
+        min_y = float(pdf[y_col].min())
+        max_x = float(pdf[x_col].max())
+        max_y = float(pdf[y_col].max())
+
+    if not np.all(np.isfinite([min_x, min_y, max_x, max_y])):
+        raise ValueError("Transcript coordinates do not contain finite bounds.")
+    return min_x, min_y, max_x, max_y
+
+
+def adjusted_density_bin_um(
+    bounds: tuple[float, float, float, float],
+    requested_bin_um: float,
+    max_pixels: int,
+) -> tuple[float, int, int]:
+    """Return a bin size and image shape that obey the requested pixel cap."""
+    min_x, min_y, max_x, max_y = (float(v) for v in bounds)
+    bin_um = max(float(requested_bin_um), np.finfo(float).eps)
+    max_pixels = max(1, int(max_pixels))
+
+    width = max(max_x - min_x, bin_um)
+    height = max(max_y - min_y, bin_um)
+    nx = max(1, int(np.ceil(width / bin_um)))
+    ny = max(1, int(np.ceil(height / bin_um)))
+    if nx * ny > max_pixels:
+        bin_um = max(bin_um, float(np.sqrt((width * height) / float(max_pixels))))
+        nx = max(1, int(np.ceil(width / bin_um)))
+        ny = max(1, int(np.ceil(height / bin_um)))
+
+    return float(bin_um), int(ny), int(nx)
+
+
+def compute_transcript_density_array(
+    points_obj,
+    x_col: str,
+    y_col: str,
+    assignment_col: str | None = None,
+    bin_um: float = 4.0,
+    max_pixels: int = 25_000_000,
+) -> tuple[np.ndarray, dict[str, object]]:
+    """Rasterize transcript point counts into assigned/unassigned density channels."""
+    cols = _point_columns(x_col, y_col, assignment_col)
+    bounds = _point_bounds(points_obj, x_col, y_col)
+    actual_bin_um, ny, nx = adjusted_density_bin_um(bounds, bin_um, max_pixels)
+    min_x, min_y, max_x, max_y = bounds
+
+    density = np.zeros((2, ny, nx), dtype=np.uint32)
+    total = 0
+    assigned_total = 0
+    unassigned_total = 0
+
+    for pdf in _iter_point_partitions(points_obj, cols):
+        x_vals = pdf[x_col].to_numpy(dtype=np.float64, copy=False)
+        y_vals = pdf[y_col].to_numpy(dtype=np.float64, copy=False)
+        good = np.isfinite(x_vals) & np.isfinite(y_vals)
+        if not np.any(good):
+            continue
+        x_vals = x_vals[good]
+        y_vals = y_vals[good]
+
+        ix = np.floor((x_vals - min_x) / actual_bin_um).astype(np.int64, copy=False)
+        iy = np.floor((y_vals - min_y) / actual_bin_um).astype(np.int64, copy=False)
+        ix = np.clip(ix, 0, nx - 1)
+        iy = np.clip(iy, 0, ny - 1)
+
+        if assignment_col is not None and assignment_col in pdf.columns:
+            assigned = assignment_mask(pdf.loc[good, assignment_col]).to_numpy(dtype=bool, copy=False)
+        else:
+            assigned = np.ones(ix.shape[0], dtype=bool)
+
+        if np.any(assigned):
+            np.add.at(density[0], (iy[assigned], ix[assigned]), 1)
+        if np.any(~assigned):
+            np.add.at(density[1], (iy[~assigned], ix[~assigned]), 1)
+
+        total += int(ix.shape[0])
+        assigned_total += int(np.count_nonzero(assigned))
+        unassigned_total += int(np.count_nonzero(~assigned))
+
+    meta = {
+        "bounds": [float(min_x), float(min_y), float(max_x), float(max_y)],
+        "requested_bin_um": float(bin_um),
+        "actual_bin_um": float(actual_bin_um),
+        "shape": [int(ny), int(nx)],
+        "total": int(total),
+        "assigned": int(assigned_total),
+        "unassigned": int(unassigned_total),
+        "max_count": int(density.max(initial=0)),
+    }
+    return density, meta
+
+
+@dataclass
+class TranscriptSpatialIndex:
+    """Compact tiled point index for viewport transcript detail overlays."""
+
+    x: np.ndarray
+    y: np.ndarray
+    assigned: np.ndarray
+    tile_ids: np.ndarray
+    tile_starts: np.ndarray
+    tile_counts: np.ndarray
+    min_x: float
+    min_y: float
+    tile_um: float
+    nx_tiles: int
+    total_rows: int
+    indexed_rows: int
+    sampled: bool
+
+
+def build_transcript_spatial_index(
+    points_obj,
+    x_col: str,
+    y_col: str,
+    assignment_col: str | None = None,
+    max_points: int = 25_000_000,
+    tile_um: float = 250.0,
+    random_state: int = 42,
+) -> TranscriptSpatialIndex | None:
+    """Build a sampled tiled point index for fast small-viewport queries."""
+    max_points = int(max_points)
+    if max_points <= 0:
+        return None
+
+    cols = _point_columns(x_col, y_col, assignment_col)
+    work = points_obj[cols]
+    if hasattr(work, "npartitions") and hasattr(work, "compute"):
+        source_total = int(work.map_partitions(len, meta=("n", "i8")).sum().compute())
+    else:
+        source_total = int(len(work))
+
+    pdf = load_points_dataframe(
+        points_obj,
+        x_col=x_col,
+        y_col=y_col,
+        assignment_col=assignment_col,
+        max_points=max_points,
+        random_state=random_state,
+    )
+    total_rows = int(len(pdf))
+    if total_rows == 0:
+        return None
+
+    x_vals = pdf[x_col].to_numpy(dtype=np.float32, copy=False)
+    y_vals = pdf[y_col].to_numpy(dtype=np.float32, copy=False)
+    good = np.isfinite(x_vals) & np.isfinite(y_vals)
+    if not np.any(good):
+        return None
+
+    x_vals = x_vals[good]
+    y_vals = y_vals[good]
+    if assignment_col is not None and assignment_col in pdf.columns:
+        assigned = assignment_mask(pdf.loc[good, assignment_col]).to_numpy(dtype=bool, copy=False)
+    else:
+        assigned = np.ones(x_vals.shape[0], dtype=bool)
+
+    min_x = float(np.min(x_vals))
+    min_y = float(np.min(y_vals))
+    tile_um = max(float(tile_um), np.finfo(float).eps)
+    tile_x = np.floor((x_vals.astype(np.float64) - min_x) / tile_um).astype(np.int64)
+    tile_y = np.floor((y_vals.astype(np.float64) - min_y) / tile_um).astype(np.int64)
+    nx_tiles = int(tile_x.max(initial=0)) + 1
+    tile_ids = tile_y * np.int64(nx_tiles) + tile_x
+
+    order = np.argsort(tile_ids, kind="stable")
+    tile_ids = tile_ids[order]
+    x_vals = np.ascontiguousarray(x_vals[order], dtype=np.float32)
+    y_vals = np.ascontiguousarray(y_vals[order], dtype=np.float32)
+    assigned = np.ascontiguousarray(assigned[order], dtype=bool)
+
+    unique_ids, starts, counts = np.unique(tile_ids, return_index=True, return_counts=True)
+    return TranscriptSpatialIndex(
+        x=x_vals,
+        y=y_vals,
+        assigned=assigned,
+        tile_ids=unique_ids.astype(np.int64, copy=False),
+        tile_starts=starts.astype(np.int64, copy=False),
+        tile_counts=counts.astype(np.int64, copy=False),
+        min_x=min_x,
+        min_y=min_y,
+        tile_um=tile_um,
+        nx_tiles=nx_tiles,
+        total_rows=source_total,
+        indexed_rows=int(x_vals.shape[0]),
+        sampled=source_total > int(x_vals.shape[0]),
+    )
+
+
+def query_transcript_spatial_index(
+    index: TranscriptSpatialIndex,
+    bounds: tuple[float, float, float, float],
+    max_points: int,
+    sample_percent: float | None = None,
+    random_state: int = 42,
+) -> dict[str, object]:
+    """Query the transcript index and return capped assigned/unassigned napari coords."""
+    min_x, min_y, max_x, max_y = (float(v) for v in bounds)
+    tile_x0 = int(np.floor((min_x - index.min_x) / index.tile_um))
+    tile_x1 = int(np.floor((max_x - index.min_x) / index.tile_um))
+    tile_y0 = int(np.floor((min_y - index.min_y) / index.tile_um))
+    tile_y1 = int(np.floor((max_y - index.min_y) / index.tile_um))
+
+    chunks: list[tuple[int, int]] = []
+    for ty in range(tile_y0, tile_y1 + 1):
+        for tx in range(tile_x0, tile_x1 + 1):
+            tile_id = np.int64(ty) * np.int64(index.nx_tiles) + np.int64(tx)
+            pos = int(np.searchsorted(index.tile_ids, tile_id))
+            if pos < len(index.tile_ids) and index.tile_ids[pos] == tile_id:
+                start = int(index.tile_starts[pos])
+                chunks.append((start, start + int(index.tile_counts[pos])))
+
+    empty = np.empty((0, 2), dtype=np.float32)
+    if len(chunks) == 0:
+        return {
+            "assigned_coords": empty,
+            "unassigned_coords": empty,
+            "total_in_view": 0,
+            "loaded": 0,
+            "loaded_fraction": 0.0,
+        }
+
+    x_vals = np.concatenate([index.x[start:end] for start, end in chunks])
+    y_vals = np.concatenate([index.y[start:end] for start, end in chunks])
+    assigned = np.concatenate([index.assigned[start:end] for start, end in chunks])
+    in_view = (x_vals >= min_x) & (x_vals <= max_x) & (y_vals >= min_y) & (y_vals <= max_y)
+    if not np.any(in_view):
+        return {
+            "assigned_coords": empty,
+            "unassigned_coords": empty,
+            "total_in_view": 0,
+            "loaded": 0,
+            "loaded_fraction": 0.0,
+        }
+
+    x_vals = x_vals[in_view]
+    y_vals = y_vals[in_view]
+    assigned = assigned[in_view]
+    total = int(x_vals.shape[0])
+
+    max_points = max(0, int(max_points))
+    if max_points == 0:
+        n = 0
+    elif sample_percent is None:
+        n = min(total, max_points)
+    else:
+        n = int(np.ceil(total * (min(100.0, max(0.0, float(sample_percent))) / 100.0)))
+        n = min(total, max_points, max(1, n))
+
+    if n < total:
+        rng = np.random.default_rng(int(random_state))
+        keep = rng.choice(total, size=n, replace=False)
+        x_vals = x_vals[keep]
+        y_vals = y_vals[keep]
+        assigned = assigned[keep]
+
+    assigned_coords = np.column_stack([y_vals[assigned], x_vals[assigned]]).astype(np.float32, copy=False)
+    unassigned_coords = np.column_stack([y_vals[~assigned], x_vals[~assigned]]).astype(np.float32, copy=False)
+    loaded = int(assigned_coords.shape[0] + unassigned_coords.shape[0])
+    return {
+        "assigned_coords": assigned_coords,
+        "unassigned_coords": unassigned_coords,
+        "total_in_view": total,
+        "loaded": loaded,
+        "loaded_fraction": 0.0 if total == 0 else float(loaded) / float(total),
+    }
 
 
 def geometry_to_napari_polygons(

@@ -17,6 +17,7 @@ import gc
 import hashlib
 import json
 import logging
+import shutil
 import sys
 import time
 import warnings
@@ -46,9 +47,11 @@ import spatialdata as sd
 import zarr
 from napari.utils.colormaps import Colormap
 from packaging.version import InvalidVersion, Version
-from spatialdata.models import Labels2DModel
+from spatialdata.models import Image2DModel, Labels2DModel
+from spatialdata.models.pyramids_utils import dask_arrays_to_datatree
 from spatialdata.transformations import Affine
 from spatialdata.transformations import get_transformation
+from spatialdata.transformations import set_transformation
 
 try:
     import napari
@@ -61,15 +64,17 @@ except ImportError:
     sys.exit(1)
 
 try:
-    from qtpy.QtCore import QTimer
+    from qtpy.QtCore import Qt, QTimer
     from qtpy.QtWidgets import (
         QAbstractItemView,
         QComboBox,
+        QHBoxLayout,
         QLabel,
         QListWidget,
         QPushButton,
         QScrollArea,
         QSizePolicy,
+        QSlider,
         QVBoxLayout,
         QWidget,
     )
@@ -86,11 +91,21 @@ try:
 except Exception:
     psutil = None
 
+try:
+    from napari.qt.threading import thread_worker
+except Exception:  # pragma: no cover - depends on the installed napari runtime
+    thread_worker = None
+
 from .utils import (
+    DERIVED_CACHE_ATTR,
     assignment_mask,
     affine_matrix_from_px_to_um,
+    build_transcript_spatial_index,
     build_napari_affine_from_px_to_um,
     channel_labels,
+    compute_transcript_density_array,
+    derived_outline_cache_key,
+    derived_transcript_density_cache_key,
     ensure_cyx,
     first_existing_col,
     geometry_to_napari_bounding_boxes,
@@ -98,6 +113,7 @@ from .utils import (
     geometry_to_napari_polygons,
     get_scale0_dataarray,
     image_scale_dataarrays,
+    is_derived_cache_key,
     label_outline_mask_chunk,
     layer_name_prefix,
     load_points_dataframe,
@@ -105,6 +121,7 @@ from .utils import (
     matching_layer_names,
     pixel_window_global_bounds,
     query_geometries_for_bounds,
+    query_transcript_spatial_index,
     rasterize_geometries_chunk,
     resolve_dataset_mask_affine,
 )
@@ -122,6 +139,19 @@ logging.getLogger("ome_zarr.scale").setLevel(logging.WARNING)
 logging.getLogger("ome_zarr.format").setLevel(logging.WARNING)
 
 
+class _OmeZarrLabelParentWarningFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        return not (
+            record.name == "ome_zarr.reader"
+            and message.startswith("no parent found for")
+            and "ome_zarr.reader.Label" in message
+        )
+
+
+logging.getLogger("ome_zarr.reader").addFilter(_OmeZarrLabelParentWarningFilter())
+
+
 @dataclass(frozen=True)
 class DatasetConfig:
     name: str
@@ -131,23 +161,39 @@ class DatasetConfig:
 
 
 @dataclass
-class StreamedShapeLayerState:
+class StreamedTranscriptLayerState:
     dataset: str
-    shape_key: str
-    gdf: object
-    detail_layer_name: str
-    overview_layer_name: str
+    points_key: str
+    assigned_layer_name: str
+    unassigned_layer_name: str
     timer: QTimer
-    edge_color: np.ndarray
+    view_percent: int
+    point_index: object | None
+    density_layer_names: list[str]
+    generation: int = 0
+    updating: bool = False
+    pending: bool = False
+    worker: object | None = None
 
 
 FAST_DEFAULT_MAX_TRANSCRIPTS = 200_000
 FAST_DEFAULT_MAX_SHAPES_PER_LAYER = 20_000
+DEFAULT_TRANSCRIPT_VIEW_PERCENT = 0
+DEFAULT_TRANSCRIPT_VIEW_MARGIN_FRACTION = 0.20
+DEFAULT_TRANSCRIPT_STREAM_DEBOUNCE_MS = 300
+DEFAULT_TRANSCRIPT_DENSITY_BIN_UM = 2.0
+TRANSCRIPT_DENSITY_PYRAMID_NORMALIZATION = "mean_v1"
+DEFAULT_TRANSCRIPT_DENSITY_MAX_PIXELS = 25_000_000
+DEFAULT_TRANSCRIPT_DETAIL_MAX_VIEW_SIZE = 1_500.0
+DEFAULT_TRANSCRIPT_DETAIL_MAX_POINTS = 300_000
+DEFAULT_TRANSCRIPT_INDEX_MAX_POINTS = 25_000_000
+DEFAULT_TRANSCRIPT_INDEX_TILE_UM = 250.0
 SYNTHETIC_IMAGE_PYRAMID_MIN_SIZE = 4096
 SYNTHETIC_IMAGE_PYRAMID_MAX_LEVELS = 10
 LABEL_CACHE_ATTR = "napari_compare_label_cache"
 LABEL_OUTLINE_PYRAMID_MIN_SIZE = 4096
 LABEL_OUTLINE_PYRAMID_MAX_LEVELS = 10
+DERIVED_CACHE_VERSION = 1
 
 
 def startup_selection(startup_mode: str, skip_images: bool, segmentation_source: str) -> tuple[str, ...] | None:
@@ -298,10 +344,47 @@ def lazy_outline_pyramid(
 ) -> list[object]:
     """Build a lazy multiscale uint8 outline pyramid from a 2D label image."""
     width = max(1, int(width))
+    label_levels = lazy_label_pyramid(label_data, min_size=min_size, max_levels=max_levels)
+    return lazy_outline_pyramid_from_label_levels(label_levels, width=width)
+
+
+def lazy_label_pyramid(
+    label_data,
+    min_size: int = LABEL_OUTLINE_PYRAMID_MIN_SIZE,
+    max_levels: int = LABEL_OUTLINE_PYRAMID_MAX_LEVELS,
+) -> list[object]:
+    """Build a lazy 2D label pyramid by max-pooling label ids."""
+    if da is not None:
+        data = da.asarray(label_data)
+        levels: list[object] = [data]
+        while len(levels) < max_levels and max(int(axis) for axis in data.shape) > min_size:
+            data = da.coarsen(np.max, data, axes={0: 2, 1: 2}, trim_excess=True)
+            if data.shape == levels[-1].shape:
+                break
+            levels.append(data)
+        return levels
+
+    data = np.asarray(label_data)
+    levels = [data]
+    while len(levels) < max_levels and max(int(axis) for axis in data.shape) > min_size:
+        y = (data.shape[0] // 2) * 2
+        x = (data.shape[1] // 2) * 2
+        if y < 2 or x < 2:
+            break
+        data = data[:y, :x].reshape(y // 2, 2, x // 2, 2).max(axis=(1, 3))
+        if data.shape == levels[-1].shape:
+            break
+        levels.append(data)
+    return levels
+
+
+def lazy_outline_mask(label_data, width: int) -> object:
+    """Build one lazy uint8 outline mask from one 2D label level."""
+    width = max(1, int(width))
 
     if da is not None:
         labels = da.asarray(label_data)
-        outline = labels.map_overlap(
+        return labels.map_overlap(
             label_outline_mask_chunk,
             depth=max(1, width),
             boundary=0,
@@ -309,28 +392,121 @@ def lazy_outline_pyramid(
             dtype=np.uint8,
             width=width,
         )
-        levels: list[object] = [outline]
-        data = outline
-        while len(levels) < max_levels and max(int(axis) for axis in data.shape) > min_size:
-            data = da.coarsen(np.max, data, axes={0: 2, 1: 2}, trim_excess=True)
+
+    return label_outline_mask_chunk(label_data, width=width)
+
+
+def _outline_width_for_level(width: int, base_shape: tuple[int, int], level_shape: tuple[int, int]) -> int:
+    """Scale outline width down for coarser pyramid levels."""
+    if width <= 1:
+        return 1
+    y_factor = float(base_shape[0]) / max(1.0, float(level_shape[0]))
+    x_factor = float(base_shape[1]) / max(1.0, float(level_shape[1]))
+    scale_factor = max(1.0, y_factor, x_factor)
+    return max(1, int(np.ceil(float(width) / scale_factor)))
+
+
+def lazy_outline_pyramid_from_label_levels(label_levels: list[object], width: int) -> list[object]:
+    """Build outline masks independently from existing or synthetic label levels."""
+    if len(label_levels) == 0:
+        return []
+    base_shape = tuple(int(axis) for axis in getattr(label_levels[0], "shape"))
+    outlines: list[object] = []
+    for level in label_levels:
+        level_shape = tuple(int(axis) for axis in getattr(level, "shape"))
+        level_width = _outline_width_for_level(int(width), base_shape, level_shape)
+        outlines.append(lazy_outline_mask(level, width=level_width))
+    return outlines
+
+
+def lazy_density_pyramid(
+    density_cyx,
+    min_size: int = SYNTHETIC_IMAGE_PYRAMID_MIN_SIZE,
+    max_levels: int = SYNTHETIC_IMAGE_PYRAMID_MAX_LEVELS,
+) -> list[object]:
+    """Build a display pyramid with coarse levels normalized to base-bin density."""
+    if da is None:
+        data = np.asarray(density_cyx, dtype=np.float32)
+        levels: list[object] = [data]
+        while len(levels) < max_levels and max(int(axis) for axis in data.shape[-2:]) > min_size:
+            y = (int(data.shape[1]) // 2) * 2
+            x = (int(data.shape[2]) // 2) * 2
+            if y < 2 or x < 2:
+                break
+            data = data[:, :y, :x].reshape(data.shape[0], y // 2, 2, x // 2, 2).mean(axis=(2, 4)).astype(
+                np.float32,
+                copy=False,
+            )
             if data.shape == levels[-1].shape:
                 break
-            levels.append(data.astype(np.uint8))
+            levels.append(data)
         return levels
 
-    outline = label_outline_mask_chunk(label_data, width=width)
-    levels = [outline]
-    data = outline
-    while len(levels) < max_levels and max(int(axis) for axis in data.shape) > min_size:
-        y = (data.shape[0] // 2) * 2
-        x = (data.shape[1] // 2) * 2
-        if y < 2 or x < 2:
+    data = da.asarray(density_cyx).astype(np.float32)
+    levels: list[object] = [data]
+    while len(levels) < max_levels and max(int(axis) for axis in data.shape[-2:]) > min_size:
+        axes = {axis: 2 for axis in (1, 2) if int(data.shape[axis]) >= 2}
+        if len(axes) == 0:
             break
-        data = data[:y, :x].reshape(y // 2, 2, x // 2, 2).max(axis=(1, 3)).astype(np.uint8)
+        data = da.coarsen(np.mean, data, axes=axes, trim_excess=True).astype(np.float32)
         if data.shape == levels[-1].shape:
             break
         levels.append(data)
     return levels
+
+
+def rgba_array(color, alpha: float = 1.0) -> np.ndarray:
+    """Convert common napari color inputs to an RGBA float array."""
+    if isinstance(color, (list, tuple, np.ndarray)):
+        arr = np.asarray(color, dtype=np.float32)
+        if arr.size == 3:
+            arr = np.concatenate([arr, np.asarray([1.0], dtype=np.float32)])
+        if arr.size >= 4:
+            arr = arr[:4].astype(np.float32, copy=False)
+            arr[3] *= float(alpha)
+            return arr
+
+    text = str(color).strip().lower()
+    named = {
+        "black": (0.0, 0.0, 0.0),
+        "white": (1.0, 1.0, 1.0),
+        "red": (1.0, 0.0, 0.0),
+        "green": (0.0, 1.0, 0.0),
+        "blue": (0.0, 0.0, 1.0),
+        "yellow": (1.0, 1.0, 0.0),
+        "cyan": (0.0, 1.0, 1.0),
+        "magenta": (1.0, 0.0, 1.0),
+        "orange": (1.0, 0.55, 0.0),
+    }
+    if text in named:
+        rgb = named[text]
+        return np.asarray([rgb[0], rgb[1], rgb[2], float(alpha)], dtype=np.float32)
+
+    if text.startswith("#"):
+        raw = text[1:]
+        if len(raw) == 3:
+            raw = "".join(ch * 2 for ch in raw)
+        if len(raw) == 6:
+            rgb = tuple(int(raw[i : i + 2], 16) / 255.0 for i in (0, 2, 4))
+            return np.asarray([rgb[0], rgb[1], rgb[2], float(alpha)], dtype=np.float32)
+
+    return np.asarray([1.0, 1.0, 1.0, float(alpha)], dtype=np.float32)
+
+
+def transparent_colormap(name: str, color, alpha: float = 1.0) -> Colormap:
+    """Return a transparent-to-color colormap for binary/density overlays."""
+    rgba = rgba_array(color, alpha=alpha)
+    return Colormap(
+        np.asarray(
+            [
+                [0.0, 0.0, 0.0, 0.0],
+                rgba,
+            ],
+            dtype=np.float32,
+        ),
+        name=name,
+        controls=np.asarray([0.0, 1.0], dtype=np.float32),
+    )
 
 
 class DatasetSwitcherWidget(QWidget):
@@ -340,32 +516,23 @@ class DatasetSwitcherWidget(QWidget):
         self,
         datasets: list[str],
         load_callback,
-        load_selected_shapes_callback,
-        load_selected_full_shapes_callback,
-        stream_selected_shapes_callback,
         load_selected_labels_callback,
         unload_selected_shapes_callback,
-        load_all_shapes_callback,
-        load_transcripts_callback,
+        load_full_transcripts_callback,
+        set_transcript_view_percent_callback,
         load_images_callback,
         initial_dataset: str = "MERSCOPE",
         skip_images: bool = False,
-        segmentation_source: str = "shapes",
-        full_shape_render_mode: str = "bbox",
+        transcript_view_percent: int = DEFAULT_TRANSCRIPT_VIEW_PERCENT,
     ):
         super().__init__()
         self._load_callback = load_callback
-        self._load_selected_shapes_callback = load_selected_shapes_callback
-        self._load_selected_full_shapes_callback = load_selected_full_shapes_callback
-        self._stream_selected_shapes_callback = stream_selected_shapes_callback
         self._load_selected_labels_callback = load_selected_labels_callback
         self._unload_selected_shapes_callback = unload_selected_shapes_callback
-        self._load_all_shapes_callback = load_all_shapes_callback
-        self._load_transcripts_callback = load_transcripts_callback
+        self._load_full_transcripts_callback = load_full_transcripts_callback
+        self._set_transcript_view_percent_callback = set_transcript_view_percent_callback
         self._load_images_callback = load_images_callback
         self._skip_images = bool(skip_images)
-        self._segmentation_source = "labels" if str(segmentation_source).lower() == "labels" else "shapes"
-        self._full_shape_render_mode = str(full_shape_render_mode).lower()
 
         self._dataset_combo = QComboBox()
         self._dataset_combo.addItems(datasets)
@@ -382,37 +549,22 @@ class DatasetSwitcherWidget(QWidget):
         self._shape_list.setMinimumHeight(80)
         self._shape_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        selected_label = (
-            "Load Selected Segmentations"
-            if self._segmentation_source == "labels"
-            else "Load Selected Segmentations (Capped)"
-        )
-        self._load_selected_shapes_button = QPushButton(selected_label)
-        self._load_selected_shapes_button.clicked.connect(self._on_load_selected_shapes)
-        self._load_selected_full_shapes_button = QPushButton(
-            f"Load Selected Segmentations (All: {self._full_shape_render_mode})"
-        )
-        self._load_selected_full_shapes_button.setEnabled(self._segmentation_source != "labels")
-        self._load_selected_full_shapes_button.clicked.connect(self._on_load_selected_full_shapes)
-        self._stream_selected_shapes_button = QPushButton("Stream Selected Polygons")
-        self._stream_selected_shapes_button.setEnabled(self._segmentation_source != "labels")
-        self._stream_selected_shapes_button.clicked.connect(self._on_stream_selected_shapes)
         self._load_selected_labels_button = QPushButton("Load Selected Labels (Outlines)")
         self._load_selected_labels_button.clicked.connect(self._on_load_selected_labels)
         self._unload_selected_shapes_button = QPushButton("Unload Selected Segmentations")
         self._unload_selected_shapes_button.clicked.connect(self._on_unload_selected_shapes)
-        load_all_label = (
-            "Load All Segmentations"
-            if self._segmentation_source == "labels"
-            else "Load All Segmentations (Capped)"
-        )
-        self._load_all_shapes_button = QPushButton(load_all_label)
-        self._load_all_shapes_button.clicked.connect(self._on_load_all_shapes)
 
-        self._load_sampled_tx_button = QPushButton("Load Sampled Transcripts")
-        self._load_sampled_tx_button.clicked.connect(self._on_load_sampled_transcripts)
-        self._load_full_tx_button = QPushButton("Load Full Transcripts")
+        self._load_full_tx_button = QPushButton("Load Full Transcripts (Viewport)")
         self._load_full_tx_button.clicked.connect(self._on_load_full_transcripts)
+        self._tx_percent_slider = QSlider(Qt.Horizontal)
+        self._tx_percent_slider.setRange(0, 100)
+        self._tx_percent_slider.setSingleStep(1)
+        self._tx_percent_slider.setPageStep(10)
+        self._tx_percent_slider.setValue(int(transcript_view_percent))
+        self._tx_percent_slider.valueChanged.connect(self._on_tx_percent_changed)
+        self._tx_percent_label = QLabel()
+        self._tx_percent_label.setWordWrap(True)
+        self._update_tx_percent_label(self._tx_percent_slider.value())
 
         self._load_images_button = QPushButton("Load Images")
         self._load_images_button.setEnabled(not self._skip_images)
@@ -431,17 +583,16 @@ class DatasetSwitcherWidget(QWidget):
         root.addWidget(QLabel("Segmentations"))
         root.addWidget(self._shape_list)
 
-        root.addWidget(self._load_selected_shapes_button)
-        if self._segmentation_source != "labels":
-            root.addWidget(self._load_selected_full_shapes_button)
-            root.addWidget(self._stream_selected_shapes_button)
-        root.addWidget(self._unload_selected_shapes_button)
         root.addWidget(self._load_selected_labels_button)
-        root.addWidget(self._load_all_shapes_button)
+        root.addWidget(self._unload_selected_shapes_button)
 
         root.addWidget(QLabel("Transcripts"))
-        root.addWidget(self._load_sampled_tx_button)
         root.addWidget(self._load_full_tx_button)
+        tx_percent_row = QHBoxLayout()
+        tx_percent_row.addWidget(QLabel("Viewport %"))
+        tx_percent_row.addWidget(self._tx_percent_slider)
+        root.addLayout(tx_percent_row)
+        root.addWidget(self._tx_percent_label)
 
         if not self._skip_images:
             root.addWidget(self._load_images_button)
@@ -477,6 +628,16 @@ class DatasetSwitcherWidget(QWidget):
     def selected_shape_keys(self) -> list[str]:
         return [str(item.text()) for item in self._shape_list.selectedItems()]
 
+    def transcript_view_percent(self) -> int:
+        return int(self._tx_percent_slider.value())
+
+    def _update_tx_percent_label(self, value: int):
+        if int(value) <= 0:
+            text = "Auto: load as many viewport transcripts as the display cap allows."
+        else:
+            text = f"Manual: load {int(value)}% of transcripts in the current viewport."
+        self._tx_percent_label.setText(text)
+
     def _on_dataset_changed(self, text: str):
         if not text:
             return
@@ -484,27 +645,6 @@ class DatasetSwitcherWidget(QWidget):
 
     def _on_reload_clicked(self):
         self._load_callback(self.current_dataset, True)
-
-    def _on_load_selected_shapes(self):
-        keys = self.selected_shape_keys()
-        if not keys:
-            self.set_status("No segmentation selected.")
-            return
-        self._load_selected_shapes_callback(self.current_dataset, keys)
-
-    def _on_load_selected_full_shapes(self):
-        keys = self.selected_shape_keys()
-        if not keys:
-            self.set_status("No segmentation selected.")
-            return
-        self._load_selected_full_shapes_callback(self.current_dataset, keys)
-
-    def _on_stream_selected_shapes(self):
-        keys = self.selected_shape_keys()
-        if not keys:
-            self.set_status("No segmentation selected.")
-            return
-        self._stream_selected_shapes_callback(self.current_dataset, keys)
 
     def _on_load_selected_labels(self):
         keys = self.selected_shape_keys()
@@ -520,14 +660,13 @@ class DatasetSwitcherWidget(QWidget):
             return
         self._unload_selected_shapes_callback(self.current_dataset, keys)
 
-    def _on_load_all_shapes(self):
-        self._load_all_shapes_callback(self.current_dataset)
-
-    def _on_load_sampled_transcripts(self):
-        self._load_transcripts_callback(self.current_dataset, False)
-
     def _on_load_full_transcripts(self):
-        self._load_transcripts_callback(self.current_dataset, True)
+        self._load_full_transcripts_callback(self.current_dataset, self.transcript_view_percent())
+
+    def _on_tx_percent_changed(self, value: int):
+        value = int(value)
+        self._update_tx_percent_label(value)
+        self._set_transcript_view_percent_callback(self.current_dataset, value)
 
     def _on_load_images(self):
         self._load_images_callback(self.current_dataset)
@@ -548,7 +687,7 @@ class ComparisonViewerController:
         self._segmentation_keys: list[str] = []
         self._x_transform: tuple[float, float, float] | None = None
         self._y_transform: tuple[float, float, float] | None = None
-        self._streamed_shape_states: dict[str, StreamedShapeLayerState] = {}
+        self._streamed_transcript_states: dict[str, StreamedTranscriptLayerState] = {}
 
     def set_status_callback(self, fn):
         self._status_callback = fn
@@ -574,17 +713,17 @@ class ComparisonViewerController:
         return "labels" if self._segmentation_source() == "labels" else "polygons"
 
     def _clear_layers(self):
-        self._clear_streamed_shape_states()
+        self._clear_streamed_transcript_states()
         for layer in list(self.viewer.layers):
             self.viewer.layers.remove(layer)
 
-    def _clear_streamed_shape_states(self):
-        for state in list(self._streamed_shape_states.values()):
+    def _clear_streamed_transcript_states(self):
+        for state in list(self._streamed_transcript_states.values()):
             try:
                 state.timer.stop()
             except Exception:
                 pass
-        self._streamed_shape_states.clear()
+        self._streamed_transcript_states.clear()
 
     def _resolve_optional_transform_paths(self, ds: str, cfg: DatasetConfig) -> tuple[Path | None, Path | None]:
         """Resolve optional transform/spec paths from explicit args or common defaults."""
@@ -615,6 +754,13 @@ class ComparisonViewerController:
                 self.viewer.layers.remove(layer)
                 return
 
+    def _get_layer_by_name(self, layer_name: str):
+        """Return a layer by exact name when present."""
+        for layer in list(self.viewer.layers):
+            if str(layer.name) == str(layer_name):
+                return layer
+        return None
+
     def _remove_layers_by_prefix(self, prefix: str):
         names = [str(layer.name) for layer in self.viewer.layers]
         for layer_name in matching_layer_names(names, prefix):
@@ -636,7 +782,7 @@ class ComparisonViewerController:
             visible=visible,
         )
         try:
-            self.viewer.add_points(
+            return self.viewer.add_points(
                 coords,
                 name=name,
                 face_color=color,
@@ -645,7 +791,7 @@ class ComparisonViewerController:
             )
         except TypeError:
             # Newer napari versions renamed edge_color -> border_color.
-            self.viewer.add_points(
+            return self.viewer.add_points(
                 coords,
                 name=name,
                 face_color=color,
@@ -709,7 +855,9 @@ class ComparisonViewerController:
 
             self.active_dataset = ds
             if self._segmentation_source() == "labels":
-                self._segmentation_keys = sorted(str(k) for k in sdata.labels.keys())
+                self._segmentation_keys = sorted(
+                    str(k) for k in sdata.labels.keys() if not is_derived_cache_key(str(k))
+                )
                 if len(self._segmentation_keys) == 0:
                     raise RuntimeError(
                         "No labels found in this store. Generate label layers first "
@@ -778,7 +926,7 @@ class ComparisonViewerController:
         failed_keys = 0
 
         try:
-            image_keys = list(sdata.images.keys())
+            image_keys = [str(k) for k in sdata.images.keys() if not is_derived_cache_key(str(k))]
         except Exception as exc:
             log.warning("[%s] Could not enumerate images; skipping image loading (%s)", ds, exc)
             return {"layers": 0, "failed_keys": 0, "skipped": True}
@@ -972,6 +1120,12 @@ class ComparisonViewerController:
         cfg = self.datasets[self.active_dataset]
         return sd.read_zarr(str(cfg.zarr_path), selection=("labels",))
 
+    def _read_images_from_store(self):
+        if self.active_dataset is None:
+            return None
+        cfg = self.datasets[self.active_dataset]
+        return sd.read_zarr(str(cfg.zarr_path), selection=("images",))
+
     def _refresh_label_key_from_store(self, label_key: str) -> bool:
         if self._active_sdata is None:
             return False
@@ -980,6 +1134,134 @@ class ComparisonViewerController:
             return False
         self._active_sdata.labels[label_key] = labels_sdata.labels[label_key]
         return True
+
+    def _refresh_image_key_from_store(self, image_key: str) -> bool:
+        if self._active_sdata is None:
+            return False
+        images_sdata = self._read_images_from_store()
+        if images_sdata is None or image_key not in images_sdata.images:
+            return False
+        self._active_sdata.images[image_key] = images_sdata.images[image_key]
+        return True
+
+    def _derived_cache_path(self, element_type: str, key: str) -> Path | None:
+        if self.active_dataset is None:
+            return None
+        cfg = self.datasets[self.active_dataset]
+        return cfg.zarr_path / str(element_type) / str(key)
+
+    def _remove_label_from_parent_metadata(self, label_key: str):
+        if self.active_dataset is None:
+            return
+        labels_path = self.datasets[self.active_dataset].zarr_path / "labels"
+        if not labels_path.exists():
+            return
+        try:
+            group = zarr.open_group(str(labels_path), mode="a")
+            labels = group.attrs.get("labels", None)
+            if isinstance(labels, list) and label_key in labels:
+                group.attrs["labels"] = [name for name in labels if name != label_key]
+        except Exception as exc:
+            log.debug("[%s] Could not update labels metadata for %s (%s)", self.active_dataset, label_key, exc)
+
+    def _discard_derived_cache_before_write(self, element_type: str, key: str):
+        """Remove a stale private cache so SpatialData can write it fresh."""
+        if not is_derived_cache_key(key):
+            raise ValueError(f"Refusing to delete non-derived cache element: {key}")
+        if self._active_sdata is None:
+            return
+
+        collection = None
+        if element_type == "labels":
+            collection = self._active_sdata.labels
+        elif element_type == "images":
+            collection = self._active_sdata.images
+        if collection is not None and key in collection:
+            try:
+                del collection[key]
+            except Exception:
+                pass
+
+        path = self._derived_cache_path(element_type, key)
+        if path is None or not path.exists():
+            return
+        if not path.is_dir():
+            raise ValueError(f"Refusing to delete non-directory derived cache path: {path}")
+        shutil.rmtree(path)
+        if element_type == "labels":
+            self._remove_label_from_parent_metadata(key)
+        log.info("[%s] Removed stale derived cache %s/%s before rewrite", self.active_dataset, element_type, key)
+
+    def _derived_cache_attrs(self, element_type: str, key: str) -> dict:
+        path = self._derived_cache_path(element_type, key)
+        if path is None or not path.exists():
+            return {}
+        try:
+            group = zarr.open_group(str(path), mode="r")
+            value = group.attrs.get(DERIVED_CACHE_ATTR, {})
+            return dict(value) if isinstance(value, dict) else {}
+        except Exception:
+            return {}
+
+    def _derived_cache_complete(self, element_type: str, key: str, expected: dict[str, object]) -> bool:
+        if bool(getattr(self.args, "overwrite_derived_caches", False)):
+            return False
+        attrs = self._derived_cache_attrs(element_type, key)
+        if not attrs.get("complete"):
+            return False
+        if attrs.get("version") != DERIVED_CACHE_VERSION:
+            return False
+        for expected_key, expected_value in expected.items():
+            if attrs.get(expected_key) != expected_value:
+                return False
+        return True
+
+    def _mark_derived_cache_complete(self, element_type: str, key: str, attrs: dict[str, object]):
+        path = self._derived_cache_path(element_type, key)
+        if path is None:
+            return
+        group = zarr.open_group(str(path), mode="a")
+        payload = {
+            "version": DERIVED_CACHE_VERSION,
+            "complete": True,
+            **attrs,
+        }
+        group.attrs[DERIVED_CACHE_ATTR] = payload
+
+    def _raster_scale_levels(self, elem) -> list[tuple[str, object]]:
+        levels: list[tuple[str, object]] = []
+        for scale_name, scale_da in image_scale_dataarrays(elem):
+            if hasattr(scale_da, "dims"):
+                for dim in ("z", "Z"):
+                    if dim in scale_da.dims:
+                        if int(scale_da.sizes[dim]) != 1:
+                            raise ValueError(
+                                f"Unsupported raster dims with non-singleton {dim}: "
+                                f"{tuple(str(d) for d in scale_da.dims)}"
+                            )
+                        scale_da = scale_da.isel({dim: 0}, drop=True)
+                dims = tuple(str(d) for d in scale_da.dims)
+                if "c" in dims and "y" in dims and "x" in dims:
+                    scale_da = scale_da.transpose("c", "y", "x")
+                elif "y" in dims and "x" in dims:
+                    scale_da = scale_da.transpose("y", "x")
+
+            level_data = scale_da.data if hasattr(scale_da, "data") else scale_da
+            if len(getattr(level_data, "shape", ())) in (2, 3):
+                levels.append((str(scale_name), level_data))
+        return levels
+
+    def _napari_affine_from_element(self, elem) -> np.ndarray:
+        tf = get_transformation(elem, to_coordinate_system="global")
+        m = tf.to_affine_matrix(input_axes=("x", "y"), output_axes=("x", "y"))
+        return np.array(
+            [
+                [float(m[1, 1]), float(m[1, 0]), float(m[1, 2])],
+                [float(m[0, 1]), float(m[0, 0]), float(m[0, 2])],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=float,
+        )
 
     def _image_grid_for_labels(self) -> tuple[tuple[int, int], tuple[int, int], np.ndarray, Affine]:
         if self.active_dataset is None:
@@ -1074,6 +1356,34 @@ class ComparisonViewerController:
             "shape": [int(shape[0]), int(shape[1])],
             "chunks": [int(chunks[0]), int(chunks[1])],
         }
+
+    def _discard_label_cache_before_write(self, label_key: str, shape_key: str):
+        if self._active_sdata is None:
+            return
+        path = self._derived_cache_path("labels", label_key)
+        if path is None or not path.exists():
+            return
+
+        attrs = self._label_cache_attrs(label_key)
+        generated_name = str(label_key) == f"{shape_key}_labels"
+        has_matching_cache_attr = attrs.get("source_shape_key") == str(shape_key)
+        explicit_overwrite = bool(getattr(self.args, "overwrite_labels", False))
+        if not (generated_name or has_matching_cache_attr or explicit_overwrite):
+            raise ValueError(
+                f"Refusing to delete existing label element '{label_key}'. "
+                "Pass --overwrite-labels if this should be rebuilt."
+            )
+
+        if label_key in self._active_sdata.labels:
+            try:
+                del self._active_sdata.labels[label_key]
+            except Exception:
+                pass
+        if not path.is_dir():
+            raise ValueError(f"Refusing to delete non-directory label cache path: {path}")
+        shutil.rmtree(path)
+        self._remove_label_from_parent_metadata(label_key)
+        log.info("[%s] Removed stale label cache %s before rewrite", self.active_dataset, label_key)
 
     def _rasterize_label_payload(
         self,
@@ -1177,12 +1487,13 @@ class ComparisonViewerController:
         t0 = time.time()
         self._set_status(f"{self.active_dataset} building labels for {shape_key}...")
         shape, chunks, napari_affine, spatialdata_affine = self._image_grid_for_labels()
+        self._discard_label_cache_before_write(label_key, shape_key)
         self._write_empty_label_element(
             label_key=label_key,
             shape=shape,
             chunks=chunks,
             transform=spatialdata_affine,
-            overwrite=True,
+            overwrite=False,
         )
         n_labels = self._rasterize_label_payload(
             shape_key=shape_key,
@@ -1206,6 +1517,106 @@ class ComparisonViewerController:
         )
         return label_key
 
+    def _datatree_from_levels(
+        self,
+        levels: list[object],
+        dims: tuple[str, ...],
+        transform,
+        channels: list[str] | None = None,
+        dtype=None,
+    ):
+        if da is None:
+            raise RuntimeError("dask is required to build derived raster caches.")
+        arrays = []
+        for level in levels:
+            arr = da.asarray(level)
+            if dtype is not None:
+                arr = arr.astype(dtype)
+            arrays.append(arr)
+        tree = dask_arrays_to_datatree(arrays, dims=dims, channels=channels)
+        set_transformation(tree, {"global": transform}, set_all=True)
+        return tree
+
+    def _ensure_label_outline_cache(self, label_key: str, width: int) -> str:
+        if self._active_sdata is None:
+            raise RuntimeError("No active dataset.")
+        if is_derived_cache_key(label_key):
+            return label_key
+
+        width = max(1, int(width))
+        cache_key = derived_outline_cache_key(label_key, width)
+        expected = {
+            "kind": "label_outline",
+            "source_label_key": str(label_key),
+            "width": int(width),
+        }
+        if (
+            not bool(getattr(self.args, "overwrite_labels", False))
+            and self._derived_cache_complete("labels", cache_key, expected)
+            and self._refresh_label_key_from_store(cache_key)
+        ):
+            return cache_key
+
+        if label_key not in self._active_sdata.labels:
+            if not self._refresh_label_key_from_store(label_key):
+                raise KeyError(f"Label key '{label_key}' not found in current dataset.")
+
+        label_elem = self._active_sdata.labels[label_key]
+        label_scale_levels = [
+            (scale_name, level_data)
+            for scale_name, level_data in self._raster_scale_levels(label_elem)
+            if len(getattr(level_data, "shape", ())) == 2
+        ]
+        if len(label_scale_levels) == 0:
+            raise ValueError(f"Expected 2D labels for {label_key}, found no readable 2D scale levels")
+
+        if len(label_scale_levels) > 1:
+            outline_levels = lazy_outline_pyramid_from_label_levels(
+                [level_data for _scale_name, level_data in label_scale_levels],
+                width=width,
+            )
+            source = "stored"
+        else:
+            outline_levels = lazy_outline_pyramid(label_scale_levels[0][1], width=width)
+            source = "synthetic" if len(outline_levels) > 1 else "single"
+
+        tf = get_transformation(label_elem, to_coordinate_system="global")
+        outline_tree = self._datatree_from_levels(
+            outline_levels,
+            dims=("y", "x"),
+            transform=tf,
+            dtype=np.uint8,
+        )
+        Labels2DModel.validate(outline_tree)
+        self._discard_derived_cache_before_write("labels", cache_key)
+        self._active_sdata.labels[cache_key] = outline_tree
+        self._set_status(f"{self.active_dataset} writing cached outline pyramid for {label_key}...")
+        self._active_sdata.write_element(cache_key, overwrite=False)
+        self._mark_derived_cache_complete(
+            "labels",
+            cache_key,
+            {
+                **expected,
+                "source": source,
+                "levels": int(len(outline_levels)),
+                "source_shapes": [
+                    [int(axis) for axis in getattr(level_data, "shape")]
+                    for _scale_name, level_data in label_scale_levels
+                ],
+            },
+        )
+        self._refresh_label_key_from_store(cache_key)
+        log.info(
+            "[%s] Built cached outline pyramid labels[%s] from labels[%s] levels=%s source=%s width=%s",
+            self.active_dataset,
+            cache_key,
+            label_key,
+            len(outline_levels),
+            source,
+            width,
+        )
+        return cache_key
+
     def _add_label_layer(self, label_key: str, layer_dataset: str | None = None) -> int:
         if self._active_sdata is None or self.active_dataset is None:
             return 0
@@ -1214,41 +1625,30 @@ class ComparisonViewerController:
             if not self._refresh_label_key_from_store(label_key):
                 raise KeyError(f"Label key '{label_key}' not found in current dataset.")
 
-        label_elem = self._active_sdata.labels[label_key]
-        label_da = get_scale0_dataarray(label_elem)
-        data = label_da.data if hasattr(label_da, "data") else label_da
+        outline_width = max(1, int(self.args.label_contour_width))
+        display_label_key = self._ensure_label_outline_cache(label_key, outline_width)
+        label_elem = self._active_sdata.labels[display_label_key]
+        label_scale_levels = [
+            (scale_name, level_data)
+            for scale_name, level_data in self._raster_scale_levels(label_elem)
+            if len(getattr(level_data, "shape", ())) == 2
+        ]
+
+        if len(label_scale_levels) == 0:
+            raise ValueError(f"Expected 2D cached outlines for {display_label_key}, found no readable 2D levels")
+
+        data = label_scale_levels[0][1]
         if len(getattr(data, "shape", ())) != 2:
-            raise ValueError(f"Expected 2D labels for {label_key}, got shape {getattr(data, 'shape', None)}")
+            raise ValueError(f"Expected 2D cached outlines for {display_label_key}, got shape {getattr(data, 'shape', None)}")
 
-        tf = get_transformation(label_elem, to_coordinate_system="global")
-        m = tf.to_affine_matrix(input_axes=("x", "y"), output_axes=("x", "y"))
-        # Convert x/y affine to napari row/col affine.
-        napari_affine = np.array(
-            [
-                [float(m[1, 1]), float(m[1, 0]), float(m[1, 2])],
-                [float(m[0, 1]), float(m[0, 0]), float(m[0, 2])],
-                [0.0, 0.0, 1.0],
-            ],
-            dtype=float,
-        )
-
+        napari_affine = self._napari_affine_from_element(label_elem)
         layer_name = make_layer_name(ds, "labels", label_key)
         self._remove_layer_by_name(layer_name)
-        outline_width = max(1, int(self.args.label_contour_width))
-        outline_levels = lazy_outline_pyramid(data, width=outline_width)
+        outline_levels = [level_data for _scale_name, level_data in label_scale_levels]
+        pyramid_source = "cache"
         outline_data = outline_levels if len(outline_levels) > 1 else outline_levels[0]
-        layer_color = np.asarray(stable_layer_color(label_key, alpha=float(self.args.shape_opacity)), dtype=np.float32)
-        color_map = Colormap(
-            np.asarray(
-                [
-                    [0.0, 0.0, 0.0, 0.0],
-                    layer_color,
-                ],
-                dtype=np.float32,
-            ),
-            name=f"{label_key}_outline",
-            controls=np.asarray([0.0, 1.0], dtype=np.float32),
-        )
+        layer_color = np.asarray(stable_layer_color(label_key, alpha=1.0), dtype=np.float32)
+        color_map = transparent_colormap(f"{label_key}_outline", layer_color, alpha=float(self.args.shape_opacity))
 
         self.viewer.add_image(
             outline_data,
@@ -1263,13 +1663,15 @@ class ComparisonViewerController:
             visible=not self.args.hide_shapes,
         )
         log.info(
-            "[%s] Added label outline layer %s with shape=%s dtype=%s levels=%s width=%s",
+            "[%s] Added label outline layer %s from cache=%s shape=%s dtype=%s levels=%s width=%s source=%s",
             ds,
             label_key,
+            display_label_key,
             tuple(int(x) for x in data.shape),
             getattr(data, "dtype", "unknown"),
             len(outline_levels),
             outline_width,
+            pyramid_source,
         )
         return 1
 
@@ -1290,27 +1692,494 @@ class ComparisonViewerController:
 
         return {"layers": total_layers, "units": total_units}
 
-    def _add_transcripts_layer(self, cap: int | None) -> dict[str, int]:
+    def _resolve_points_columns(self):
         if self._active_sdata is None or self.active_dataset is None:
-            return {"total": 0, "assigned": 0, "unassigned": 0}
+            raise RuntimeError("No active dataset.")
+        if len(self._active_sdata.points) == 0:
+            raise RuntimeError("No points available in SpatialData.")
 
-        ds = self.active_dataset
-        sdata = self._active_sdata
-        self._remove_layers_by_prefix(layer_name_prefix(ds, "transcripts"))
-
-        if len(sdata.points) == 0:
-            log.warning("[%s] No points available in SpatialData.", ds)
-            return {"total": 0, "assigned": 0, "unassigned": 0}
-
-        points_key = list(sdata.points.keys())[0]
-        points_obj = sdata.points[points_key]
-
+        points_key = list(self._active_sdata.points.keys())[0]
+        points_obj = self._active_sdata.points[points_key]
         x_col = first_existing_col(points_obj, ["x", "x_micron", "global_x", "x_location", "observed_x"])
         y_col = first_existing_col(points_obj, ["y", "y_micron", "global_y", "y_location", "observed_y"])
         assignment_col = first_existing_col(points_obj, ["assignment", "cell", "cell_id"])
 
         if x_col is None or y_col is None:
             raise KeyError(f"Could not resolve x/y columns in points[{points_key}]")
+        return points_key, points_obj, x_col, y_col, assignment_col
+
+    def _transcript_coords_from_pdf(
+        self,
+        points_pdf,
+        x_col: str,
+        y_col: str,
+        assignment_col: str | None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if len(points_pdf) == 0:
+            empty = np.empty((0, 2), dtype=np.float32)
+            return empty, empty
+
+        if assignment_col is not None and assignment_col in points_pdf.columns:
+            assigned_mask = assignment_mask(points_pdf[assignment_col]).to_numpy(dtype=bool, copy=False)
+        else:
+            assigned_mask = np.ones(len(points_pdf), dtype=bool)
+
+        x_vals = points_pdf[x_col].to_numpy(dtype=np.float32, copy=False)
+        y_vals = points_pdf[y_col].to_numpy(dtype=np.float32, copy=False)
+        good = np.isfinite(x_vals) & np.isfinite(y_vals)
+        if not np.all(good):
+            x_vals = x_vals[good]
+            y_vals = y_vals[good]
+            assigned_mask = assigned_mask[good]
+
+        assigned_coords = np.column_stack([y_vals[assigned_mask], x_vals[assigned_mask]]).astype(
+            np.float32,
+            copy=False,
+        )
+        unassigned_coords = np.column_stack([y_vals[~assigned_mask], x_vals[~assigned_mask]]).astype(
+            np.float32,
+            copy=False,
+        )
+        return assigned_coords, unassigned_coords
+
+    def _compute_transcript_view_payload(
+        self,
+        state: StreamedTranscriptLayerState,
+        bounds: tuple[float, float, float, float] | None,
+        view_percent: int,
+    ) -> dict[str, object]:
+        empty = np.empty((0, 2), dtype=np.float32)
+        if state.point_index is None or bounds is None:
+            return {
+                "assigned_coords": empty,
+                "unassigned_coords": empty,
+                "total_in_view": 0,
+                "loaded": 0,
+                "assigned": 0,
+                "unassigned": 0,
+                "loaded_fraction": 0.0,
+                "bounds": bounds,
+                "view_percent": int(view_percent),
+                "detail_enabled": False,
+                "detail_reason": "density-only",
+                "view_margin_fraction": 0.0,
+            }
+
+        view_width = float(bounds[2] - bounds[0])
+        view_height = float(bounds[3] - bounds[1])
+        if max(view_width, view_height) > float(self.args.transcript_detail_max_view_size):
+            return {
+                "assigned_coords": empty,
+                "unassigned_coords": empty,
+                "total_in_view": 0,
+                "loaded": 0,
+                "assigned": 0,
+                "unassigned": 0,
+                "loaded_fraction": 0.0,
+                "bounds": bounds,
+                "view_percent": int(view_percent),
+                "detail_enabled": False,
+                "detail_reason": "zoom-in",
+                "view_size": max(view_width, view_height),
+                "view_margin_fraction": 0.0,
+            }
+
+        query_bounds = self._expanded_view_bounds(bounds)
+        sample_percent = None if int(view_percent) <= 0 else float(view_percent)
+        result = query_transcript_spatial_index(
+            state.point_index,
+            bounds=query_bounds,
+            max_points=self.args.transcript_detail_max_points,
+            sample_percent=sample_percent,
+            random_state=self.args.random_state,
+        )
+        assigned_coords = result["assigned_coords"]
+        unassigned_coords = result["unassigned_coords"]
+        loaded = int(result["loaded"])
+        return {
+            "assigned_coords": assigned_coords,
+            "unassigned_coords": unassigned_coords,
+            "total_in_view": int(result["total_in_view"]),
+            "loaded": loaded,
+            "assigned": int(len(assigned_coords)),
+            "unassigned": int(len(unassigned_coords)),
+            "loaded_fraction": float(result["loaded_fraction"]),
+            "bounds": query_bounds,
+            "viewport_bounds": bounds,
+            "view_percent": int(view_percent),
+            "detail_enabled": True,
+            "detail_reason": "indexed",
+            "view_margin_fraction": float(self.args.transcript_view_margin_fraction),
+        }
+
+    def _set_points_layer_data(self, layer_name: str, coords: np.ndarray, color, visible: bool):
+        layer = self._get_layer_by_name(layer_name)
+        if layer is None:
+            self._add_points_layer(coords, name=layer_name, color=color, visible=visible)
+            return
+        layer.data = coords
+        layer.visible = bool(visible)
+
+    def _set_layers_visible(self, layer_names: list[str], visible: bool):
+        for layer_name in layer_names:
+            layer = self._get_layer_by_name(layer_name)
+            if layer is not None:
+                layer.visible = bool(visible)
+
+    def _transcript_state_key(self, ds: str) -> str:
+        return make_layer_name(ds, "transcripts", "viewport")
+
+    def _schedule_streamed_transcript_update(self, state_key: str, delay_ms: int | None = None):
+        state = self._streamed_transcript_states.get(state_key)
+        if state is None:
+            return
+        if state.updating:
+            state.pending = True
+            return
+        delay = int(self.args.transcript_stream_debounce_ms if delay_ms is None else delay_ms)
+        state.timer.start(max(0, delay))
+
+    def _apply_streamed_transcript_update(self, state_key: str, generation: int, payload: dict[str, object]):
+        state = self._streamed_transcript_states.get(state_key)
+        if state is None or state.generation != generation or self.active_dataset != state.dataset:
+            return
+
+        state.updating = False
+        state.worker = None
+        transcripts_visible = not self.args.hide_transcripts
+        detail_enabled = bool(payload.get("detail_enabled", False))
+        self._set_layers_visible(state.density_layer_names, transcripts_visible and not detail_enabled)
+        self._set_points_layer_data(
+            state.assigned_layer_name,
+            payload["assigned_coords"],
+            self.args.assigned_color,
+            transcripts_visible and detail_enabled,
+        )
+        self._set_points_layer_data(
+            state.unassigned_layer_name,
+            payload["unassigned_coords"],
+            self.args.unassigned_color,
+            transcripts_visible and detail_enabled,
+        )
+
+        loaded = int(payload["loaded"])
+        total_in_view = int(payload["total_in_view"])
+        mode = "auto" if int(payload["view_percent"]) <= 0 else f"{int(payload['view_percent'])}%"
+        if detail_enabled:
+            fraction = float(payload["loaded_fraction"]) * 100.0
+            margin = max(0.0, float(payload.get("view_margin_fraction", 0.0)))
+            margin_note = f", {margin * 100.0:.0f}% pan buffer" if margin > 0 else ""
+            cap_note = ""
+            if total_in_view > int(self.args.transcript_detail_max_points) and loaded >= int(self.args.transcript_detail_max_points):
+                cap_note = f", capped at {int(self.args.transcript_detail_max_points):,}"
+            self._set_status(
+                f"{state.dataset} transcript point detail ({mode}): showing {loaded:,}/{total_in_view:,} "
+                f"indexed points ({fraction:.1f}%{cap_note}{margin_note}); assigned={int(payload['assigned']):,}, "
+                f"unassigned={int(payload['unassigned']):,}."
+            )
+        else:
+            reason = str(payload.get("detail_reason", "density-only"))
+            if reason == "zoom-in":
+                self._set_status(
+                    f"{state.dataset} transcript density visible; zoom in below "
+                    f"{float(self.args.transcript_detail_max_view_size):.0f} um for point detail."
+                )
+            else:
+                self._set_status(f"{state.dataset} transcript density visible; point detail index unavailable.")
+
+        if state.pending:
+            state.pending = False
+            self._schedule_streamed_transcript_update(state_key, delay_ms=0)
+
+    def _handle_streamed_transcript_error(self, state_key: str, generation: int, exc):
+        state = self._streamed_transcript_states.get(state_key)
+        if state is None or state.generation != generation:
+            return
+        state.updating = False
+        state.worker = None
+        message = exc[1] if isinstance(exc, tuple) and len(exc) > 1 else exc
+        self._set_status(f"{state.dataset} transcript viewport update failed: {message}")
+        log.error("[%s] Transcript viewport update failed: %s", state.dataset, message)
+        if state.pending:
+            state.pending = False
+            self._schedule_streamed_transcript_update(state_key, delay_ms=0)
+
+    def _update_streamed_transcript_layer(self, state_key: str):
+        state = self._streamed_transcript_states.get(state_key)
+        if state is None or self.active_dataset != state.dataset:
+            return
+        if state.updating:
+            state.pending = True
+            return
+
+        bounds = self._current_view_bounds()
+        state.generation += 1
+        generation = state.generation
+        state.updating = True
+        state.pending = False
+        view_percent = int(state.view_percent)
+        mode = "auto" if view_percent <= 0 else f"{view_percent}%"
+        self._set_status(f"{state.dataset} updating viewport transcripts ({mode})...")
+
+        if thread_worker is None:
+            try:
+                payload = self._compute_transcript_view_payload(state, bounds, view_percent)
+            except Exception as exc:
+                self._handle_streamed_transcript_error(state_key, generation, exc)
+                return
+            self._apply_streamed_transcript_update(state_key, generation, payload)
+            return
+
+        def compute():
+            return self._compute_transcript_view_payload(state, bounds, view_percent)
+
+        worker_factory = thread_worker(compute)
+        worker = worker_factory()
+        worker.returned.connect(
+            lambda payload, key=state_key, gen=generation: self._apply_streamed_transcript_update(key, gen, payload)
+        )
+        worker.errored.connect(
+            lambda exc, key=state_key, gen=generation: self._handle_streamed_transcript_error(key, gen, exc)
+        )
+        state.worker = worker
+        worker.start()
+
+    def _ensure_transcript_density_cache(
+        self,
+        points_key: str,
+        points_obj,
+        x_col: str,
+        y_col: str,
+        assignment_col: str | None,
+    ) -> tuple[str, dict[str, object]]:
+        if self._active_sdata is None or self.active_dataset is None:
+            raise RuntimeError("No active dataset.")
+
+        requested_bin_um = float(self.args.transcript_density_bin_um)
+        cache_key = derived_transcript_density_cache_key(points_key, requested_bin_um)
+        expected = {
+            "kind": "transcript_density",
+            "points_key": str(points_key),
+            "x_col": str(x_col),
+            "y_col": str(y_col),
+            "assignment_col": None if assignment_col is None else str(assignment_col),
+            "requested_bin_um": float(requested_bin_um),
+            "max_pixels": int(self.args.transcript_density_max_pixels),
+            "pyramid_normalization": TRANSCRIPT_DENSITY_PYRAMID_NORMALIZATION,
+        }
+        if self._derived_cache_complete("images", cache_key, expected) and self._refresh_image_key_from_store(cache_key):
+            return cache_key, self._derived_cache_attrs("images", cache_key)
+
+        self._set_status(f"{self.active_dataset} building transcript density cache for {points_key}...")
+        density, density_meta = compute_transcript_density_array(
+            points_obj,
+            x_col=x_col,
+            y_col=y_col,
+            assignment_col=assignment_col,
+            bin_um=requested_bin_um,
+            max_pixels=int(self.args.transcript_density_max_pixels),
+        )
+        levels = lazy_density_pyramid(density)
+        if da is not None:
+            levels = [
+                da.asarray(level).rechunk(
+                    (
+                        1,
+                        min(1024, int(level.shape[1])),
+                        min(1024, int(level.shape[2])),
+                    )
+                )
+                for level in levels
+            ]
+        actual_bin_um = float(density_meta["actual_bin_um"])
+        min_x, min_y, _max_x, _max_y = (float(v) for v in density_meta["bounds"])
+        transform = Affine(
+            [
+                [actual_bin_um, 0.0, min_x],
+                [0.0, actual_bin_um, min_y],
+                [0.0, 0.0, 1.0],
+            ],
+            input_axes=("x", "y"),
+            output_axes=("x", "y"),
+        )
+        density_tree = self._datatree_from_levels(
+            levels,
+            dims=("c", "y", "x"),
+            channels=["assigned", "unassigned"],
+            transform=transform,
+            dtype=np.float32,
+        )
+        Image2DModel.validate(density_tree)
+        self._discard_derived_cache_before_write("images", cache_key)
+        self._active_sdata.images[cache_key] = density_tree
+        self._set_status(f"{self.active_dataset} writing transcript density pyramid for {points_key}...")
+        self._active_sdata.write_element(cache_key, overwrite=False)
+        attrs = {
+            **expected,
+            **density_meta,
+            "levels": int(len(levels)),
+        }
+        self._mark_derived_cache_complete("images", cache_key, attrs)
+        self._refresh_image_key_from_store(cache_key)
+        log.info(
+            "[%s] Built transcript density cache images[%s] from points[%s] shape=%s levels=%s bin=%s requested_bin=%s",
+            self.active_dataset,
+            cache_key,
+            points_key,
+            density.shape,
+            len(levels),
+            actual_bin_um,
+            requested_bin_um,
+        )
+        return cache_key, attrs
+
+    def _add_transcript_density_layers(self, cache_key: str, attrs: dict[str, object]) -> list[str]:
+        if self._active_sdata is None or self.active_dataset is None:
+            return []
+        if cache_key not in self._active_sdata.images and not self._refresh_image_key_from_store(cache_key):
+            raise KeyError(f"Transcript density cache '{cache_key}' not found.")
+
+        ds = self.active_dataset
+        image_elem = self._active_sdata.images[cache_key]
+        levels = self._raster_scale_levels(image_elem)
+        if len(levels) == 0:
+            raise ValueError(f"Transcript density cache {cache_key} has no readable levels.")
+
+        scale_levels = []
+        for scale_name, data in levels:
+            if len(getattr(data, "shape", ())) != 3:
+                continue
+            scale_levels.append((scale_name, data))
+        if len(scale_levels) == 0:
+            raise ValueError(f"Transcript density cache {cache_key} has no 3D c/y/x levels.")
+
+        napari_affine = self._napari_affine_from_element(image_elem)
+        visible = not self.args.hide_transcripts
+        layer_names: list[str] = []
+        channel_specs = [
+            ("assigned", 0, self.args.assigned_color),
+            ("unassigned", 1, self.args.unassigned_color),
+        ]
+        for label, channel_idx, color in channel_specs:
+            channel_levels = [data[channel_idx, :, :] for _scale_name, data in scale_levels]
+            ch_data = channel_levels if len(channel_levels) > 1 else channel_levels[0]
+            layer_name = make_layer_name(ds, "transcript_density", label)
+            self._remove_layer_by_name(layer_name)
+            self.viewer.add_image(
+                ch_data,
+                name=layer_name,
+                affine=napari_affine,
+                colormap=transparent_colormap(f"{cache_key}_{label}", color, alpha=1.0),
+                contrast_limits=(0.0, 35.0),
+                interpolation2d="nearest",
+                multiscale=len(channel_levels) > 1,
+                opacity=1.0,
+                blending="additive",
+                visible=visible,
+            )
+            layer_names.append(layer_name)
+        return layer_names
+
+    def _add_streamed_transcripts_layer(self, view_percent: int | None = None) -> dict[str, int | bool]:
+        if self._active_sdata is None or self.active_dataset is None:
+            return {"total": 0, "assigned": 0, "unassigned": 0, "streamed": True}
+
+        ds = self.active_dataset
+        points_key, points_obj, x_col, y_col, assignment_col = self._resolve_points_columns()
+        self._clear_streamed_transcript_states()
+        self._remove_layers_by_prefix(layer_name_prefix(ds, "transcripts"))
+        self._remove_layers_by_prefix(layer_name_prefix(ds, "transcript_density"))
+        gc.collect()
+
+        density_cache_key, density_attrs = self._ensure_transcript_density_cache(
+            points_key,
+            points_obj,
+            x_col,
+            y_col,
+            assignment_col,
+        )
+        density_layer_names = self._add_transcript_density_layers(density_cache_key, density_attrs)
+
+        self._set_status(f"{ds} building transcript point detail index for {points_key}...")
+        point_index = build_transcript_spatial_index(
+            points_obj,
+            x_col=x_col,
+            y_col=y_col,
+            assignment_col=assignment_col,
+            max_points=int(self.args.transcript_index_max_points),
+            tile_um=float(self.args.transcript_index_tile_um),
+            random_state=int(self.args.random_state),
+        )
+
+        assigned_layer_name = make_layer_name(ds, "transcripts", "assigned")
+        unassigned_layer_name = make_layer_name(ds, "transcripts", "unassigned")
+        visible = not self.args.hide_transcripts
+        empty = np.empty((0, 2), dtype=np.float32)
+        self._add_points_layer(
+            empty,
+            name=unassigned_layer_name,
+            color=self.args.unassigned_color,
+            visible=visible,
+        )
+        self._add_points_layer(
+            empty,
+            name=assigned_layer_name,
+            color=self.args.assigned_color,
+            visible=visible,
+        )
+
+        state_key = self._transcript_state_key(ds)
+        timer = QTimer()
+        timer.setSingleShot(True)
+        timer.timeout.connect(lambda key=state_key: self._update_streamed_transcript_layer(key))
+        state = StreamedTranscriptLayerState(
+            dataset=ds,
+            points_key=points_key,
+            assigned_layer_name=assigned_layer_name,
+            unassigned_layer_name=unassigned_layer_name,
+            timer=timer,
+            view_percent=self.args.transcript_view_percent if view_percent is None else int(view_percent),
+            point_index=point_index,
+            density_layer_names=density_layer_names,
+        )
+        self._streamed_transcript_states[state_key] = state
+
+        def schedule(_event=None, key=state_key):
+            self._schedule_streamed_transcript_update(key)
+
+        try:
+            self.viewer.camera.events.zoom.connect(schedule)
+            self.viewer.camera.events.center.connect(schedule)
+        except Exception:
+            pass
+
+        self._schedule_streamed_transcript_update(state_key, delay_ms=0)
+        log.info(
+            "[%s] Added hybrid transcript layers from points[%s] density_cache=%s viewport_percent=%s detail_max_points=%s indexed=%s",
+            ds,
+            points_key,
+            density_cache_key,
+            state.view_percent,
+            self.args.transcript_detail_max_points,
+            0 if point_index is None else point_index.indexed_rows,
+        )
+        return {"total": 0, "assigned": 0, "unassigned": 0, "streamed": True}
+
+    def _add_transcripts_layer(self, cap: int | None) -> dict[str, int]:
+        if self._active_sdata is None or self.active_dataset is None:
+            return {"total": 0, "assigned": 0, "unassigned": 0}
+
+        ds = self.active_dataset
+        sdata = self._active_sdata
+        self._clear_streamed_transcript_states()
+        self._remove_layers_by_prefix(layer_name_prefix(ds, "transcripts"))
+        self._remove_layers_by_prefix(layer_name_prefix(ds, "transcript_density"))
+
+        if len(sdata.points) == 0:
+            log.warning("[%s] No points available in SpatialData.", ds)
+            return {"total": 0, "assigned": 0, "unassigned": 0}
+
+        points_key, points_obj, x_col, y_col, assignment_col = self._resolve_points_columns()
 
         points_pdf = load_points_dataframe(
             points_obj,
@@ -1370,55 +2239,6 @@ class ComparisonViewerController:
 
         return {"total": total, "assigned": assigned, "unassigned": unassigned}
 
-    def _load_shape_keys(
-        self,
-        dataset_name: str,
-        shape_keys: list[str],
-        cap: int | None,
-        mode: str,
-        render_mode: str | None = None,
-    ):
-        if not self._ensure_dataset_is_active(dataset_name):
-            self._set_status(f"Could not activate dataset {dataset_name}.")
-            return
-        added_layers = 0
-        total_units = 0
-        mem_before = memory_snapshot_gb()
-        for shape_key in shape_keys:
-            n = self._add_shape_layer(
-                shape_key,
-                cap=cap,
-                simplify_tolerance=self.args.shape_simplify_tolerance,
-                render_mode=render_mode,
-            )
-            if n > 0:
-                added_layers += 1
-                total_units += n
-        mem_after = memory_snapshot_gb()
-        self._set_status(
-            f"{self.active_dataset} loaded {mode} {self._segmentation_layer_type()} "
-            f"layer(s)={added_layers}, {self._segmentation_unit_name()}={total_units:,} | "
-            f"RSS {mem_before['rss_gb']:.1f}->{mem_after['rss_gb']:.1f} GB"
-        )
-
-    def load_selected_shapes(self, dataset_name: str, shape_keys: list[str]):
-        self._load_shape_keys(
-            dataset_name,
-            shape_keys,
-            cap=self.args.max_shapes_per_layer,
-            mode="capped selected",
-            render_mode=self.args.shape_render_mode,
-        )
-
-    def load_selected_shapes_full(self, dataset_name: str, shape_keys: list[str]):
-        self._load_shape_keys(
-            dataset_name,
-            shape_keys,
-            cap=None,
-            mode=f"full selected ({self.args.full_shape_render_mode})",
-            render_mode=self.args.full_shape_render_mode,
-        )
-
     def load_selected_labels(self, dataset_name: str, shape_keys: list[str]):
         if not self._ensure_dataset_is_active(dataset_name):
             self._set_status(f"Could not activate dataset {dataset_name}.")
@@ -1465,136 +2285,15 @@ class ComparisonViewerController:
         half_y = max(height_px / (2.0 * zoom), 1.0)
         return (x_center - half_x, y_center - half_y, x_center + half_x, y_center + half_y)
 
-    def _streamed_state_key(self, ds: str, shape_key: str) -> str:
-        return make_layer_name(ds, "streamed", shape_key)
-
-    def _schedule_streamed_shape_update(self, state_key: str):
-        state = self._streamed_shape_states.get(state_key)
-        if state is None:
-            return
-        state.timer.start(int(self.args.stream_shapes_debounce_ms))
-
-    def _update_streamed_shape_layer(self, state_key: str):
-        state = self._streamed_shape_states.get(state_key)
-        if state is None or self.active_dataset != state.dataset:
-            return
-
-        bounds = self._current_view_bounds()
-        if bounds is None:
-            return
-        view_width = float(bounds[2] - bounds[0])
-        view_height = float(bounds[3] - bounds[1])
-        if max(view_width, view_height) > float(self.args.stream_shapes_max_view_size):
-            self._remove_layer_by_name(state.detail_layer_name)
-            self._set_status(
-                f"{state.dataset} {state.shape_key}: zoom in to stream exact polygons "
-                f"(view={max(view_width, view_height):.0f} > {self.args.stream_shapes_max_view_size:.0f})."
-            )
-            return
-
-        candidates = query_geometries_for_bounds(state.gdf, bounds)
-        n_candidates = int(len(candidates))
-        if n_candidates > int(self.args.stream_shapes_max_polygons):
-            self._remove_layer_by_name(state.detail_layer_name)
-            self._set_status(
-                f"{state.dataset} {state.shape_key}: {n_candidates:,} cells in view; "
-                f"zoom further or raise --stream-shapes-max-polygons."
-            )
-            return
-
-        data = geometry_to_napari_polygons(
-            candidates.geometry,
-            max_shapes=None,
-            simplify_tolerance=self.args.shape_simplify_tolerance,
-            max_vertices_per_polygon=self.args.shape_max_vertices_per_polygon,
-        )
-        self._remove_layer_by_name(state.detail_layer_name)
-        if len(data) > 0:
-            self.viewer.add_shapes(
-                data,
-                shape_type="path",
-                name=state.detail_layer_name,
-                edge_color=state.edge_color,
-                edge_width=self.args.shape_edge_width,
-                visible=not self.args.hide_shapes,
-            )
-        self._set_status(
-            f"{state.dataset} streamed exact polygons for {state.shape_key}: "
-            f"{len(data):,} polygons in current view."
-        )
-
-    def _add_streamed_shape_layer(self, shape_key: str) -> int:
-        if self._active_sdata is None or self.active_dataset is None:
-            return 0
-        ds = self.active_dataset
-        if shape_key not in self._active_sdata.shapes:
-            raise KeyError(f"Shape key '{shape_key}' not found in current dataset.")
-
-        state_key = self._streamed_state_key(ds, shape_key)
-        old_state = self._streamed_shape_states.pop(state_key, None)
-        if old_state is not None:
-            old_state.timer.stop()
-
-        overview_layer_name = make_layer_name(ds, "streamed_bbox", shape_key)
-        detail_layer_name = state_key
-        self._remove_layer_by_name(overview_layer_name)
-        self._remove_layer_by_name(detail_layer_name)
-
-        gdf = self._active_sdata.shapes[shape_key]
-        edge_color = np.asarray(stable_layer_color(shape_key, alpha=self.args.shape_opacity), dtype=float)
-        overview = geometry_to_napari_bounding_boxes(gdf.geometry, max_shapes=None)
-        if len(overview) > 0:
-            self.viewer.add_shapes(
-                overview,
-                shape_type="rectangle",
-                name=overview_layer_name,
-                edge_color=edge_color,
-                edge_width=self.args.shape_edge_width,
-                face_color="transparent",
-                opacity=min(float(self.args.shape_opacity), 0.35),
-                visible=not self.args.hide_shapes,
-            )
-
-        timer = QTimer()
-        timer.setSingleShot(True)
-        timer.timeout.connect(lambda key=state_key: self._update_streamed_shape_layer(key))
-        state = StreamedShapeLayerState(
-            dataset=ds,
-            shape_key=shape_key,
-            gdf=gdf,
-            detail_layer_name=detail_layer_name,
-            overview_layer_name=overview_layer_name,
-            timer=timer,
-            edge_color=edge_color,
-        )
-        self._streamed_shape_states[state_key] = state
-
-        def schedule(_event=None, key=state_key):
-            self._schedule_streamed_shape_update(key)
-
-        try:
-            self.viewer.camera.events.zoom.connect(schedule)
-            self.viewer.camera.events.center.connect(schedule)
-        except Exception:
-            pass
-        self._schedule_streamed_shape_update(state_key)
-        return int(len(gdf))
-
-    def stream_selected_shapes(self, dataset_name: str, shape_keys: list[str]):
-        if not self._ensure_dataset_is_active(dataset_name):
-            self._set_status(f"Could not activate dataset {dataset_name}.")
-            return
-        added_layers = 0
-        total_units = 0
-        for shape_key in shape_keys:
-            n = self._add_streamed_shape_layer(shape_key)
-            if n > 0:
-                added_layers += 1
-                total_units += n
-        self._set_status(
-            f"{self.active_dataset} added streamed polygon layer(s)={added_layers}, "
-            f"overview cells={total_units:,}; zoom in for exact boundaries."
-        )
+    def _expanded_view_bounds(
+        self,
+        bounds: tuple[float, float, float, float],
+    ) -> tuple[float, float, float, float]:
+        margin = max(0.0, float(self.args.transcript_view_margin_fraction))
+        min_x, min_y, max_x, max_y = (float(v) for v in bounds)
+        pad_x = max(0.0, max_x - min_x) * margin
+        pad_y = max(0.0, max_y - min_y) * margin
+        return (min_x - pad_x, min_y - pad_y, max_x + pad_x, max_y + pad_y)
 
     def unload_selected_shapes(self, dataset_name: str, shape_keys: list[str]):
         if not self._ensure_dataset_is_active(dataset_name):
@@ -1607,50 +2306,40 @@ class ComparisonViewerController:
                 make_layer_name(ds, self._segmentation_layer_type(), shape_key),
                 make_layer_name(ds, "labels", shape_key),
                 make_layer_name(ds, "labels", self._label_key_for_shape_key(shape_key)),
-                make_layer_name(ds, "streamed", shape_key),
-                make_layer_name(ds, "streamed_bbox", shape_key),
             ]
             for name in layer_names:
                 before = len(self.viewer.layers)
                 self._remove_layer_by_name(name)
                 if len(self.viewer.layers) < before:
                     removed += 1
-            state_key = self._streamed_state_key(ds, shape_key)
-            state = self._streamed_shape_states.pop(state_key, None)
-            if state is not None:
-                state.timer.stop()
         self._set_status(f"{ds} removed {removed} {self._segmentation_layer_type()} layer(s).")
 
-    def load_all_shapes_capped(self, dataset_name: str):
-        if not self._ensure_dataset_is_active(dataset_name):
-            self._set_status(f"Could not activate dataset {dataset_name}.")
+    def set_transcript_view_percent(self, dataset_name: str, percent: int):
+        percent = int(percent)
+        self.args.transcript_view_percent = percent
+        ds = str(dataset_name).upper()
+        state = self._streamed_transcript_states.get(self._transcript_state_key(ds))
+        if state is None:
             return
-        added_layers = 0
-        total_units = 0
-        for shape_key in self._segmentation_keys:
-            n = self._add_shape_layer(
-                shape_key,
-                cap=self.args.max_shapes_per_layer,
-                simplify_tolerance=self.args.shape_simplify_tolerance,
-            )
-            if n > 0:
-                added_layers += 1
-                total_units += n
-        self._set_status(
-            f"{self.active_dataset} loaded all capped {self._segmentation_layer_type()}: "
-            f"{added_layers} layer(s), {self._segmentation_unit_name()}={total_units:,}"
-        )
+        state.view_percent = percent
+        if self.active_dataset == ds:
+            self._schedule_streamed_transcript_update(self._transcript_state_key(ds), delay_ms=0)
 
-    def load_transcripts(self, dataset_name: str, full: bool):
+    def load_full_transcripts(self, dataset_name: str, view_percent: int | None = None):
         if not self._ensure_dataset_is_active(dataset_name):
             self._set_status(f"Could not activate dataset {dataset_name}.")
             return
-        cap = None if full else self.args.max_transcripts
-        stats = self._add_transcripts_layer(cap)
-        mode = "full" if cap is None else f"sampled ({cap:,})"
+        if view_percent is not None:
+            self.args.transcript_view_percent = int(view_percent)
+        self._add_streamed_transcripts_layer(view_percent=view_percent)
+        mode = (
+            "auto"
+            if int(self.args.transcript_view_percent) <= 0
+            else f"{int(self.args.transcript_view_percent)}%"
+        )
         self._set_status(
-            f"{self.active_dataset} loaded {mode} transcripts: total={stats['total']:,}, "
-            f"assigned={stats['assigned']:,}, unassigned={stats['unassigned']:,}"
+            f"{self.active_dataset} enabled transcript density + indexed detail ({mode}); "
+            f"detail max points={int(self.args.transcript_detail_max_points):,}."
         )
 
     def load_images_on_demand(self, dataset_name: str):
@@ -1717,6 +2406,72 @@ def parse_args() -> argparse.Namespace:
         help="Optional cap/sampling limit for transcripts per dataset load.",
     )
     parser.add_argument(
+        "--transcript-view-percent",
+        default=DEFAULT_TRANSCRIPT_VIEW_PERCENT,
+        type=int,
+        help=(
+            "Percentage of transcripts in the current viewport to show in streamed full-transcript mode. "
+            "Use 0 for auto, which loads up to --transcript-detail-max-points."
+        ),
+    )
+    parser.add_argument(
+        "--transcript-view-margin-fraction",
+        default=DEFAULT_TRANSCRIPT_VIEW_MARGIN_FRACTION,
+        type=float,
+        help=(
+            "Fraction of the current viewport width/height to add on each side when querying "
+            "zoomed-in transcript point detail."
+        ),
+    )
+    parser.add_argument(
+        "--transcript-max-view-points",
+        default=None,
+        type=int,
+        help="Deprecated alias for --transcript-detail-max-points.",
+    )
+    parser.add_argument(
+        "--transcript-stream-debounce-ms",
+        default=DEFAULT_TRANSCRIPT_STREAM_DEBOUNCE_MS,
+        type=int,
+        help="Delay after pan/zoom before refreshing viewport-streamed transcript layers.",
+    )
+    parser.add_argument(
+        "--transcript-density-bin-um",
+        default=DEFAULT_TRANSCRIPT_DENSITY_BIN_UM,
+        type=float,
+        help="Requested transcript density bin size in microns.",
+    )
+    parser.add_argument(
+        "--transcript-density-max-pixels",
+        default=DEFAULT_TRANSCRIPT_DENSITY_MAX_PIXELS,
+        type=int,
+        help="Maximum pixels per transcript density channel; bin size increases automatically above this.",
+    )
+    parser.add_argument(
+        "--transcript-detail-max-view-size",
+        default=DEFAULT_TRANSCRIPT_DETAIL_MAX_VIEW_SIZE,
+        type=float,
+        help="Maximum viewport width/height in microns before transcript point detail is shown.",
+    )
+    parser.add_argument(
+        "--transcript-detail-max-points",
+        default=None,
+        type=int,
+        help="Maximum transcript points displayed in the zoomed-in detail overlay.",
+    )
+    parser.add_argument(
+        "--transcript-index-max-points",
+        default=DEFAULT_TRANSCRIPT_INDEX_MAX_POINTS,
+        type=int,
+        help="Maximum transcript points loaded into the in-memory detail index.",
+    )
+    parser.add_argument(
+        "--transcript-index-tile-um",
+        default=DEFAULT_TRANSCRIPT_INDEX_TILE_UM,
+        type=float,
+        help="Tile size in microns for the in-memory transcript detail index.",
+    )
+    parser.add_argument(
         "--max-shapes-per-layer",
         default=None,
         type=int,
@@ -1733,15 +2488,6 @@ def parse_args() -> argparse.Namespace:
         default="path",
         choices=["path", "polygon", "bbox", "centroid"],
         help="Render capped segmentation loads as path, polygon, bbox, or centroid.",
-    )
-    parser.add_argument(
-        "--full-shape-render-mode",
-        default="bbox",
-        choices=["path", "polygon", "bbox", "centroid"],
-        help=(
-            "Render mode for uncapped selected segmentation loads. "
-            "bbox is much lighter than full boundaries for large Cellpose layers."
-        ),
     )
     parser.add_argument(
         "--shape-max-vertices-per-polygon",
@@ -1770,22 +2516,9 @@ def parse_args() -> argparse.Namespace:
         help="Rebuild cached label elements even if labels with the same keys already exist.",
     )
     parser.add_argument(
-        "--stream-shapes-max-view-size",
-        default=2500.0,
-        type=float,
-        help="Maximum current view width/height in world units before exact polygon streaming is enabled.",
-    )
-    parser.add_argument(
-        "--stream-shapes-max-polygons",
-        default=2500,
-        type=int,
-        help="Maximum number of polygons to render in the streamed exact-detail layer.",
-    )
-    parser.add_argument(
-        "--stream-shapes-debounce-ms",
-        default=250,
-        type=int,
-        help="Delay after pan/zoom before refreshing streamed exact polygon detail.",
+        "--overwrite-derived-caches",
+        action="store_true",
+        help="Rebuild viewer-derived density/outline caches even when matching cache metadata exists.",
     )
     parser.add_argument("--random-state", default=42, type=int, help="Random seed used for sampling")
 
@@ -1810,19 +2543,41 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.merscope_zarr is None and args.xenium_zarr is None:
         parser.error("Pass at least one dataset path: --merscope-zarr and/or --xenium-zarr.")
-    if args.startup_mode == "fast":
-        if args.max_transcripts is None:
-            args.max_transcripts = FAST_DEFAULT_MAX_TRANSCRIPTS
+    if args.max_transcripts is None:
+        args.max_transcripts = FAST_DEFAULT_MAX_TRANSCRIPTS
+    if args.max_transcripts <= 0:
+        parser.error("--max-transcripts must be positive.")
+    if not 0 <= args.transcript_view_percent <= 100:
+        parser.error("--transcript-view-percent must be between 0 and 100.")
+    if args.transcript_view_margin_fraction < 0:
+        parser.error("--transcript-view-margin-fraction must be non-negative.")
+    if args.transcript_detail_max_points is None:
+        args.transcript_detail_max_points = (
+            args.transcript_max_view_points
+            if args.transcript_max_view_points is not None
+            else DEFAULT_TRANSCRIPT_DETAIL_MAX_POINTS
+        )
+    args.transcript_max_view_points = args.transcript_detail_max_points
+    if args.transcript_detail_max_points <= 0:
+        parser.error("--transcript-detail-max-points must be positive.")
+    if args.transcript_stream_debounce_ms < 0:
+        parser.error("--transcript-stream-debounce-ms must be non-negative.")
+    if args.transcript_density_bin_um <= 0:
+        parser.error("--transcript-density-bin-um must be positive.")
+    if args.transcript_density_max_pixels <= 0:
+        parser.error("--transcript-density-max-pixels must be positive.")
+    if args.transcript_detail_max_view_size <= 0:
+        parser.error("--transcript-detail-max-view-size must be positive.")
+    if args.transcript_index_max_points <= 0:
+        parser.error("--transcript-index-max-points must be positive.")
+    if args.transcript_index_tile_um <= 0:
+        parser.error("--transcript-index-tile-um must be positive.")
     if args.max_shapes_per_layer is None:
         args.max_shapes_per_layer = FAST_DEFAULT_MAX_SHAPES_PER_LAYER
     if args.label_chunk_size <= 0:
         parser.error("--label-chunk-size must be positive.")
     if args.label_contour_width < 0:
         parser.error("--label-contour-width must be non-negative.")
-    if args.stream_shapes_max_polygons <= 0:
-        parser.error("--stream-shapes-max-polygons must be positive.")
-    if args.stream_shapes_debounce_ms < 0:
-        parser.error("--stream-shapes-debounce-ms must be non-negative.")
     return args
 
 
@@ -1869,18 +2624,14 @@ def main():
     switcher = DatasetSwitcherWidget(
         datasets=available_datasets,
         load_callback=controller.load_dataset,
-        load_selected_shapes_callback=controller.load_selected_shapes,
-        load_selected_full_shapes_callback=controller.load_selected_shapes_full,
-        stream_selected_shapes_callback=controller.stream_selected_shapes,
         load_selected_labels_callback=controller.load_selected_labels,
         unload_selected_shapes_callback=controller.unload_selected_shapes,
-        load_all_shapes_callback=controller.load_all_shapes_capped,
-        load_transcripts_callback=controller.load_transcripts,
+        load_full_transcripts_callback=controller.load_full_transcripts,
+        set_transcript_view_percent_callback=controller.set_transcript_view_percent,
         load_images_callback=controller.load_images_on_demand,
         initial_dataset=initial_dataset,
         skip_images=args.skip_images,
-        segmentation_source=args.segmentation_source,
-        full_shape_render_mode=args.full_shape_render_mode,
+        transcript_view_percent=args.transcript_view_percent,
     )
     controller.set_status_callback(switcher.set_status)
     controller.set_shape_keys_callback(switcher.set_shape_keys)
