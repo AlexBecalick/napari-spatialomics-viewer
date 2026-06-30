@@ -13,6 +13,7 @@ from typing import Iterable
 
 import numpy as np
 import pandas as pd
+import zarr
 from shapely.geometry import box
 
 try:
@@ -24,6 +25,47 @@ log = logging.getLogger("napari_compare_utils")
 
 DERIVED_CACHE_PREFIX = "_napari_compare_"
 DERIVED_CACHE_ATTR = "napari_compare_derived_cache"
+CELLPOSE_SHAPE_KEY = "MOSAIK_cellpose"
+CELLPOSE_LABEL_KEY = "MOSAIK_cellpose_labels"
+CELLPOSE_QUANTIFICATION_TABLE_KEY = "table_MOSAIK_cellpose_image_quantification"
+CELLPOSE_VALUE_BINS = 256
+CELLPOSE_VALUE_CLIP_PERCENTILES = (1.0, 99.0)
+TRANSPARENT_RGBA = (0.0, 0.0, 0.0, 0.0)
+
+
+@dataclass(frozen=True)
+class CellposeQuantificationFeature:
+    """One image-statistic column in the Cellpose quantification table."""
+
+    feature: str
+    image_key: str
+    channel: str
+    statistic: str
+    column_index: int
+
+
+@dataclass(frozen=True)
+class CellposeQuantificationValues:
+    """Label ids and selected per-cell values from the Cellpose quantification table."""
+
+    feature: CellposeQuantificationFeature
+    label_ids: np.ndarray
+    values: np.ndarray
+
+
+@dataclass(frozen=True)
+class BinnedLabelColorMapping:
+    """Direct label colors plus numeric scaling metadata for a value overlay."""
+
+    color_dict: dict[int | None, tuple[float, float, float, float]]
+    clip_low: float
+    clip_high: float
+    finite_count: int
+    label_count: int
+    bin_count: int
+    unique_color_count: int
+    lower_percentile: float
+    upper_percentile: float
 
 
 def _safe_cache_token(value: str, max_len: int = 96) -> str:
@@ -57,6 +99,220 @@ def _format_float_token(value: float) -> str:
 def derived_transcript_density_cache_key(points_key: str, bin_um: float) -> str:
     """Build the private images cache key for transcript density."""
     return f"{DERIVED_CACHE_PREFIX}tx_density__{_safe_cache_token(points_key)}__bin{_format_float_token(bin_um)}"
+
+
+def open_zarr_group_unconsolidated(zarr_path: str | Path):
+    """Open a zarr group without consolidated metadata.
+
+    Some SpatialData stores can have stale consolidated metadata after new
+    arrays are written. Reading direct metadata avoids false missing-key errors.
+    """
+    try:
+        return zarr.open_group(str(zarr_path), mode="r", use_consolidated=False)
+    except TypeError:
+        return zarr.open_group(str(zarr_path), mode="r")
+
+
+def _zarr_path_exists(root, path: str) -> bool:
+    try:
+        root[path]
+        return True
+    except Exception:
+        return False
+
+
+def _read_zarr_string_list(array_like) -> list[str]:
+    values = array_like[:]
+    if hasattr(values, "tolist"):
+        values = values.tolist()
+    return [str(value) for value in values]
+
+
+def _cellpose_quantification_table(root):
+    return root[f"tables/{CELLPOSE_QUANTIFICATION_TABLE_KEY}"]
+
+
+def _cellpose_quantification_features_from_table(table) -> list[CellposeQuantificationFeature]:
+    image_keys = _read_zarr_string_list(table["var/image_key"])
+    channels = _read_zarr_string_list(table["var/channel"])
+    statistics = _read_zarr_string_list(table["var/statistic"])
+    if not (len(image_keys) == len(channels) == len(statistics)):
+        raise ValueError("Cellpose quantification var columns have inconsistent lengths.")
+
+    try:
+        features = _read_zarr_string_list(table["var/feature"])
+    except Exception:
+        features = [
+            f"{image_key}__{channel}__{statistic}"
+            for image_key, channel, statistic in zip(image_keys, channels, statistics, strict=True)
+        ]
+    if len(features) != len(channels):
+        raise ValueError("Cellpose quantification feature column length does not match var metadata.")
+
+    return [
+        CellposeQuantificationFeature(
+            feature=str(feature),
+            image_key=str(image_key),
+            channel=str(channel),
+            statistic=str(statistic),
+            column_index=int(idx),
+        )
+        for idx, (feature, image_key, channel, statistic) in enumerate(
+            zip(features, image_keys, channels, statistics, strict=True)
+        )
+    ]
+
+
+def cellpose_quantification_table_available(zarr_path: str | Path) -> bool:
+    """Return whether the hard-coded Cellpose value-overlay inputs are present."""
+    try:
+        root = open_zarr_group_unconsolidated(zarr_path)
+        table = _cellpose_quantification_table(root)
+        required = (
+            "obs/label_id",
+            "var/image_key",
+            "var/channel",
+            "var/statistic",
+            "X",
+        )
+        has_required_table_parts = all(_zarr_path_exists(table, key) for key in required)
+        has_region = _zarr_path_exists(root, f"labels/{CELLPOSE_LABEL_KEY}") or _zarr_path_exists(
+            root,
+            f"shapes/{CELLPOSE_SHAPE_KEY}",
+        )
+        return bool(has_required_table_parts and has_region)
+    except Exception:
+        return False
+
+
+def cellpose_quantification_features(zarr_path: str | Path) -> list[CellposeQuantificationFeature]:
+    """List available Cellpose image-statistic quantification columns."""
+    root = open_zarr_group_unconsolidated(zarr_path)
+    return _cellpose_quantification_features_from_table(_cellpose_quantification_table(root))
+
+
+def resolve_cellpose_quantification_feature(
+    zarr_path: str | Path,
+    channel: str,
+    statistic: str,
+) -> CellposeQuantificationFeature:
+    """Resolve a selected channel/statistic to a quantification table column."""
+    channel_key = str(channel).casefold()
+    statistic_key = str(statistic).casefold()
+    for feature in cellpose_quantification_features(zarr_path):
+        if feature.channel.casefold() == channel_key and feature.statistic.casefold() == statistic_key:
+            return feature
+    raise KeyError(f"No Cellpose quantification feature for channel={channel!r}, statistic={statistic!r}.")
+
+
+def load_cellpose_quantification_values(
+    zarr_path: str | Path,
+    channel: str,
+    statistic: str,
+) -> CellposeQuantificationValues:
+    """Load label ids and one selected Cellpose quantification column."""
+    root = open_zarr_group_unconsolidated(zarr_path)
+    table = _cellpose_quantification_table(root)
+    feature = None
+    channel_key = str(channel).casefold()
+    statistic_key = str(statistic).casefold()
+    for candidate in _cellpose_quantification_features_from_table(table):
+        if candidate.channel.casefold() == channel_key and candidate.statistic.casefold() == statistic_key:
+            feature = candidate
+            break
+    if feature is None:
+        raise KeyError(f"No Cellpose quantification feature for channel={channel!r}, statistic={statistic!r}.")
+
+    label_ids = np.asarray(table["obs/label_id"][:], dtype=np.uint32)
+    values = np.asarray(table["X"][:, feature.column_index], dtype=np.float32)
+    if label_ids.shape[0] != values.shape[0]:
+        raise ValueError(
+            "Cellpose quantification label/value length mismatch: "
+            f"{label_ids.shape[0]} labels vs {values.shape[0]} values."
+        )
+    return CellposeQuantificationValues(feature=feature, label_ids=label_ids, values=values)
+
+
+def cellpose_value_clip_range(
+    values,
+    lower_percentile: float = CELLPOSE_VALUE_CLIP_PERCENTILES[0],
+    upper_percentile: float = CELLPOSE_VALUE_CLIP_PERCENTILES[1],
+) -> tuple[float, float]:
+    """Return finite percentile clip limits for per-cell value coloring."""
+    arr = np.asarray(values, dtype=np.float64)
+    finite = arr[np.isfinite(arr)]
+    if finite.size == 0:
+        raise ValueError("No finite Cellpose quantification values are available.")
+
+    low, high = np.percentile(
+        finite,
+        [float(lower_percentile), float(upper_percentile)],
+    )
+    if not np.isfinite(low) or not np.isfinite(high):
+        raise ValueError("Could not compute finite Cellpose quantification percentiles.")
+    return float(low), float(high)
+
+
+def build_binned_label_color_dict(
+    label_ids,
+    values,
+    colors_rgba,
+    lower_percentile: float = CELLPOSE_VALUE_CLIP_PERCENTILES[0],
+    upper_percentile: float = CELLPOSE_VALUE_CLIP_PERCENTILES[1],
+) -> BinnedLabelColorMapping:
+    """Map label ids to a bounded set of RGBA colors from scalar values."""
+    labels = np.asarray(label_ids)
+    values_arr = np.asarray(values, dtype=np.float64)
+    if labels.shape[0] != values_arr.shape[0]:
+        raise ValueError(f"Expected one value per label id, got {labels.shape[0]} labels and {values_arr.shape[0]} values.")
+
+    color_lut = np.asarray(colors_rgba, dtype=np.float32)
+    if color_lut.ndim != 2 or color_lut.shape[0] == 0 or color_lut.shape[1] not in (3, 4):
+        raise ValueError("colors_rgba must be an array with shape (N, 3) or (N, 4).")
+    if color_lut.shape[1] == 3:
+        color_lut = np.column_stack([color_lut, np.ones(color_lut.shape[0], dtype=np.float32)])
+
+    clip_low, clip_high = cellpose_value_clip_range(
+        values_arr,
+        lower_percentile=lower_percentile,
+        upper_percentile=upper_percentile,
+    )
+    finite = np.isfinite(values_arr) & (labels > 0)
+    finite_count = int(np.count_nonzero(finite))
+    color_dict: dict[int | None, tuple[float, float, float, float]] = {
+        0: TRANSPARENT_RGBA,
+        None: TRANSPARENT_RGBA,
+    }
+
+    if finite_count > 0:
+        if clip_high <= clip_low:
+            bin_indices = np.full(finite_count, min(color_lut.shape[0] // 2, color_lut.shape[0] - 1), dtype=np.int64)
+        else:
+            normalized = (values_arr[finite] - clip_low) / (clip_high - clip_low)
+            normalized = np.clip(normalized, 0.0, 1.0)
+            bin_indices = np.floor(normalized * (color_lut.shape[0] - 1)).astype(np.int64, copy=False)
+
+        for label, bin_index in zip(labels[finite], bin_indices, strict=True):
+            rgba = color_lut[int(bin_index), :4]
+            color_dict[int(label)] = (
+                float(rgba[0]),
+                float(rgba[1]),
+                float(rgba[2]),
+                float(rgba[3]),
+            )
+
+    unique_color_count = len({tuple(color) for color in color_dict.values()})
+    return BinnedLabelColorMapping(
+        color_dict=color_dict,
+        clip_low=float(clip_low),
+        clip_high=float(clip_high),
+        finite_count=finite_count,
+        label_count=int(labels.shape[0]),
+        bin_count=int(color_lut.shape[0]),
+        unique_color_count=int(unique_color_count),
+        lower_percentile=float(lower_percentile),
+        upper_percentile=float(upper_percentile),
+    )
 
 
 def first_existing_col(df_like, candidates: Iterable[str]) -> str | None:

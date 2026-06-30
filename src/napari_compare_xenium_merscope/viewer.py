@@ -45,7 +45,7 @@ warnings.filterwarnings(
 
 import spatialdata as sd
 import zarr
-from napari.utils.colormaps import Colormap
+from napari.utils.colormaps import Colormap, DirectLabelColormap, ensure_colormap
 from packaging.version import InvalidVersion, Version
 from spatialdata.models import Image2DModel, Labels2DModel
 from spatialdata.models.pyramids_utils import dask_arrays_to_datatree
@@ -97,11 +97,18 @@ except Exception:  # pragma: no cover - depends on the installed napari runtime
     thread_worker = None
 
 from .utils import (
+    CELLPOSE_LABEL_KEY,
+    CELLPOSE_QUANTIFICATION_TABLE_KEY,
+    CELLPOSE_SHAPE_KEY,
+    CELLPOSE_VALUE_BINS,
     DERIVED_CACHE_ATTR,
     assignment_mask,
     affine_matrix_from_px_to_um,
+    build_binned_label_color_dict,
     build_transcript_spatial_index,
     build_napari_affine_from_px_to_um,
+    cellpose_quantification_features,
+    cellpose_quantification_table_available,
     channel_labels,
     compute_transcript_density_array,
     derived_outline_cache_key,
@@ -116,6 +123,7 @@ from .utils import (
     is_derived_cache_key,
     label_outline_mask_chunk,
     layer_name_prefix,
+    load_cellpose_quantification_values,
     load_points_dataframe,
     make_layer_name,
     matching_layer_names,
@@ -521,6 +529,8 @@ class DatasetSwitcherWidget(QWidget):
         load_full_transcripts_callback,
         set_transcript_view_percent_callback,
         load_images_callback,
+        load_cellpose_values_callback,
+        remove_cellpose_values_callback,
         initial_dataset: str = "MERSCOPE",
         skip_images: bool = False,
         transcript_view_percent: int = DEFAULT_TRANSCRIPT_VIEW_PERCENT,
@@ -532,6 +542,8 @@ class DatasetSwitcherWidget(QWidget):
         self._load_full_transcripts_callback = load_full_transcripts_callback
         self._set_transcript_view_percent_callback = set_transcript_view_percent_callback
         self._load_images_callback = load_images_callback
+        self._load_cellpose_values_callback = load_cellpose_values_callback
+        self._remove_cellpose_values_callback = remove_cellpose_values_callback
         self._skip_images = bool(skip_images)
 
         self._dataset_combo = QComboBox()
@@ -553,6 +565,16 @@ class DatasetSwitcherWidget(QWidget):
         self._load_selected_labels_button.clicked.connect(self._on_load_selected_labels)
         self._unload_selected_shapes_button = QPushButton("Unload Selected Segmentations")
         self._unload_selected_shapes_button.clicked.connect(self._on_unload_selected_shapes)
+
+        self._cellpose_channel_combo = QComboBox()
+        self._cellpose_statistic_combo = QComboBox()
+        self._cellpose_colormap_combo = QComboBox()
+        self._cellpose_colormap_combo.addItems(["viridis", "magma", "inferno", "plasma", "turbo", "gray"])
+        self._load_cellpose_values_button = QPushButton("Load Cellpose Value Overlay")
+        self._load_cellpose_values_button.clicked.connect(self._on_load_cellpose_values)
+        self._remove_cellpose_values_button = QPushButton("Remove Cellpose Value Overlay")
+        self._remove_cellpose_values_button.clicked.connect(self._on_remove_cellpose_values)
+        self.set_cellpose_value_options([], [], enabled=False)
 
         self._load_full_tx_button = QPushButton("Load Full Transcripts (Viewport)")
         self._load_full_tx_button.clicked.connect(self._on_load_full_transcripts)
@@ -585,6 +607,16 @@ class DatasetSwitcherWidget(QWidget):
 
         root.addWidget(self._load_selected_labels_button)
         root.addWidget(self._unload_selected_shapes_button)
+
+        root.addWidget(QLabel("Cell Mask Values"))
+        root.addWidget(QLabel("Channel"))
+        root.addWidget(self._cellpose_channel_combo)
+        root.addWidget(QLabel("Statistic"))
+        root.addWidget(self._cellpose_statistic_combo)
+        root.addWidget(QLabel("Colormap"))
+        root.addWidget(self._cellpose_colormap_combo)
+        root.addWidget(self._load_cellpose_values_button)
+        root.addWidget(self._remove_cellpose_values_button)
 
         root.addWidget(QLabel("Transcripts"))
         root.addWidget(self._load_full_tx_button)
@@ -624,6 +656,35 @@ class DatasetSwitcherWidget(QWidget):
     def set_shape_keys(self, keys: list[str]):
         self._shape_list.clear()
         self._shape_list.addItems([str(k) for k in keys])
+
+    def set_cellpose_value_options(self, channels: list[str], statistics: list[str], enabled: bool):
+        channel_current = str(self._cellpose_channel_combo.currentText())
+        statistic_current = str(self._cellpose_statistic_combo.currentText())
+
+        self._cellpose_channel_combo.clear()
+        self._cellpose_statistic_combo.clear()
+        self._cellpose_channel_combo.addItems([str(value) for value in channels])
+        self._cellpose_statistic_combo.addItems([str(value) for value in statistics])
+
+        if channel_current in channels:
+            self._cellpose_channel_combo.setCurrentText(channel_current)
+        elif "DAPI" in channels:
+            self._cellpose_channel_combo.setCurrentText("DAPI")
+
+        if statistic_current in statistics:
+            self._cellpose_statistic_combo.setCurrentText(statistic_current)
+        elif "median" in statistics:
+            self._cellpose_statistic_combo.setCurrentText("median")
+
+        enabled = bool(enabled) and len(channels) > 0 and len(statistics) > 0
+        for widget in (
+            self._cellpose_channel_combo,
+            self._cellpose_statistic_combo,
+            self._cellpose_colormap_combo,
+            self._load_cellpose_values_button,
+            self._remove_cellpose_values_button,
+        ):
+            widget.setEnabled(enabled)
 
     def selected_shape_keys(self) -> list[str]:
         return [str(item.text()) for item in self._shape_list.selectedItems()]
@@ -671,6 +732,20 @@ class DatasetSwitcherWidget(QWidget):
     def _on_load_images(self):
         self._load_images_callback(self.current_dataset)
 
+    def _on_load_cellpose_values(self):
+        if not self._load_cellpose_values_button.isEnabled():
+            self.set_status("Cellpose value overlay is not available for this dataset.")
+            return
+        self._load_cellpose_values_callback(
+            self.current_dataset,
+            str(self._cellpose_channel_combo.currentText()),
+            str(self._cellpose_statistic_combo.currentText()),
+            str(self._cellpose_colormap_combo.currentText()),
+        )
+
+    def _on_remove_cellpose_values(self):
+        self._remove_cellpose_values_callback(self.current_dataset)
+
 
 class ComparisonViewerController:
     """Coordinate loading/clearing napari layers for each dataset."""
@@ -682,18 +757,24 @@ class ComparisonViewerController:
         self.active_dataset: str | None = None
         self._status_callback = None
         self._shape_keys_callback = None
+        self._cellpose_value_options_callback = None
         self._active_sdata = None
         self._active_images_sdata = None
         self._segmentation_keys: list[str] = []
         self._x_transform: tuple[float, float, float] | None = None
         self._y_transform: tuple[float, float, float] | None = None
         self._streamed_transcript_states: dict[str, StreamedTranscriptLayerState] = {}
+        self._cellpose_value_generation = 0
+        self._cellpose_value_worker: object | None = None
 
     def set_status_callback(self, fn):
         self._status_callback = fn
 
     def set_shape_keys_callback(self, fn):
         self._shape_keys_callback = fn
+
+    def set_cellpose_value_options_callback(self, fn):
+        self._cellpose_value_options_callback = fn
 
     def _set_status(self, text: str):
         if self._status_callback is not None:
@@ -702,6 +783,30 @@ class ComparisonViewerController:
     def _publish_shape_keys(self):
         if self._shape_keys_callback is not None:
             self._shape_keys_callback(list(self._segmentation_keys))
+
+    def _publish_cellpose_value_options(self):
+        if self._cellpose_value_options_callback is None:
+            return
+        if self.active_dataset is None or self.active_dataset != "MERSCOPE":
+            self._cellpose_value_options_callback([], [], False)
+            return
+
+        cfg = self.datasets[self.active_dataset]
+        try:
+            if not cellpose_quantification_table_available(cfg.zarr_path):
+                self._cellpose_value_options_callback([], [], False)
+                return
+            features = cellpose_quantification_features(cfg.zarr_path)
+            channels = sorted({feature.channel for feature in features})
+            statistic_order = ["min", "median", "mean", "max", "iqr"]
+            statistics = sorted(
+                {feature.statistic for feature in features},
+                key=lambda value: (0, statistic_order.index(value)) if value in statistic_order else (1, value),
+            )
+            self._cellpose_value_options_callback(channels, statistics, True)
+        except Exception as exc:
+            log.warning("[%s] Could not inspect Cellpose value table (%s)", self.active_dataset, exc)
+            self._cellpose_value_options_callback([], [], False)
 
     def _segmentation_source(self) -> str:
         return "labels" if str(self.args.segmentation_source).lower() == "labels" else "shapes"
@@ -834,6 +939,8 @@ class ComparisonViewerController:
             gc.collect()
             self._segmentation_keys = []
             self._publish_shape_keys()
+            if self._cellpose_value_options_callback is not None:
+                self._cellpose_value_options_callback([], [], False)
 
             selection = startup_selection(
                 self.args.startup_mode,
@@ -866,6 +973,7 @@ class ComparisonViewerController:
             else:
                 self._segmentation_keys = sorted(str(k) for k in sdata.shapes.keys())
             self._publish_shape_keys()
+            self._publish_cellpose_value_options()
 
             if self.args.startup_mode == "full":
                 img_stats = self._add_image_layers(ds, sdata, x_transform, y_transform)
@@ -915,6 +1023,8 @@ class ComparisonViewerController:
             self._active_images_sdata = None
             self._segmentation_keys = []
             self._publish_shape_keys()
+            if self._cellpose_value_options_callback is not None:
+                self._cellpose_value_options_callback([], [], False)
 
     def _add_image_layers(self, ds: str, sdata, x_transform, y_transform) -> dict[str, int]:
         if getattr(self.args, "skip_images", False):
@@ -1125,6 +1235,12 @@ class ComparisonViewerController:
             return None
         cfg = self.datasets[self.active_dataset]
         return sd.read_zarr(str(cfg.zarr_path), selection=("images",))
+
+    def _read_shapes_from_store(self):
+        if self.active_dataset is None:
+            return None
+        cfg = self.datasets[self.active_dataset]
+        return sd.read_zarr(str(cfg.zarr_path), selection=("shapes",))
 
     def _refresh_label_key_from_store(self, label_key: str) -> bool:
         if self._active_sdata is None:
@@ -2266,6 +2382,189 @@ class ComparisonViewerController:
             f"labels={total_labels:,} | RSS {mem_before['rss_gb']:.1f}->{mem_after['rss_gb']:.1f} GB"
         )
 
+    def _ensure_cellpose_label_key(self) -> str:
+        if self._active_sdata is None or self.active_dataset is None:
+            raise RuntimeError("No active dataset.")
+
+        if CELLPOSE_LABEL_KEY in self._active_sdata.labels or self._refresh_label_key_from_store(CELLPOSE_LABEL_KEY):
+            return CELLPOSE_LABEL_KEY
+
+        if CELLPOSE_SHAPE_KEY not in self._active_sdata.shapes:
+            shapes_sdata = self._read_shapes_from_store()
+            if shapes_sdata is not None:
+                for key, value in shapes_sdata.shapes.items():
+                    self._active_sdata.shapes[key] = value
+
+        return self.ensure_label_for_shape_key(CELLPOSE_SHAPE_KEY)
+
+    def _compute_cellpose_value_payload(
+        self,
+        zarr_path: Path,
+        channel: str,
+        statistic: str,
+        colormap_name: str,
+    ) -> dict[str, object]:
+        quantification = load_cellpose_quantification_values(
+            zarr_path,
+            channel=channel,
+            statistic=statistic,
+        )
+        colors_rgba = ensure_colormap(colormap_name).map(
+            np.linspace(0.0, 1.0, CELLPOSE_VALUE_BINS, dtype=np.float32)
+        )
+        mapping = build_binned_label_color_dict(
+            quantification.label_ids,
+            quantification.values,
+            colors_rgba,
+        )
+        return {
+            "channel": str(channel),
+            "statistic": str(statistic),
+            "colormap_name": str(colormap_name),
+            "feature": quantification.feature,
+            "mapping": mapping,
+            "colormap": DirectLabelColormap(color_dict=mapping.color_dict),
+        }
+
+    def _apply_cellpose_value_payload(self, generation: int, label_key: str, payload: dict[str, object]):
+        if generation != self._cellpose_value_generation or self.active_dataset != "MERSCOPE":
+            return
+        self._cellpose_value_worker = None
+        if self._active_sdata is None:
+            return
+
+        if label_key not in self._active_sdata.labels and not self._refresh_label_key_from_store(label_key):
+            self._set_status(f"MERSCOPE Cellpose value overlay failed: label key {label_key!r} not found.")
+            return
+
+        label_elem = self._active_sdata.labels[label_key]
+        label_scale_levels = [
+            (scale_name, level_data)
+            for scale_name, level_data in self._raster_scale_levels(label_elem)
+            if len(getattr(level_data, "shape", ())) == 2
+        ]
+        if len(label_scale_levels) == 0:
+            self._set_status(f"MERSCOPE Cellpose value overlay failed: labels[{label_key}] has no 2D levels.")
+            return
+
+        label_levels = [level_data for _scale_name, level_data in label_scale_levels]
+        if len(label_levels) == 1:
+            label_levels = lazy_label_pyramid(label_levels[0])
+        label_data = label_levels if len(label_levels) > 1 else label_levels[0]
+
+        ds = self.active_dataset
+        channel = str(payload["channel"])
+        statistic = str(payload["statistic"])
+        layer_name = make_layer_name(ds, "cell_values", CELLPOSE_SHAPE_KEY, f"{channel} {statistic}")
+        self._remove_layers_by_prefix(layer_name_prefix(ds, "cell_values"))
+        self.viewer.add_labels(
+            label_data,
+            name=layer_name,
+            affine=self._napari_affine_from_element(label_elem),
+            colormap=payload["colormap"],
+            multiscale=len(label_levels) > 1,
+            opacity=min(1.0, max(0.0, float(self.args.shape_opacity))),
+            blending="translucent",
+            visible=True,
+        )
+
+        mapping = payload["mapping"]
+        self._set_status(
+            f"{ds} Cellpose values: {channel} {statistic} ({payload['colormap_name']}), "
+            f"{mapping.lower_percentile:g}-{mapping.upper_percentile:g}%="
+            f"{mapping.clip_low:.4g}..{mapping.clip_high:.4g}; "
+            f"finite={mapping.finite_count:,}/{mapping.label_count:,}, "
+            f"colors={mapping.unique_color_count:,}."
+        )
+        log.info(
+            "[%s] Added Cellpose value overlay label=%s channel=%s statistic=%s colormap=%s "
+            "clip=(%s, %s) finite=%s/%s colors=%s levels=%s",
+            ds,
+            label_key,
+            channel,
+            statistic,
+            payload["colormap_name"],
+            mapping.clip_low,
+            mapping.clip_high,
+            mapping.finite_count,
+            mapping.label_count,
+            mapping.unique_color_count,
+            len(label_levels),
+        )
+
+    def _handle_cellpose_value_error(self, generation: int, exc):
+        if generation != self._cellpose_value_generation:
+            return
+        self._cellpose_value_worker = None
+        message = exc[1] if isinstance(exc, tuple) and len(exc) > 1 else exc
+        self._set_status(f"MERSCOPE Cellpose value overlay failed: {message}")
+        log.error("[MERSCOPE] Cellpose value overlay failed: %s", message)
+
+    def load_cellpose_value_overlay(
+        self,
+        dataset_name: str,
+        channel: str,
+        statistic: str,
+        colormap_name: str,
+    ):
+        if not self._ensure_dataset_is_active(dataset_name):
+            self._set_status(f"Could not activate dataset {dataset_name}.")
+            return
+        if self.active_dataset != "MERSCOPE":
+            self._set_status("Cellpose value overlay is only enabled for MERSCOPE datasets.")
+            return
+
+        cfg = self.datasets[self.active_dataset]
+        if not cellpose_quantification_table_available(cfg.zarr_path):
+            self._set_status(f"Missing {CELLPOSE_QUANTIFICATION_TABLE_KEY}; cannot load Cellpose value overlay.")
+            return
+
+        try:
+            label_key = self._ensure_cellpose_label_key()
+        except Exception as exc:
+            self._set_status(f"Could not prepare {CELLPOSE_LABEL_KEY}: {exc}")
+            log.exception("[MERSCOPE] Could not prepare Cellpose labels")
+            return
+
+        self._cellpose_value_generation += 1
+        generation = self._cellpose_value_generation
+        self._set_status(f"MERSCOPE building Cellpose value overlay: {channel} {statistic}...")
+
+        if thread_worker is None:
+            try:
+                payload = self._compute_cellpose_value_payload(cfg.zarr_path, channel, statistic, colormap_name)
+            except Exception as exc:
+                self._handle_cellpose_value_error(generation, exc)
+                return
+            self._apply_cellpose_value_payload(generation, label_key, payload)
+            return
+
+        def compute():
+            return self._compute_cellpose_value_payload(cfg.zarr_path, channel, statistic, colormap_name)
+
+        worker_factory = thread_worker(compute)
+        worker = worker_factory()
+        worker.returned.connect(
+            lambda payload, gen=generation, key=label_key: self._apply_cellpose_value_payload(gen, key, payload)
+        )
+        worker.errored.connect(lambda exc, gen=generation: self._handle_cellpose_value_error(gen, exc))
+        self._cellpose_value_worker = worker
+        worker.start()
+
+    def remove_cellpose_value_overlay(self, dataset_name: str):
+        ds = str(dataset_name).upper()
+        self._cellpose_value_generation += 1
+        self._cellpose_value_worker = None
+        removed = 0
+        prefix = layer_name_prefix(ds, "cell_values")
+        names = [str(layer.name) for layer in self.viewer.layers]
+        for layer_name in matching_layer_names(names, prefix):
+            before = len(self.viewer.layers)
+            self._remove_layer_by_name(layer_name)
+            if len(self.viewer.layers) < before:
+                removed += 1
+        self._set_status(f"{ds} removed {removed} Cellpose value overlay layer(s).")
+
     def _current_view_bounds(self) -> tuple[float, float, float, float] | None:
         try:
             center = tuple(float(v) for v in self.viewer.camera.center)
@@ -2629,12 +2928,15 @@ def main():
         load_full_transcripts_callback=controller.load_full_transcripts,
         set_transcript_view_percent_callback=controller.set_transcript_view_percent,
         load_images_callback=controller.load_images_on_demand,
+        load_cellpose_values_callback=controller.load_cellpose_value_overlay,
+        remove_cellpose_values_callback=controller.remove_cellpose_value_overlay,
         initial_dataset=initial_dataset,
         skip_images=args.skip_images,
         transcript_view_percent=args.transcript_view_percent,
     )
     controller.set_status_callback(switcher.set_status)
     controller.set_shape_keys_callback(switcher.set_shape_keys)
+    controller.set_cellpose_value_options_callback(switcher.set_cellpose_value_options)
     viewer.window.add_dock_widget(switcher, area="right", name="Dataset Switcher")
 
     controller.load_dataset(initial_dataset, force=True)

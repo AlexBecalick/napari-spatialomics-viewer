@@ -2,10 +2,17 @@ from __future__ import annotations
 
 import numpy as np
 import xarray as xr
+import zarr
 from shapely.geometry import MultiPolygon, Polygon
 
 from napari_compare_xenium_merscope.utils import (
+    CELLPOSE_LABEL_KEY,
+    CELLPOSE_QUANTIFICATION_TABLE_KEY,
+    build_binned_label_color_dict,
     build_transcript_spatial_index,
+    cellpose_quantification_features,
+    cellpose_quantification_table_available,
+    cellpose_value_clip_range,
     compute_transcript_density_array,
     derived_outline_cache_key,
     derived_transcript_density_cache_key,
@@ -17,6 +24,7 @@ from napari_compare_xenium_merscope.utils import (
     is_derived_cache_key,
     label_outline_mask_chunk,
     layer_name_prefix,
+    load_cellpose_quantification_values,
     load_viewport_points_dataframe,
     make_layer_name,
     matching_layer_names,
@@ -25,7 +33,44 @@ from napari_compare_xenium_merscope.utils import (
     query_geometries_for_bounds,
     query_transcript_spatial_index,
     rasterize_geometries_chunk,
+    resolve_cellpose_quantification_feature,
 )
+
+
+def _create_string_array(group, name: str, values: list[str]):
+    max_len = max(1, max(len(value) for value in values))
+    group.create_array(name, data=np.asarray(values, dtype=f"<U{max_len}"))
+
+
+def _make_cellpose_quantification_zarr(tmp_path):
+    path = tmp_path / "cellpose_quant.zarr"
+    root = zarr.open_group(str(path), mode="w")
+    tables = root.create_group("tables")
+    labels = root.create_group("labels")
+    labels.create_group(CELLPOSE_LABEL_KEY)
+    table = tables.create_group(CELLPOSE_QUANTIFICATION_TABLE_KEY)
+    obs = table.create_group("obs")
+    var = table.create_group("var")
+
+    label_ids = np.asarray([10, 20, 30, 40], dtype=np.int64)
+    obs.create_array("label_id", data=label_ids)
+    _create_string_array(obs, "cell_id", [f"cellpose_{label_id}" for label_id in label_ids])
+
+    image_key = ["MERSCOPE_z_projection"] * 10
+    channels = ["DAPI"] * 5 + ["PolyT"] * 5
+    statistics = ["min", "median", "mean", "max", "iqr"] * 2
+    features = [
+        f"{image}__{channel}__{statistic}"
+        for image, channel, statistic in zip(image_key, channels, statistics, strict=True)
+    ]
+    _create_string_array(var, "image_key", image_key)
+    _create_string_array(var, "channel", channels)
+    _create_string_array(var, "statistic", statistics)
+    _create_string_array(var, "feature", features)
+
+    x = np.arange(40, dtype=np.float64).reshape(4, 10)
+    table.create_array("X", data=x)
+    return path
 
 
 def _wavy_polygon(n_points: int = 256) -> Polygon:
@@ -73,6 +118,114 @@ def test_derived_cache_key_naming_and_filtering():
     assert is_derived_cache_key(density_key)
     assert "/" not in weird_key
     assert not is_derived_cache_key("cell_boundaries")
+
+
+def test_cellpose_quantification_feature_lookup_and_value_load(tmp_path):
+    path = _make_cellpose_quantification_zarr(tmp_path)
+
+    assert cellpose_quantification_table_available(path)
+    features = cellpose_quantification_features(path)
+    assert len(features) == 10
+
+    dapi_median = resolve_cellpose_quantification_feature(path, "DAPI", "median")
+    polyt_mean = resolve_cellpose_quantification_feature(path, "PolyT", "mean")
+
+    assert dapi_median.column_index == 1
+    assert dapi_median.feature == "MERSCOPE_z_projection__DAPI__median"
+    assert polyt_mean.column_index == 7
+    assert polyt_mean.feature == "MERSCOPE_z_projection__PolyT__mean"
+
+    loaded = load_cellpose_quantification_values(path, "DAPI", "median")
+    assert loaded.feature == dapi_median
+    assert loaded.label_ids.tolist() == [10, 20, 30, 40]
+    assert loaded.values.tolist() == [1.0, 11.0, 21.0, 31.0]
+
+
+def test_cellpose_value_clip_range_uses_percentiles():
+    values = np.arange(100, dtype=float)
+
+    low, high = cellpose_value_clip_range(values, lower_percentile=1, upper_percentile=99)
+
+    assert np.isclose(low, 0.99)
+    assert np.isclose(high, 98.01)
+
+
+def test_binned_label_color_dict_uses_label_ids_and_transparent_defaults():
+    label_ids = np.asarray([10, 20, 30, 40], dtype=np.uint32)
+    values = np.asarray([0.0, 5.0, np.nan, 10.0], dtype=np.float32)
+    colors = np.asarray(
+        [
+            [1.0, 0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+            [1.0, 1.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+
+    mapping = build_binned_label_color_dict(
+        label_ids,
+        values,
+        colors,
+        lower_percentile=0,
+        upper_percentile=100,
+    )
+
+    assert mapping.color_dict[0] == (0.0, 0.0, 0.0, 0.0)
+    assert mapping.color_dict[None] == (0.0, 0.0, 0.0, 0.0)
+    assert mapping.color_dict[10] == (1.0, 0.0, 0.0, 1.0)
+    assert mapping.color_dict[20] == (0.0, 1.0, 0.0, 1.0)
+    assert mapping.color_dict[40] == (1.0, 1.0, 0.0, 1.0)
+    assert mapping.color_dict.get(30, mapping.color_dict[None]) == (0.0, 0.0, 0.0, 0.0)
+    assert 1 not in mapping.color_dict
+
+
+def test_binned_label_color_dict_constant_values_are_safe():
+    colors = np.asarray(
+        [
+            [1.0, 0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+            [1.0, 1.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+
+    mapping = build_binned_label_color_dict(
+        np.asarray([5, 6], dtype=np.uint32),
+        np.asarray([42.0, 42.0], dtype=np.float32),
+        colors,
+    )
+
+    assert mapping.clip_low == 42.0
+    assert mapping.clip_high == 42.0
+    assert mapping.color_dict[5] == mapping.color_dict[6]
+    assert mapping.color_dict[5] != (0.0, 0.0, 0.0, 0.0)
+
+
+def test_binned_label_color_dict_keeps_unique_colors_bounded():
+    colors = np.asarray(
+        [
+            [1.0, 0.0, 0.0, 1.0],
+            [0.0, 1.0, 0.0, 1.0],
+            [0.0, 0.0, 1.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    mapping = build_binned_label_color_dict(
+        np.arange(1, 21, dtype=np.uint32),
+        np.linspace(0.0, 1.0, 20, dtype=np.float32),
+        colors,
+        lower_percentile=0,
+        upper_percentile=100,
+    )
+
+    assert mapping.unique_color_count <= colors.shape[0] + 1
+
+    from napari.utils.colormaps import DirectLabelColormap
+
+    colormap = DirectLabelColormap(color_dict=mapping.color_dict)
+    assert colormap._num_unique_colors <= colors.shape[0] + 1
 
 
 def test_geometry_to_napari_polygons_cap_and_simplify():
