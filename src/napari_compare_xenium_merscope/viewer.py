@@ -68,9 +68,11 @@ try:
     from qtpy.QtWidgets import (
         QAbstractItemView,
         QComboBox,
+        QFileDialog,
         QHBoxLayout,
         QLabel,
         QListWidget,
+        QMessageBox,
         QPushButton,
         QScrollArea,
         QSizePolicy,
@@ -101,10 +103,16 @@ from .utils import (
     CELLPOSE_QUANTIFICATION_TABLE_KEY,
     CELLPOSE_SHAPE_KEY,
     CELLPOSE_VALUE_BINS,
+    CORTICAL_DEPTH_DEFAULT_PIECE_ID,
+    CORTICAL_DEPTH_PIECE_ID_PROPERTY,
+    CORTICAL_DEPTH_ROLE_ORDER,
+    CORTICAL_DEPTH_ROLE_SPECS,
+    CorticalDepthShapeInput,
     DERIVED_CACHE_ATTR,
     assignment_mask,
     affine_matrix_from_px_to_um,
     build_binned_label_color_dict,
+    build_cortical_depth_annotation_geojson,
     build_transcript_spatial_index,
     build_napari_affine_from_px_to_um,
     cellpose_quantification_features,
@@ -132,6 +140,9 @@ from .utils import (
     query_transcript_spatial_index,
     rasterize_geometries_chunk,
     resolve_dataset_mask_affine,
+    snap_cortical_depth_boundaries_to_edge,
+    write_cortical_depth_annotation_geojson,
+    write_cortical_depth_separate_geojsons,
 )
 
 logging.basicConfig(
@@ -202,6 +213,22 @@ LABEL_CACHE_ATTR = "napari_compare_label_cache"
 LABEL_OUTLINE_PYRAMID_MIN_SIZE = 4096
 LABEL_OUTLINE_PYRAMID_MAX_LEVELS = 10
 DERIVED_CACHE_VERSION = 1
+CORTICAL_DEPTH_LAYER_TYPE = "cortical_depth"
+CORTICAL_DEPTH_LAYER_COLORS = {
+    "pia": "#00d5ff",
+    "wm": "#ffb000",
+    "side": "#ff5da2",
+    "exclusion": "#ff3333",
+    "ribbon": "#00d084",
+}
+CORTICAL_DEPTH_FILL_COLORS = {
+    "pia": "transparent",
+    "wm": "transparent",
+    "side": "transparent",
+    "exclusion": [1.0, 0.2, 0.2, 0.20],
+    "ribbon": [0.0, 0.8, 0.5, 0.12],
+}
+CORTICAL_DEPTH_PIECE_ROLES = ("pia", "wm", "exclusion", "ribbon")
 
 
 def startup_selection(startup_mode: str, skip_images: bool, segmentation_source: str) -> tuple[str, ...] | None:
@@ -531,6 +558,13 @@ class DatasetSwitcherWidget(QWidget):
         load_images_callback,
         load_cellpose_values_callback,
         remove_cellpose_values_callback,
+        create_annotation_layers_callback,
+        set_annotation_piece_callback,
+        apply_annotation_piece_callback,
+        snap_annotation_side_edges_callback,
+        validate_annotation_callback,
+        export_annotation_callback,
+        export_separate_annotations_callback,
         initial_dataset: str = "MERSCOPE",
         skip_images: bool = False,
         transcript_view_percent: int = DEFAULT_TRANSCRIPT_VIEW_PERCENT,
@@ -544,6 +578,13 @@ class DatasetSwitcherWidget(QWidget):
         self._load_images_callback = load_images_callback
         self._load_cellpose_values_callback = load_cellpose_values_callback
         self._remove_cellpose_values_callback = remove_cellpose_values_callback
+        self._create_annotation_layers_callback = create_annotation_layers_callback
+        self._set_annotation_piece_callback = set_annotation_piece_callback
+        self._apply_annotation_piece_callback = apply_annotation_piece_callback
+        self._snap_annotation_side_edges_callback = snap_annotation_side_edges_callback
+        self._validate_annotation_callback = validate_annotation_callback
+        self._export_annotation_callback = export_annotation_callback
+        self._export_separate_annotations_callback = export_separate_annotations_callback
         self._skip_images = bool(skip_images)
 
         self._dataset_combo = QComboBox()
@@ -592,6 +633,25 @@ class DatasetSwitcherWidget(QWidget):
         self._load_images_button.setEnabled(not self._skip_images)
         self._load_images_button.clicked.connect(self._on_load_images)
 
+        self._create_annotations_button = QPushButton("Create Drawing Layers")
+        self._create_annotations_button.clicked.connect(self._on_create_annotations)
+        self._piece_combo = QComboBox()
+        self._piece_combo.setEditable(True)
+        self._piece_combo.addItem(CORTICAL_DEPTH_DEFAULT_PIECE_ID)
+        self._piece_combo.currentTextChanged.connect(self._on_piece_changed)
+        self._new_piece_button = QPushButton("New Piece")
+        self._new_piece_button.clicked.connect(self._on_new_piece)
+        self._apply_piece_button = QPushButton("Apply Piece To Selection")
+        self._apply_piece_button.clicked.connect(self._on_apply_piece)
+        self._snap_side_edges_button = QPushButton("Snap Boundaries To Edge")
+        self._snap_side_edges_button.clicked.connect(self._on_snap_side_edges)
+        self._validate_annotations_button = QPushButton("Validate Annotations")
+        self._validate_annotations_button.clicked.connect(self._on_validate_annotations)
+        self._export_annotations_button = QPushButton("Export Combined GeoJSON")
+        self._export_annotations_button.clicked.connect(self._on_export_annotations)
+        self._export_separate_annotations_button = QPushButton("Export Separate GeoJSONs")
+        self._export_separate_annotations_button.clicked.connect(self._on_export_separate_annotations)
+
         self._status_label = QLabel("Ready")
         self._status_label.setWordWrap(True)
 
@@ -628,6 +688,19 @@ class DatasetSwitcherWidget(QWidget):
 
         if not self._skip_images:
             root.addWidget(self._load_images_button)
+
+        root.addWidget(QLabel("Cortical Depth Annotations"))
+        root.addWidget(self._create_annotations_button)
+        root.addWidget(QLabel("Current Tissue Piece"))
+        root.addWidget(self._piece_combo)
+        piece_row = QHBoxLayout()
+        piece_row.addWidget(self._new_piece_button)
+        piece_row.addWidget(self._apply_piece_button)
+        root.addLayout(piece_row)
+        root.addWidget(self._snap_side_edges_button)
+        root.addWidget(self._validate_annotations_button)
+        root.addWidget(self._export_annotations_button)
+        root.addWidget(self._export_separate_annotations_button)
 
         root.addWidget(self._status_label)
         root.addStretch(1)
@@ -692,6 +765,10 @@ class DatasetSwitcherWidget(QWidget):
     def transcript_view_percent(self) -> int:
         return int(self._tx_percent_slider.value())
 
+    def current_annotation_piece(self) -> str:
+        text = str(self._piece_combo.currentText()).strip()
+        return text or CORTICAL_DEPTH_DEFAULT_PIECE_ID
+
     def _update_tx_percent_label(self, value: int):
         if int(value) <= 0:
             text = "Auto: load as many viewport transcripts as the display cap allows."
@@ -746,6 +823,137 @@ class DatasetSwitcherWidget(QWidget):
     def _on_remove_cellpose_values(self):
         self._remove_cellpose_values_callback(self.current_dataset)
 
+    def _on_create_annotations(self):
+        self._create_annotation_layers_callback(self.current_dataset)
+        self._set_annotation_piece_callback(self.current_dataset, self.current_annotation_piece())
+
+    def _on_piece_changed(self, text: str):
+        piece_id = str(text).strip()
+        if piece_id:
+            self._set_annotation_piece_callback(self.current_dataset, piece_id)
+
+    def _on_new_piece(self):
+        existing = {str(self._piece_combo.itemText(idx)) for idx in range(self._piece_combo.count())}
+        next_idx = 1
+        while f"piece_{next_idx}" in existing:
+            next_idx += 1
+        piece_id = f"piece_{next_idx}"
+        self._piece_combo.addItem(piece_id)
+        self._piece_combo.setCurrentText(piece_id)
+
+    def _on_apply_piece(self):
+        piece_id = self.current_annotation_piece()
+        try:
+            changed = self._apply_annotation_piece_callback(self.current_dataset, piece_id)
+        except Exception as exc:
+            self.set_status(f"Apply piece failed: {exc}")
+            QMessageBox.warning(self, "Apply Piece To Selection", str(exc))
+            return
+        self.set_status(f"Applied {piece_id} to {changed} selected annotation shape(s).")
+
+    def _on_snap_side_edges(self):
+        try:
+            snapped = self._snap_annotation_side_edges_callback(self.current_dataset)
+        except Exception as exc:
+            self.set_status(f"Boundary snapping failed: {exc}")
+            QMessageBox.warning(self, "Snap Boundaries To Edge", str(exc))
+            return
+        if snapped:
+            self.set_status("Pial/WM endpoints snapped to the tissue edge.")
+
+    def _on_validate_annotations(self):
+        try:
+            result = self._validate_annotation_callback(self.current_dataset)
+        except Exception as exc:
+            self.set_status(f"Annotation validation failed: {exc}")
+            QMessageBox.warning(self, "Validate Annotations", str(exc))
+            return
+        self._show_annotation_validation_result("Validate Annotations", result)
+
+    def _on_export_annotations(self):
+        default_name = f"{self.current_dataset.lower()}_cortical_depth_annotations.geojson"
+        path, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Export Cortical Depth Annotations",
+            default_name,
+            "GeoJSON (*.geojson *.json);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            result = self._export_annotation_callback(self.current_dataset, Path(path))
+        except Exception as exc:
+            self.set_status(f"Annotation export failed: {exc}")
+            QMessageBox.warning(self, "Export Combined GeoJSON", str(exc))
+            return
+        if not getattr(result, "ok", False):
+            errors = "\n".join(f"- {message}" for message in getattr(result, "errors", ()))
+            choice = QMessageBox.question(
+                self,
+                "Export Combined GeoJSON",
+                (
+                    "Validation failed, so this file may not run in MerXen.\n\n"
+                    f"{errors}\n\n"
+                    "Save the current annotations anyway for debugging?"
+                ),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if choice == QMessageBox.Yes:
+                try:
+                    result = self._export_annotation_callback(self.current_dataset, Path(path), allow_invalid=True)
+                except Exception as exc:
+                    self.set_status(f"Debug annotation export failed: {exc}")
+                    QMessageBox.warning(self, "Export Combined GeoJSON", str(exc))
+                    return
+                self.set_status(f"Saved validation-failed annotations for debugging: {path}")
+                QMessageBox.information(
+                    self,
+                    "Export Combined GeoJSON",
+                    (
+                        "Saved annotations for debugging.\n\n"
+                        f"{path}\n\n"
+                        "The file includes napari_compare_validation with the validation errors."
+                    ),
+                )
+                return
+        self._show_annotation_validation_result("Export Combined GeoJSON", result, export_path=Path(path))
+
+    def _on_export_separate_annotations(self):
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Export Separate Cortical Depth GeoJSONs",
+            "",
+        )
+        if not directory:
+            return
+        try:
+            result = self._export_separate_annotations_callback(self.current_dataset, Path(directory))
+        except Exception as exc:
+            self.set_status(f"Separate annotation export failed: {exc}")
+            QMessageBox.warning(self, "Export Separate GeoJSONs", str(exc))
+            return
+        self._show_annotation_validation_result("Export Separate GeoJSONs", result, export_path=Path(directory))
+
+    def _show_annotation_validation_result(self, title: str, result, export_path: Path | None = None):
+        errors = list(getattr(result, "errors", ()))
+        warnings_ = list(getattr(result, "warnings", ()))
+        if errors:
+            text = "Export blocked:\n\n" + "\n".join(f"- {message}" for message in errors)
+            if warnings_:
+                text += "\n\nWarnings:\n" + "\n".join(f"- {message}" for message in warnings_)
+            QMessageBox.warning(self, title, text)
+            return
+
+        text = "Annotations are valid."
+        if export_path is not None:
+            text = f"Exported:\n{export_path}"
+        if warnings_:
+            text += "\n\nWarnings:\n" + "\n".join(f"- {message}" for message in warnings_)
+            QMessageBox.information(self, title, text)
+            return
+        QMessageBox.information(self, title, text)
+
 
 class ComparisonViewerController:
     """Coordinate loading/clearing napari layers for each dataset."""
@@ -758,6 +966,7 @@ class ComparisonViewerController:
         self._status_callback = None
         self._shape_keys_callback = None
         self._cellpose_value_options_callback = None
+        self._current_cortical_depth_piece_id = CORTICAL_DEPTH_DEFAULT_PIECE_ID
         self._active_sdata = None
         self._active_images_sdata = None
         self._segmentation_keys: list[str] = []
@@ -903,6 +1112,274 @@ class ComparisonViewerController:
                 border_color=color,
                 **common_kwargs,
             )
+
+    def _cortical_depth_layer_name(self, ds: str, role: str) -> str:
+        return make_layer_name(ds, CORTICAL_DEPTH_LAYER_TYPE, role)
+
+    def _find_cortical_depth_annotation_layer(self, ds: str, role: str):
+        ds = str(ds).upper()
+        role = str(role)
+        expected_name = self._cortical_depth_layer_name(ds, role)
+        for layer in self.viewer.layers:
+            metadata = getattr(layer, "metadata", {}) or {}
+            if metadata.get("cortical_depth_dataset") == ds and metadata.get("cortical_depth_role") == role:
+                return layer
+        return self._get_layer_by_name(expected_name)
+
+    def _ensure_cortical_depth_annotation_layer(self, ds: str, role: str):
+        ds = str(ds).upper()
+        role = str(role)
+        layer = self._find_cortical_depth_annotation_layer(ds, role)
+        if layer is None:
+            spec = CORTICAL_DEPTH_ROLE_SPECS[role]
+            shape_type = "path" if spec.geometry_kind == "line" else "polygon"
+            feature_kwargs = {}
+            if role in CORTICAL_DEPTH_PIECE_ROLES:
+                feature_kwargs = {
+                    "features": {CORTICAL_DEPTH_PIECE_ID_PROPERTY: []},
+                    "feature_defaults": {
+                        CORTICAL_DEPTH_PIECE_ID_PROPERTY: [self._current_cortical_depth_piece_id]
+                    },
+                    "property_choices": {
+                        CORTICAL_DEPTH_PIECE_ID_PROPERTY: [self._current_cortical_depth_piece_id]
+                    },
+                }
+            layer = self.viewer.add_shapes(
+                data=[],
+                ndim=2,
+                shape_type=shape_type,
+                name=self._cortical_depth_layer_name(ds, role),
+                edge_color=CORTICAL_DEPTH_LAYER_COLORS[role],
+                face_color=CORTICAL_DEPTH_FILL_COLORS[role],
+                edge_width=max(1.5, float(self.args.shape_edge_width) * 2.0),
+                visible=True,
+                **feature_kwargs,
+            )
+        metadata = getattr(layer, "metadata", None)
+        if metadata is None:
+            metadata = {}
+            layer.metadata = metadata
+        metadata["cortical_depth_dataset"] = ds
+        metadata["cortical_depth_role"] = role
+        metadata["cortical_depth_geojson_role"] = CORTICAL_DEPTH_ROLE_SPECS[role].geojson_role
+        if role in CORTICAL_DEPTH_PIECE_ROLES:
+            self._set_layer_current_piece(layer, self._current_cortical_depth_piece_id)
+        return layer
+
+    def _annotation_layer_shapes(self, layer) -> list[np.ndarray]:
+        if layer is None:
+            return []
+        data = getattr(layer, "data", [])
+        if data is None:
+            return []
+        if isinstance(data, np.ndarray) and data.ndim == 2:
+            return [np.asarray(data, dtype=float)]
+        return [np.asarray(shape, dtype=float) for shape in list(data)]
+
+    def _annotation_layer_shape_inputs(self, layer, role: str) -> list[CorticalDepthShapeInput]:
+        shapes = self._annotation_layer_shapes(layer)
+        if role not in CORTICAL_DEPTH_PIECE_ROLES:
+            return [CorticalDepthShapeInput(data=shape) for shape in shapes]
+        piece_ids = self._layer_piece_ids(layer, len(shapes))
+        return [
+            CorticalDepthShapeInput(data=shape, tissue_piece_id=piece_ids[idx])
+            for idx, shape in enumerate(shapes)
+        ]
+
+    def _layer_piece_ids(self, layer, n_shapes: int) -> list[str]:
+        if layer is None or n_shapes <= 0:
+            return []
+        fallback = self._current_cortical_depth_piece_id or CORTICAL_DEPTH_DEFAULT_PIECE_ID
+        try:
+            features = getattr(layer, "features", None)
+            if features is not None and CORTICAL_DEPTH_PIECE_ID_PROPERTY in features:
+                values = list(features[CORTICAL_DEPTH_PIECE_ID_PROPERTY])
+                out = [str(value).strip() or fallback for value in values[:n_shapes]]
+                if len(out) < n_shapes:
+                    out.extend([fallback] * (n_shapes - len(out)))
+                return out
+        except Exception:
+            pass
+        return [fallback] * n_shapes
+
+    def _set_layer_current_piece(self, layer, piece_id: str):
+        if layer is None:
+            return
+        piece_id = str(piece_id).strip() or CORTICAL_DEPTH_DEFAULT_PIECE_ID
+        try:
+            choices = getattr(layer, "property_choices", {}) or {}
+            existing = list(choices.get(CORTICAL_DEPTH_PIECE_ID_PROPERTY, []))
+            if piece_id not in [str(value) for value in existing]:
+                existing.append(piece_id)
+            choices[CORTICAL_DEPTH_PIECE_ID_PROPERTY] = existing
+            layer.property_choices = choices
+        except Exception:
+            pass
+        try:
+            layer.current_properties = {CORTICAL_DEPTH_PIECE_ID_PROPERTY: [piece_id]}
+        except Exception:
+            pass
+
+    def _collect_cortical_depth_annotations(self, ds: str) -> tuple[dict[str, list[np.ndarray]], dict[str, str]]:
+        ds = str(ds).upper()
+        layers_by_role: dict[str, list[np.ndarray]] = {}
+        layer_names: dict[str, str] = {}
+        for role in CORTICAL_DEPTH_ROLE_ORDER:
+            layer = self._find_cortical_depth_annotation_layer(ds, role)
+            layers_by_role[role] = self._annotation_layer_shape_inputs(layer, role)
+            if layer is not None:
+                layer_names[role] = str(layer.name)
+        return layers_by_role, layer_names
+
+    def create_cortical_depth_annotation_layers(self, dataset_name: str):
+        if not self._ensure_dataset_is_active(dataset_name):
+            self._set_status(f"Could not activate dataset {dataset_name}.")
+            return
+        ds = self.active_dataset
+        first_layer = None
+        created = 0
+        for role in CORTICAL_DEPTH_ROLE_ORDER:
+            before = self._find_cortical_depth_annotation_layer(ds, role)
+            layer = self._ensure_cortical_depth_annotation_layer(ds, role)
+            if first_layer is None:
+                first_layer = layer
+            if before is None:
+                created += 1
+        if first_layer is not None:
+            try:
+                self.viewer.layers.selection.active = first_layer
+                first_layer.mode = "add_path"
+            except Exception:
+                pass
+        self._set_status(f"{ds} cortical-depth drawing layers ready ({created} created).")
+
+    def set_cortical_depth_current_piece(self, dataset_name: str, piece_id: str):
+        self._current_cortical_depth_piece_id = str(piece_id).strip() or CORTICAL_DEPTH_DEFAULT_PIECE_ID
+        ds = str(dataset_name).upper()
+        for role in CORTICAL_DEPTH_PIECE_ROLES:
+            layer = self._find_cortical_depth_annotation_layer(ds, role)
+            self._set_layer_current_piece(layer, self._current_cortical_depth_piece_id)
+
+    def apply_cortical_depth_piece_to_selection(self, dataset_name: str, piece_id: str) -> int:
+        if not self._ensure_dataset_is_active(dataset_name):
+            self._set_status(f"Could not activate dataset {dataset_name}.")
+            return 0
+        ds = self.active_dataset
+        piece_id = str(piece_id).strip() or CORTICAL_DEPTH_DEFAULT_PIECE_ID
+        changed = 0
+        for role in CORTICAL_DEPTH_PIECE_ROLES:
+            layer = self._find_cortical_depth_annotation_layer(ds, role)
+            if layer is None:
+                continue
+            self._set_layer_current_piece(layer, piece_id)
+            selected = sorted(int(idx) for idx in getattr(layer, "selected_data", set()) or set())
+            if not selected:
+                continue
+            features = getattr(layer, "features", None)
+            if features is None:
+                continue
+            features = features.copy()
+            if CORTICAL_DEPTH_PIECE_ID_PROPERTY not in features:
+                features[CORTICAL_DEPTH_PIECE_ID_PROPERTY] = [self._current_cortical_depth_piece_id] * len(features)
+            for idx in selected:
+                if 0 <= idx < len(features):
+                    features.iloc[idx, features.columns.get_loc(CORTICAL_DEPTH_PIECE_ID_PROPERTY)] = piece_id
+                    changed += 1
+            layer.features = features
+        self._current_cortical_depth_piece_id = piece_id
+        self._set_status(f"{ds} applied {piece_id} to {changed} selected annotation shape(s).")
+        return changed
+
+    def validate_cortical_depth_annotations(self, dataset_name: str):
+        if not self._ensure_dataset_is_active(dataset_name):
+            empty = build_cortical_depth_annotation_geojson({}, dataset=str(dataset_name).upper())
+            self._set_status(f"Could not activate dataset {dataset_name}.")
+            return empty
+        ds = self.active_dataset
+        layers_by_role, layer_names = self._collect_cortical_depth_annotations(ds)
+        result = build_cortical_depth_annotation_geojson(
+            layers_by_role,
+            layer_names=layer_names,
+            dataset=ds,
+        )
+        feature_count = len(result.geojson.get("features", []))
+        if result.ok:
+            self._set_status(
+                f"{ds} cortical-depth annotations valid: features={feature_count}, warnings={len(result.warnings)}."
+            )
+        else:
+            self._set_status(
+                f"{ds} cortical-depth annotations invalid: errors={len(result.errors)}, warnings={len(result.warnings)}."
+            )
+        return result
+
+    def export_cortical_depth_annotations(self, dataset_name: str, path: Path, *, allow_invalid: bool = False):
+        result = self.validate_cortical_depth_annotations(dataset_name)
+        if not result.ok and not allow_invalid:
+            return result
+        path = Path(path)
+        write_cortical_depth_annotation_geojson(
+            path,
+            result,
+            allow_invalid=allow_invalid,
+            include_validation_report=allow_invalid,
+        )
+        if allow_invalid and not result.ok:
+            self._set_status(
+                f"{str(dataset_name).upper()} exported validation-failed cortical-depth annotations to {path} "
+                f"(errors={len(result.errors)}, warnings={len(result.warnings)})."
+            )
+        else:
+            self._set_status(
+                f"{str(dataset_name).upper()} exported cortical-depth annotations to {path} "
+                f"(features={len(result.geojson.get('features', []))}, warnings={len(result.warnings)})."
+            )
+        return result
+
+    def export_separate_cortical_depth_annotations(self, dataset_name: str, output_dir: Path):
+        result = self.validate_cortical_depth_annotations(dataset_name)
+        if not result.ok:
+            return result
+        ds = str(dataset_name).upper()
+        written = write_cortical_depth_separate_geojsons(
+            output_dir,
+            result,
+            stem=f"{ds.lower()}_cortical_depth",
+        )
+        self._set_status(
+            f"{ds} exported {len(written)} separate cortical-depth GeoJSON file(s) to {Path(output_dir)} "
+            f"(warnings={len(result.warnings)})."
+        )
+        return result
+
+    def snap_cortical_depth_side_edges(self, dataset_name: str) -> bool:
+        if not self._ensure_dataset_is_active(dataset_name):
+            self._set_status(f"Could not activate dataset {dataset_name}.")
+            return False
+        ds = self.active_dataset
+        pial_layer = self._find_cortical_depth_annotation_layer(ds, "pia")
+        wm_layer = self._find_cortical_depth_annotation_layer(ds, "wm")
+        side_layer = self._find_cortical_depth_annotation_layer(ds, "side")
+        snapped = snap_cortical_depth_boundaries_to_edge(
+            self._annotation_layer_shapes(pial_layer),
+            self._annotation_layer_shapes(wm_layer),
+            self._annotation_layer_shapes(side_layer),
+        )
+        if pial_layer is not None:
+            pial_layer.data = snapped["pia"]
+        if wm_layer is not None:
+            wm_layer.data = snapped["wm"]
+        try:
+            active_layer = pial_layer or wm_layer
+            if active_layer is not None:
+                self.viewer.layers.selection.active = active_layer
+                active_layer.mode = "select"
+        except Exception:
+            pass
+        self._set_status(
+            f"{ds} snapped {len(snapped['pia']) + len(snapped['wm'])} pial/WM boundary line(s) to the tissue edge."
+        )
+        return True
 
     def _ensure_dataset_is_active(self, dataset_name: str) -> bool:
         ds = str(dataset_name).upper()
@@ -2930,6 +3407,13 @@ def main():
         load_images_callback=controller.load_images_on_demand,
         load_cellpose_values_callback=controller.load_cellpose_value_overlay,
         remove_cellpose_values_callback=controller.remove_cellpose_value_overlay,
+        create_annotation_layers_callback=controller.create_cortical_depth_annotation_layers,
+        set_annotation_piece_callback=controller.set_cortical_depth_current_piece,
+        apply_annotation_piece_callback=controller.apply_cortical_depth_piece_to_selection,
+        snap_annotation_side_edges_callback=controller.snap_cortical_depth_side_edges,
+        validate_annotation_callback=controller.validate_cortical_depth_annotations,
+        export_annotation_callback=controller.export_cortical_depth_annotations,
+        export_separate_annotations_callback=controller.export_separate_cortical_depth_annotations,
         initial_dataset=initial_dataset,
         skip_images=args.skip_images,
         transcript_view_percent=args.transcript_view_percent,

@@ -9,12 +9,13 @@ import re
 from dataclasses import dataclass
 from hashlib import blake2s
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable, Mapping
 
 import numpy as np
 import pandas as pd
 import zarr
-from shapely.geometry import box
+from shapely.geometry import GeometryCollection, LineString, MultiLineString, MultiPolygon, Point, Polygon, box, mapping
+from shapely.ops import linemerge, polygonize, unary_union
 
 try:
     from skimage.draw import polygon as draw_polygon
@@ -31,6 +32,84 @@ CELLPOSE_QUANTIFICATION_TABLE_KEY = "table_MOSAIK_cellpose_image_quantification"
 CELLPOSE_VALUE_BINS = 256
 CELLPOSE_VALUE_CLIP_PERCENTILES = (1.0, 99.0)
 TRANSPARENT_RGBA = (0.0, 0.0, 0.0, 0.0)
+
+
+@dataclass(frozen=True)
+class CorticalDepthRoleSpec:
+    """One supported cortical-depth annotation role."""
+
+    key: str
+    geojson_role: str
+    geometry_kind: str
+    layer_label: str
+
+
+CORTICAL_DEPTH_ROLE_SPECS: dict[str, CorticalDepthRoleSpec] = {
+    "pia": CorticalDepthRoleSpec(
+        key="pia",
+        geojson_role="pial_boundary",
+        geometry_kind="line",
+        layer_label="Pial boundary",
+    ),
+    "wm": CorticalDepthRoleSpec(
+        key="wm",
+        geojson_role="gray_white_boundary",
+        geometry_kind="line",
+        layer_label="Gray/white boundary",
+    ),
+    "side": CorticalDepthRoleSpec(
+        key="side",
+        geojson_role="side_boundary",
+        geometry_kind="line",
+        layer_label="Tissue edge boundary",
+    ),
+    "exclusion": CorticalDepthRoleSpec(
+        key="exclusion",
+        geojson_role="exclusion",
+        geometry_kind="polygon",
+        layer_label="Exclusion polygons",
+    ),
+    "ribbon": CorticalDepthRoleSpec(
+        key="ribbon",
+        geojson_role="cortical_ribbon",
+        geometry_kind="polygon",
+        layer_label="Cortical ribbon",
+    ),
+}
+CORTICAL_DEPTH_ROLE_ORDER = ("pia", "wm", "side", "exclusion", "ribbon")
+CORTICAL_DEPTH_PIECE_ID_PROPERTY = "tissue_piece_id"
+CORTICAL_DEPTH_PIECE_MODE_PROPERTY = "piece_mode"
+CORTICAL_DEPTH_DEFAULT_PIECE_ID = "piece_1"
+CORTICAL_DEPTH_DEPTH_MODE = "depth"
+CORTICAL_DEPTH_MASK_QC_ONLY_MODE = "mask_qc_only"
+CORTICAL_DEPTH_SEPARATE_FILE_STEMS = {
+    "pia": "pial_boundary",
+    "wm": "wm_boundary",
+    "side": "side_boundaries",
+    "exclusion": "exclusion_masks",
+    "ribbon": "cortical_ribbon",
+}
+
+
+@dataclass(frozen=True)
+class CorticalDepthAnnotationExport:
+    """Combined GeoJSON payload plus validation messages."""
+
+    geojson: dict[str, Any]
+    errors: tuple[str, ...]
+    warnings: tuple[str, ...]
+
+    @property
+    def ok(self) -> bool:
+        return len(self.errors) == 0
+
+
+@dataclass(frozen=True)
+class CorticalDepthShapeInput:
+    """One napari shape plus its optional cortical-depth tissue piece id."""
+
+    data: np.ndarray
+    tissue_piece_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -368,6 +447,861 @@ def matching_layer_names(layer_names: Iterable[str], prefix: str) -> list[str]:
         if s == prefix or s.startswith(prefix + " | "):
             out.append(s)
     return out
+
+
+def build_cortical_depth_annotation_geojson(
+    layers_by_role: Mapping[str, Iterable[Any]],
+    *,
+    layer_names: Mapping[str, str] | None = None,
+    dataset: str | None = None,
+) -> CorticalDepthAnnotationExport:
+    """Build a validated MerXen cortical-depth GeoJSON FeatureCollection.
+
+    Napari shape coordinates are stored in display order ``(y, x)``. GeoJSON and
+    MerXen expect ``[x, y]``. This function only swaps those two axes; it does
+    not scale, normalize, rotate, or otherwise transform coordinate values.
+    """
+    layer_names = {} if layer_names is None else dict(layer_names)
+    errors: list[str] = []
+    warnings_out: list[str] = []
+
+    line_inputs: dict[str, list[tuple[LineString, str | None]]] = {}
+    polygon_inputs: dict[str, list[tuple[Polygon, str | None]]] = {}
+    for role in CORTICAL_DEPTH_ROLE_ORDER:
+        spec = CORTICAL_DEPTH_ROLE_SPECS[role]
+        role_shapes = layers_by_role.get(role, ())
+        raw_shapes = _coerce_annotation_shape_inputs([] if role_shapes is None else list(role_shapes))
+        source_name = layer_names.get(role, spec.layer_label)
+        if spec.geometry_kind == "line":
+            line_inputs[role] = _napari_shape_inputs_to_lines(
+                raw_shapes,
+                label=source_name,
+                allow_closed=role == "side",
+                errors=errors,
+            )
+        else:
+            polygon_inputs[role] = _napari_shape_inputs_to_polygons(
+                raw_shapes,
+                label=source_name,
+                errors=errors,
+            )
+
+    side_lines = tuple(line for line, _piece_id in line_inputs.get("side", ()))
+    if not side_lines:
+        errors.append("Missing tissue-edge boundary line.")
+    elif len(side_lines) > 1:
+        errors.append("Draw exactly one tissue-edge boundary line; multiple edge lines are not supported.")
+    edge_line = side_lines[0] if len(side_lines) == 1 else None
+
+    pial_by_piece = _group_lines_by_piece(line_inputs.get("pia", ()))
+    wm_by_piece = _group_lines_by_piece(line_inputs.get("wm", ()))
+    exclusions_by_piece = _group_polygons_by_piece(polygon_inputs.get("exclusion", ()))
+    ribbons_by_piece = _group_polygons_by_piece(polygon_inputs.get("ribbon", ()))
+    piece_ids = sorted(set(pial_by_piece) | set(wm_by_piece) | set(exclusions_by_piece) | set(ribbons_by_piece))
+    if not piece_ids:
+        errors.append("Missing pial boundary line.")
+
+    pieces: dict[str, dict[str, Any]] = {}
+    overlap_polygons: dict[str, Polygon | MultiPolygon] = {}
+    for piece_id in piece_ids:
+        pial = _merge_single_required_line(
+            pial_by_piece.get(piece_id, []),
+            role_label=f"pial boundary for {piece_id}",
+            errors=errors,
+            warnings_out=warnings_out,
+        )
+        wm = _merge_single_required_line(
+            wm_by_piece.get(piece_id, []),
+            role_label=f"gray/white boundary for {piece_id}",
+            errors=errors,
+            warnings_out=warnings_out,
+        )
+        exclusions = tuple(exclusions_by_piece.get(piece_id, ()))
+        ribbons = tuple(ribbons_by_piece.get(piece_id, ()))
+        if pial is None:
+            if wm is not None:
+                errors.append(f"{piece_id} has a gray/white boundary but no pial boundary.")
+            elif exclusions or ribbons:
+                errors.append(f"{piece_id} has piece-specific polygons but no pial boundary.")
+            continue
+
+        piece_mode = CORTICAL_DEPTH_DEPTH_MODE if wm is not None else CORTICAL_DEPTH_MASK_QC_ONLY_MODE
+        pieces[piece_id] = {
+            "pial": pial,
+            "wm": wm,
+            "exclusions": exclusions,
+            "ribbons": ribbons,
+            "piece_mode": piece_mode,
+        }
+        polygon = _validate_piece_relationships(
+            piece_id=piece_id,
+            pial=pial,
+            wm=wm,
+            edge_line=edge_line,
+            exclusions=exclusions,
+            ribbons=ribbons,
+            errors=errors,
+            warnings_out=warnings_out,
+        )
+        if polygon is not None:
+            overlap_polygons[piece_id] = polygon
+
+    _warn_for_overlapping_piece_polygons(overlap_polygons, warnings_out=warnings_out)
+
+    features: list[dict[str, Any]] = []
+    if edge_line is not None:
+        features.append(
+            _feature_for_geometry(
+                edge_line,
+                role="side",
+                layer_name=layer_names.get("side"),
+                dataset=dataset,
+            )
+        )
+    for piece_id in piece_ids:
+        piece = pieces.get(piece_id)
+        if piece is None:
+            continue
+        piece_mode = str(piece["piece_mode"])
+        features.append(
+            _feature_for_geometry(
+                piece["pial"],
+                role="pia",
+                layer_name=layer_names.get("pia"),
+                dataset=dataset,
+                tissue_piece_id=piece_id,
+                piece_mode=piece_mode,
+            )
+        )
+        if piece["wm"] is not None:
+            features.append(
+                _feature_for_geometry(
+                    piece["wm"],
+                    role="wm",
+                    layer_name=layer_names.get("wm"),
+                    dataset=dataset,
+                    tissue_piece_id=piece_id,
+                    piece_mode=piece_mode,
+                )
+            )
+        exclusions = tuple(piece["exclusions"])
+        if exclusions:
+            exclusion_geom = exclusions[0] if len(exclusions) == 1 else MultiPolygon(exclusions)
+            features.append(
+                _feature_for_geometry(
+                    exclusion_geom,
+                    role="exclusion",
+                    layer_name=layer_names.get("exclusion"),
+                    dataset=dataset,
+                    tissue_piece_id=piece_id,
+                    piece_mode=piece_mode,
+                )
+            )
+        ribbons = tuple(piece["ribbons"])
+        if ribbons:
+            ribbon_geom = ribbons[0] if len(ribbons) == 1 else MultiPolygon(ribbons)
+            features.append(
+                _feature_for_geometry(
+                    ribbon_geom,
+                    role="ribbon",
+                    layer_name=layer_names.get("ribbon"),
+                    dataset=dataset,
+                    tissue_piece_id=piece_id,
+                    piece_mode=piece_mode,
+                )
+            )
+
+    geojson = {
+        "type": "FeatureCollection",
+        "features": features,
+    }
+    return CorticalDepthAnnotationExport(
+        geojson=_jsonable(geojson),
+        errors=tuple(dict.fromkeys(errors)),
+        warnings=tuple(dict.fromkeys(warnings_out)),
+    )
+
+
+def write_cortical_depth_annotation_geojson(
+    path: str | Path,
+    export: CorticalDepthAnnotationExport,
+    *,
+    allow_invalid: bool = False,
+    include_validation_report: bool = False,
+) -> None:
+    """Write a cortical-depth annotation export, failing on validation errors."""
+    if not export.ok and not allow_invalid:
+        joined = "\n".join(export.errors)
+        raise ValueError(f"Cortical-depth annotations are invalid:\n{joined}")
+    payload = dict(export.geojson)
+    if include_validation_report:
+        payload["napari_compare_validation"] = {
+            "ok": bool(export.ok),
+            "errors": list(export.errors),
+            "warnings": list(export.warnings),
+        }
+    Path(path).write_text(json.dumps(_jsonable(payload), indent=2) + "\n")
+
+
+def split_cortical_depth_annotation_geojson(
+    export: CorticalDepthAnnotationExport,
+) -> dict[str, dict[str, Any]]:
+    """Split a combined cortical-depth export into per-role FeatureCollections."""
+    if not export.ok:
+        joined = "\n".join(export.errors)
+        raise ValueError(f"Cortical-depth annotations are invalid:\n{joined}")
+
+    out: dict[str, dict[str, Any]] = {}
+    for feature in export.geojson.get("features", []):
+        properties = feature.get("properties", {})
+        role = str(properties.get("annotation_role", ""))
+        if role not in CORTICAL_DEPTH_SEPARATE_FILE_STEMS:
+            continue
+        out.setdefault(role, {"type": "FeatureCollection", "features": []})["features"].append(feature)
+    return out
+
+
+def write_cortical_depth_separate_geojsons(
+    output_dir: str | Path,
+    export: CorticalDepthAnnotationExport,
+    *,
+    stem: str = "cortical_depth",
+) -> dict[str, Path]:
+    """Write per-role cortical-depth GeoJSON files and return role->path."""
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    payloads = split_cortical_depth_annotation_geojson(export)
+    written: dict[str, Path] = {}
+    safe_stem = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(stem)).strip("_") or "cortical_depth"
+    for role in CORTICAL_DEPTH_ROLE_ORDER:
+        payload = payloads.get(role)
+        if not payload:
+            continue
+        path = output_dir / f"{safe_stem}_{CORTICAL_DEPTH_SEPARATE_FILE_STEMS[role]}.geojson"
+        path.write_text(json.dumps(_jsonable(payload), indent=2) + "\n")
+        written[role] = path
+    return written
+
+
+def snap_cortical_depth_boundaries_to_edge(
+    pial_shapes: Iterable[np.ndarray],
+    wm_shapes: Iterable[np.ndarray] | None = None,
+    edge_shapes: Iterable[np.ndarray] | None = None,
+) -> dict[str, list[np.ndarray]]:
+    """Snap pia/WM path endpoints to the nearest point on the one tissue edge.
+
+    Returned arrays remain in napari ``(y, x)`` order.
+    """
+    errors: list[str] = []
+    pial_lines = _napari_shapes_to_lines(
+        list(pial_shapes if pial_shapes is not None else ()),
+        label="pial boundary",
+        errors=errors,
+    )
+    wm_lines = _napari_shapes_to_lines(
+        list(wm_shapes if wm_shapes is not None else ()),
+        label="gray/white boundary",
+        errors=errors,
+    )
+    edge_lines = _napari_shapes_to_lines(
+        list(edge_shapes or ()),
+        label="tissue edge boundary",
+        allow_closed=True,
+        errors=errors,
+    )
+    if not edge_lines:
+        errors.append("One tissue-edge boundary line is required for snapping.")
+    elif len(edge_lines) > 1:
+        errors.append("Draw exactly one tissue-edge boundary line before snapping.")
+    if errors:
+        raise ValueError("; ".join(dict.fromkeys(errors)))
+
+    edge = edge_lines[0]
+    return {
+        "pia": [_snap_line_endpoints_to_edge(line, edge) for line in pial_lines],
+        "wm": [_snap_line_endpoints_to_edge(line, edge) for line in wm_lines],
+    }
+
+
+def snap_side_boundaries_to_pia_wm(
+    pial_shapes: Iterable[np.ndarray],
+    wm_shapes: Iterable[np.ndarray],
+    side_shapes: Iterable[np.ndarray] | None = None,
+) -> list[np.ndarray]:
+    """Deprecated compatibility wrapper for the old two-side-edge snapping API."""
+    snapped = snap_cortical_depth_boundaries_to_edge(pial_shapes, wm_shapes, side_shapes)
+    return snapped["pia"] + snapped["wm"]
+
+
+def _coerce_annotation_shape_inputs(shapes: Iterable[Any]) -> list[CorticalDepthShapeInput]:
+    out: list[CorticalDepthShapeInput] = []
+    for shape in shapes:
+        if isinstance(shape, CorticalDepthShapeInput):
+            out.append(shape)
+            continue
+        if isinstance(shape, Mapping):
+            data = shape.get("data")
+            if data is None:
+                data = shape.get("shape")
+            out.append(
+                CorticalDepthShapeInput(
+                    data=np.asarray(data, dtype=float),
+                    tissue_piece_id=_clean_piece_id(shape.get(CORTICAL_DEPTH_PIECE_ID_PROPERTY)),
+                )
+            )
+            continue
+        if isinstance(shape, tuple) and len(shape) == 2:
+            out.append(
+                CorticalDepthShapeInput(
+                    data=np.asarray(shape[0], dtype=float),
+                    tissue_piece_id=_clean_piece_id(shape[1]),
+                )
+            )
+            continue
+        out.append(CorticalDepthShapeInput(data=np.asarray(shape, dtype=float)))
+    return out
+
+
+def _clean_piece_id(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _piece_id_for_shape(shape: CorticalDepthShapeInput) -> str:
+    return _clean_piece_id(shape.tissue_piece_id) or CORTICAL_DEPTH_DEFAULT_PIECE_ID
+
+
+def _napari_shape_inputs_to_lines(
+    shapes: Iterable[CorticalDepthShapeInput],
+    *,
+    label: str,
+    errors: list[str],
+    allow_closed: bool = False,
+) -> list[tuple[LineString, str | None]]:
+    lines: list[tuple[LineString, str | None]] = []
+    for idx, shape in enumerate(shapes, start=1):
+        parsed = _napari_shape_to_line(
+            shape.data,
+            label=f"{label} shape {idx}",
+            errors=errors,
+            allow_closed=allow_closed,
+        )
+        if parsed is not None:
+            lines.append((parsed, _piece_id_for_shape(shape)))
+    return lines
+
+
+def _napari_shape_inputs_to_polygons(
+    shapes: Iterable[CorticalDepthShapeInput],
+    *,
+    label: str,
+    errors: list[str],
+) -> list[tuple[Polygon, str | None]]:
+    polygons: list[tuple[Polygon, str | None]] = []
+    for idx, shape in enumerate(shapes, start=1):
+        parsed = _napari_shape_to_polygon(shape.data, label=f"{label} shape {idx}", errors=errors)
+        if parsed is not None:
+            polygons.append((parsed, _piece_id_for_shape(shape)))
+    return polygons
+
+
+def _napari_shapes_to_lines(
+    shapes: Iterable[np.ndarray],
+    *,
+    label: str,
+    errors: list[str],
+    allow_closed: bool = False,
+) -> list[LineString]:
+    lines: list[LineString] = []
+    for idx, shape_data in enumerate(shapes, start=1):
+        line = _napari_shape_to_line(
+            shape_data,
+            label=f"{label} shape {idx}",
+            errors=errors,
+            allow_closed=allow_closed,
+        )
+        if line is not None:
+            lines.append(line)
+    return lines
+
+
+def _napari_shape_to_line(
+    shape_data,
+    *,
+    label: str,
+    errors: list[str],
+    allow_closed: bool = False,
+) -> LineString | None:
+    xy = _napari_yx_to_xy(shape_data, label=label, errors=errors)
+    if xy is None:
+        return None
+    xy = _drop_consecutive_duplicate_points(xy)
+    if xy.shape[0] < 2:
+        errors.append(f"{label} must contain at least two distinct points.")
+        return None
+    if np.allclose(xy[0], xy[-1]) and not allow_closed:
+        errors.append(f"{label} is closed; draw pia/WM boundaries as open polylines.")
+        return None
+    line = LineString(xy)
+    if line.is_empty or line.length <= 0:
+        errors.append(f"{label} has zero line length.")
+        return None
+    return line
+
+
+def _napari_shapes_to_polygons(
+    shapes: Iterable[np.ndarray],
+    *,
+    label: str,
+    errors: list[str],
+) -> list[Polygon]:
+    polygons: list[Polygon] = []
+    for idx, shape_data in enumerate(shapes, start=1):
+        polygon = _napari_shape_to_polygon(shape_data, label=f"{label} shape {idx}", errors=errors)
+        if polygon is not None:
+            polygons.append(polygon)
+    return polygons
+
+
+def _napari_shape_to_polygon(shape_data, *, label: str, errors: list[str]) -> Polygon | None:
+    xy = _napari_yx_to_xy(shape_data, label=label, errors=errors)
+    if xy is None:
+        return None
+    xy = _drop_consecutive_duplicate_points(xy)
+    if xy.shape[0] < 3:
+        errors.append(f"{label} must contain at least three distinct points.")
+        return None
+    if not np.allclose(xy[0], xy[-1]):
+        xy = np.vstack([xy, xy[0]])
+    polygon = Polygon(xy)
+    if polygon.is_empty or polygon.area <= 0:
+        errors.append(f"{label} has zero polygon area.")
+        return None
+    if not polygon.is_valid:
+        errors.append(f"{label} is invalid or self-intersecting; redraw it as a simple polygon.")
+        return None
+    return polygon
+
+
+def _napari_yx_to_xy(
+    shape_data,
+    *,
+    label: str,
+    errors: list[str],
+) -> np.ndarray | None:
+    arr = np.asarray(shape_data, dtype=float)
+    if arr.ndim != 2 or arr.shape[1] < 2:
+        errors.append(f"{label} must be a 2D napari shape with y/x coordinates.")
+        return None
+    yx = arr[:, :2]
+    if not np.isfinite(yx).all():
+        errors.append(f"{label} contains non-finite coordinates.")
+        return None
+    return yx[:, [1, 0]].astype(float, copy=False)
+
+
+def _drop_consecutive_duplicate_points(xy: np.ndarray) -> np.ndarray:
+    if xy.shape[0] <= 1:
+        return xy
+    keep = np.ones(xy.shape[0], dtype=bool)
+    keep[1:] = np.linalg.norm(np.diff(xy, axis=0), axis=1) > 0
+    return xy[keep]
+
+
+def _merge_single_required_line(
+    lines: list[LineString],
+    *,
+    role_label: str,
+    errors: list[str],
+    warnings_out: list[str],
+) -> LineString | None:
+    if not lines:
+        return None
+    if len(lines) == 1:
+        return lines[0]
+    merged = linemerge(MultiLineString(lines))
+    if isinstance(merged, LineString):
+        warnings_out.append(f"Merged {len(lines)} {role_label} path segments into one LineString.")
+        return merged
+    errors.append(f"Multiple {role_label} path segments could not be merged into one continuous line.")
+    return None
+
+
+def _group_lines_by_piece(items: Iterable[tuple[LineString, str | None]]) -> dict[str, list[LineString]]:
+    grouped: dict[str, list[LineString]] = {}
+    for line, piece_id in items:
+        grouped.setdefault(piece_id or CORTICAL_DEPTH_DEFAULT_PIECE_ID, []).append(line)
+    return grouped
+
+
+def _group_polygons_by_piece(items: Iterable[tuple[Polygon, str | None]]) -> dict[str, list[Polygon]]:
+    grouped: dict[str, list[Polygon]] = {}
+    for polygon, piece_id in items:
+        grouped.setdefault(piece_id or CORTICAL_DEPTH_DEFAULT_PIECE_ID, []).append(polygon)
+    return grouped
+
+
+def _validate_piece_relationships(
+    *,
+    piece_id: str,
+    pial: LineString,
+    wm: LineString | None,
+    edge_line: LineString | None,
+    exclusions: tuple[Polygon, ...],
+    ribbons: tuple[Polygon, ...],
+    errors: list[str],
+    warnings_out: list[str],
+) -> Polygon | MultiPolygon | None:
+    if wm is not None:
+        intersection = pial.intersection(wm)
+        if not intersection.is_empty:
+            warnings_out.append(
+                f"{piece_id}: pial and gray/white boundary lines intersect; avoid crossing or touching these boundaries."
+            )
+
+    for idx, polygon in enumerate(exclusions, start=1):
+        if polygon.intersects(pial) or (wm is not None and polygon.intersects(wm)):
+            warnings_out.append(
+                f"{piece_id}: exclusion polygon {idx} touches or overlaps the pial/gray-white boundary; "
+                "this can remove Dirichlet boundary pixels and degrade the Laplace solve."
+            )
+
+    explicit_ribbon = _union_piece_polygons(ribbons)
+    if explicit_ribbon is not None:
+        return explicit_ribbon
+
+    if edge_line is None:
+        return None
+
+    tolerance = max(1e-6, 0.02 * max(float(pial.length), float(wm.length) if wm is not None else 0.0))
+    for label, line in (("pial", pial), ("gray/white", wm)):
+        if line is None:
+            continue
+        coords = np.asarray(line.coords, dtype=float)[:, :2]
+        for endpoint_label, xy in (("start", coords[0]), ("end", coords[-1])):
+            distance = float(edge_line.distance(Point(float(xy[0]), float(xy[1]))))
+            if distance > tolerance:
+                warnings_out.append(
+                    f"{piece_id}: {label} boundary {endpoint_label} point is not on the tissue edge "
+                    f"(distance {distance:.3g}); use Snap To Edge or draw an explicit ribbon polygon."
+                )
+
+    candidates = _candidate_piece_polygons(edge_line=edge_line, pial=pial, wm=wm)
+    if wm is None:
+        if len(candidates) != 1:
+            errors.append(
+                f"{piece_id}: pial-only pieces need exactly one polygon from tissue edge + pia, "
+                "or an explicit cortical-ribbon polygon."
+            )
+            return None
+    elif len(candidates) == 0:
+        errors.append(
+            f"{piece_id}: tissue edge, pial boundary, and gray/white boundary do not form a polygon; "
+            "snap endpoints to the edge or draw an explicit cortical-ribbon polygon."
+        )
+        return None
+    elif len(candidates) > 1:
+        warnings_out.append(
+            f"{piece_id}: multiple candidate ribbon polygons were found; draw an explicit cortical-ribbon "
+            "polygon if MerXen chooses the wrong tissue region."
+        )
+    return min(candidates, key=lambda geom: float(geom.area)) if candidates else None
+
+
+def _candidate_piece_polygons(
+    *,
+    edge_line: LineString,
+    pial: LineString,
+    wm: LineString | None,
+) -> list[Polygon]:
+    candidates = _edge_subchain_candidate_piece_polygons(edge_line=edge_line, pial=pial, wm=wm)
+
+    lines = [edge_line, pial]
+    if wm is not None:
+        lines.append(wm)
+    merged = unary_union(lines)
+    polygonized = polygonize(merged)
+    polygon_geoms = getattr(polygonized, "geoms", polygonized)
+    polygons = [poly for poly in polygon_geoms if isinstance(poly, Polygon) and poly.area > 0]
+    for polygon in polygons:
+        boundary = polygon.boundary
+        if not boundary.intersects(pial):
+            continue
+        if wm is not None and not boundary.intersects(wm):
+            continue
+        candidates.append(polygon)
+    return [
+        polygon
+        for polygon in _unique_valid_polygons(candidates)
+        if _polygon_boundary_line_coverage(polygon, pial) >= 0.95
+        and (wm is None or _polygon_boundary_line_coverage(polygon, wm) >= 0.95)
+    ]
+
+
+def _edge_subchain_candidate_piece_polygons(
+    *,
+    edge_line: LineString,
+    pial: LineString,
+    wm: LineString | None,
+) -> list[Polygon]:
+    pial_coords = _line_xy_array(pial)
+    if pial_coords.shape[0] < 2:
+        return []
+
+    pial_distances = _line_endpoint_edge_distances(edge_line, pial)
+    if wm is None:
+        candidates: list[Polygon] = []
+        for edge_path in _edge_paths_between(edge_line, pial_distances[1], pial_distances[0]):
+            ring = _join_coordinate_parts([pial_coords, edge_path[1:]])
+            candidates.extend(_valid_polygons_from_ring_coordinates(ring))
+        return _unique_valid_polygons(candidates)
+
+    wm_coords = _line_xy_array(wm)
+    if wm_coords.shape[0] < 2:
+        return []
+    wm_distances = _line_endpoint_edge_distances(edge_line, wm)
+
+    pairings = (
+        # pial start -> WM start, pial end -> WM end.
+        (wm_coords[::-1], wm_distances[1], wm_distances[0]),
+        # pial start -> WM end, pial end -> WM start.
+        (wm_coords, wm_distances[0], wm_distances[1]),
+    )
+    candidates: list[Polygon] = []
+    for wm_path_coords, pial_end_wm_distance, wm_start_pial_distance in pairings:
+        for edge_to_wm in _edge_paths_between(edge_line, pial_distances[1], pial_end_wm_distance):
+            for edge_to_pia in _edge_paths_between(edge_line, wm_start_pial_distance, pial_distances[0]):
+                ring = _join_coordinate_parts(
+                    [
+                        pial_coords,
+                        edge_to_wm[1:],
+                        wm_path_coords[1:],
+                        edge_to_pia[1:],
+                    ]
+                )
+                candidates.extend(_valid_polygons_from_ring_coordinates(ring))
+    return _unique_valid_polygons(candidates)
+
+
+def _line_xy_array(line: LineString) -> np.ndarray:
+    return np.asarray(line.coords, dtype=float)[:, :2]
+
+
+def _line_endpoint_edge_distances(edge_line: LineString, line: LineString) -> tuple[float, float]:
+    coords = _line_xy_array(line)
+    start = Point(float(coords[0, 0]), float(coords[0, 1]))
+    end = Point(float(coords[-1, 0]), float(coords[-1, 1]))
+    return float(edge_line.project(start)), float(edge_line.project(end))
+
+
+def _edge_paths_between(edge_line: LineString, start_distance: float, end_distance: float) -> list[np.ndarray]:
+    if _is_closed_line(edge_line):
+        if np.isclose(start_distance, end_distance, rtol=0.0, atol=1e-9):
+            return [_edge_path_forward(edge_line, start_distance, end_distance)]
+        forward = _edge_path_forward(edge_line, start_distance, end_distance)
+        backward = _edge_path_forward(edge_line, end_distance, start_distance)[::-1]
+        return _unique_coordinate_paths([forward, backward])
+    return [_edge_path_no_wrap(edge_line, start_distance, end_distance)]
+
+
+def _edge_path_forward(edge_line: LineString, start_distance: float, end_distance: float) -> np.ndarray:
+    length = float(edge_line.length)
+    start = float(np.clip(start_distance, 0.0, length))
+    end = float(np.clip(end_distance, 0.0, length))
+    if start <= end:
+        return _edge_path_no_wrap(edge_line, start, end)
+    first = _edge_path_no_wrap(edge_line, start, length)
+    second = _edge_path_no_wrap(edge_line, 0.0, end)
+    return _drop_consecutive_duplicate_points(np.vstack([first, second[1:]]))
+
+
+def _edge_path_no_wrap(edge_line: LineString, start_distance: float, end_distance: float) -> np.ndarray:
+    length = float(edge_line.length)
+    start = float(np.clip(start_distance, 0.0, length))
+    end = float(np.clip(end_distance, 0.0, length))
+    if start > end:
+        return _edge_path_no_wrap(edge_line, end, start)[::-1]
+
+    edge_coords = _line_xy_array(edge_line)
+    points: list[np.ndarray] = [_point_on_line(edge_line, start)]
+    cumulative = 0.0
+    for idx in range(edge_coords.shape[0] - 1):
+        segment_length = float(np.linalg.norm(edge_coords[idx + 1] - edge_coords[idx]))
+        next_cumulative = cumulative + segment_length
+        if segment_length > 0 and start < next_cumulative < end:
+            points.append(edge_coords[idx + 1].astype(float, copy=True))
+        cumulative = next_cumulative
+    points.append(_point_on_line(edge_line, end))
+    return _drop_consecutive_duplicate_points(np.vstack(points))
+
+
+def _point_on_line(line: LineString, distance: float) -> np.ndarray:
+    point = line.interpolate(float(distance))
+    return np.asarray(point.coords[0][:2], dtype=float)
+
+
+def _is_closed_line(line: LineString) -> bool:
+    coords = _line_xy_array(line)
+    return coords.shape[0] > 2 and bool(np.allclose(coords[0], coords[-1], rtol=0.0, atol=1e-9))
+
+
+def _join_coordinate_parts(parts: Iterable[np.ndarray]) -> np.ndarray:
+    arrays = [np.asarray(part, dtype=float)[:, :2] for part in parts if np.asarray(part).size]
+    if not arrays:
+        return np.empty((0, 2), dtype=float)
+    return _drop_consecutive_duplicate_points(np.vstack(arrays))
+
+
+def _valid_polygons_from_ring_coordinates(coords: np.ndarray) -> list[Polygon]:
+    coords = _drop_consecutive_duplicate_points(np.asarray(coords, dtype=float)[:, :2])
+    if coords.shape[0] < 3:
+        return []
+    if not np.allclose(coords[0], coords[-1], rtol=0.0, atol=1e-9):
+        coords = np.vstack([coords, coords[0]])
+    polygon = Polygon(coords)
+    if not polygon.is_valid:
+        polygon = polygon.buffer(0)
+    if isinstance(polygon, Polygon):
+        return [polygon] if not polygon.is_empty and polygon.area > 0 else []
+    if isinstance(polygon, MultiPolygon):
+        return [part for part in polygon.geoms if not part.is_empty and part.area > 0]
+    if isinstance(polygon, GeometryCollection):
+        return [part for part in polygon.geoms if isinstance(part, Polygon) and not part.is_empty and part.area > 0]
+    return []
+
+
+def _unique_valid_polygons(polygons: Iterable[Polygon]) -> list[Polygon]:
+    out: list[Polygon] = []
+    seen: set[tuple[float, float, float]] = set()
+    for polygon in polygons:
+        if not isinstance(polygon, Polygon) or polygon.is_empty or polygon.area <= 0:
+            continue
+        candidate = polygon if polygon.is_valid else polygon.buffer(0)
+        for part in _geometry_polygon_parts(candidate):
+            key = (round(float(part.area), 6), round(float(part.centroid.x), 6), round(float(part.centroid.y), 6))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(part)
+    return out
+
+
+def _polygon_boundary_line_coverage(polygon: Polygon, line: LineString) -> float:
+    tolerance = max(1e-6, 1e-9 * max(float(polygon.length), float(line.length)))
+    missing = line.difference(polygon.boundary.buffer(tolerance))
+    missing_length = 0.0 if missing.is_empty else float(getattr(missing, "length", 0.0))
+    line_length = float(line.length)
+    if line_length <= 0:
+        return 0.0
+    return max(0.0, min(1.0, 1.0 - missing_length / line_length))
+
+
+def _geometry_polygon_parts(geom) -> list[Polygon]:
+    if isinstance(geom, Polygon):
+        return [geom] if not geom.is_empty and geom.area > 0 else []
+    if isinstance(geom, MultiPolygon):
+        return [part for part in geom.geoms if not part.is_empty and part.area > 0]
+    if isinstance(geom, GeometryCollection):
+        return [part for part in geom.geoms if isinstance(part, Polygon) and not part.is_empty and part.area > 0]
+    return []
+
+
+def _unique_coordinate_paths(paths: Iterable[np.ndarray]) -> list[np.ndarray]:
+    out: list[np.ndarray] = []
+    seen: set[tuple[tuple[float, float], ...]] = set()
+    for path in paths:
+        path = _drop_consecutive_duplicate_points(np.asarray(path, dtype=float)[:, :2])
+        key = tuple((round(float(x), 6), round(float(y), 6)) for x, y in path)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(path)
+    return out
+
+
+def _union_piece_polygons(polygons: tuple[Polygon, ...]) -> Polygon | MultiPolygon | None:
+    if not polygons:
+        return None
+    merged = unary_union(polygons)
+    if isinstance(merged, Polygon | MultiPolygon):
+        return merged
+    if isinstance(merged, GeometryCollection):
+        parts = [geom for geom in merged.geoms if isinstance(geom, Polygon) and geom.area > 0]
+        if parts:
+            unioned = unary_union(parts)
+            if isinstance(unioned, Polygon | MultiPolygon):
+                return unioned
+    return None
+
+
+def _warn_for_overlapping_piece_polygons(
+    polygons: Mapping[str, Polygon | MultiPolygon],
+    *,
+    warnings_out: list[str],
+) -> None:
+    items = list(polygons.items())
+    for idx, (left_id, left) in enumerate(items):
+        for right_id, right in items[idx + 1 :]:
+            try:
+                overlap = left.intersection(right)
+            except Exception:
+                continue
+            if not overlap.is_empty and float(overlap.area) > 0:
+                warnings_out.append(
+                    f"{left_id} and {right_id} candidate ribbon polygons overlap; check tissue_piece_id grouping."
+                )
+
+
+def _snap_line_endpoints_to_edge(line: LineString, edge: LineString) -> np.ndarray:
+    coords = np.asarray(line.coords, dtype=float)[:, :2].copy()
+    for idx in (0, coords.shape[0] - 1):
+        point = Point(float(coords[idx, 0]), float(coords[idx, 1]))
+        snapped = edge.interpolate(edge.project(point))
+        coords[idx] = np.asarray(snapped.coords[0][:2], dtype=float)
+    return coords[:, [1, 0]].astype(np.float32, copy=False)
+
+
+def _feature_for_geometry(
+    geom,
+    *,
+    role: str,
+    layer_name: str | None,
+    dataset: str | None,
+    tissue_piece_id: str | None = None,
+    piece_mode: str | None = None,
+) -> dict[str, Any]:
+    spec = CORTICAL_DEPTH_ROLE_SPECS[role]
+    properties: dict[str, Any] = {
+        "role": spec.geojson_role,
+        "annotation_role": role,
+    }
+    if tissue_piece_id is not None:
+        properties[CORTICAL_DEPTH_PIECE_ID_PROPERTY] = str(tissue_piece_id)
+    if piece_mode is not None:
+        properties[CORTICAL_DEPTH_PIECE_MODE_PROPERTY] = str(piece_mode)
+    if layer_name:
+        properties["name"] = str(layer_name)
+    if dataset:
+        properties["dataset"] = str(dataset)
+    return {
+        "type": "Feature",
+        "properties": properties,
+        "geometry": mapping(geom),
+    }
+
+
+def _jsonable(value):
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, float):
+        return float(value)
+    return value
 
 
 def to_pandas(df_like) -> pd.DataFrame:
