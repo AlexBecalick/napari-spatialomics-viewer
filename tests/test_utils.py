@@ -38,6 +38,7 @@ from napari_compare_xenium_merscope.utils import (
     snap_cortical_depth_boundaries_to_edge,
     write_cortical_depth_annotation_geojson,
     write_cortical_depth_separate_geojsons,
+    _unique_valid_polygons,
 )
 
 
@@ -331,6 +332,14 @@ def test_cortical_depth_geojson_export_accepts_edge_overhang_with_near_snapped_e
 
     assert result.ok
     assert not any("do not form a polygon" in error for error in result.errors)
+
+
+def test_cortical_depth_geojson_export_deduplicates_near_identical_candidate_polygons():
+    square = Polygon([(0.0, 0.0), (10.0, 0.0), (10.0, 10.0), (0.0, 10.0)])
+    near_square = Polygon([(0.0, 0.0), (10.0, 0.0), (10.0, 10.000001), (0.0, 10.0)])
+    distinct = Polygon([(20.0, 0.0), (30.0, 0.0), (30.0, 10.0), (20.0, 10.0)])
+
+    assert _unique_valid_polygons([square, near_square, distinct]) == [square, distinct]
 
 
 def test_cortical_depth_geojson_export_rejects_wm_without_pia():
