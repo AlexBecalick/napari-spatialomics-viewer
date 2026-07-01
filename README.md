@@ -115,6 +115,79 @@ Xenium inputs may include `experiment.xenium` either inside the zarr directory o
 
 The SpatialData stores should contain points for transcripts, images for channel display, and either vector `shapes` or raster `labels` for segmentations.
 
+## Cortical-depth annotations for MerXen
+
+For a complete step-by-step workflow, see
+[docs/cortical_depth_annotation_guide.md](docs/cortical_depth_annotation_guide.md).
+
+The right-side dock has a **Cortical Depth Annotations** section. Click
+**Create Drawing Layers** to add one editable napari Shapes layer for each
+MerXen cortical-depth input role. Draw in the same visible coordinate frame as
+the SpatialData cells/transcripts, then click **Validate Annotations** or
+**Export Combined GeoJSON**. **Export Separate GeoJSONs** writes the same
+validated annotations as one file per role.
+
+The exporter writes a single GeoJSON `FeatureCollection` with MerXen role
+labels. Napari stores shape vertices as `(y, x)`; export converts them back to
+GeoJSON `[x, y]` and does not otherwise transform, scale, flip, normalize, or
+rotate coordinates.
+
+Use **Current Tissue Piece** to choose the `tissue_piece_id` for each cortical
+piece. New pia, WM, exclusion, and ribbon shapes inherit the selected piece ID.
+Use **New Piece** for another independent tissue piece and **Apply Piece To
+Selection** to relabel selected existing shapes.
+
+Draw the required inputs first:
+
+1. **Tissue edge**: on `side`, draw exactly one tissue-edge path. It may be an
+   open U-shaped path with sharp corners or a closed box-like path around the
+   tissue. It is global, not piece-specific.
+2. **Pial boundary**: on `pia`, draw one open path per tissue piece along the
+   pial surface. This is cortical depth 0 for depth pieces. A pial-only piece is
+   allowed and is exported as `piece_mode: mask_qc_only`.
+3. **Gray/white boundary**: on `wm`, draw one open path for each tissue piece
+   that has gray/white matter. This is cortical depth 1. A WM line without a pia
+   line for the same `tissue_piece_id` is invalid.
+
+Optional inputs improve QC and geometry handling:
+
+4. **Snap to edge**: use **Snap Boundaries To Edge** after drawing the edge,
+   pia, and optional WM paths. This moves pia/WM endpoints to their nearest
+   position on the single tissue edge.
+5. **Exclusion polygons**: on `exclusion`, draw simple polygons around tears,
+   folds, vessels, debris, or artifacts to subtract from the cortical ribbon.
+   Keep exclusions inside the ribbon when possible and avoid touching the pia or
+   WM boundaries unless the artifact really opens to the tissue edge.
+6. **Full cortical ribbon**: on `ribbon`, draw a complete simple polygon or
+   polygons for a piece when edge + pia + optional WM does not unambiguously
+   define the usable cortical ribbon. Pial-only pieces with ambiguous geometry
+   require an explicit ribbon polygon.
+
+Validation blocks export when required lines are missing, lines are closed or
+empty, polygon coordinates are invalid, or coordinates contain non-finite
+values. It also blocks multiple edge lines and WM-only pieces, and warns about
+pial/WM crossings, endpoints far from the tissue edge, overlapping piece
+polygons, and exclusions touching pia/WM.
+
+Use the exported combined GeoJSON in MerXen samplesheets with:
+
+```csv
+xenium_cortical_depth_annotation_geojson
+merscope_cortical_depth_annotation_geojson
+```
+
+Generic single-platform rows may also use:
+
+```csv
+cortical_depth_annotation_geojson
+```
+
+For the separate-file export, point MerXen at the generated files with
+platform-prefixed columns such as `xenium_pial_boundary_geojson`,
+`xenium_wm_boundary_geojson`, `xenium_side_boundaries_geojson`,
+`xenium_exclusion_masks_geojson`, and `xenium_cortical_ribbon_geojson`; use
+`merscope_` for MERSCOPE rows.
+
 ## Development
 
 ```bash
