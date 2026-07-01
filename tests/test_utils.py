@@ -8,6 +8,7 @@ from shapely.geometry import MultiPolygon, Polygon
 from napari_compare_xenium_merscope.utils import (
     CELLPOSE_LABEL_KEY,
     CELLPOSE_QUANTIFICATION_TABLE_KEY,
+    build_cortical_depth_annotation_geojson,
     build_binned_label_color_dict,
     build_transcript_spatial_index,
     cellpose_quantification_features,
@@ -34,7 +35,29 @@ from napari_compare_xenium_merscope.utils import (
     query_transcript_spatial_index,
     rasterize_geometries_chunk,
     resolve_cellpose_quantification_feature,
+    snap_cortical_depth_boundaries_to_edge,
+    write_cortical_depth_annotation_geojson,
+    write_cortical_depth_separate_geojsons,
 )
+
+
+def test_empty_polygon_annotation_layer_colors_are_napari_compatible():
+    from napari.layers import Shapes
+    from napari_compare_xenium_merscope.viewer import (
+        CORTICAL_DEPTH_FILL_COLORS,
+        CORTICAL_DEPTH_LAYER_COLORS,
+    )
+
+    layer = Shapes(
+        data=[],
+        ndim=2,
+        shape_type="polygon",
+        edge_color=CORTICAL_DEPTH_LAYER_COLORS["exclusion"],
+        face_color=CORTICAL_DEPTH_FILL_COLORS["exclusion"],
+        name="test cortical depth exclusion",
+    )
+
+    assert len(layer.data) == 0
 
 
 def _create_string_array(group, name: str, values: list[str]):
@@ -226,6 +249,166 @@ def test_binned_label_color_dict_keeps_unique_colors_bounded():
 
     colormap = DirectLabelColormap(color_dict=mapping.color_dict)
     assert colormap._num_unique_colors <= colors.shape[0] + 1
+
+
+def test_cortical_depth_geojson_export_preserves_spatialdata_xy(tmp_path):
+    result = build_cortical_depth_annotation_geojson(
+        {
+            # Napari layer data are y/x; exported GeoJSON must be x/y.
+            "side": [np.asarray([[200.0, 100.0], [250.0, 100.0], [265.0, 200.0], [215.0, 200.0]])],
+            "pia": [(np.asarray([[200.0, 100.0], [205.0, 150.0], [215.0, 200.0]]), "piece_a")],
+            "wm": [(np.asarray([[250.0, 100.0], [255.0, 150.0], [265.0, 200.0]]), "piece_a")],
+            "exclusion": [
+                (
+                    np.asarray([[225.0, 140.0], [225.0, 160.0], [235.0, 160.0], [235.0, 140.0]]),
+                    "piece_a",
+                )
+            ],
+        },
+        dataset="XENIUM",
+    )
+
+    assert result.errors == ()
+    roles = [feature["properties"]["role"] for feature in result.geojson["features"]]
+    assert roles == ["side_boundary", "pial_boundary", "gray_white_boundary", "exclusion"]
+    assert result.geojson["features"][1]["properties"]["tissue_piece_id"] == "piece_a"
+    assert result.geojson["features"][1]["properties"]["piece_mode"] == "depth"
+    assert result.geojson["features"][1]["geometry"] == {
+        "type": "LineString",
+        "coordinates": [[100.0, 200.0], [150.0, 205.0], [200.0, 215.0]],
+    }
+    assert result.geojson["features"][2]["geometry"]["coordinates"] == [
+        [100.0, 250.0],
+        [150.0, 255.0],
+        [200.0, 265.0],
+    ]
+
+    out = tmp_path / "annotations.geojson"
+    write_cortical_depth_annotation_geojson(out, result)
+    saved = out.read_text()
+    assert '"role": "pial_boundary"' in saved
+    assert "[\n            100.0,\n            200.0\n          ]" in saved
+
+    written = write_cortical_depth_separate_geojsons(tmp_path / "separate", result, stem="xenium_cortical_depth")
+    assert set(written) == {"pia", "wm", "side", "exclusion"}
+    assert written["pia"].name == "xenium_cortical_depth_pial_boundary.geojson"
+    assert written["wm"].name == "xenium_cortical_depth_wm_boundary.geojson"
+    assert '"tissue_piece_id": "piece_a"' in written["pia"].read_text()
+    assert '"role": "exclusion"' in written["exclusion"].read_text()
+
+
+def test_cortical_depth_geojson_export_accepts_pial_only_piece():
+    result = build_cortical_depth_annotation_geojson(
+        {
+            "side": [np.asarray([[0.0, 0.0], [50.0, 0.0], [50.0, 100.0], [0.0, 100.0]])],
+            "pia": [(np.asarray([[10.0, 0.0], [10.0, 100.0]]), "surface_only")],
+        }
+    )
+
+    assert result.ok
+    pial = next(feature for feature in result.geojson["features"] if feature["properties"]["annotation_role"] == "pia")
+    assert pial["properties"]["tissue_piece_id"] == "surface_only"
+    assert pial["properties"]["piece_mode"] == "mask_qc_only"
+
+
+def test_cortical_depth_geojson_export_accepts_edge_overhang_with_near_snapped_endpoints():
+    result = build_cortical_depth_annotation_geojson(
+        {
+            "side": [
+                np.asarray(
+                    [
+                        [-20.0, 0.0],
+                        [80.0, 0.0],
+                        [80.0, 100.0],
+                        [-20.0, 100.0],
+                    ]
+                )
+            ],
+            "pia": [(np.asarray([[10.0, 0.0001], [10.0, 100.0]]), "piece_a")],
+            "wm": [(np.asarray([[50.0, 0.0], [50.0, 100.0001]]), "piece_a")],
+        }
+    )
+
+    assert result.ok
+    assert not any("do not form a polygon" in error for error in result.errors)
+
+
+def test_cortical_depth_geojson_export_rejects_wm_without_pia():
+    result = build_cortical_depth_annotation_geojson(
+        {
+            "side": [np.asarray([[0.0, 0.0], [50.0, 0.0], [50.0, 100.0], [0.0, 100.0]])],
+            "wm": [(np.asarray([[30.0, 0.0], [30.0, 100.0]]), "piece_a")],
+        }
+    )
+
+    assert not result.ok
+    assert any("gray/white boundary but no pial boundary" in error for error in result.errors)
+
+
+def test_cortical_depth_geojson_export_rejects_multiple_edge_lines():
+    result = build_cortical_depth_annotation_geojson(
+        {
+            "side": [
+                np.asarray([[0.0, 0.0], [50.0, 0.0]]),
+                np.asarray([[0.0, 100.0], [50.0, 100.0]]),
+            ],
+            "pia": [np.asarray([[10.0, 0.0], [10.0, 100.0]])],
+        }
+    )
+
+    assert not result.ok
+    assert any("exactly one tissue-edge" in error for error in result.errors)
+
+
+def test_cortical_depth_geojson_export_can_force_write_invalid_debug_file(tmp_path):
+    result = build_cortical_depth_annotation_geojson(
+        {
+            "side": [np.asarray([[0.0, 0.0], [50.0, 0.0]])],
+            "wm": [(np.asarray([[30.0, 0.0], [30.0, 50.0]]), "piece_a")],
+        }
+    )
+    assert not result.ok
+
+    out = tmp_path / "debug_annotations.geojson"
+    write_cortical_depth_annotation_geojson(
+        out,
+        result,
+        allow_invalid=True,
+        include_validation_report=True,
+    )
+
+    saved = out.read_text()
+    assert '"napari_compare_validation"' in saved
+    assert '"ok": false' in saved
+    assert "gray/white boundary but no pial boundary" in saved
+
+
+def test_cortical_depth_geojson_export_flags_crossing_and_exclusion_touch():
+    result = build_cortical_depth_annotation_geojson(
+        {
+            "side": [np.asarray([[0.0, 0.0], [0.0, 100.0], [100.0, 100.0], [100.0, 0.0], [0.0, 0.0]])],
+            "pia": [np.asarray([[0.0, 0.0], [100.0, 100.0]])],
+            "wm": [np.asarray([[100.0, 0.0], [0.0, 100.0]])],
+            "exclusion": [np.asarray([[20.0, 20.0], [20.0, 40.0], [40.0, 40.0], [40.0, 20.0]])],
+        }
+    )
+
+    assert not result.ok
+    assert any("do not form a polygon" in error for error in result.errors)
+    assert any("intersect" in warning for warning in result.warnings)
+    assert any("exclusion polygon 1 touches or overlaps" in warning for warning in result.warnings)
+
+
+def test_cortical_depth_snap_moves_boundary_endpoints_to_edge():
+    snapped = snap_cortical_depth_boundaries_to_edge(
+        pial_shapes=[np.asarray([[5.0, 2.0], [5.0, 98.0]])],
+        wm_shapes=[np.asarray([[40.0, 2.0], [40.0, 98.0]])],
+        edge_shapes=[np.asarray([[0.0, 0.0], [50.0, 0.0], [50.0, 100.0], [0.0, 100.0]])],
+    )
+
+    assert set(snapped) == {"pia", "wm"}
+    assert np.allclose(snapped["pia"][0], np.asarray([[5.0, 0.0], [5.0, 100.0]]))
+    assert np.allclose(snapped["wm"][0], np.asarray([[40.0, 0.0], [40.0, 100.0]]))
 
 
 def test_geometry_to_napari_polygons_cap_and_simplify():
