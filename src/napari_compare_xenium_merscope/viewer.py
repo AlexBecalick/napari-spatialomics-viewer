@@ -206,6 +206,9 @@ DEFAULT_TRANSCRIPT_STREAM_DEBOUNCE_MS = 300
 DEFAULT_TRANSCRIPT_DENSITY_BIN_UM = 2.0
 TRANSCRIPT_DENSITY_PYRAMID_NORMALIZATION = "mean_v1"
 DEFAULT_TRANSCRIPT_DENSITY_MAX_PIXELS = 25_000_000
+# Upper contrast limit for transcript density layers. Lower => brighter; 8 shows
+# typical transcript density clearly where the previous 35 looked very dim.
+DEFAULT_TRANSCRIPT_DENSITY_CONTRAST_MAX = 8.0
 DEFAULT_TRANSCRIPT_DETAIL_MAX_VIEW_SIZE = 1_500.0
 DEFAULT_TRANSCRIPT_DETAIL_MAX_POINTS = 300_000
 DEFAULT_TRANSCRIPT_INDEX_MAX_POINTS = 25_000_000
@@ -2930,7 +2933,7 @@ class ComparisonViewerController:
                 name=layer_name,
                 affine=napari_affine,
                 colormap=transparent_colormap(f"{cache_key}_{label}", color, alpha=1.0),
-                contrast_limits=(0.0, 35.0),
+                contrast_limits=(0.0, max(1.0, float(self.args.transcript_density_contrast_max))),
                 interpolation2d="nearest",
                 multiscale=len(channel_levels) > 1,
                 opacity=1.0,
@@ -3909,6 +3912,15 @@ def parse_args() -> argparse.Namespace:
         help="Maximum pixels per transcript density channel; bin size increases automatically above this.",
     )
     parser.add_argument(
+        "--transcript-density-contrast-max",
+        default=DEFAULT_TRANSCRIPT_DENSITY_CONTRAST_MAX,
+        type=float,
+        help=(
+            "Upper contrast limit for the rasterized transcript density layers (per-bin counts). "
+            "Lower values make transcripts appear brighter/denser; raise to dim them."
+        ),
+    )
+    parser.add_argument(
         "--transcript-detail-max-view-size",
         default=DEFAULT_TRANSCRIPT_DETAIL_MAX_VIEW_SIZE,
         type=float,
@@ -4054,6 +4066,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--transcript-density-bin-um must be positive.")
     if args.transcript_density_max_pixels <= 0:
         parser.error("--transcript-density-max-pixels must be positive.")
+    if args.transcript_density_contrast_max <= 0:
+        parser.error("--transcript-density-contrast-max must be positive.")
     if args.transcript_detail_max_view_size <= 0:
         parser.error("--transcript-detail-max-view-size must be positive.")
     if args.transcript_index_max_points <= 0:
