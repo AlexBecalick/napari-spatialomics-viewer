@@ -1618,8 +1618,12 @@ class ComparisonViewerController:
                     self.viewer.add_image(ch_data, **add_kwargs)
                     total_layers += 1
                     shapes = [tuple(int(axis) for axis in level.shape) for level in channel_levels]
+                    base_chunks = getattr(channel_levels[0], "chunksize", None) or getattr(
+                        channel_levels[0], "chunks", None
+                    )
                     log.info(
-                        "[%s] Added image layer %s from %s levels=%s source=%s base=%s dtype=%s",
+                        "[%s] Added image layer %s from %s levels=%s source=%s base=%s dtype=%s "
+                        "base_shape=%s base_chunks=%s nchan=%s",
                         ds,
                         layer_name,
                         image_key,
@@ -1627,6 +1631,9 @@ class ComparisonViewerController:
                         pyramid_source,
                         base_scale_name,
                         getattr(channel_levels[0], "dtype", "unknown"),
+                        shapes[0] if shapes else None,
+                        base_chunks,
+                        len(labels),
                     )
                     log.debug("[%s] Image layer %s level shapes=%s", ds, layer_name, shapes)
             except Exception as exc:
@@ -3338,6 +3345,62 @@ class ComparisonViewerController:
         self._set_status(f"{ds} loaded image layers={stats['layers']} (failed={stats['failed_keys']}).")
 
 
+def log_environment_diagnostics(viewer) -> None:
+    """Log the rendering stack once at startup to aid performance triage.
+
+    Records the machine architecture (to catch Rosetta), the Qt binding, the
+    VisPy backend, and — deferred until the GL context is live — the OpenGL
+    renderer/vendor strings. On Apple Silicon this confirms whether napari is
+    running natively and which GL implementation Metal is backing.
+    """
+    import platform
+
+    try:
+        log.info(
+            "Environment: machine=%s platform=%s python=%s",
+            platform.machine(),
+            platform.platform(),
+            sys.version.split()[0],
+        )
+    except Exception:
+        pass
+
+    try:
+        import qtpy
+
+        log.info("Qt binding: %s (Qt %s)", qtpy.API_NAME, getattr(qtpy, "QT_VERSION", "unknown"))
+    except Exception as exc:  # pragma: no cover - depends on runtime env
+        log.debug("Could not read Qt binding info (%s)", exc)
+
+    try:
+        import vispy
+        import vispy.app
+
+        log.info("VisPy: %s backend=%s", vispy.__version__, vispy.app.use_app().backend_name)
+    except Exception as exc:  # pragma: no cover - depends on runtime env
+        log.debug("Could not read VisPy info (%s)", exc)
+
+    def _log_opengl():
+        try:
+            from vispy.gloo import gl
+
+            log.info(
+                "OpenGL: renderer=%s vendor=%s version=%s",
+                gl.glGetParameter(gl.GL_RENDERER),
+                gl.glGetParameter(gl.GL_VENDOR),
+                gl.glGetParameter(gl.GL_VERSION),
+            )
+        except Exception as exc:  # pragma: no cover - depends on GL context
+            log.debug("Could not read OpenGL info (%s)", exc)
+
+    # The GL context is not realized until the event loop paints; defer the
+    # query so glGetParameter runs against a live context.
+    try:
+        QTimer.singleShot(0, _log_opengl)
+    except Exception:  # pragma: no cover - depends on runtime env
+        pass
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Napari comparison viewer for MERSCOPE and Xenium SpatialData outputs."
@@ -3597,6 +3660,7 @@ def main():
         validate_spatialdata_store_compatibility(cfg.zarr_path)
 
     viewer = napari.Viewer(title="Xenium vs MERSCOPE Comparison")
+    log_environment_diagnostics(viewer)
     controller = ComparisonViewerController(viewer=viewer, datasets=datasets, args=args)
 
     switcher = DatasetSwitcherWidget(
