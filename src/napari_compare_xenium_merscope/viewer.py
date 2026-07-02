@@ -992,6 +992,7 @@ class ComparisonViewerController:
         self._transcript_build_worker: object | None = None
         self._label_build_generation = 0
         self._label_build_worker: object | None = None
+        self._canvas_size: tuple[int, int] | None = None
 
     def set_status_callback(self, fn):
         self._status_callback = fn
@@ -3223,16 +3224,43 @@ class ComparisonViewerController:
                 removed += 1
         self._set_status(f"{ds} removed {removed} Cellpose value overlay layer(s).")
 
+    def _get_canvas_size(self) -> tuple[int, int] | None:
+        """Return the canvas size in pixels, robust across napari versions.
+
+        napari has no stable public canvas-size API. We try the private
+        ``_qt_viewer`` first (the real attribute) so the common path never
+        touches the deprecated ``qt_viewer`` property, fall back to it if
+        needed, and cache the last good value so a future napari that renames or
+        removes either accessor keeps working.
+        """
+        window = getattr(self.viewer, "window", None)
+        if window is not None:
+            for attr in ("_qt_viewer", "qt_viewer"):
+                try:
+                    qt_viewer = getattr(window, attr, None)
+                except Exception:
+                    qt_viewer = None
+                canvas = getattr(qt_viewer, "canvas", None) if qt_viewer is not None else None
+                if canvas is None:
+                    continue
+                try:
+                    size = tuple(int(v) for v in canvas.size)
+                except Exception:
+                    continue
+                if len(size) >= 2 and size[0] > 0 and size[1] > 0:
+                    self._canvas_size = (int(size[0]), int(size[1]))
+                    return self._canvas_size
+        return self._canvas_size
+
     def _current_view_bounds(self) -> tuple[float, float, float, float] | None:
         try:
             center = tuple(float(v) for v in self.viewer.camera.center)
             zoom = float(self.viewer.camera.zoom)
-            canvas = self.viewer.window.qt_viewer.canvas
-            size = tuple(int(v) for v in canvas.size)
         except Exception:
             return None
 
-        if len(center) < 2 or len(size) < 2 or zoom <= 0:
+        size = self._get_canvas_size()
+        if size is None or len(center) < 2 or len(size) < 2 or zoom <= 0:
             return None
 
         y_center = center[-2]
