@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import colorsys
 import json
 import logging
 import re
@@ -1920,6 +1921,305 @@ def query_transcript_spatial_index(
         "loaded": loaded,
         "loaded_fraction": 0.0 if total == 0 else float(loaded) / float(total),
     }
+
+
+# ---------------------------------------------------------------------------
+# Per-gene transcript inspection ("Inspect Genes")
+# ---------------------------------------------------------------------------
+
+GENE_COLUMN_CANDIDATES = ("gene", "feature_name", "target", "feature_id", "gene_id")
+
+# Napari's point symbols, ordered so the most visually distinct shapes come
+# first. Genes cycle through this list; combined with a distinct colour per
+# gene, every gene gets a unique (colour, shape) pair.
+GENE_MARKER_SYMBOLS = (
+    "disc",
+    "ring",
+    "cross",
+    "x",
+    "square",
+    "diamond",
+    "triangle_up",
+    "triangle_down",
+    "star",
+    "arrow",
+    "hbar",
+    "vbar",
+    "clobber",
+    "tailed_arrow",
+)
+
+_CONTROL_GENE_PATTERNS = (
+    "blank",
+    "negcontrol",
+    "neg_control",
+    "negprobe",
+    "neg_probe",
+    "antisense",
+    "intergenic",
+    "deprecated",
+    "unassigned_codeword",
+    "genomic_control",
+)
+
+
+def resolve_gene_column(df_like) -> str | None:
+    """Return the transcript gene/feature-name column, if present."""
+    return first_existing_col(df_like, GENE_COLUMN_CANDIDATES)
+
+
+def is_control_gene(name: object) -> bool:
+    """True for negative-control / blank codeword names (not real genes)."""
+    text = str(name).strip().lower()
+    if not text:
+        return False
+    return any(pattern in text for pattern in _CONTROL_GENE_PATTERNS)
+
+
+def _hex_to_rgba(value: str, alpha: float) -> tuple[float, float, float, float]:
+    text = str(value).lstrip("#")
+    r = int(text[0:2], 16) / 255.0
+    g = int(text[2:4], 16) / 255.0
+    b = int(text[4:6], 16) / 255.0
+    return (float(r), float(g), float(b), float(alpha))
+
+
+def _distinct_palette(n: int) -> list[tuple[float, float, float]]:
+    """Fallback max-distinct RGB palette when colorcet is unavailable."""
+    colors: list[tuple[float, float, float]] = []
+    golden = 0.61803398875
+    for i in range(max(0, int(n))):
+        hue = (i * golden) % 1.0
+        sat = 0.65 + 0.30 * ((i // 2) % 2)
+        val = 0.95 - 0.30 * (i % 3) / 2.0
+        colors.append(colorsys.hsv_to_rgb(hue, sat, val))
+    return colors
+
+
+def gene_palette_rgba(n: int, alpha: float = 1.0) -> list[tuple[float, float, float, float]]:
+    """Return ``n`` deterministic, maximally distinct RGBA colours."""
+    try:
+        import colorcet as cc
+
+        base = list(cc.glasbey)
+        return [_hex_to_rgba(base[i % len(base)], alpha) for i in range(max(0, int(n)))]
+    except Exception:  # pragma: no cover - depends on runtime env
+        return [(r, g, b, float(alpha)) for (r, g, b) in _distinct_palette(n)]
+
+
+@dataclass(frozen=True)
+class GeneVisual:
+    """The stable colour + marker shape assigned to one gene."""
+
+    rgba: tuple[float, float, float, float]
+    symbol: str
+
+
+def assign_gene_visuals(
+    gene_names: Iterable[str],
+    alpha: float = 1.0,
+) -> dict[str, GeneVisual]:
+    """Assign each gene a deterministic (colour, marker shape) pair.
+
+    Genes are sorted alphabetically and indexed ``i``. The shape cycles through
+    :data:`GENE_MARKER_SYMBOLS` (period 14) and the colour cycles through a
+    max-distinct palette (period 256). The two periods only realign after
+    ``lcm(14, 256) = 1792`` genes, so every real Xenium/MERSCOPE panel gets a
+    unique (colour, shape) pair per gene with no collisions.
+    """
+    names = sorted({str(name) for name in gene_names})
+    palette = gene_palette_rgba(len(names), alpha=alpha)
+    visuals: dict[str, GeneVisual] = {}
+    for i, name in enumerate(names):
+        symbol = GENE_MARKER_SYMBOLS[i % len(GENE_MARKER_SYMBOLS)]
+        visuals[name] = GeneVisual(rgba=palette[i], symbol=symbol)
+    return visuals
+
+
+@dataclass
+class GenePointStore:
+    """Backing store for the per-gene transcript renderer.
+
+    Points are grouped by marker symbol into ``group_coords`` / ``group_colors``
+    (one entry per napari Points layer). Within a group, each gene's points form
+    one contiguous run, foreground (in-cell) points first then background points,
+    so toggling a gene or hiding background is a cheap contiguous-range gather.
+    """
+
+    group_symbols: list[str]
+    group_coords: list[np.ndarray]           # each (M, 2) float32, napari (y, x)
+    group_colors: list[np.ndarray]           # each (M, 4) float32 RGBA
+    # gene -> (group_index, fg_start, fg_end, bg_end) relative to that group.
+    gene_offsets: dict[str, tuple[int, int, int, int]]
+    gene_counts: dict[str, int]              # total (fg + bg) points per gene
+    genes: list[str]                         # alphabetical (real genes + controls)
+    control_genes: set[str]
+    total_points: int
+    sampled: bool = False
+
+    def gene_symbol(self, gene: str) -> str | None:
+        entry = self.gene_offsets.get(str(gene))
+        return None if entry is None else self.group_symbols[entry[0]]
+
+
+def _empty_gene_point_store() -> GenePointStore:
+    return GenePointStore(
+        group_symbols=[],
+        group_coords=[],
+        group_colors=[],
+        gene_offsets={},
+        gene_counts={},
+        genes=[],
+        control_genes=set(),
+        total_points=0,
+        sampled=False,
+    )
+
+
+def build_gene_point_groups(
+    points_obj,
+    x_col: str,
+    y_col: str,
+    gene_col: str,
+    assignment_col: str | None = None,
+    background_col: str | None = None,
+    gene_visuals: Mapping[str, GeneVisual] | None = None,
+    max_points: int | None = None,
+    random_state: int = 42,
+    alpha: float = 1.0,
+) -> GenePointStore:
+    """Read all transcripts into a symbol-grouped, gene-sorted point store.
+
+    ``background`` is taken from ``background_col`` (bool) if present, else from
+    ``assignment_col`` (unassigned == not :func:`assignment_mask`), else all
+    foreground. If the total exceeds ``max_points`` a uniform random subsample is
+    taken (this preserves per-gene proportions in expectation).
+    """
+    cols = [x_col, y_col, gene_col]
+    if background_col is not None:
+        cols.append(background_col)
+    if assignment_col is not None and assignment_col not in cols:
+        cols.append(assignment_col)
+
+    xs: list[np.ndarray] = []
+    ys: list[np.ndarray] = []
+    gene_parts: list[np.ndarray] = []
+    bg_parts: list[np.ndarray] = []
+
+    for pdf in _iter_point_partitions(points_obj, cols):
+        x_vals = pdf[x_col].to_numpy(dtype=np.float32, copy=False)
+        y_vals = pdf[y_col].to_numpy(dtype=np.float32, copy=False)
+        gene_vals = pdf[gene_col].astype("string").to_numpy(dtype=object)
+        good = np.isfinite(x_vals) & np.isfinite(y_vals) & pd.notna(gene_vals)
+        if not np.any(good):
+            continue
+        if background_col is not None and background_col in pdf.columns:
+            bg = pdf[background_col].to_numpy(dtype=bool, copy=False)
+        elif assignment_col is not None and assignment_col in pdf.columns:
+            bg = ~assignment_mask(pdf[assignment_col]).to_numpy(dtype=bool, copy=False)
+        else:
+            bg = np.zeros(len(pdf), dtype=bool)
+        xs.append(np.ascontiguousarray(x_vals[good]))
+        ys.append(np.ascontiguousarray(y_vals[good]))
+        gene_parts.append(gene_vals[good].astype(str))
+        bg_parts.append(np.ascontiguousarray(bg[good]))
+
+    if not xs:
+        return _empty_gene_point_store()
+
+    x = np.concatenate(xs)
+    y = np.concatenate(ys)
+    gene = np.concatenate(gene_parts)
+    bg = np.concatenate(bg_parts)
+    del xs, ys, gene_parts, bg_parts
+    total_source = int(x.shape[0])
+
+    sampled = False
+    if max_points is not None and 0 < int(max_points) < total_source:
+        rng = np.random.default_rng(int(random_state))
+        keep = np.sort(rng.choice(total_source, size=int(max_points), replace=False))
+        x, y, gene, bg = x[keep], y[keep], gene[keep], bg[keep]
+        sampled = True
+
+    # Stable gene visuals + integer codes over the alphabetical gene panel.
+    unique_names = sorted(set(gene.tolist()))
+    if gene_visuals is None:
+        gene_visuals = assign_gene_visuals(unique_names, alpha=alpha)
+    codes = pd.Categorical(gene, categories=unique_names).codes.astype(np.int64)
+    del gene
+
+    # Which of the 14 marker symbols each gene falls under, mapped to compact
+    # group indices for only the symbols actually used.
+    symbol_idx_per_point = codes % len(GENE_MARKER_SYMBOLS)
+    used_symbol_idx = np.unique(symbol_idx_per_point)
+    sidx_to_group = np.full(len(GENE_MARKER_SYMBOLS), -1, dtype=np.int64)
+    for group_index, sidx in enumerate(used_symbol_idx):
+        sidx_to_group[int(sidx)] = group_index
+    group_per_point = sidx_to_group[symbol_idx_per_point]
+    group_symbols = [GENE_MARKER_SYMBOLS[int(sidx)] for sidx in used_symbol_idx]
+
+    # Sort primary by group, then gene code, then background (foreground first).
+    order = np.lexsort((bg, codes, group_per_point))
+    coords = np.column_stack([y[order], x[order]]).astype(np.float32, copy=False)
+    codes_sorted = codes[order]
+    bg_sorted = bg[order]
+    group_sorted = group_per_point[order]
+    del order, x, y, bg, codes, group_per_point, symbol_idx_per_point
+
+    code_to_rgba = np.array(
+        [gene_visuals[name].rgba for name in unique_names], dtype=np.float32
+    )
+    colors_all = code_to_rgba[codes_sorted]
+
+    n = coords.shape[0]
+    # Per-group coord/colour slices (views into the sorted arrays). group_sorted
+    # is non-decreasing, so np.unique gives each group's start in order.
+    _uniq_groups, group_starts = np.unique(group_sorted, return_index=True)
+    group_ends = list(group_starts[1:]) + [n]
+    group_coords = []
+    group_colors = []
+    for gi in range(len(group_symbols)):
+        gs = int(group_starts[gi])
+        ge = int(group_ends[gi])
+        group_coords.append(coords[gs:ge])
+        group_colors.append(colors_all[gs:ge])
+
+    # Per-gene contiguous ranges (relative to their group array). Each gene code
+    # is one contiguous run in ``codes_sorted`` (each code maps to one group and
+    # is code-sorted within it), but the runs are ordered by (group, code) rather
+    # than by code value, so run boundaries must come from actual value changes
+    # -- NOT from a code-sorted np.unique index.
+    if n > 0:
+        change = np.flatnonzero(np.diff(codes_sorted) != 0) + 1
+        block_starts = np.concatenate(([0], change))
+        block_ends = np.concatenate((change, [n]))
+    else:
+        block_starts = np.empty(0, dtype=np.int64)
+        block_ends = np.empty(0, dtype=np.int64)
+    gene_offsets: dict[str, tuple[int, int, int, int]] = {}
+    gene_counts: dict[str, int] = {}
+    for bi in range(len(block_starts)):
+        cs = int(block_starts[bi])
+        ce = int(block_ends[bi])
+        g = int(group_sorted[cs])
+        gstart = int(group_starts[g])
+        fg_count = int(np.count_nonzero(~bg_sorted[cs:ce]))
+        name = unique_names[int(codes_sorted[cs])]
+        gene_offsets[name] = (g, cs - gstart, cs + fg_count - gstart, ce - gstart)
+        gene_counts[name] = ce - cs
+
+    control_genes = {name for name in unique_names if is_control_gene(name)}
+    return GenePointStore(
+        group_symbols=group_symbols,
+        group_coords=group_coords,
+        group_colors=group_colors,
+        gene_offsets=gene_offsets,
+        gene_counts=gene_counts,
+        genes=list(unique_names),
+        control_genes=control_genes,
+        total_points=n,
+        sampled=sampled,
+    )
 
 
 def geometry_to_napari_polygons(

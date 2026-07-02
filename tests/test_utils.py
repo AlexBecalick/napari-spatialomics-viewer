@@ -6,6 +6,13 @@ import zarr
 from shapely.geometry import MultiPolygon, Polygon
 
 from napari_compare_xenium_merscope.utils import (
+    GENE_MARKER_SYMBOLS,
+    GeneVisual,
+    assign_gene_visuals,
+    build_gene_point_groups,
+    gene_palette_rgba,
+    is_control_gene,
+    resolve_gene_column,
     CELLPOSE_LABEL_KEY,
     CELLPOSE_QUANTIFICATION_TABLE_KEY,
     build_cortical_depth_annotation_geojson,
@@ -710,3 +717,173 @@ def test_ensure_cyx_squeezes_singleton_z_plane():
 
     assert cyx.dims == ("c", "y", "x")
     assert cyx.shape == (2, 4, 8)
+
+
+def test_resolve_gene_column_prefers_known_names():
+    import pandas as pd
+
+    assert resolve_gene_column(pd.DataFrame(columns=["x", "y", "gene"])) == "gene"
+    assert resolve_gene_column(pd.DataFrame(columns=["x", "y", "feature_name"])) == "feature_name"
+    assert resolve_gene_column(pd.DataFrame(columns=["x", "y"])) is None
+
+
+def test_is_control_gene_matches_blanks_and_controls():
+    assert is_control_gene("Blank-10")
+    assert is_control_gene("NegControlProbe_00042")
+    assert is_control_gene("antisense-FOO")
+    assert not is_control_gene("APP")
+    assert not is_control_gene("GJA1")
+    assert not is_control_gene("")
+
+
+def test_assign_gene_visuals_deterministic_alphabetical_and_unique():
+    names = [f"G{i:03d}" for i in range(300)]
+    shuffled = list(reversed(names))
+    a = assign_gene_visuals(shuffled)
+    b = assign_gene_visuals(names)
+
+    # Deterministic regardless of input order.
+    assert a == b
+    # Alphabetical assignment: first gene gets the first symbol.
+    assert a["G000"].symbol == GENE_MARKER_SYMBOLS[0]
+    assert a["G001"].symbol == GENE_MARKER_SYMBOLS[1]
+    # Every (colour, symbol) pair is unique across the whole panel.
+    pairs = {(v.rgba, v.symbol) for v in a.values()}
+    assert len(pairs) == len(names)
+    assert all(isinstance(v, GeneVisual) for v in a.values())
+
+
+def test_gene_palette_rgba_shape_and_range():
+    palette = gene_palette_rgba(5, alpha=0.5)
+    assert len(palette) == 5
+    for rgba in palette:
+        assert len(rgba) == 4
+        assert rgba[3] == 0.5
+        assert all(0.0 <= c <= 1.0 for c in rgba)
+
+
+def _gene_points_frame():
+    import pandas as pd
+
+    # 10 points across 3 genes + 1 control. background True == unassigned noise.
+    rows = [
+        # gene,     x,    y,    background
+        ("AAA", 1.0, 10.0, False),
+        ("AAA", 2.0, 11.0, False),
+        ("AAA", 3.0, 12.0, True),
+        ("BBB", 4.0, 20.0, False),
+        ("BBB", 5.0, 21.0, False),
+        ("Blank-1", 6.0, 30.0, False),
+        ("CCC", 7.0, 40.0, False),
+        ("CCC", 8.0, 41.0, True),
+        ("CCC", 9.0, 42.0, True),
+        ("CCC", 10.0, 43.0, True),
+    ]
+    df = pd.DataFrame(rows, columns=["gene", "x", "y", "background"])
+    df["assignment"] = np.where(df["background"].to_numpy(), 0, 7).astype("uint32")
+    return df
+
+
+def test_build_gene_point_groups_structure_and_offsets():
+    df = _gene_points_frame()
+    store = build_gene_point_groups(
+        df, x_col="x", y_col="y", gene_col="gene", background_col="background"
+    )
+
+    assert store.total_points == 10
+    assert not store.sampled
+    assert store.genes == ["AAA", "BBB", "Blank-1", "CCC"]
+    assert store.control_genes == {"Blank-1"}
+    # 4 distinct genes -> 4 distinct symbols -> 4 groups.
+    assert store.group_symbols == list(GENE_MARKER_SYMBOLS[:4])
+    assert store.gene_counts == {"AAA": 3, "BBB": 2, "Blank-1": 1, "CCC": 4}
+
+    # Each gene occupies its own group here; offsets are relative to the group.
+    assert store.gene_offsets["AAA"] == (0, 0, 2, 3)   # 2 fg then 1 bg
+    assert store.gene_offsets["BBB"] == (1, 0, 2, 2)   # all fg
+    assert store.gene_offsets["Blank-1"] == (2, 0, 1, 1)
+    assert store.gene_offsets["CCC"] == (3, 0, 1, 4)   # 1 fg then 3 bg
+
+    # Coords are (y, x); foreground rows come before background rows.
+    aaa = store.group_coords[0]
+    assert aaa.shape == (3, 2)
+    assert set(aaa[:2, 0].tolist()) == {10.0, 11.0}    # fg y-values
+    assert aaa[2, 0] == 12.0                            # bg y-value
+    assert aaa[0, 1] in (1.0, 2.0)                      # x column
+
+    # Colours match the assigned gene visuals.
+    visuals = assign_gene_visuals(store.genes)
+    np.testing.assert_allclose(store.group_colors[0][0], visuals["AAA"].rgba, atol=1e-6)
+    assert store.gene_symbol("CCC") == GENE_MARKER_SYMBOLS[3]
+
+
+def test_build_gene_point_groups_assignment_fallback_matches_background():
+    df = _gene_points_frame()
+    from_bg = build_gene_point_groups(
+        df, x_col="x", y_col="y", gene_col="gene", background_col="background"
+    )
+    from_assignment = build_gene_point_groups(
+        df, x_col="x", y_col="y", gene_col="gene", assignment_col="assignment"
+    )
+    assert from_assignment.gene_offsets == from_bg.gene_offsets
+    assert from_assignment.gene_counts == from_bg.gene_counts
+
+
+def test_build_gene_point_groups_subsamples_when_over_cap():
+    df = _gene_points_frame()
+    store = build_gene_point_groups(
+        df, x_col="x", y_col="y", gene_col="gene", background_col="background",
+        max_points=5, random_state=0,
+    )
+    assert store.sampled
+    assert store.total_points == 5
+    assert sum(store.gene_counts.values()) == 5
+
+
+def test_build_gene_point_groups_empty_input():
+    import pandas as pd
+
+    df = pd.DataFrame({"x": [np.nan], "y": [1.0], "gene": ["AAA"], "background": [False]})
+    store = build_gene_point_groups(
+        df, x_col="x", y_col="y", gene_col="gene", background_col="background"
+    )
+    assert store.total_points == 0
+    assert store.genes == []
+    assert store.group_coords == []
+
+
+def test_build_gene_point_groups_many_genes_share_symbol_groups():
+    # >14 genes force several genes into the same symbol group, where a gene's
+    # points are NOT ordered by code value. Regression test that per-gene counts
+    # and offsets stay correct in that interleaved layout.
+    import pandas as pd
+
+    rows = []
+    for i in range(20):                       # G000..G019; gene i has i+1 points
+        gene = f"G{i:03d}"
+        for j in range(i + 1):
+            bg = (i == 5 and j == 0)          # one background point in a shared group
+            rows.append((gene, float(i * 1000 + j), float(j), bg))
+    df = pd.DataFrame(rows, columns=["gene", "x", "y", "background"])
+
+    store = build_gene_point_groups(
+        df, x_col="x", y_col="y", gene_col="gene", background_col="background"
+    )
+
+    # All 14 symbols used; counts match ground truth.
+    assert len(store.group_symbols) == 14
+    expected = {f"G{i:03d}": i + 1 for i in range(20)}
+    assert store.gene_counts == expected
+    assert sum(store.gene_counts.values()) == store.total_points == sum(range(1, 21))
+
+    # Each gene's stored points are exactly its own (verify via x signature).
+    for i in range(20):
+        gene = f"G{i:03d}"
+        gi, fg_start, fg_end, bg_end = store.gene_offsets[gene]
+        xs = store.group_coords[gi][fg_start:bg_end][:, 1]  # coords are (y, x)
+        assert len(xs) == i + 1
+        assert xs.min() >= i * 1000 and xs.max() < i * 1000 + (i + 1)
+
+    # G005 has its one background point ordered last (fg then bg).
+    gi, fg_start, fg_end, bg_end = store.gene_offsets["G005"]
+    assert bg_end - fg_end == 1
