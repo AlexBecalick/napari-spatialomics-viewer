@@ -120,6 +120,7 @@ from .utils import (
     channel_labels,
     compute_transcript_density_array,
     derived_image_pyramid_cache_key,
+    derived_label_pyramid_cache_key,
     derived_outline_cache_key,
     derived_transcript_density_cache_key,
     ensure_cyx,
@@ -3232,6 +3233,113 @@ class ComparisonViewerController:
         self._set_status(f"{ds} label outline build failed: {message}")
         log.error("[%s] Label outline build failed: %s", ds, message)
 
+    def _label_pyramid_levels_from_element(self, elem) -> list[object]:
+        """Return the 2D label DataArrays of a stored label element, coarsest last."""
+        return [
+            level_data
+            for _scale_name, level_data in self._raster_scale_levels(elem)
+            if len(getattr(level_data, "shape", ())) == 2
+        ]
+
+    def _ensure_label_pyramid_cache(self, label_key: str, step: int) -> list[object]:
+        """Ensure a materialized max-pooled label pyramid exists for a single-scale
+        label element, returning the coarse levels (base excluded).
+
+        Mirrors the image pyramid cache but uses ``np.max`` coarsening so label
+        ids survive downsampling — this keeps the value-overlay colouring exactly
+        what the previous lazy ``lazy_label_pyramid`` produced, just persisted so
+        zoomed-out views no longer re-read the full-resolution label array.
+        """
+        if self._active_sdata is None or self.active_dataset is None or da is None:
+            return []
+        if is_derived_cache_key(label_key):
+            return []
+
+        step = max(2, int(step))
+        cache_key = derived_label_pyramid_cache_key(label_key, step)
+        expected = {
+            "kind": "label_pyramid",
+            "source_label_key": str(label_key),
+            "downsample": int(step),
+            "min_size": int(LABEL_OUTLINE_PYRAMID_MIN_SIZE),
+        }
+        if (
+            not bool(getattr(self.args, "overwrite_derived_caches", False))
+            and self._derived_cache_complete("labels", cache_key, expected)
+            and self._refresh_label_key_from_store(cache_key)
+        ):
+            return self._label_pyramid_levels_from_element(self._active_sdata.labels[cache_key])
+
+        if label_key not in self._active_sdata.labels and not self._refresh_label_key_from_store(label_key):
+            raise KeyError(f"Label key '{label_key}' not found in current dataset.")
+
+        label_elem = self._active_sdata.labels[label_key]
+        base_levels = self._label_pyramid_levels_from_element(label_elem)
+        if len(base_levels) == 0:
+            raise ValueError(f"Expected 2D labels for {label_key}, found no readable 2D levels")
+
+        base = base_levels[0]
+        levels = lazy_coarsened_pyramid(base, step=step, reducer=np.max, min_size=LABEL_OUTLINE_PYRAMID_MIN_SIZE)
+        if len(levels) == 0:
+            return []
+
+        transform = get_transformation(label_elem, to_coordinate_system="global")
+        pyramid_tree = self._datatree_from_levels(
+            levels,
+            dims=("y", "x"),
+            transform=transform,
+            dtype=getattr(base, "dtype", None),
+        )
+        Labels2DModel.validate(pyramid_tree)
+        self._discard_derived_cache_before_write("labels", cache_key)
+        self._active_sdata.labels[cache_key] = pyramid_tree
+        self._set_status(
+            f"{self.active_dataset} writing label pyramid cache for {label_key} (downsample {step}x)..."
+        )
+        self._active_sdata.write_element(cache_key, overwrite=False)
+        self._mark_derived_cache_complete("labels", cache_key, {**expected, "levels": int(len(levels))})
+        self._refresh_label_key_from_store(cache_key)
+        log.info(
+            "[%s] Built label pyramid cache labels[%s] from labels[%s] downsample=%sx levels=%s",
+            self.active_dataset,
+            cache_key,
+            label_key,
+            step,
+            len(levels),
+        )
+        return self._label_pyramid_levels_from_element(self._active_sdata.labels[cache_key])
+
+    def _build_cellpose_label_display(self, label_key: str) -> tuple[list[object], np.ndarray]:
+        """Return (label_levels, napari_affine) for the cell-value overlay.
+
+        Uses the stored pyramid when present, otherwise the lazy base plus a
+        materialized max-pooled coarse pyramid, so pan/zoom over the value
+        overlay reads small tiles instead of the full-resolution label array.
+        """
+        if label_key not in self._active_sdata.labels and not self._refresh_label_key_from_store(label_key):
+            raise KeyError(f"Label key '{label_key}' not found in current dataset.")
+        label_elem = self._active_sdata.labels[label_key]
+        stored = self._label_pyramid_levels_from_element(label_elem)
+        if len(stored) == 0:
+            raise ValueError(f"labels[{label_key}] has no readable 2D levels")
+
+        levels = stored
+        if len(stored) == 1 and da is not None:
+            step = max(2, int(self.args.image_pyramid_downsample))
+            try:
+                coarse = self._ensure_label_pyramid_cache(label_key, step)
+            except Exception as exc:
+                log.warning(
+                    "[%s] Label pyramid cache build failed for %s (%s); using lazy fallback.",
+                    self.active_dataset,
+                    label_key,
+                    exc,
+                )
+                coarse = lazy_label_pyramid(stored[0])[1:]
+            if coarse:
+                levels = [stored[0]] + list(coarse)
+        return levels, self._napari_affine_from_element(label_elem)
+
     def _ensure_cellpose_label_key(self) -> str:
         if self._active_sdata is None or self.active_dataset is None:
             raise RuntimeError("No active dataset.")
@@ -3276,30 +3384,19 @@ class ComparisonViewerController:
             "colormap": DirectLabelColormap(color_dict=mapping.color_dict),
         }
 
-    def _apply_cellpose_value_payload(self, generation: int, label_key: str, payload: dict[str, object]):
+    def _apply_cellpose_value_payload(self, generation: int, payload: dict[str, object]):
         if generation != self._cellpose_value_generation or self.active_dataset != "MERSCOPE":
             return
         self._cellpose_value_worker = None
         if self._active_sdata is None:
             return
 
-        if label_key not in self._active_sdata.labels and not self._refresh_label_key_from_store(label_key):
-            self._set_status(f"MERSCOPE Cellpose value overlay failed: label key {label_key!r} not found.")
-            return
-
-        label_elem = self._active_sdata.labels[label_key]
-        label_scale_levels = [
-            (scale_name, level_data)
-            for scale_name, level_data in self._raster_scale_levels(label_elem)
-            if len(getattr(level_data, "shape", ())) == 2
-        ]
-        if len(label_scale_levels) == 0:
+        label_key = str(payload["label_key"])
+        label_levels = payload["label_levels"]
+        napari_affine = payload["napari_affine"]
+        if not label_levels:
             self._set_status(f"MERSCOPE Cellpose value overlay failed: labels[{label_key}] has no 2D levels.")
             return
-
-        label_levels = [level_data for _scale_name, level_data in label_scale_levels]
-        if len(label_levels) == 1:
-            label_levels = lazy_label_pyramid(label_levels[0])
         label_data = label_levels if len(label_levels) > 1 else label_levels[0]
 
         ds = self.active_dataset
@@ -3310,7 +3407,7 @@ class ComparisonViewerController:
         self.viewer.add_labels(
             label_data,
             name=layer_name,
-            affine=self._napari_affine_from_element(label_elem),
+            affine=napari_affine,
             colormap=payload["colormap"],
             multiscale=len(label_levels) > 1,
             opacity=min(1.0, max(0.0, float(self.args.shape_opacity))),
@@ -3369,33 +3466,38 @@ class ComparisonViewerController:
             self._set_status(f"Missing {CELLPOSE_QUANTIFICATION_TABLE_KEY}; cannot load Cellpose value overlay.")
             return
 
-        try:
-            label_key = self._ensure_cellpose_label_key()
-        except Exception as exc:
-            self._set_status(f"Could not prepare {CELLPOSE_LABEL_KEY}: {exc}")
-            log.exception("[MERSCOPE] Could not prepare Cellpose labels")
-            return
-
         self._cellpose_value_generation += 1
         generation = self._cellpose_value_generation
         self._set_status(f"MERSCOPE building Cellpose value overlay: {channel} {statistic}...")
 
+        def compute():
+            # Heavy: prepares (rasterizes if needed) the Cellpose labels, builds
+            # the color mapping, and materializes a max-pooled label pyramid so
+            # the overlay pans/zooms without re-reading the full-resolution
+            # labels. All off the GUI thread; layer creation happens on apply.
+            label_key = self._ensure_cellpose_label_key()
+            label_levels, napari_affine = self._build_cellpose_label_display(label_key)
+            payload = self._compute_cellpose_value_payload(cfg.zarr_path, channel, statistic, colormap_name)
+            return {
+                **payload,
+                "label_key": label_key,
+                "label_levels": label_levels,
+                "napari_affine": napari_affine,
+            }
+
         if thread_worker is None:
             try:
-                payload = self._compute_cellpose_value_payload(cfg.zarr_path, channel, statistic, colormap_name)
+                payload = compute()
             except Exception as exc:
                 self._handle_cellpose_value_error(generation, exc)
                 return
-            self._apply_cellpose_value_payload(generation, label_key, payload)
+            self._apply_cellpose_value_payload(generation, payload)
             return
-
-        def compute():
-            return self._compute_cellpose_value_payload(cfg.zarr_path, channel, statistic, colormap_name)
 
         worker_factory = thread_worker(compute)
         worker = worker_factory()
         worker.returned.connect(
-            lambda payload, gen=generation, key=label_key: self._apply_cellpose_value_payload(gen, key, payload)
+            lambda payload, gen=generation: self._apply_cellpose_value_payload(gen, payload)
         )
         worker.errored.connect(lambda exc, gen=generation: self._handle_cellpose_value_error(gen, exc))
         self._cellpose_value_worker = worker

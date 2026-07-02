@@ -185,6 +185,11 @@ def derived_image_pyramid_cache_key(image_key: str, downsample: int) -> str:
     return f"{DERIVED_CACHE_PREFIX}imgpyr__{_safe_cache_token(image_key)}__ds{int(downsample)}"
 
 
+def derived_label_pyramid_cache_key(label_key: str, downsample: int) -> str:
+    """Build the private labels cache key for a materialized coarse-level label pyramid."""
+    return f"{DERIVED_CACHE_PREFIX}labelpyr__{_safe_cache_token(label_key)}__ds{int(downsample)}"
+
+
 def open_zarr_group_unconsolidated(zarr_path: str | Path):
     """Open a zarr group without consolidated metadata.
 
