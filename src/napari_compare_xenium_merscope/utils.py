@@ -180,6 +180,11 @@ def derived_transcript_density_cache_key(points_key: str, bin_um: float) -> str:
     return f"{DERIVED_CACHE_PREFIX}tx_density__{_safe_cache_token(points_key)}__bin{_format_float_token(bin_um)}"
 
 
+def derived_image_pyramid_cache_key(image_key: str, downsample: int) -> str:
+    """Build the private images cache key for a materialized coarse-level pyramid."""
+    return f"{DERIVED_CACHE_PREFIX}imgpyr__{_safe_cache_token(image_key)}__ds{int(downsample)}"
+
+
 def open_zarr_group_unconsolidated(zarr_path: str | Path):
     """Open a zarr group without consolidated metadata.
 

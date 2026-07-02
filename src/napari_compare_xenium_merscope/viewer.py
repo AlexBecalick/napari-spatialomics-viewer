@@ -119,6 +119,7 @@ from .utils import (
     cellpose_quantification_table_available,
     channel_labels,
     compute_transcript_density_array,
+    derived_image_pyramid_cache_key,
     derived_outline_cache_key,
     derived_transcript_density_cache_key,
     ensure_cyx,
@@ -369,6 +370,64 @@ def lazy_subsampled_pyramid(
             break
         levels.append(data)
 
+    return levels
+
+
+def lazy_coarsened_pyramid(
+    base_data,
+    step: int,
+    reducer=None,
+    min_size: int = SYNTHETIC_IMAGE_PYRAMID_MIN_SIZE,
+    max_levels: int = SYNTHETIC_IMAGE_PYRAMID_MAX_LEVELS,
+    tile: int = 1024,
+) -> list[object]:
+    """Build materialized-ready coarse levels for an image or label array.
+
+    Each level downsamples the trailing (y, x) axes by ``step`` using ``reducer``
+    (``np.mean`` for intensity images; ``np.max`` for label ids so ids are
+    preserved rather than averaged). Unlike stride subsampling, every returned
+    level is a genuine reduced-resolution array, so reading a coarse tile does
+    NOT force a full-resolution read once the level is persisted. Level 0 (the
+    base) is intentionally excluded; callers reuse the existing lazy base array
+    so the multi-gigapixel scale0 is never duplicated.
+    """
+    if da is None:
+        return []
+    if reducer is None:
+        reducer = np.mean
+    step = max(2, int(step))
+    data = da.asarray(base_data)
+    ndim = data.ndim
+    if ndim not in (2, 3):
+        return []
+    y_axis, x_axis = ndim - 2, ndim - 1
+    dtype = data.dtype
+    is_integer = np.issubdtype(dtype, np.integer)
+
+    levels: list[object] = []
+    current = data
+    prev_shape = tuple(int(s) for s in data.shape)
+    while len(levels) < max_levels and max(int(current.shape[y_axis]), int(current.shape[x_axis])) > min_size:
+        if int(current.shape[y_axis]) < step or int(current.shape[x_axis]) < step:
+            break
+        coarsened = da.coarsen(reducer, current, axes={y_axis: step, x_axis: step}, trim_excess=True)
+        # Averaging promotes to float; round back for integer sources. Max/other
+        # reducers preserve the integer dtype, so avoid a needless float round-trip.
+        if reducer is np.mean and is_integer:
+            coarsened = da.rint(coarsened).astype(dtype)
+        else:
+            coarsened = coarsened.astype(dtype)
+        new_shape = tuple(int(s) for s in coarsened.shape)
+        if new_shape[-2:] == prev_shape[-2:]:
+            break
+        if ndim == 3:
+            chunks = (new_shape[0], min(tile, new_shape[1]), min(tile, new_shape[2]))
+        else:
+            chunks = (min(tile, new_shape[0]), min(tile, new_shape[1]))
+        coarsened = coarsened.rechunk(chunks)
+        levels.append(coarsened)
+        current = coarsened
+        prev_shape = new_shape
     return levels
 
 
@@ -992,6 +1051,8 @@ class ComparisonViewerController:
         self._transcript_build_worker: object | None = None
         self._label_build_generation = 0
         self._label_build_worker: object | None = None
+        self._image_build_generation = 0
+        self._image_build_worker: object | None = None
         self._canvas_size: tuple[int, int] | None = None
 
     def set_status_callback(self, fn):
@@ -1537,6 +1598,130 @@ class ComparisonViewerController:
             if self._cellpose_value_options_callback is not None:
                 self._cellpose_value_options_callback([], [], False)
 
+    def _pyramid_levels_from_element(self, elem) -> list[object]:
+        """Return the (c, y, x) DataArrays of a stored image element, coarsest last."""
+        return [ensure_cyx(cyx) for _name, cyx in image_scale_dataarrays(elem)]
+
+    def _ensure_image_pyramid_cache(self, image_key: str, image_elem) -> list[object]:
+        """Ensure a materialized coarse-level pyramid exists for a single-scale image.
+
+        Returns the coarse (c, y, x) levels (level 1..N, base excluded) read back
+        from the persisted zarr cache, or [] if one could not be built. Building
+        streams the full-resolution base once to write small mean-downsampled
+        levels, so subsequent zoomed-out/mid views read tiny tiles instead of
+        re-reading full-resolution chunks.
+        """
+        if self._active_sdata is None or self.active_dataset is None or da is None:
+            return []
+
+        step = max(2, int(self.args.image_pyramid_downsample))
+        cache_key = derived_image_pyramid_cache_key(image_key, step)
+        expected = {
+            "kind": "image_pyramid",
+            "source_image_key": str(image_key),
+            "downsample": int(step),
+            "min_size": int(SYNTHETIC_IMAGE_PYRAMID_MIN_SIZE),
+        }
+        if (
+            not bool(getattr(self.args, "overwrite_derived_caches", False))
+            and self._derived_cache_complete("images", cache_key, expected)
+            and self._refresh_image_key_from_store(cache_key)
+        ):
+            return self._pyramid_levels_from_element(self._active_sdata.images[cache_key])
+
+        base_cyx = ensure_cyx(get_scale0_dataarray(image_elem))
+        levels = lazy_coarsened_pyramid(base_cyx.data, step=step, reducer=np.mean)
+        if len(levels) == 0:
+            return []
+
+        transform = get_transformation(image_elem, to_coordinate_system="global")
+        channels = channel_labels(base_cyx)
+        base_dtype = getattr(base_cyx, "dtype", None)
+        pyramid_tree = self._datatree_from_levels(
+            levels,
+            dims=("c", "y", "x"),
+            channels=channels,
+            transform=transform,
+            dtype=base_dtype,
+        )
+        Image2DModel.validate(pyramid_tree)
+        self._discard_derived_cache_before_write("images", cache_key)
+        self._active_sdata.images[cache_key] = pyramid_tree
+        self._set_status(
+            f"{self.active_dataset} writing image pyramid cache for {image_key} (downsample {step}x)..."
+        )
+        self._active_sdata.write_element(cache_key, overwrite=False)
+        self._mark_derived_cache_complete("images", cache_key, {**expected, "levels": int(len(levels))})
+        self._refresh_image_key_from_store(cache_key)
+        log.info(
+            "[%s] Built image pyramid cache images[%s] from images[%s] downsample=%sx levels=%s",
+            self.active_dataset,
+            cache_key,
+            image_key,
+            step,
+            len(levels),
+        )
+        return self._pyramid_levels_from_element(self._active_sdata.images[cache_key])
+
+    def _display_scale_levels_for_image(self, image_key: str, sdata) -> tuple[list[tuple[str, object]], str]:
+        """Return (scale_levels, source) for display: stored pyramid, or base plus
+        a materialized coarse pyramid for single-scale images."""
+        elem = sdata.images[image_key]
+        stored = [(name, ensure_cyx(cyx)) for name, cyx in image_scale_dataarrays(elem)]
+        if len(stored) == 0:
+            return [], "none"
+        if len(stored) > 1:
+            return stored, "stored"
+
+        if da is not None:
+            try:
+                coarse = self._ensure_image_pyramid_cache(image_key, elem)
+            except Exception as exc:
+                log.warning(
+                    "[%s] Image pyramid cache build failed for %s (%s); using synthetic fallback.",
+                    self.active_dataset,
+                    image_key,
+                    exc,
+                )
+                coarse = []
+            if coarse:
+                extended = stored + [(f"imgpyr{idx + 1}", cyx) for idx, cyx in enumerate(coarse)]
+                return extended, "materialized"
+        return stored, "single"
+
+    def _prime_image_pyramid_caches(self, ds: str, sdata) -> None:
+        """Pre-build materialized pyramids for single-scale images (worker-thread safe)."""
+        if da is None or sdata is None:
+            return
+        try:
+            image_keys = [str(k) for k in sdata.images.keys() if not is_derived_cache_key(str(k))]
+        except Exception:
+            return
+        for image_key in image_keys:
+            try:
+                if len(image_scale_dataarrays(sdata.images[image_key])) > 1:
+                    continue
+                self._ensure_image_pyramid_cache(image_key, sdata.images[image_key])
+            except Exception as exc:
+                log.warning("[%s] Could not build image pyramid cache for %s (%s)", ds, image_key, exc)
+
+    def _default_visible_channels(self, labels: list[str]) -> set[str]:
+        """Channels shown by default on load; the rest are loaded but hidden.
+
+        Fewer simultaneously-visible additive layers means fewer per-frame reads
+        and blend passes. Every channel stays a toggleable layer in napari.
+        """
+        configured = getattr(self.args, "visible_channels", None)
+        if configured:
+            wanted = {token.strip().lower() for token in str(configured).split(",") if token.strip()}
+            selected = {label for label in labels if str(label).lower() in wanted}
+            if selected:
+                return selected
+        for label in labels:
+            if "dapi" in str(label).lower():
+                return {label}
+        return {labels[0]} if labels else set()
+
     def _add_image_layers(self, ds: str, sdata, x_transform, y_transform) -> dict[str, int]:
         if getattr(self.args, "skip_images", False):
             log.info("[%s] Image loading skipped (--skip-images).", ds)
@@ -1558,15 +1743,13 @@ class ComparisonViewerController:
 
         for image_key in image_keys:
             try:
-                scale_levels = [
-                    (scale_name, ensure_cyx(da))
-                    for scale_name, da in image_scale_dataarrays(sdata.images[image_key])
-                ]
+                scale_levels, image_source = self._display_scale_levels_for_image(image_key, sdata)
                 if len(scale_levels) == 0:
                     raise ValueError("image has no readable scale levels")
 
                 base_scale_name, base_image_cyx = scale_levels[0]
                 labels = channel_labels(base_image_cyx)
+                default_visible = self._default_visible_channels(labels)
 
                 x_coords = (
                     np.asarray(base_image_cyx.coords["x"].values)
@@ -1591,7 +1774,7 @@ class ComparisonViewerController:
                         image_cyx.isel(c=chan_idx).data
                         for _scale_name, image_cyx in scale_levels
                     ]
-                    pyramid_source = "stored"
+                    pyramid_source = image_source
                     if len(channel_levels) == 1:
                         channel_levels = lazy_subsampled_pyramid(channel_levels[0])
                         pyramid_source = "synthetic" if len(channel_levels) > 1 else "single"
@@ -1599,6 +1782,7 @@ class ComparisonViewerController:
                     multiscale = len(channel_levels) > 1
                     ch_data = channel_levels if multiscale else channel_levels[0]
                     cmap = image_colormap_for_channel(chan_name, chan_idx)
+                    chan_visible = visible and (chan_name in default_visible)
 
                     add_kwargs = dict(
                         name=layer_name,
@@ -1606,7 +1790,7 @@ class ComparisonViewerController:
                         colormap=cmap,
                         blending="additive",
                         opacity=self.args.image_opacity,
-                        visible=visible,
+                        visible=chan_visible,
                     )
                     if multiscale:
                         add_kwargs["multiscale"] = True
@@ -3340,9 +3524,57 @@ class ComparisonViewerController:
         if self._x_transform is None or self._y_transform is None:
             raise RuntimeError("Image transform is not initialized.")
 
+        images_sdata = self._active_images_sdata
+        self._image_build_generation += 1
+        generation = self._image_build_generation
+        self._set_status(f"{ds} preparing image pyramids (this is a one-time cached build)...")
+
+        def compute():
+            # Heavy: streams full-resolution channels once to materialize small
+            # coarse-level pyramids into the zarr. Runs on a worker thread so the
+            # UI stays responsive; the layer creation happens on the GUI thread.
+            t0 = time.time()
+            self._prime_image_pyramid_caches(ds, images_sdata)
+            return {"build_seconds": time.time() - t0}
+
+        if thread_worker is None:
+            try:
+                payload = compute()
+            except Exception as exc:
+                self._handle_image_build_error(generation, ds, exc)
+                return
+            self._apply_image_build(generation, ds, payload)
+            return
+
+        worker_factory = thread_worker(compute)
+        worker = worker_factory()
+        worker.returned.connect(
+            lambda payload, gen=generation, d=ds: self._apply_image_build(gen, d, payload)
+        )
+        worker.errored.connect(
+            lambda exc, gen=generation, d=ds: self._handle_image_build_error(gen, d, exc)
+        )
+        self._image_build_worker = worker
+        worker.start()
+
+    def _apply_image_build(self, generation: int, ds: str, payload: dict[str, object]):
+        if generation != self._image_build_generation or self.active_dataset != ds:
+            return
+        self._image_build_worker = None
         self._remove_layers_by_prefix(layer_name_prefix(ds, "image"))
         stats = self._add_image_layers(ds, self._active_images_sdata, self._x_transform, self._y_transform)
-        self._set_status(f"{ds} loaded image layers={stats['layers']} (failed={stats['failed_keys']}).")
+        self._set_status(
+            f"{ds} loaded image layers={stats['layers']} (failed={stats['failed_keys']}); "
+            f"pyramid build={float(payload.get('build_seconds', 0.0)):.1f}s."
+        )
+
+    def _handle_image_build_error(self, generation: int, ds: str, exc):
+        if generation != self._image_build_generation:
+            return
+        self._image_build_worker = None
+        message = exc[1] if isinstance(exc, tuple) and len(exc) > 1 else exc
+        self._set_status(f"{ds} image load failed: {message}")
+        log.error("[%s] Image pyramid build/load failed: %s", ds, message)
 
 
 def log_environment_diagnostics(viewer) -> None:
@@ -3559,7 +3791,25 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--overwrite-derived-caches",
         action="store_true",
-        help="Rebuild viewer-derived density/outline caches even when matching cache metadata exists.",
+        help="Rebuild viewer-derived density/outline/image-pyramid caches even when matching cache metadata exists.",
+    )
+    parser.add_argument(
+        "--image-pyramid-downsample",
+        default=4,
+        type=int,
+        help=(
+            "Downsample factor between materialized image-pyramid levels for single-scale "
+            "images (>=2). 4 keeps caches small; 2 is smoothest but ~5x larger."
+        ),
+    )
+    parser.add_argument(
+        "--visible-channels",
+        default=None,
+        help=(
+            "Comma-separated channel names to show by default when images load (e.g. 'DAPI,PolyT'). "
+            "Others are loaded but hidden and can be toggled in napari. Default: a DAPI-like channel, "
+            "else the first channel."
+        ),
     )
     parser.add_argument("--random-state", default=42, type=int, help="Random seed used for sampling")
 
@@ -3619,6 +3869,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--label-chunk-size must be positive.")
     if args.label_contour_width < 0:
         parser.error("--label-contour-width must be non-negative.")
+    if args.image_pyramid_downsample < 2:
+        parser.error("--image-pyramid-downsample must be >= 2.")
     return args
 
 
