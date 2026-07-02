@@ -3735,6 +3735,27 @@ def log_environment_diagnostics(viewer) -> None:
         pass
 
 
+def request_gl_core_profile() -> None:
+    """Request an OpenGL 4.1 core-profile context before the Qt app is created.
+
+    On macOS the default (compatibility) context is capped at legacy OpenGL 2.1
+    layered over Metal. A core profile is the only way to obtain GL 4.1 on Apple
+    Silicon. This is experimental: some VisPy visuals assume legacy GL, so it is
+    opt-in via --gl-core-profile. Must run before the first QOpenGLContext, i.e.
+    before napari.Viewer() creates the QApplication.
+    """
+    try:
+        from qtpy.QtGui import QSurfaceFormat
+
+        fmt = QSurfaceFormat()
+        fmt.setProfile(QSurfaceFormat.CoreProfile)
+        fmt.setVersion(4, 1)
+        QSurfaceFormat.setDefaultFormat(fmt)
+        log.info("Requested OpenGL 4.1 core profile (experimental --gl-core-profile).")
+    except Exception as exc:  # pragma: no cover - depends on runtime env
+        log.warning("Could not request an OpenGL core profile (%s)", exc)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Napari comparison viewer for MERSCOPE and Xenium SpatialData outputs."
@@ -3932,6 +3953,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do not attempt to load image layers (useful for image-less zarr transfers).",
     )
+    parser.add_argument(
+        "--gl-core-profile",
+        action="store_true",
+        help=(
+            "Experimental: request an OpenGL 4.1 core-profile context instead of the macOS "
+            "default legacy 2.1 context. Check the 'OpenGL: version=...' startup log to confirm. "
+            "May affect rendering on some setups; leave off if visuals look wrong."
+        ),
+    )
 
     args = parser.parse_args()
     if args.merscope_zarr is None and args.xenium_zarr is None:
@@ -4012,6 +4042,9 @@ def main():
 
     for cfg in datasets.values():
         validate_spatialdata_store_compatibility(cfg.zarr_path)
+
+    if getattr(args, "gl_core_profile", False):
+        request_gl_core_profile()
 
     viewer = napari.Viewer(title="Xenium vs MERSCOPE Comparison")
     log_environment_diagnostics(viewer)
