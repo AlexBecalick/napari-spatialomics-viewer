@@ -621,6 +621,7 @@ class DatasetSwitcherWidget(QWidget):
         unload_selected_shapes_callback,
         load_full_transcripts_callback,
         set_transcript_view_percent_callback,
+        unload_transcripts_callback,
         load_images_callback,
         load_cellpose_values_callback,
         remove_cellpose_values_callback,
@@ -641,6 +642,7 @@ class DatasetSwitcherWidget(QWidget):
         self._unload_selected_shapes_callback = unload_selected_shapes_callback
         self._load_full_transcripts_callback = load_full_transcripts_callback
         self._set_transcript_view_percent_callback = set_transcript_view_percent_callback
+        self._unload_transcripts_callback = unload_transcripts_callback
         self._load_images_callback = load_images_callback
         self._load_cellpose_values_callback = load_cellpose_values_callback
         self._remove_cellpose_values_callback = remove_cellpose_values_callback
@@ -685,6 +687,8 @@ class DatasetSwitcherWidget(QWidget):
 
         self._load_full_tx_button = QPushButton("Load Full Transcripts (Viewport)")
         self._load_full_tx_button.clicked.connect(self._on_load_full_transcripts)
+        self._unload_tx_button = QPushButton("Unload Transcripts")
+        self._unload_tx_button.clicked.connect(self._on_unload_transcripts)
         self._tx_percent_slider = QSlider(Qt.Horizontal)
         self._tx_percent_slider.setRange(0, 100)
         self._tx_percent_slider.setSingleStep(1)
@@ -747,6 +751,7 @@ class DatasetSwitcherWidget(QWidget):
 
         root.addWidget(QLabel("Transcripts"))
         root.addWidget(self._load_full_tx_button)
+        root.addWidget(self._unload_tx_button)
         tx_percent_row = QHBoxLayout()
         tx_percent_row.addWidget(QLabel("Viewport %"))
         tx_percent_row.addWidget(self._tx_percent_slider)
@@ -871,6 +876,9 @@ class DatasetSwitcherWidget(QWidget):
 
     def _on_load_full_transcripts(self):
         self._load_full_transcripts_callback(self.current_dataset, self.transcript_view_percent())
+
+    def _on_unload_transcripts(self):
+        self._unload_transcripts_callback(self.current_dataset)
 
     def _on_tx_percent_changed(self, value: int):
         value = int(value)
@@ -1551,7 +1559,7 @@ class ComparisonViewerController:
             if self.args.startup_mode == "full":
                 img_stats = self._add_image_layers(ds, sdata, x_transform, y_transform)
                 shape_stats = self._add_shape_layers(ds, sdata)
-                tx_stats = self._add_transcripts_layer(self.args.max_transcripts)
+                tx_stats = self._load_startup_transcripts()
             else:
                 img_stats = {
                     "layers": 0,
@@ -1560,7 +1568,7 @@ class ComparisonViewerController:
                     "deferred": not bool(self.args.skip_images),
                 }
                 shape_stats = {"layers": 0, "units": 0}
-                tx_stats = self._add_transcripts_layer(self.args.max_transcripts)
+                tx_stats = self._load_startup_transcripts()
 
             elapsed = time.time() - t0
             mem_after = memory_snapshot_gb()
@@ -1576,13 +1584,20 @@ class ComparisonViewerController:
                     f"(failed_keys={img_stats['failed_keys']})"
                 )
 
+            if tx_stats.get("streamed"):
+                tx_summary = "tx=streaming (density + viewport detail)"
+            else:
+                tx_summary = (
+                    f"tx_total={tx_stats['total']:,} assigned={tx_stats['assigned']:,} "
+                    f"unassigned={tx_stats['unassigned']:,}"
+                )
+
             summary = (
                 f"{ds} loaded in {elapsed:.1f}s ({self.args.startup_mode} startup) | "
                 f"{image_summary} | "
                 f"{self._segmentation_layer_type()}_layers={shape_stats['layers']} "
                 f"{self._segmentation_unit_name()}={shape_stats['units']:,} | "
-                f"tx_total={tx_stats['total']:,} assigned={tx_stats['assigned']:,} "
-                f"unassigned={tx_stats['unassigned']:,} | "
+                f"{tx_summary} | "
                 f"RSS {mem_before['rss_gb']:.1f}->{mem_after['rss_gb']:.1f} GB"
             )
             self._set_status(summary)
@@ -2925,8 +2940,21 @@ class ComparisonViewerController:
             layer_names.append(layer_name)
         return layer_names
 
+    def _load_startup_transcripts(self) -> dict[str, object]:
+        """Load transcripts on dataset load per --transcripts-mode.
+
+        Defaults to the streamed hybrid layer (density pyramid always visible +
+        viewport point detail when zoomed in) rather than a fixed capped sample.
+        """
+        if str(getattr(self.args, "transcripts_mode", "streamed")).lower() == "capped":
+            return self._add_transcripts_layer(self.args.max_transcripts)
+        return self._add_streamed_transcripts_layer()
+
     def _add_streamed_transcripts_layer(self, view_percent: int | None = None) -> dict[str, int | bool]:
         if self._active_sdata is None or self.active_dataset is None:
+            return {"total": 0, "assigned": 0, "unassigned": 0, "streamed": True}
+        if len(getattr(self._active_sdata, "points", {})) == 0:
+            log.warning("[%s] No points available; skipping streamed transcript layers.", self.active_dataset)
             return {"total": 0, "assigned": 0, "unassigned": 0, "streamed": True}
 
         ds = self.active_dataset
@@ -3613,6 +3641,33 @@ class ComparisonViewerController:
         # apply callbacks, so we intentionally do not overwrite it here.
         self._add_streamed_transcripts_layer(view_percent=view_percent)
 
+    def unload_transcripts(self, dataset_name: str):
+        """Fully unload streamed transcripts so pan/zoom cannot bring them back.
+
+        Tears down the streamed state (stops the debounce timer, disconnects the
+        camera pan/zoom callbacks, and cancels any in-flight build) and removes
+        the transcript point + density layers. Without this, deleting the layers
+        by hand left the camera callbacks alive, which recreated the points on
+        the next pan/zoom.
+        """
+        ds = str(dataset_name).upper()
+        # Bumps the build generation and disconnects camera callbacks for all
+        # streamed states, so a queued update or in-flight build cannot re-add
+        # layers after this returns.
+        self._clear_streamed_transcript_states()
+        removed = 0
+        for prefix in (layer_name_prefix(ds, "transcripts"), layer_name_prefix(ds, "transcript_density")):
+            names = [str(layer.name) for layer in self.viewer.layers]
+            for layer_name in matching_layer_names(names, prefix):
+                before = len(self.viewer.layers)
+                self._remove_layer_by_name(layer_name)
+                if len(self.viewer.layers) < before:
+                    removed += 1
+        self._set_status(
+            f"{ds} unloaded transcripts ({removed} layer(s) removed). "
+            "Use 'Load Full Transcripts' to bring them back."
+        )
+
     def load_images_on_demand(self, dataset_name: str):
         if self.args.skip_images:
             self._set_status("Image loading disabled (--skip-images).")
@@ -3796,10 +3851,20 @@ def parse_args() -> argparse.Namespace:
         help="Load segmentation layers from shapes (vector) or labels (raster masks).",
     )
     parser.add_argument(
+        "--transcripts-mode",
+        default="streamed",
+        choices=["streamed", "capped"],
+        help=(
+            "How transcripts load on dataset load. 'streamed' (default): density pyramid "
+            "always visible plus full viewport point detail when zoomed in. 'capped': a fixed "
+            "sampled subset of --max-transcripts points."
+        ),
+    )
+    parser.add_argument(
         "--max-transcripts",
         default=None,
         type=int,
-        help="Optional cap/sampling limit for transcripts per dataset load.",
+        help="Optional cap/sampling limit for transcripts per dataset load (used by --transcripts-mode capped).",
     )
     parser.add_argument(
         "--transcript-view-percent",
@@ -4057,6 +4122,7 @@ def main():
         unload_selected_shapes_callback=controller.unload_selected_shapes,
         load_full_transcripts_callback=controller.load_full_transcripts,
         set_transcript_view_percent_callback=controller.set_transcript_view_percent,
+        unload_transcripts_callback=controller.unload_transcripts,
         load_images_callback=controller.load_images_on_demand,
         load_cellpose_values_callback=controller.load_cellpose_value_overlay,
         remove_cellpose_values_callback=controller.remove_cellpose_value_overlay,
