@@ -1682,6 +1682,7 @@ def compute_transcript_density_array(
     min_x, min_y, max_x, max_y = bounds
 
     density = np.zeros((2, ny, nx), dtype=np.uint32)
+    n_bins = int(ny) * int(nx)
     total = 0
     assigned_total = 0
     unassigned_total = 0
@@ -1697,22 +1698,30 @@ def compute_transcript_density_array(
 
         ix = np.floor((x_vals - min_x) / actual_bin_um).astype(np.int64, copy=False)
         iy = np.floor((y_vals - min_y) / actual_bin_um).astype(np.int64, copy=False)
-        ix = np.clip(ix, 0, nx - 1)
-        iy = np.clip(iy, 0, ny - 1)
+        np.clip(ix, 0, nx - 1, out=ix)
+        np.clip(iy, 0, ny - 1, out=iy)
+        flat = iy * np.int64(nx) + ix
 
         if assignment_col is not None and assignment_col in pdf.columns:
             assigned = assignment_mask(pdf.loc[good, assignment_col]).to_numpy(dtype=bool, copy=False)
         else:
-            assigned = np.ones(ix.shape[0], dtype=bool)
+            assigned = np.ones(flat.shape[0], dtype=bool)
 
-        if np.any(assigned):
-            np.add.at(density[0], (iy[assigned], ix[assigned]), 1)
-        if np.any(~assigned):
-            np.add.at(density[1], (iy[~assigned], ix[~assigned]), 1)
+        # np.bincount is vectorized and ~10-50x faster than np.add.at, which is
+        # an unbuffered scatter. The per-channel counts are reshaped (a view) and
+        # accumulated into the running density grid.
+        n_points = int(flat.shape[0])
+        assigned_count = int(np.count_nonzero(assigned))
+        if assigned_count > 0:
+            counts = np.bincount(flat[assigned], minlength=n_bins)
+            density[0] += counts[:n_bins].reshape(ny, nx).astype(np.uint32, copy=False)
+        if assigned_count < n_points:
+            counts = np.bincount(flat[~assigned], minlength=n_bins)
+            density[1] += counts[:n_bins].reshape(ny, nx).astype(np.uint32, copy=False)
 
-        total += int(ix.shape[0])
-        assigned_total += int(np.count_nonzero(assigned))
-        unassigned_total += int(np.count_nonzero(~assigned))
+        total += n_points
+        assigned_total += assigned_count
+        unassigned_total += n_points - assigned_count
 
     meta = {
         "bounds": [float(min_x), float(min_y), float(max_x), float(max_y)],
