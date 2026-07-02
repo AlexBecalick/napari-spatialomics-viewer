@@ -107,6 +107,34 @@ napari-compare-xenium-merscope ... \
 napari-compare-xenium-merscope ... --full-shape-render-mode path
 ```
 
+## Inspect genes
+
+Click **Inspect Genes** in the Transcripts section of the right dock to open the
+**Gene Inspector** panel. It loads the full gene panel for the current dataset,
+alphabetically, and gives every gene a unique **colour + marker shape** shown as a
+large icon beside its name. Unlike the default assigned/unassigned view, this
+renders *all* transcripts as real points coloured by gene (no density raster or
+viewport sampling) — feasible because a typical section is ~10-20M transcripts.
+Opening it takes over the transcript display; **Close Gene Inspector** restores the
+default density/assigned-unassigned view.
+
+Genes are grouped by marker shape into at most 14 napari Points layers, so per-gene
+toggles stay fast even with hundreds of genes. The panel offers:
+
+- a per-gene checkbox (with the colour/shape marker) and a **Show all genes** toggle,
+- a **Spot size** slider (world microns; spots keep a real size and scale with zoom),
+- **Hide background (unassigned) spots** to drop transcripts not assigned to a cell,
+- **Show control / blank probes** to include negative-control codewords (hidden by
+  default), and a filter box to search the list.
+
+```bash
+napari-compare-xenium-merscope ... \
+  --gene-spot-size 2.0 \            # initial world-micron spot size
+  --gene-hide-background \          # start with background spots hidden
+  --gene-show-controls \            # start with control/blank probes shown
+  --gene-max-render-points 40000000 # subsample cap for very large panels
+```
+
 ## Data Assumptions
 
 MERSCOPE inputs may include `micron_to_mosaic_pixel_transform.csv` inside the zarr directory. If missing, the viewer falls back to `0.108 um/px`.

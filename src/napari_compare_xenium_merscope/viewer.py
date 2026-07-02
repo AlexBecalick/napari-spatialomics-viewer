@@ -64,14 +64,19 @@ except ImportError:
     sys.exit(1)
 
 try:
-    from qtpy.QtCore import Qt, QTimer, Signal
+    from qtpy.QtCore import QPointF, QRectF, Qt, QTimer, Signal
+    from qtpy.QtGui import QBrush, QColor, QIcon, QPainter, QPen, QPixmap, QPolygonF
     from qtpy.QtWidgets import (
         QAbstractItemView,
+        QCheckBox,
         QComboBox,
+        QDoubleSpinBox,
         QFileDialog,
         QHBoxLayout,
         QLabel,
+        QLineEdit,
         QListWidget,
+        QListWidgetItem,
         QMessageBox,
         QPushButton,
         QScrollArea,
@@ -107,12 +112,15 @@ from .utils import (
     CORTICAL_DEPTH_PIECE_ID_PROPERTY,
     CORTICAL_DEPTH_ROLE_ORDER,
     CORTICAL_DEPTH_ROLE_SPECS,
+    GeneVisual,
     CorticalDepthShapeInput,
     DERIVED_CACHE_ATTR,
+    assign_gene_visuals,
     assignment_mask,
     affine_matrix_from_px_to_um,
     build_binned_label_color_dict,
     build_cortical_depth_annotation_geojson,
+    build_gene_point_groups,
     build_transcript_spatial_index,
     build_napari_affine_from_px_to_um,
     cellpose_quantification_features,
@@ -142,6 +150,7 @@ from .utils import (
     query_transcript_spatial_index,
     rasterize_geometries_chunk,
     resolve_dataset_mask_affine,
+    resolve_gene_column,
     snap_cortical_depth_boundaries_to_edge,
     write_cortical_depth_annotation_geojson,
     write_cortical_depth_separate_geojsons,
@@ -197,6 +206,30 @@ class StreamedTranscriptLayerState:
     worker: object | None = None
     camera_callback: object | None = None
 
+
+@dataclass
+class GeneInspectorState:
+    """Live state for the per-gene transcript renderer of one dataset."""
+
+    dataset: str
+    points_key: str
+    store: object                      # utils.GenePointStore
+    gene_visuals: dict                 # gene -> utils.GeneVisual
+    layer_names: list[str]             # one napari Points layer per symbol group
+    enabled_genes: set                 # genes currently shown
+    spot_size: float
+    hide_background: bool = False
+    show_controls: bool = False
+    rebuild_timer: QTimer | None = None
+    pending_groups: set | None = None
+
+
+DEFAULT_GENE_SPOT_SIZE = 0.5
+GENE_SPOT_SIZE_MIN = 0.1
+GENE_SPOT_SIZE_MAX = 5.0
+GENE_SPOT_SIZE_STEP = 0.1
+DEFAULT_GENE_MAX_RENDER_POINTS = 40_000_000
+GENE_REBUILD_DEBOUNCE_MS = 60
 
 FAST_DEFAULT_MAX_TRANSCRIPTS = 200_000
 FAST_DEFAULT_MAX_SHAPES_PER_LAYER = 20_000
@@ -625,6 +658,7 @@ class DatasetSwitcherWidget(QWidget):
         load_full_transcripts_callback,
         set_transcript_view_percent_callback,
         unload_transcripts_callback,
+        inspect_genes_callback,
         load_images_callback,
         load_cellpose_values_callback,
         remove_cellpose_values_callback,
@@ -646,6 +680,7 @@ class DatasetSwitcherWidget(QWidget):
         self._load_full_transcripts_callback = load_full_transcripts_callback
         self._set_transcript_view_percent_callback = set_transcript_view_percent_callback
         self._unload_transcripts_callback = unload_transcripts_callback
+        self._inspect_genes_callback = inspect_genes_callback
         self._load_images_callback = load_images_callback
         self._load_cellpose_values_callback = load_cellpose_values_callback
         self._remove_cellpose_values_callback = remove_cellpose_values_callback
@@ -692,6 +727,8 @@ class DatasetSwitcherWidget(QWidget):
         self._load_full_tx_button.clicked.connect(self._on_load_full_transcripts)
         self._unload_tx_button = QPushButton("Unload Transcripts")
         self._unload_tx_button.clicked.connect(self._on_unload_transcripts)
+        self._inspect_genes_button = QPushButton("Inspect Genes")
+        self._inspect_genes_button.clicked.connect(self._on_inspect_genes)
         self._tx_percent_slider = QSlider(Qt.Horizontal)
         self._tx_percent_slider.setRange(0, 100)
         self._tx_percent_slider.setSingleStep(1)
@@ -755,6 +792,7 @@ class DatasetSwitcherWidget(QWidget):
         root.addWidget(QLabel("Transcripts"))
         root.addWidget(self._load_full_tx_button)
         root.addWidget(self._unload_tx_button)
+        root.addWidget(self._inspect_genes_button)
         tx_percent_row = QHBoxLayout()
         tx_percent_row.addWidget(QLabel("Viewport %"))
         tx_percent_row.addWidget(self._tx_percent_slider)
@@ -882,6 +920,9 @@ class DatasetSwitcherWidget(QWidget):
 
     def _on_unload_transcripts(self):
         self._unload_transcripts_callback(self.current_dataset)
+
+    def _on_inspect_genes(self):
+        self._inspect_genes_callback(self.current_dataset)
 
     def _on_tx_percent_changed(self, value: int):
         value = int(value)
@@ -1037,6 +1078,377 @@ class DatasetSwitcherWidget(QWidget):
         QMessageBox.information(self, title, text)
 
 
+def _rgba_to_qcolor(rgba) -> QColor:
+    r, g, b, a = (float(v) for v in rgba)
+    color = QColor()
+    color.setRgbF(max(0.0, min(1.0, r)), max(0.0, min(1.0, g)), max(0.0, min(1.0, b)), max(0.0, min(1.0, a)))
+    return color
+
+
+def make_gene_marker_pixmap(rgba, symbol: str, px: int = 20) -> QPixmap:
+    """Draw a napari point ``symbol`` in ``rgba`` as a small QPixmap legend icon."""
+    pm = QPixmap(px, px)
+    pm.fill(Qt.transparent)
+    painter = QPainter(pm)
+    try:
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        color = _rgba_to_qcolor(rgba)
+        m = 2.0
+        lo, hi = m, px - m
+        cx = cy = px / 2.0
+        r = (px - 2.0 * m) / 2.0
+        fill = QBrush(color)
+        line = QPen(color)
+        line.setWidthF(max(1.6, px * 0.14))
+        line.setCapStyle(Qt.RoundCap)
+        no_pen = QPen(Qt.NoPen)
+        sym = str(symbol)
+
+        def poly(points):
+            return QPolygonF([QPointF(x, y) for x, y in points])
+
+        if sym == "ring":
+            painter.setBrush(Qt.NoBrush)
+            ring_pen = QPen(color)
+            ring_pen.setWidthF(max(1.6, px * 0.14))
+            painter.setPen(ring_pen)
+            painter.drawEllipse(QPointF(cx, cy), r * 0.9, r * 0.9)
+        elif sym == "square":
+            painter.setPen(no_pen)
+            painter.setBrush(fill)
+            painter.drawRect(QRectF(lo, lo, hi - lo, hi - lo))
+        elif sym == "diamond":
+            painter.setPen(no_pen)
+            painter.setBrush(fill)
+            painter.drawPolygon(poly([(cx, lo), (hi, cy), (cx, hi), (lo, cy)]))
+        elif sym == "cross":
+            painter.setPen(line)
+            painter.drawLine(QPointF(cx, lo), QPointF(cx, hi))
+            painter.drawLine(QPointF(lo, cy), QPointF(hi, cy))
+        elif sym == "x":
+            painter.setPen(line)
+            painter.drawLine(QPointF(lo, lo), QPointF(hi, hi))
+            painter.drawLine(QPointF(lo, hi), QPointF(hi, lo))
+        elif sym == "triangle_up":
+            painter.setPen(no_pen)
+            painter.setBrush(fill)
+            painter.drawPolygon(poly([(cx, lo), (hi, hi), (lo, hi)]))
+        elif sym == "triangle_down":
+            painter.setPen(no_pen)
+            painter.setBrush(fill)
+            painter.drawPolygon(poly([(lo, lo), (hi, lo), (cx, hi)]))
+        elif sym == "star":
+            import math
+
+            pts = []
+            for k in range(10):
+                ang = -math.pi / 2 + k * math.pi / 5
+                rad = r if k % 2 == 0 else r * 0.42
+                pts.append((cx + rad * math.cos(ang), cy + rad * math.sin(ang)))
+            painter.setPen(no_pen)
+            painter.setBrush(fill)
+            painter.drawPolygon(poly(pts))
+        elif sym in ("arrow", "tailed_arrow"):
+            painter.setPen(no_pen)
+            painter.setBrush(fill)
+            painter.drawPolygon(poly([(cx, lo), (hi, cy), (cx + r * 0.35, cy), (cx + r * 0.35, hi), (cx - r * 0.35, hi), (cx - r * 0.35, cy), (lo, cy)]))
+        elif sym == "hbar":
+            painter.setPen(no_pen)
+            painter.setBrush(fill)
+            painter.drawRect(QRectF(lo, cy - r * 0.35, hi - lo, r * 0.7))
+        elif sym == "vbar":
+            painter.setPen(no_pen)
+            painter.setBrush(fill)
+            painter.drawRect(QRectF(cx - r * 0.35, lo, r * 0.7, hi - lo))
+        elif sym == "clobber":
+            painter.setPen(no_pen)
+            painter.setBrush(fill)
+            cr = r * 0.5
+            painter.drawEllipse(QPointF(cx, lo + cr), cr, cr)
+            painter.drawEllipse(QPointF(lo + cr, hi - cr), cr, cr)
+            painter.drawEllipse(QPointF(hi - cr, hi - cr), cr, cr)
+        else:  # disc (default)
+            painter.setPen(no_pen)
+            painter.setBrush(fill)
+            painter.drawEllipse(QPointF(cx, cy), r, r)
+    finally:
+        painter.end()
+    return pm
+
+
+class GeneInspectorWidget(QWidget):
+    """Right-dock panel listing every gene with a colour+shape marker and toggle."""
+
+    status_message = Signal(str)
+
+    # Slider integer <-> world-micron spot size at GENE_SPOT_SIZE_STEP (0.1 um)
+    # granularity, over [GENE_SPOT_SIZE_MIN, GENE_SPOT_SIZE_MAX].
+    _SPOT_SLIDER_SCALE = 1.0 / GENE_SPOT_SIZE_STEP
+    _SPOT_SLIDER_MIN = int(round(GENE_SPOT_SIZE_MIN / GENE_SPOT_SIZE_STEP))
+    _SPOT_SLIDER_MAX = int(round(GENE_SPOT_SIZE_MAX / GENE_SPOT_SIZE_STEP))
+
+    def __init__(
+        self,
+        close_callback,
+        set_gene_visible_callback,
+        set_all_genes_callback,
+        set_spot_size_callback,
+        set_hide_background_callback,
+        set_show_controls_callback,
+        spot_size: float = DEFAULT_GENE_SPOT_SIZE,
+        hide_background: bool = False,
+        show_controls: bool = False,
+    ):
+        super().__init__()
+        self._close_callback = close_callback
+        self._set_gene_visible_callback = set_gene_visible_callback
+        self._set_all_genes_callback = set_all_genes_callback
+        self._set_spot_size_callback = set_spot_size_callback
+        self._set_hide_background_callback = set_hide_background_callback
+        self._set_show_controls_callback = set_show_controls_callback
+
+        self._dataset: str | None = None
+        self._checkboxes: dict[str, QCheckBox] = {}
+        self._items: dict[str, QListWidgetItem] = {}
+        self._control_genes: set[str] = set()
+        self._suppress = False
+
+        self._title = QLabel("Gene Inspector")
+        self._status_label = QLabel("Click “Inspect Genes” to load the gene panel.")
+        self._status_label.setWordWrap(True)
+        self.status_message.connect(self._status_label.setText)
+
+        self._close_button = QPushButton("Close Gene Inspector")
+        self._close_button.clicked.connect(self._on_close)
+
+        self._spot_slider = QSlider(Qt.Horizontal)
+        self._spot_slider.setRange(self._SPOT_SLIDER_MIN, self._SPOT_SLIDER_MAX)
+        self._spot_slider.setValue(self._spot_size_to_slider(spot_size))
+        # Only emit (and rebuild) on release; the spin box mirrors the value live
+        # while dragging. This avoids an O(points) size re-upload per drag step.
+        self._spot_slider.setTracking(False)
+        self._spot_slider.valueChanged.connect(self._on_spot_slider_changed)
+        self._spot_slider.sliderMoved.connect(self._on_spot_slider_moved)
+        # Editable numeric entry: clamps to [MIN, MAX] and rounds to 0.1 um,
+        # rejecting out-of-range / non-numeric input.
+        self._spot_spin = QDoubleSpinBox()
+        self._spot_spin.setRange(GENE_SPOT_SIZE_MIN, GENE_SPOT_SIZE_MAX)
+        self._spot_spin.setSingleStep(GENE_SPOT_SIZE_STEP)
+        self._spot_spin.setDecimals(1)
+        self._spot_spin.setSuffix(" µm")
+        self._spot_spin.setKeyboardTracking(False)  # emit only on Enter/focus-out
+        self._spot_spin.setValue(float(spot_size))
+        self._spot_spin.valueChanged.connect(self._on_spot_spin_changed)
+
+        self._show_all_check = QCheckBox("Show all genes")
+        self._show_all_check.setTristate(True)
+        self._show_all_check.clicked.connect(self._on_show_all_clicked)
+        self._hide_bg_check = QCheckBox("Hide background (unassigned) spots")
+        self._hide_bg_check.setChecked(bool(hide_background))
+        self._hide_bg_check.toggled.connect(self._on_hide_background_toggled)
+        self._show_controls_check = QCheckBox("Show control / blank probes")
+        self._show_controls_check.setChecked(bool(show_controls))
+        self._show_controls_check.toggled.connect(self._on_show_controls_toggled)
+
+        self._filter_edit = QLineEdit()
+        self._filter_edit.setPlaceholderText("Filter genes…")
+        self._filter_edit.textChanged.connect(self._apply_filter)
+
+        self._gene_list = QListWidget()
+        self._gene_list.setSelectionMode(QAbstractItemView.NoSelection)
+        self._gene_list.setUniformItemSizes(True)
+        self._gene_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        root = QVBoxLayout()
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
+        root.addWidget(self._title)
+        root.addWidget(self._close_button)
+        spot_row = QHBoxLayout()
+        spot_row.addWidget(QLabel("Spot size"))
+        spot_row.addWidget(self._spot_slider)
+        spot_row.addWidget(self._spot_spin)
+        root.addLayout(spot_row)
+        root.addWidget(self._show_all_check)
+        root.addWidget(self._hide_bg_check)
+        root.addWidget(self._show_controls_check)
+        root.addWidget(self._filter_edit)
+        root.addWidget(self._gene_list, stretch=1)
+        root.addWidget(self._status_label)
+        self.setLayout(root)
+        self.setMinimumWidth(240)
+
+    # -- public API ---------------------------------------------------------
+    def set_status(self, text: str):
+        self.status_message.emit(str(text))
+
+    @property
+    def dataset(self) -> str | None:
+        return self._dataset
+
+    def clear(self):
+        self._suppress = True
+        try:
+            self._gene_list.clear()
+            self._checkboxes.clear()
+            self._items.clear()
+            self._control_genes = set()
+            self._dataset = None
+            self._show_all_check.setCheckState(Qt.Unchecked)
+        finally:
+            self._suppress = False
+
+    def spot_size(self) -> float:
+        return self._slider_to_spot_size(self._spot_slider.value())
+
+    def populate(
+        self,
+        dataset: str,
+        genes: list[str],
+        gene_visuals: dict,
+        gene_counts: dict,
+        control_genes: set,
+        enabled_genes: set,
+        hide_background: bool,
+        show_controls: bool,
+        spot_size: float,
+    ):
+        """Build the gene rows for ``dataset`` (called on the GUI thread)."""
+        self._suppress = True
+        try:
+            self._gene_list.clear()
+            self._checkboxes.clear()
+            self._items.clear()
+            self._dataset = str(dataset)
+            self._control_genes = set(control_genes)
+            self._hide_bg_check.setChecked(bool(hide_background))
+            self._show_controls_check.setChecked(bool(show_controls))
+            self._set_spot_widgets(float(spot_size))
+
+            for gene in genes:
+                visual = gene_visuals.get(gene)
+                symbol = getattr(visual, "symbol", "disc")
+                rgba = getattr(visual, "rgba", (1.0, 1.0, 1.0, 1.0))
+                count = int(gene_counts.get(gene, 0))
+                check = QCheckBox(f"{gene}    ({count:,})")
+                check.setIcon(QIcon(make_gene_marker_pixmap(rgba, symbol, px=22)))
+                check.setChecked(gene in enabled_genes)
+                check.toggled.connect(lambda on, g=gene: self._on_gene_toggled(g, on))
+                item = QListWidgetItem()
+                item.setSizeHint(check.sizeHint())
+                self._gene_list.addItem(item)
+                self._gene_list.setItemWidget(item, check)
+                self._checkboxes[gene] = check
+                self._items[gene] = item
+
+            self._refresh_row_visibility()
+            self._refresh_show_all_state()
+        finally:
+            self._suppress = False
+
+    # -- helpers ------------------------------------------------------------
+    def _spot_size_to_slider(self, um: float) -> int:
+        raw = int(round(float(um) * self._SPOT_SLIDER_SCALE))
+        return max(self._SPOT_SLIDER_MIN, min(self._SPOT_SLIDER_MAX, raw))
+
+    def _slider_to_spot_size(self, value: int) -> float:
+        return round(float(value) / self._SPOT_SLIDER_SCALE, 1)
+
+    def _set_spot_widgets(self, um: float):
+        """Set slider + spin box to ``um`` without emitting callbacks."""
+        um = round(min(GENE_SPOT_SIZE_MAX, max(GENE_SPOT_SIZE_MIN, float(um))), 1)
+        self._spot_slider.blockSignals(True)
+        self._spot_spin.blockSignals(True)
+        self._spot_slider.setValue(self._spot_size_to_slider(um))
+        self._spot_spin.setValue(um)
+        self._spot_slider.blockSignals(False)
+        self._spot_spin.blockSignals(False)
+
+    def _eligible_genes(self) -> list[str]:
+        show_controls = self._show_controls_check.isChecked()
+        return [g for g in self._checkboxes if show_controls or g not in self._control_genes]
+
+    def _refresh_row_visibility(self):
+        show_controls = self._show_controls_check.isChecked()
+        needle = self._filter_edit.text().strip().lower()
+        for gene, item in self._items.items():
+            hidden = (gene in self._control_genes and not show_controls) or (
+                bool(needle) and needle not in gene.lower()
+            )
+            item.setHidden(hidden)
+
+    def _refresh_show_all_state(self):
+        eligible = self._eligible_genes()
+        checked = sum(1 for g in eligible if self._checkboxes[g].isChecked())
+        self._show_all_check.blockSignals(True)
+        if not eligible or checked == 0:
+            self._show_all_check.setCheckState(Qt.Unchecked)
+        elif checked == len(eligible):
+            self._show_all_check.setCheckState(Qt.Checked)
+        else:
+            self._show_all_check.setCheckState(Qt.PartiallyChecked)
+        self._show_all_check.blockSignals(False)
+
+    # -- event handlers -----------------------------------------------------
+    def _on_close(self):
+        if self._dataset is not None:
+            self._close_callback(self._dataset)
+
+    def _on_gene_toggled(self, gene: str, on: bool):
+        if self._suppress or self._dataset is None:
+            return
+        self._set_gene_visible_callback(self._dataset, gene, bool(on))
+        self._refresh_show_all_state()
+
+    def _on_show_all_clicked(self, _checked=None):
+        if self._suppress or self._dataset is None:
+            return
+        # A click on a tri-state box cycles to fully on unless already fully on.
+        turn_on = self._show_all_check.checkState() != Qt.Unchecked
+        self._suppress = True
+        try:
+            for gene in self._eligible_genes():
+                self._checkboxes[gene].setChecked(turn_on)
+        finally:
+            self._suppress = False
+        self._refresh_show_all_state()
+        self._set_all_genes_callback(self._dataset, turn_on)
+
+    def _on_hide_background_toggled(self, on: bool):
+        if self._suppress or self._dataset is None:
+            return
+        self._set_hide_background_callback(self._dataset, bool(on))
+
+    def _on_show_controls_toggled(self, on: bool):
+        self._refresh_row_visibility()
+        self._refresh_show_all_state()
+        if self._suppress or self._dataset is None:
+            return
+        self._set_show_controls_callback(self._dataset, bool(on))
+
+    def _emit_spot_size(self, um: float):
+        self._set_spot_widgets(um)
+        if self._suppress or self._dataset is None:
+            return
+        self._set_spot_size_callback(self._dataset, round(float(um), 1))
+
+    def _on_spot_slider_changed(self, value: int):
+        # Fires on release (tracking off) or programmatic setValue.
+        self._emit_spot_size(self._slider_to_spot_size(value))
+
+    def _on_spot_slider_moved(self, value: int):
+        # Live mirror into the spin box while dragging (no callback).
+        self._spot_spin.blockSignals(True)
+        self._spot_spin.setValue(self._slider_to_spot_size(value))
+        self._spot_spin.blockSignals(False)
+
+    def _on_spot_spin_changed(self, um: float):
+        self._emit_spot_size(float(um))
+
+    def _apply_filter(self, _text: str):
+        self._refresh_row_visibility()
+
+
 class ComparisonViewerController:
     """Coordinate loading/clearing napari layers for each dataset."""
 
@@ -1066,9 +1478,17 @@ class ComparisonViewerController:
         self._image_build_generation = 0
         self._image_build_worker: object | None = None
         self._canvas_size: tuple[int, int] | None = None
+        # Per-gene "Inspect Genes" renderer.
+        self._gene_inspector_states: dict[str, GeneInspectorState] = {}
+        self._gene_build_generation = 0
+        self._gene_build_worker: object | None = None
+        self._gene_inspector_widget = None
 
     def set_status_callback(self, fn):
         self._status_callback = fn
+
+    def set_gene_inspector_widget(self, widget):
+        self._gene_inspector_widget = widget
 
     def set_shape_keys_callback(self, fn):
         self._shape_keys_callback = fn
@@ -1119,6 +1539,7 @@ class ComparisonViewerController:
 
     def _clear_layers(self):
         self._clear_streamed_transcript_states()
+        self._clear_gene_inspector_states()
         for layer in list(self.viewer.layers):
             self.viewer.layers.remove(layer)
 
@@ -3671,6 +4092,342 @@ class ComparisonViewerController:
             "Use 'Load Full Transcripts' to bring them back."
         )
 
+    # ------------------------------------------------------------------
+    # "Inspect Genes": per-gene transcript renderer
+    # ------------------------------------------------------------------
+    def _gene_layer_name(self, ds: str, group_index: int) -> str:
+        return make_layer_name(ds, "genes", f"shape{group_index}")
+
+    def _resolve_gene_points_columns(self):
+        points_key, points_obj, x_col, y_col, assignment_col = self._resolve_points_columns()
+        gene_col = resolve_gene_column(points_obj)
+        background_col = first_existing_col(points_obj, ["background"])
+        return points_key, points_obj, x_col, y_col, assignment_col, gene_col, background_col
+
+    def open_gene_inspector(self, dataset_name: str):
+        if not self._ensure_dataset_is_active(dataset_name):
+            self._set_status(f"Could not activate dataset {dataset_name}.")
+            return
+        ds = str(dataset_name).upper()
+        try:
+            (points_key, points_obj, x_col, y_col, assignment_col, gene_col,
+             background_col) = self._resolve_gene_points_columns()
+        except Exception as exc:
+            self._set_status(f"{ds} inspect genes failed: {exc}")
+            return
+        if gene_col is None:
+            self._set_status(f"{ds} has no gene/feature-name column in points[{points_key}].")
+            return
+
+        # Tear down any prior gene inspector, then take over the transcript
+        # display by unloading the streamed density / assigned-unassigned layers.
+        self._teardown_gene_inspector(ds, restore=False)
+        self._clear_streamed_transcript_states()
+        self._remove_layers_by_prefix(layer_name_prefix(ds, "transcripts"))
+        self._remove_layers_by_prefix(layer_name_prefix(ds, "transcript_density"))
+        gc.collect()
+
+        self._gene_build_generation += 1
+        generation = self._gene_build_generation
+        max_points = int(getattr(self.args, "gene_max_render_points", DEFAULT_GENE_MAX_RENDER_POINTS))
+        random_state = int(getattr(self.args, "random_state", 42))
+        self._set_status(f"{ds} building per-gene point store for {points_key}...")
+
+        def compute():
+            t0 = time.time()
+            store = build_gene_point_groups(
+                points_obj,
+                x_col=x_col,
+                y_col=y_col,
+                gene_col=gene_col,
+                assignment_col=assignment_col,
+                background_col=background_col,
+                max_points=max_points if max_points > 0 else None,
+                random_state=random_state,
+            )
+            return {"points_key": points_key, "store": store, "build_seconds": time.time() - t0}
+
+        if thread_worker is None:
+            try:
+                payload = compute()
+            except Exception as exc:
+                self._handle_gene_inspector_build_error(generation, ds, exc)
+                return
+            self._apply_gene_inspector_build(generation, ds, payload)
+            return
+
+        worker = thread_worker(compute)()
+        worker.returned.connect(
+            lambda payload, gen=generation, d=ds: self._apply_gene_inspector_build(gen, d, payload)
+        )
+        worker.errored.connect(
+            lambda exc, gen=generation, d=ds: self._handle_gene_inspector_build_error(gen, d, exc)
+        )
+        self._gene_build_worker = worker
+        worker.start()
+
+    def _apply_gene_inspector_build(self, generation: int, ds: str, payload: dict):
+        if generation != self._gene_build_generation or self.active_dataset != ds:
+            return
+        self._gene_build_worker = None
+        store = payload["store"]
+        points_key = str(payload["points_key"])
+        if store.total_points == 0 or not store.genes:
+            self._set_status(f"{ds} inspect genes: no transcripts found.")
+            return
+
+        gene_visuals = assign_gene_visuals(store.genes)
+        hide_background = bool(getattr(self.args, "gene_hide_background", False))
+        show_controls = bool(getattr(self.args, "gene_show_controls", False))
+        spot_size = float(getattr(self.args, "gene_spot_size", DEFAULT_GENE_SPOT_SIZE))
+        enabled = {g for g in store.genes if show_controls or g not in store.control_genes}
+
+        timer = QTimer()
+        timer.setSingleShot(True)
+        state = GeneInspectorState(
+            dataset=ds,
+            points_key=points_key,
+            store=store,
+            gene_visuals=gene_visuals,
+            layer_names=[],
+            enabled_genes=enabled,
+            spot_size=spot_size,
+            hide_background=hide_background,
+            show_controls=show_controls,
+            rebuild_timer=timer,
+            pending_groups=set(),
+        )
+        timer.timeout.connect(lambda d=ds: self._flush_gene_group_rebuild(d))
+        self._gene_inspector_states[ds] = state
+
+        # Create each layer already populated with its enabled genes' points +
+        # per-point colours + symbol. Building populated (vs. empty then growing)
+        # avoids napari's data-resize path that both drops the per-point symbol
+        # back to the default disc and can reset colours to white.
+        for gi, symbol in enumerate(store.group_symbols):
+            coords, colors = self._gene_group_arrays(state, gi)
+            layer_name = self._gene_layer_name(ds, gi)
+            self._create_gene_points_layer(layer_name, symbol, spot_size, coords, colors)
+            state.layer_names.append(layer_name)
+        layer_names = state.layer_names
+
+        if self._gene_inspector_widget is not None:
+            self._gene_inspector_widget.populate(
+                ds,
+                list(store.genes),
+                gene_visuals,
+                dict(store.gene_counts),
+                set(store.control_genes),
+                set(enabled),
+                hide_background,
+                show_controls,
+                spot_size,
+            )
+            try:
+                self._gene_inspector_widget.show()
+                self._gene_inspector_widget.raise_()
+            except Exception:
+                pass
+
+        note = " (subsampled to cap)" if store.sampled else ""
+        self._set_status(
+            f"{ds} inspecting {len(store.genes)} genes ({len(store.control_genes)} controls), "
+            f"{store.total_points:,} points{note} across {len(layer_names)} shape layers; "
+            f"build {float(payload.get('build_seconds', 0.0)):.1f}s"
+        )
+        log.info(
+            "[%s] Gene inspector: genes=%s points=%s layers=%s sampled=%s build=%.1fs",
+            ds, len(store.genes), store.total_points, len(layer_names), store.sampled,
+            float(payload.get("build_seconds", 0.0)),
+        )
+
+    def _handle_gene_inspector_build_error(self, generation: int, ds: str, exc):
+        if generation != self._gene_build_generation:
+            return
+        self._gene_build_worker = None
+        message = exc[1] if isinstance(exc, tuple) and len(exc) > 1 else exc
+        self._set_status(f"{ds} inspect genes failed: {message}")
+        log.error("[%s] Gene inspector build failed: %s", ds, message)
+
+    def _gene_group_arrays(self, state: GeneInspectorState, gi: int):
+        """Concatenate the enabled genes' point + colour ranges for one group."""
+        store = state.store
+        gcoords = store.group_coords[gi]
+        gcolors = store.group_colors[gi]
+        coord_slices: list[np.ndarray] = []
+        color_slices: list[np.ndarray] = []
+        for gene in state.enabled_genes:
+            entry = store.gene_offsets.get(gene)
+            if entry is None or entry[0] != gi:
+                continue
+            _g, fg_start, fg_end, bg_end = entry
+            end = fg_end if state.hide_background else bg_end
+            if end > fg_start:
+                coord_slices.append(gcoords[fg_start:end])
+                color_slices.append(gcolors[fg_start:end])
+        if coord_slices:
+            return np.concatenate(coord_slices, axis=0), np.concatenate(color_slices, axis=0)
+        return np.empty((0, 2), dtype=np.float32), np.empty((0, 4), dtype=np.float32)
+
+    def _create_gene_points_layer(self, name, symbol, spot_size, coords, colors):
+        """Add a Points layer pre-populated with data + per-point colour + symbol."""
+        kwargs = dict(name=name, size=float(spot_size), opacity=1.0, visible=True, symbol=str(symbol))
+        try:
+            layer = self.viewer.add_points(coords, face_color=colors, border_color=colors, **kwargs)
+        except TypeError:
+            layer = self.viewer.add_points(coords, face_color=colors, edge_color=colors, **kwargs)
+        for attr, value in (("antialiasing", 0), ("border_width", 0.0), ("symbol", str(symbol))):
+            try:
+                setattr(layer, attr, value)
+            except Exception:
+                pass
+        return layer
+
+    def _set_gene_layer_data(self, layer, coords, colors, symbol):
+        layer.data = coords
+        if len(coords):
+            try:
+                layer.face_color = colors
+            except Exception:
+                pass
+            try:
+                layer.border_color = colors
+            except (AttributeError, TypeError):
+                try:
+                    layer.edge_color = colors
+                except Exception:
+                    pass
+            # Re-apply the symbol: changing ``data`` resets the per-point symbol
+            # array back to the default disc, so it must be re-broadcast here.
+            try:
+                layer.symbol = str(symbol)
+            except Exception:
+                pass
+
+    def _rebuild_gene_group_layers(self, state: GeneInspectorState, group_indices=None):
+        store = state.store
+        if group_indices is None:
+            group_indices = range(len(store.group_symbols))
+        for gi in group_indices:
+            if gi < 0 or gi >= len(state.layer_names):
+                continue
+            layer = self._get_layer_by_name(state.layer_names[gi])
+            if layer is None:
+                continue
+            coords, colors = self._gene_group_arrays(state, gi)
+            self._set_gene_layer_data(layer, coords, colors, store.group_symbols[gi])
+
+    def _schedule_gene_group_rebuild(self, state: GeneInspectorState, group_index: int):
+        if state.pending_groups is None:
+            state.pending_groups = set()
+        state.pending_groups.add(int(group_index))
+        if state.rebuild_timer is not None:
+            state.rebuild_timer.start(GENE_REBUILD_DEBOUNCE_MS)
+        else:
+            self._rebuild_gene_group_layers(state, group_indices={int(group_index)})
+
+    def _flush_gene_group_rebuild(self, ds: str):
+        state = self._gene_inspector_states.get(str(ds).upper())
+        if state is None:
+            return
+        groups = state.pending_groups or set()
+        state.pending_groups = set()
+        self._rebuild_gene_group_layers(state, group_indices=sorted(groups) if groups else None)
+
+    def set_gene_visible(self, dataset_name: str, gene: str, on: bool):
+        state = self._gene_inspector_states.get(str(dataset_name).upper())
+        if state is None:
+            return
+        gene = str(gene)
+        entry = state.store.gene_offsets.get(gene)
+        if entry is None:
+            return
+        if on:
+            state.enabled_genes.add(gene)
+        else:
+            state.enabled_genes.discard(gene)
+        self._schedule_gene_group_rebuild(state, entry[0])
+
+    def set_all_genes_visible(self, dataset_name: str, on: bool):
+        state = self._gene_inspector_states.get(str(dataset_name).upper())
+        if state is None:
+            return
+        store = state.store
+        if on:
+            state.enabled_genes = {
+                g for g in store.genes if state.show_controls or g not in store.control_genes
+            }
+        else:
+            state.enabled_genes = set()
+        self._rebuild_gene_group_layers(state, group_indices=None)
+
+    def set_gene_spot_size(self, dataset_name: str, size: float):
+        state = self._gene_inspector_states.get(str(dataset_name).upper())
+        if state is None:
+            return
+        state.spot_size = float(size)
+        for name in state.layer_names:
+            layer = self._get_layer_by_name(name)
+            if layer is not None:
+                try:
+                    layer.size = float(size)
+                except Exception:
+                    pass
+
+    def set_gene_hide_background(self, dataset_name: str, on: bool):
+        state = self._gene_inspector_states.get(str(dataset_name).upper())
+        if state is None:
+            return
+        state.hide_background = bool(on)
+        self._rebuild_gene_group_layers(state, group_indices=None)
+
+    def set_gene_show_controls(self, dataset_name: str, on: bool):
+        state = self._gene_inspector_states.get(str(dataset_name).upper())
+        if state is None:
+            return
+        state.show_controls = bool(on)
+        if not on:
+            # Turning controls off hides any control genes that were enabled.
+            state.enabled_genes -= set(state.store.control_genes)
+            self._rebuild_gene_group_layers(state, group_indices=None)
+
+    def close_gene_inspector(self, dataset_name: str):
+        ds = str(dataset_name).upper()
+        had = ds in self._gene_inspector_states
+        self._teardown_gene_inspector(ds, restore=had and self.active_dataset == ds)
+        if had:
+            self._set_status(f"{ds} closed gene inspector; restored transcript view.")
+
+    def _teardown_gene_inspector(self, ds: str, restore: bool):
+        ds = str(ds).upper()
+        # Cancel any in-flight build so a stale result cannot install layers.
+        self._gene_build_generation += 1
+        self._gene_build_worker = None
+        state = self._gene_inspector_states.pop(ds, None)
+        if state is not None and state.rebuild_timer is not None:
+            try:
+                state.rebuild_timer.stop()
+            except Exception:
+                pass
+        self._remove_layers_by_prefix(layer_name_prefix(ds, "genes"))
+        if self._gene_inspector_widget is not None and self._gene_inspector_widget.dataset == ds:
+            self._gene_inspector_widget.clear()
+        if restore:
+            self._load_startup_transcripts()
+
+    def _clear_gene_inspector_states(self):
+        self._gene_build_generation += 1
+        self._gene_build_worker = None
+        for state in list(self._gene_inspector_states.values()):
+            if state.rebuild_timer is not None:
+                try:
+                    state.rebuild_timer.stop()
+                except Exception:
+                    pass
+        self._gene_inspector_states.clear()
+        if self._gene_inspector_widget is not None:
+            self._gene_inspector_widget.clear()
+
     def load_images_on_demand(self, dataset_name: str):
         if self.args.skip_images:
             self._set_status("Image loading disabled (--skip-images).")
@@ -4015,6 +4772,28 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--point-size", default=2.0, type=float, help="Napari point size for transcript layers")
     parser.add_argument("--point-opacity", default=0.50, type=float, help="Napari point opacity")
+    parser.add_argument(
+        "--gene-spot-size",
+        default=DEFAULT_GENE_SPOT_SIZE,
+        type=float,
+        help="Initial world-micron spot size for the Inspect Genes per-gene renderer",
+    )
+    parser.add_argument(
+        "--gene-max-render-points",
+        default=DEFAULT_GENE_MAX_RENDER_POINTS,
+        type=int,
+        help="Cap on total per-gene points rendered at once; above this the store is uniformly subsampled",
+    )
+    parser.add_argument(
+        "--gene-hide-background",
+        action="store_true",
+        help="Start the Inspect Genes view with background (unassigned) spots hidden",
+    )
+    parser.add_argument(
+        "--gene-show-controls",
+        action="store_true",
+        help="Start the Inspect Genes view with control/blank probes shown",
+    )
     parser.add_argument("--shape-edge-width", default=0.75, type=float, help="Shape layer edge width")
     parser.add_argument("--shape-opacity", default=0.95, type=float, help="Shape layer edge alpha")
     parser.add_argument("--shape-centroid-size", default=1.0, type=float, help="Point size for centroid segmentation rendering")
@@ -4137,6 +4916,7 @@ def main():
         load_full_transcripts_callback=controller.load_full_transcripts,
         set_transcript_view_percent_callback=controller.set_transcript_view_percent,
         unload_transcripts_callback=controller.unload_transcripts,
+        inspect_genes_callback=controller.open_gene_inspector,
         load_images_callback=controller.load_images_on_demand,
         load_cellpose_values_callback=controller.load_cellpose_value_overlay,
         remove_cellpose_values_callback=controller.remove_cellpose_value_overlay,
@@ -4151,10 +4931,29 @@ def main():
         skip_images=args.skip_images,
         transcript_view_percent=args.transcript_view_percent,
     )
+    gene_inspector = GeneInspectorWidget(
+        close_callback=controller.close_gene_inspector,
+        set_gene_visible_callback=controller.set_gene_visible,
+        set_all_genes_callback=controller.set_all_genes_visible,
+        set_spot_size_callback=controller.set_gene_spot_size,
+        set_hide_background_callback=controller.set_gene_hide_background,
+        set_show_controls_callback=controller.set_gene_show_controls,
+        spot_size=args.gene_spot_size,
+        hide_background=args.gene_hide_background,
+        show_controls=args.gene_show_controls,
+    )
     controller.set_status_callback(switcher.set_status)
     controller.set_shape_keys_callback(switcher.set_shape_keys)
     controller.set_cellpose_value_options_callback(switcher.set_cellpose_value_options)
-    viewer.window.add_dock_widget(switcher, area="right", name="Dataset Switcher")
+    controller.set_gene_inspector_widget(gene_inspector)
+    switcher_dock = viewer.window.add_dock_widget(switcher, area="right", name="Dataset Switcher")
+    gene_dock = viewer.window.add_dock_widget(gene_inspector, area="right", name="Gene Inspector")
+    # Tab the two right-side docks together and keep the switcher in front.
+    try:
+        viewer.window._qt_window.tabifyDockWidget(switcher_dock, gene_dock)
+        switcher_dock.raise_()
+    except Exception:
+        pass
 
     controller.load_dataset(initial_dataset, force=True)
     napari.run()
