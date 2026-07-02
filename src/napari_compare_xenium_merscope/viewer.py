@@ -64,7 +64,7 @@ except ImportError:
     sys.exit(1)
 
 try:
-    from qtpy.QtCore import Qt, QTimer
+    from qtpy.QtCore import Qt, QTimer, Signal
     from qtpy.QtWidgets import (
         QAbstractItemView,
         QComboBox,
@@ -193,6 +193,7 @@ class StreamedTranscriptLayerState:
     updating: bool = False
     pending: bool = False
     worker: object | None = None
+    camera_callback: object | None = None
 
 
 FAST_DEFAULT_MAX_TRANSCRIPTS = 200_000
@@ -547,6 +548,11 @@ def transparent_colormap(name: str, color, alpha: float = 1.0) -> Colormap:
 class DatasetSwitcherWidget(QWidget):
     """Dock widget with dataset controls and on-demand layer loading controls."""
 
+    # Thread-safe status updates: heavy work runs in napari thread_workers that
+    # call ``set_status`` from a background thread. Routing every update through a
+    # Qt signal marshals the actual widget mutation back onto the GUI thread.
+    status_message = Signal(str)
+
     def __init__(
         self,
         datasets: list[str],
@@ -654,6 +660,7 @@ class DatasetSwitcherWidget(QWidget):
 
         self._status_label = QLabel("Ready")
         self._status_label.setWordWrap(True)
+        self.status_message.connect(self._on_status_message)
 
         content = QWidget()
         root = QVBoxLayout()
@@ -724,6 +731,10 @@ class DatasetSwitcherWidget(QWidget):
         return str(self._dataset_combo.currentText())
 
     def set_status(self, text: str):
+        # Safe to call from any thread; the queued signal hops to the GUI thread.
+        self.status_message.emit(str(text))
+
+    def _on_status_message(self, text: str):
         self._status_label.setText(str(text))
 
     def set_shape_keys(self, keys: list[str]):
@@ -975,6 +986,12 @@ class ComparisonViewerController:
         self._streamed_transcript_states: dict[str, StreamedTranscriptLayerState] = {}
         self._cellpose_value_generation = 0
         self._cellpose_value_worker: object | None = None
+        # Background build bookkeeping for the heavy transcript / label pipelines
+        # that now run in napari thread_workers so the UI stays responsive.
+        self._transcript_build_generation = 0
+        self._transcript_build_worker: object | None = None
+        self._label_build_generation = 0
+        self._label_build_worker: object | None = None
 
     def set_status_callback(self, fn):
         self._status_callback = fn
@@ -1032,12 +1049,28 @@ class ComparisonViewerController:
             self.viewer.layers.remove(layer)
 
     def _clear_streamed_transcript_states(self):
+        # Invalidate any in-flight background transcript build so a stale result
+        # cannot install layers/state after the dataset was cleared.
+        self._transcript_build_generation += 1
+        self._transcript_build_worker = None
         for state in list(self._streamed_transcript_states.values()):
             try:
                 state.timer.stop()
             except Exception:
                 pass
+            self._disconnect_transcript_camera_callback(state)
         self._streamed_transcript_states.clear()
+
+    def _disconnect_transcript_camera_callback(self, state: StreamedTranscriptLayerState):
+        callback = getattr(state, "camera_callback", None)
+        if callback is None:
+            return
+        for events in (self.viewer.camera.events.zoom, self.viewer.camera.events.center):
+            try:
+                events.disconnect(callback)
+            except Exception:
+                pass
+        state.camera_callback = None
 
     def _resolve_optional_transform_paths(self, ds: str, cfg: DatasetConfig) -> tuple[Path | None, Path | None]:
         """Resolve optional transform/spec paths from explicit args or common defaults."""
@@ -2210,10 +2243,16 @@ class ComparisonViewerController:
         )
         return cache_key
 
-    def _add_label_layer(self, label_key: str, layer_dataset: str | None = None) -> int:
+    def _prepare_label_outline_display(self, label_key: str) -> dict[str, object] | None:
+        """Build/refresh the outline pyramid and gather display data (thread-safe).
+
+        This does the heavy work (outline pyramid build + zarr I/O + lazy scale
+        reads) but performs no napari layer operations, so it is safe to call
+        from a worker thread. Pair it with :meth:`_finish_label_layer` on the GUI
+        thread.
+        """
         if self._active_sdata is None or self.active_dataset is None:
-            return 0
-        ds = layer_dataset or self.active_dataset
+            return None
         if label_key not in self._active_sdata.labels:
             if not self._refresh_label_key_from_store(label_key):
                 raise KeyError(f"Label key '{label_key}' not found in current dataset.")
@@ -2235,38 +2274,58 @@ class ComparisonViewerController:
             raise ValueError(f"Expected 2D cached outlines for {display_label_key}, got shape {getattr(data, 'shape', None)}")
 
         napari_affine = self._napari_affine_from_element(label_elem)
+        outline_levels = [level_data for _scale_name, level_data in label_scale_levels]
+        outline_data = outline_levels if len(outline_levels) > 1 else outline_levels[0]
+        return {
+            "display_label_key": display_label_key,
+            "napari_affine": napari_affine,
+            "outline_data": outline_data,
+            "n_levels": len(outline_levels),
+            "outline_width": outline_width,
+            "base_shape": tuple(int(x) for x in data.shape),
+            "base_dtype": getattr(data, "dtype", "unknown"),
+        }
+
+    def _finish_label_layer(self, ds: str, label_key: str, prepared: dict[str, object] | None) -> int:
+        """Add the prepared label outline layer to the viewer (GUI thread only)."""
+        if prepared is None:
+            return 0
+        n_levels = int(prepared["n_levels"])
         layer_name = make_layer_name(ds, "labels", label_key)
         self._remove_layer_by_name(layer_name)
-        outline_levels = [level_data for _scale_name, level_data in label_scale_levels]
-        pyramid_source = "cache"
-        outline_data = outline_levels if len(outline_levels) > 1 else outline_levels[0]
         layer_color = np.asarray(stable_layer_color(label_key, alpha=1.0), dtype=np.float32)
         color_map = transparent_colormap(f"{label_key}_outline", layer_color, alpha=float(self.args.shape_opacity))
 
         self.viewer.add_image(
-            outline_data,
+            prepared["outline_data"],
             name=layer_name,
-            affine=napari_affine,
+            affine=prepared["napari_affine"],
             colormap=color_map,
             contrast_limits=(0.0, 1.0),
             interpolation2d="nearest",
-            multiscale=len(outline_levels) > 1,
+            multiscale=n_levels > 1,
             opacity=self.args.shape_opacity,
             blending="additive",
             visible=not self.args.hide_shapes,
         )
         log.info(
-            "[%s] Added label outline layer %s from cache=%s shape=%s dtype=%s levels=%s width=%s source=%s",
+            "[%s] Added label outline layer %s from cache=%s shape=%s dtype=%s levels=%s width=%s source=cache",
             ds,
             label_key,
-            display_label_key,
-            tuple(int(x) for x in data.shape),
-            getattr(data, "dtype", "unknown"),
-            len(outline_levels),
-            outline_width,
-            pyramid_source,
+            prepared["display_label_key"],
+            prepared["base_shape"],
+            prepared["base_dtype"],
+            n_levels,
+            prepared["outline_width"],
         )
         return 1
+
+    def _add_label_layer(self, label_key: str, layer_dataset: str | None = None) -> int:
+        if self._active_sdata is None or self.active_dataset is None:
+            return 0
+        ds = layer_dataset or self.active_dataset
+        prepared = self._prepare_label_outline_display(label_key)
+        return self._finish_label_layer(ds, label_key, prepared)
 
     def _add_shape_layers(self, ds: str, sdata) -> dict[str, int]:
         total_layers = 0
@@ -2679,29 +2738,83 @@ class ComparisonViewerController:
 
         ds = self.active_dataset
         points_key, points_obj, x_col, y_col, assignment_col = self._resolve_points_columns()
+        # _clear_streamed_transcript_states() bumps the build generation, so
+        # capture the new generation afterwards.
         self._clear_streamed_transcript_states()
         self._remove_layers_by_prefix(layer_name_prefix(ds, "transcripts"))
         self._remove_layers_by_prefix(layer_name_prefix(ds, "transcript_density"))
         gc.collect()
 
-        density_cache_key, density_attrs = self._ensure_transcript_density_cache(
-            points_key,
-            points_obj,
-            x_col,
-            y_col,
-            assignment_col,
+        resolved_view_percent = (
+            int(self.args.transcript_view_percent) if view_percent is None else int(view_percent)
         )
-        density_layer_names = self._add_transcript_density_layers(density_cache_key, density_attrs)
+        self._transcript_build_generation += 1
+        generation = self._transcript_build_generation
+        self._set_status(f"{ds} building transcript density + detail index for {points_key}...")
 
-        self._set_status(f"{ds} building transcript point detail index for {points_key}...")
-        point_index = build_transcript_spatial_index(
-            points_obj,
-            x_col=x_col,
-            y_col=y_col,
-            assignment_col=assignment_col,
-            max_points=int(self.args.transcript_index_max_points),
-            tile_um=float(self.args.transcript_index_tile_um),
-            random_state=int(self.args.random_state),
+        def compute():
+            # Heavy: builds/persists the density pyramid and the in-memory point
+            # index. Runs on a worker thread; only pure data is returned so the
+            # napari layer creation can happen back on the GUI thread.
+            t0 = time.time()
+            density_cache_key, density_attrs = self._ensure_transcript_density_cache(
+                points_key,
+                points_obj,
+                x_col,
+                y_col,
+                assignment_col,
+            )
+            self._set_status(f"{ds} building transcript point detail index for {points_key}...")
+            point_index = build_transcript_spatial_index(
+                points_obj,
+                x_col=x_col,
+                y_col=y_col,
+                assignment_col=assignment_col,
+                max_points=int(self.args.transcript_index_max_points),
+                tile_um=float(self.args.transcript_index_tile_um),
+                random_state=int(self.args.random_state),
+            )
+            return {
+                "points_key": points_key,
+                "density_cache_key": density_cache_key,
+                "density_attrs": density_attrs,
+                "point_index": point_index,
+                "view_percent": resolved_view_percent,
+                "build_seconds": time.time() - t0,
+            }
+
+        if thread_worker is None:
+            try:
+                payload = compute()
+            except Exception as exc:
+                self._handle_streamed_transcript_build_error(generation, ds, exc)
+                return {"total": 0, "assigned": 0, "unassigned": 0, "streamed": True}
+            self._apply_streamed_transcripts_build(generation, ds, payload)
+            return {"total": 0, "assigned": 0, "unassigned": 0, "streamed": True}
+
+        worker_factory = thread_worker(compute)
+        worker = worker_factory()
+        worker.returned.connect(
+            lambda payload, gen=generation, d=ds: self._apply_streamed_transcripts_build(gen, d, payload)
+        )
+        worker.errored.connect(
+            lambda exc, gen=generation, d=ds: self._handle_streamed_transcript_build_error(gen, d, exc)
+        )
+        self._transcript_build_worker = worker
+        worker.start()
+        return {"total": 0, "assigned": 0, "unassigned": 0, "streamed": True}
+
+    def _apply_streamed_transcripts_build(self, generation: int, ds: str, payload: dict[str, object]):
+        if generation != self._transcript_build_generation or self.active_dataset != ds:
+            return
+        self._transcript_build_worker = None
+
+        points_key = str(payload["points_key"])
+        density_cache_key = str(payload["density_cache_key"])
+        point_index = payload["point_index"]
+        density_layer_names = self._add_transcript_density_layers(
+            density_cache_key,
+            payload["density_attrs"],
         )
 
         assigned_layer_name = make_layer_name(ds, "transcripts", "assigned")
@@ -2731,14 +2844,16 @@ class ComparisonViewerController:
             assigned_layer_name=assigned_layer_name,
             unassigned_layer_name=unassigned_layer_name,
             timer=timer,
-            view_percent=self.args.transcript_view_percent if view_percent is None else int(view_percent),
+            view_percent=int(payload["view_percent"]),
             point_index=point_index,
             density_layer_names=density_layer_names,
         )
-        self._streamed_transcript_states[state_key] = state
 
         def schedule(_event=None, key=state_key):
             self._schedule_streamed_transcript_update(key)
+
+        state.camera_callback = schedule
+        self._streamed_transcript_states[state_key] = state
 
         try:
             self.viewer.camera.events.zoom.connect(schedule)
@@ -2748,15 +2863,24 @@ class ComparisonViewerController:
 
         self._schedule_streamed_transcript_update(state_key, delay_ms=0)
         log.info(
-            "[%s] Added hybrid transcript layers from points[%s] density_cache=%s viewport_percent=%s detail_max_points=%s indexed=%s",
+            "[%s] Added hybrid transcript layers from points[%s] density_cache=%s viewport_percent=%s "
+            "detail_max_points=%s indexed=%s build=%.1fs",
             ds,
             points_key,
             density_cache_key,
             state.view_percent,
             self.args.transcript_detail_max_points,
             0 if point_index is None else point_index.indexed_rows,
+            float(payload.get("build_seconds", 0.0)),
         )
-        return {"total": 0, "assigned": 0, "unassigned": 0, "streamed": True}
+
+    def _handle_streamed_transcript_build_error(self, generation: int, ds: str, exc):
+        if generation != self._transcript_build_generation:
+            return
+        self._transcript_build_worker = None
+        message = exc[1] if isinstance(exc, tuple) and len(exc) > 1 else exc
+        self._set_status(f"{ds} transcript build failed: {message}")
+        log.error("[%s] Transcript density/index build failed: %s", ds, message)
 
     def _add_transcripts_layer(self, cap: int | None) -> dict[str, int]:
         if self._active_sdata is None or self.active_dataset is None:
@@ -2837,27 +2961,84 @@ class ComparisonViewerController:
             self._set_status(f"Could not activate dataset {dataset_name}.")
             return
 
-        added_layers = 0
-        total_labels = 0
+        ds = self.active_dataset
+        keys = [str(k) for k in shape_keys]
+        if not keys:
+            self._set_status("No segmentation selected.")
+            return
+
+        self._label_build_generation += 1
+        generation = self._label_build_generation
         mem_before = memory_snapshot_gb()
-        for key in shape_keys:
-            if self._segmentation_source() == "labels" and key in self._active_sdata.labels:
-                label_key = key
-            else:
-                label_key = self.ensure_label_for_shape_key(key)
-            added = self._add_label_layer(label_key)
+        self._set_status(
+            f"{ds} building label outline layer(s) for {len(keys)} segmentation(s)..."
+        )
+
+        def compute():
+            # Heavy: rasterizes shapes to labels (first run) and builds the
+            # outline pyramid, both with zarr I/O. Returns display-ready specs;
+            # the napari layers are added on the GUI thread in the apply step.
+            t0 = time.time()
+            specs: list[dict[str, object]] = []
+            total_labels = 0
+            for key in keys:
+                if self._segmentation_source() == "labels" and key in self._active_sdata.labels:
+                    label_key = key
+                else:
+                    label_key = self.ensure_label_for_shape_key(key)
+                prepared = self._prepare_label_outline_display(label_key)
+                try:
+                    n_labels = int(len(self._active_sdata.shapes[key]))
+                except Exception:
+                    n_labels = 1
+                specs.append({"label_key": label_key, "prepared": prepared, "n_labels": n_labels})
+                total_labels += n_labels
+            return {"specs": specs, "total_labels": total_labels, "build_seconds": time.time() - t0}
+
+        if thread_worker is None:
+            try:
+                payload = compute()
+            except Exception as exc:
+                self._handle_label_build_error(generation, ds, mem_before, exc)
+                return
+            self._apply_label_build(generation, ds, mem_before, payload)
+            return
+
+        worker_factory = thread_worker(compute)
+        worker = worker_factory()
+        worker.returned.connect(
+            lambda payload, gen=generation, d=ds, mb=mem_before: self._apply_label_build(gen, d, mb, payload)
+        )
+        worker.errored.connect(
+            lambda exc, gen=generation, d=ds, mb=mem_before: self._handle_label_build_error(gen, d, mb, exc)
+        )
+        self._label_build_worker = worker
+        worker.start()
+
+    def _apply_label_build(self, generation: int, ds: str, mem_before: dict[str, float], payload: dict[str, object]):
+        if generation != self._label_build_generation or self.active_dataset != ds:
+            return
+        self._label_build_worker = None
+        added_layers = 0
+        for spec in payload["specs"]:
+            added = self._finish_label_layer(ds, str(spec["label_key"]), spec["prepared"])
             if added > 0:
                 added_layers += 1
-                try:
-                    total_labels += int(len(self._active_sdata.shapes[key]))
-                except Exception:
-                    total_labels += 1
-
         mem_after = memory_snapshot_gb()
         self._set_status(
-            f"{self.active_dataset} loaded label outline layer(s)={added_layers}, "
-            f"labels={total_labels:,} | RSS {mem_before['rss_gb']:.1f}->{mem_after['rss_gb']:.1f} GB"
+            f"{ds} loaded label outline layer(s)={added_layers}, "
+            f"labels={int(payload['total_labels']):,} | "
+            f"RSS {mem_before['rss_gb']:.1f}->{mem_after['rss_gb']:.1f} GB "
+            f"(build={float(payload.get('build_seconds', 0.0)):.1f}s)"
         )
+
+    def _handle_label_build_error(self, generation: int, ds: str, mem_before: dict[str, float], exc):
+        if generation != self._label_build_generation:
+            return
+        self._label_build_worker = None
+        message = exc[1] if isinstance(exc, tuple) and len(exc) > 1 else exc
+        self._set_status(f"{ds} label outline build failed: {message}")
+        log.error("[%s] Label outline build failed: %s", ds, message)
 
     def _ensure_cellpose_label_key(self) -> str:
         if self._active_sdata is None or self.active_dataset is None:
@@ -3107,16 +3288,9 @@ class ComparisonViewerController:
             return
         if view_percent is not None:
             self.args.transcript_view_percent = int(view_percent)
+        # The build now runs on a worker thread; status is driven by the build /
+        # apply callbacks, so we intentionally do not overwrite it here.
         self._add_streamed_transcripts_layer(view_percent=view_percent)
-        mode = (
-            "auto"
-            if int(self.args.transcript_view_percent) <= 0
-            else f"{int(self.args.transcript_view_percent)}%"
-        )
-        self._set_status(
-            f"{self.active_dataset} enabled transcript density + indexed detail ({mode}); "
-            f"detail max points={int(self.args.transcript_detail_max_points):,}."
-        )
 
     def load_images_on_demand(self, dataset_name: str):
         if self.args.skip_images:
