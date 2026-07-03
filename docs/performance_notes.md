@@ -18,13 +18,15 @@ slowness were addressed:
 All heavy builds now run in `napari` `thread_worker`s and only touch napari
 layers back on the GUI thread:
 
-- transcript density pyramid + in-memory point index build,
+- per-gene transcript point-store build,
 - label rasterization + label-outline pyramid build,
 - image pyramid build,
 - Cellpose value-overlay label prep + pyramid build + colour mapping.
 
-Status updates from worker threads are marshalled to the GUI thread via a Qt
-signal (`DatasetSwitcherWidget.status_message`).
+Status/progress updates from worker threads are marshalled to the GUI thread via
+Qt signals (`ViewerControlPanel.status_message` / `ViewerControlPanel.progress_message`).
+A busy progress bar with a stage label below the tabs shows which stage is
+running (image pyramids, cell masks, transcripts, …).
 
 ### Materialized pyramids (smooth pan/zoom)
 
@@ -37,22 +39,18 @@ caches, rechunked to ~1024² tiles:
 - images: mean-downsampled (`_napari_compare_imgpyr__<key>__ds<N>`),
 - label value overlays: max-pooled so label ids survive
   (`_napari_compare_labelpyr__<key>__ds<N>`),
-- transcript density and label outlines were already materialized caches.
+- label outlines were already a materialized cache.
 
 The full-resolution base is reused as level 0 (never duplicated), so a pyramid
 adds only a fraction of the base size (~8 GB at 4x downsample for the reference
 MERSCOPE element). Builds are one-time and cached; rebuild with
 `--overwrite-derived-caches`.
 
-Density build also switched from `np.add.at` to `np.bincount` (10-50x faster),
-producing bit-identical output.
-
 ## Relevant flags
 
-- `--transcripts-mode {streamed,capped}` (default `streamed`): stream the full
-  transcript density + viewport detail on load instead of a fixed capped sample.
-- `--transcript-density-contrast-max FLOAT` (default 8.0): upper contrast limit
-  for transcript density layers; lower = brighter.
+- `--skip-images` / `--skip-cellpose` / `--skip-proseg` / `--skip-transcripts`:
+  suppress the *startup* auto-load of that layer type (load it manually from its
+  tab afterwards) — useful on low-RAM systems.
 - `--image-pyramid-downsample INT` (default 4): downsample step between
   materialized image/label pyramid levels; 2 is smoothest but ~5x larger on disk.
 - `--visible-channels "DAPI,PolyT"`: channels visible by default on image load
@@ -61,10 +59,6 @@ producing bit-identical output.
   caches even when matching cache metadata exists.
 - `--gl-core-profile` (experimental): request an OpenGL 4.1 core context instead
   of the macOS default legacy 2.1 context; see below.
-
-The "Unload Transcripts" button in the dock fully tears down the streamed
-transcript state so pan/zoom cannot bring the layers back (previously, deleting
-the layers by hand left the camera callbacks alive and they reappeared).
 
 ## Environment / GPU
 
@@ -91,12 +85,10 @@ carry regression risk. Revisit if a specific interaction still feels heavy.
    current baseline before committing. `qtpy` already abstracts the binding, so
    the code should not need changes.
 
-3. **Points layer tuning.** The streamed transcript *detail points* are capped
-   (default 300k) and currently render fine. If they ever feel heavy at extreme
-   counts, set `layer.antialiasing = 0` and drop per-point borders on the
-   assigned/unassigned point layers (`_add_points_layer`). Note this slightly
-   changes point appearance (hard-edged, no border), so it is a deliberate
-   trade-off, not a free win.
+3. **Points layer tuning.** The per-gene transcript points already render with
+   `antialiasing = 0` and no per-point border (`_create_gene_points_layer`) so
+   that tens of millions of points stay responsive. If they ever feel heavy at
+   extreme counts, lower `--gene-max-render-points` to uniformly subsample.
 
 4. **Persisted label pyramid for outlines.** The label *outline* cache is
    already materialized, but building it from a single-scale 12-gigapixel label

@@ -40,7 +40,7 @@ but does not compute depth values for cells inside them.
 
 ## Step 2: Create Drawing Layers
 
-1. In the right-side dock, find **Cortical Depth Annotations**.
+1. In the right-side dock, open the **Draw tissue annotations** tab.
 2. Click **Create Drawing Layers**.
 3. The viewer creates editable layers for `pia`, `wm`, `side`, `exclusion`, and
    `ribbon`.
