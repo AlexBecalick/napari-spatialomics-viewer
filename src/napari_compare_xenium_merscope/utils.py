@@ -1674,15 +1674,22 @@ class GenePointStore:
     group_colors: list[np.ndarray]           # each (M, 4) float32 RGBA
     # gene -> (group_index, fg_start, fg_end, bg_end) relative to that group.
     gene_offsets: dict[str, tuple[int, int, int, int]]
-    gene_counts: dict[str, int]              # total (fg + bg) points per gene
+    gene_counts: dict[str, int]              # rendered total (fg + bg) points per gene
     genes: list[str]                         # alphabetical (real genes + controls)
     control_genes: set[str]
-    total_points: int
+    total_points: int                        # rendered point count
     sampled: bool = False
+    source_gene_counts: dict[str, int] | None = None
+    source_total_points: int | None = None
 
     def gene_symbol(self, gene: str) -> str | None:
         entry = self.gene_offsets.get(str(gene))
         return None if entry is None else self.group_symbols[entry[0]]
+
+    def full_gene_count(self, gene: str) -> int:
+        """Return the source-dataset count for ``gene`` when available."""
+        counts = self.source_gene_counts if self.source_gene_counts is not None else self.gene_counts
+        return int(counts.get(str(gene), 0))
 
 
 def _empty_gene_point_store() -> GenePointStore:
@@ -1696,6 +1703,8 @@ def _empty_gene_point_store() -> GenePointStore:
         control_genes=set(),
         total_points=0,
         sampled=False,
+        source_gene_counts={},
+        source_total_points=0,
     )
 
 
@@ -1756,6 +1765,11 @@ def build_gene_point_groups(
     bg = np.concatenate(bg_parts)
     del xs, ys, gene_parts, bg_parts
     total_source = int(x.shape[0])
+    source_names, source_counts = np.unique(gene, return_counts=True)
+    source_gene_counts = {
+        str(name): int(count)
+        for name, count in zip(source_names.tolist(), source_counts.tolist(), strict=True)
+    }
 
     sampled = False
     if max_points is not None and 0 < int(max_points) < total_source:
@@ -1842,6 +1856,8 @@ def build_gene_point_groups(
         control_genes=control_genes,
         total_points=n,
         sampled=sampled,
+        source_gene_counts=source_gene_counts,
+        source_total_points=total_source,
     )
 
 

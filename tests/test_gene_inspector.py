@@ -48,6 +48,7 @@ class _FakeLayer:
         self.symbol = "disc"
         self.antialiasing = 1
         self.border_width = 0.05
+        self._pick_value = None
         self._data = np.asarray(data)
         if kw.get("symbol"):
             self.symbol = kw["symbol"]
@@ -61,10 +62,14 @@ class _FakeLayer:
         self._data = np.asarray(value)
         self.symbol = "disc"  # napari resets per-point symbol on data change
 
+    def get_value(self, _position, **_kwargs):
+        return self._pick_value
+
 
 class _FakeViewer:
     def __init__(self):
         self.layers = []
+        self.mouse_drag_callbacks = []
 
     def add_points(self, coords, name=None, **kw):
         layer = _FakeLayer(name, coords, **kw)
@@ -221,3 +226,51 @@ def test_gene_layer_names_use_marker_symbol_labels(qapp):
         f"Genes | {gene_marker_symbol_label(symbol)}"
         for symbol in store.group_symbols
     ]
+
+
+def test_clicking_transcripts_accumulates_highlights_and_empty_click_clears(qapp):
+    store = _demo_store()
+    ctrl = _controller(store, qapp)
+    messages = []
+    ctrl.set_status_callback(messages.append)
+    state = ctrl._gene_inspector_states["TEST"]
+    ctrl.set_gene_spot_size("TEST", 0.5)
+
+    aaa_layer = ctrl._get_layer_by_name(state.layer_names[store.gene_offsets["AAA"][0]])
+    bbb_layer = ctrl._get_layer_by_name(state.layer_names[store.gene_offsets["BBB"][0]])
+    aaa_layer._pick_value = 0
+    event = types.SimpleNamespace(
+        type="mouse_press",
+        position=(10.0, 1.0),
+        view_direction=None,
+        dims_displayed=(0, 1),
+    )
+
+    ctrl._on_viewer_mouse_press(ctrl.viewer, event)
+
+    assert state.highlighted_genes == ["AAA"]
+    assert "AAA: 6 counts" in messages[-1]
+    assert "Click in empty space to deselect all genes." in messages[-1]
+    assert isinstance(aaa_layer.size, np.ndarray)
+    assert aaa_layer.size.tolist() == [V.GENE_HIGHLIGHT_SPOT_SIZE] * 6
+
+    aaa_layer._pick_value = None
+    bbb_layer._pick_value = 0
+    ctrl._on_viewer_mouse_press(ctrl.viewer, event)
+
+    assert state.highlighted_genes == ["AAA", "BBB"]
+    assert "AAA: 6 counts" in messages[-1]
+    assert "BBB: 3 counts" in messages[-1]
+    assert isinstance(aaa_layer.size, np.ndarray)
+    assert aaa_layer.size.tolist() == [V.GENE_HIGHLIGHT_SPOT_SIZE] * 6
+    assert isinstance(bbb_layer.size, np.ndarray)
+    assert bbb_layer.size.tolist() == [V.GENE_HIGHLIGHT_SPOT_SIZE] * 3
+
+    aaa_layer._pick_value = None
+    bbb_layer._pick_value = None
+    ctrl._on_viewer_mouse_press(ctrl.viewer, event)
+
+    assert state.highlighted_genes == []
+    assert messages[-1] == "Click on any transcript to highlight that gene"
+    assert float(aaa_layer.size) == 0.5
+    assert float(bbb_layer.size) == 0.5
