@@ -627,6 +627,8 @@ def test_build_gene_point_groups_subsamples_when_over_cap():
     assert store.sampled
     assert store.total_points == 5
     assert sum(store.gene_counts.values()) == 5
+    assert store.source_total_points == 10
+    assert store.source_gene_counts == {"AAA": 3, "BBB": 2, "Blank-1": 1, "CCC": 4}
 
 
 def test_build_gene_point_groups_empty_input():

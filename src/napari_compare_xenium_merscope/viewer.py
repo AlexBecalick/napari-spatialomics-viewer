@@ -15,6 +15,7 @@ import argparse
 import colorsys
 import gc
 import hashlib
+import html
 import json
 import logging
 import shutil
@@ -204,14 +205,33 @@ class GeneInspectorState:
     show_controls: bool = False
     rebuild_timer: QTimer | None = None
     pending_groups: set | None = None
+    highlighted_genes: list | None = None
+    group_display_ranges: list[list[tuple[int, int, str]]] | None = None
 
 
 DEFAULT_GENE_SPOT_SIZE = 0.5
+GENE_HIGHLIGHT_SPOT_SIZE = 2.0
 GENE_SPOT_SIZE_MIN = 0.1
 GENE_SPOT_SIZE_MAX = 5.0
 GENE_SPOT_SIZE_STEP = 0.1
 DEFAULT_GENE_MAX_RENDER_POINTS = 40_000_000
 GENE_REBUILD_DEBOUNCE_MS = 60
+GENE_STATUS_SYMBOL_GLYPHS = {
+    "disc": "●",
+    "ring": "○",
+    "square": "■",
+    "diamond": "◆",
+    "cross": "+",
+    "x": "×",
+    "triangle_up": "▲",
+    "triangle_down": "▼",
+    "star": "★",
+    "arrow": "▲",
+    "tailed_arrow": "▲",
+    "hbar": "▬",
+    "vbar": "▌",
+    "clobber": "✣",
+}
 
 SYNTHETIC_IMAGE_PYRAMID_MIN_SIZE = 4096
 SYNTHETIC_IMAGE_PYRAMID_MAX_LEVELS = 10
@@ -1771,6 +1791,7 @@ class ComparisonViewerController:
         self._gene_build_generation = 0
         self._gene_build_worker: object | None = None
         self._gene_inspector_widget = None
+        self._install_gene_pick_callback()
 
     def set_status_callback(self, fn):
         self._status_callback = fn
@@ -1780,6 +1801,15 @@ class ComparisonViewerController:
 
     def set_gene_inspector_widget(self, widget):
         self._gene_inspector_widget = widget
+
+    def _install_gene_pick_callback(self):
+        callbacks = getattr(self.viewer, "mouse_drag_callbacks", None)
+        if callbacks is None:
+            return
+        try:
+            callbacks.append(self._on_viewer_mouse_press)
+        except Exception as exc:
+            log.debug("Could not install transcript pick callback: %s", exc)
 
     def set_shape_keys_callback(self, fn):
         self._shape_keys_callback = fn
@@ -3804,6 +3834,8 @@ class ComparisonViewerController:
             show_controls=show_controls,
             rebuild_timer=timer,
             pending_groups=set(),
+            highlighted_genes=[],
+            group_display_ranges=[[] for _ in store.group_symbols],
         )
         timer.timeout.connect(lambda d=ds: self._flush_gene_group_rebuild(d))
         self._gene_inspector_states[ds] = state
@@ -3813,9 +3845,10 @@ class ComparisonViewerController:
         # avoids napari's data-resize path that both drops the per-point symbol
         # back to the default disc and can reset colours to white.
         for gi, symbol in enumerate(store.group_symbols):
-            coords, colors = self._gene_group_arrays(state, gi)
+            coords, colors, sizes, ranges = self._gene_group_arrays(state, gi)
+            state.group_display_ranges[gi] = ranges
             layer_name = self._gene_layer_name(ds, symbol)
-            self._create_gene_points_layer(layer_name, symbol, spot_size, coords, colors)
+            self._create_gene_points_layer(layer_name, symbol, spot_size, coords, colors, sizes)
             state.layer_names.append(layer_name)
         layer_names = state.layer_names
 
@@ -3824,7 +3857,7 @@ class ComparisonViewerController:
                 ds,
                 list(store.genes),
                 gene_visuals,
-                dict(store.gene_counts),
+                dict(store.source_gene_counts or store.gene_counts),
                 set(store.control_genes),
                 set(enabled),
                 hide_assigned,
@@ -3838,15 +3871,11 @@ class ComparisonViewerController:
             except Exception:
                 pass
 
-        note = " (subsampled to cap)" if store.sampled else ""
-        self._set_status(
-            f"{ds} inspecting {len(store.genes)} genes ({len(store.control_genes)} controls), "
-            f"{store.total_points:,} points{note} across {len(layer_names)} shape layers; "
-            f"build {float(payload.get('build_seconds', 0.0)):.1f}s"
-        )
+        source_total = int(store.source_total_points if store.source_total_points is not None else store.total_points)
+        self._set_status("Click on any transcript to highlight that gene")
         log.info(
-            "[%s] Gene inspector: genes=%s points=%s layers=%s sampled=%s build=%.1fs",
-            ds, len(store.genes), store.total_points, len(layer_names), store.sampled,
+            "[%s] Gene inspector: genes=%s source_points=%s rendered_points=%s layers=%s sampled=%s build=%.1fs",
+            ds, len(store.genes), source_total, store.total_points, len(layer_names), store.sampled,
             float(payload.get("build_seconds", 0.0)),
         )
 
@@ -3860,30 +3889,60 @@ class ComparisonViewerController:
         log.error("[%s] Gene inspector build failed: %s", ds, message)
 
     def _gene_group_arrays(self, state: GeneInspectorState, gi: int):
-        """Concatenate the enabled genes' point + colour ranges for one group."""
+        """Concatenate enabled genes for one marker group and track click ranges."""
         store = state.store
         gcoords = store.group_coords[gi]
         gcolors = store.group_colors[gi]
         coord_slices: list[np.ndarray] = []
         color_slices: list[np.ndarray] = []
-        for gene in state.enabled_genes:
+        display_ranges: list[tuple[int, int, str]] = []
+        cursor = 0
+        for gene in store.genes:
+            if gene not in state.enabled_genes:
+                continue
             entry = store.gene_offsets.get(gene)
             if entry is None or entry[0] != gi:
                 continue
             _g, fg_start, fg_end, bg_end = entry
+            start = cursor
             if not state.hide_assigned and fg_end > fg_start:
                 coord_slices.append(gcoords[fg_start:fg_end])
                 color_slices.append(gcolors[fg_start:fg_end])
+                cursor += int(fg_end - fg_start)
             if not state.hide_background and bg_end > fg_end:
                 coord_slices.append(gcoords[fg_end:bg_end])
                 color_slices.append(gcolors[fg_end:bg_end])
+                cursor += int(bg_end - fg_end)
+            if cursor > start:
+                display_ranges.append((start, cursor, str(gene)))
         if coord_slices:
-            return np.concatenate(coord_slices, axis=0), np.concatenate(color_slices, axis=0)
-        return np.empty((0, 2), dtype=np.float32), np.empty((0, 4), dtype=np.float32)
+            coords = np.concatenate(coord_slices, axis=0)
+            colors = np.concatenate(color_slices, axis=0)
+            sizes = self._gene_group_size_array(state, len(coords), display_ranges)
+            return coords, colors, sizes, display_ranges
+        return (
+            np.empty((0, 2), dtype=np.float32),
+            np.empty((0, 4), dtype=np.float32),
+            None,
+            display_ranges,
+        )
 
-    def _create_gene_points_layer(self, name, symbol, spot_size, coords, colors):
+    def _gene_group_size_array(self, state: GeneInspectorState, n_points: int, ranges: list[tuple[int, int, str]]):
+        highlighted_genes = set(state.highlighted_genes or [])
+        if not highlighted_genes or n_points <= 0:
+            return None
+        if not any(gene in highlighted_genes for _start, _end, gene in ranges):
+            return None
+        sizes = np.full(int(n_points), float(state.spot_size), dtype=np.float32)
+        for start, end, gene in ranges:
+            if gene in highlighted_genes:
+                sizes[int(start):int(end)] = float(GENE_HIGHLIGHT_SPOT_SIZE)
+        return sizes
+
+    def _create_gene_points_layer(self, name, symbol, spot_size, coords, colors, sizes=None):
         """Add a Points layer pre-populated with data + per-point colour + symbol."""
-        kwargs = dict(name=name, size=float(spot_size), opacity=1.0, visible=True, symbol=str(symbol))
+        size = sizes if sizes is not None else float(spot_size)
+        kwargs = dict(name=name, size=size, opacity=1.0, visible=True, symbol=str(symbol))
         try:
             layer = self.viewer.add_points(coords, face_color=colors, border_color=colors, **kwargs)
         except TypeError:
@@ -3895,8 +3954,12 @@ class ComparisonViewerController:
                 pass
         return layer
 
-    def _set_gene_layer_data(self, layer, coords, colors, symbol):
+    def _set_gene_layer_data(self, layer, coords, colors, symbol, spot_size, sizes=None):
         layer.data = coords
+        try:
+            layer.size = sizes if sizes is not None else float(spot_size)
+        except Exception:
+            pass
         if len(coords):
             try:
                 layer.face_color = colors
@@ -3926,8 +3989,10 @@ class ComparisonViewerController:
             layer = self._get_layer_by_name(state.layer_names[gi])
             if layer is None:
                 continue
-            coords, colors = self._gene_group_arrays(state, gi)
-            self._set_gene_layer_data(layer, coords, colors, store.group_symbols[gi])
+            coords, colors, sizes, ranges = self._gene_group_arrays(state, gi)
+            if state.group_display_ranges is not None and gi < len(state.group_display_ranges):
+                state.group_display_ranges[gi] = ranges
+            self._set_gene_layer_data(layer, coords, colors, store.group_symbols[gi], state.spot_size, sizes)
 
     def _schedule_gene_group_rebuild(self, state: GeneInspectorState, group_index: int):
         if state.pending_groups is None:
@@ -3946,6 +4011,168 @@ class ComparisonViewerController:
         state.pending_groups = set()
         self._rebuild_gene_group_layers(state, group_indices=sorted(groups) if groups else None)
 
+    def _on_viewer_mouse_press(self, _viewer, event):
+        event_type = str(getattr(event, "type", "mouse_press"))
+        if "press" not in event_type:
+            return
+        if self.active_dataset is None:
+            return
+        state = self._gene_inspector_states.get(str(self.active_dataset).upper())
+        if state is None:
+            return
+        gene = self._pick_gene_from_event(state, event)
+        if gene is None:
+            if state.highlighted_genes:
+                self._clear_highlighted_genes(state)
+            return
+        self._add_highlighted_gene(state, gene)
+
+    def _pick_gene_from_event(self, state: GeneInspectorState, event) -> str | None:
+        if state.group_display_ranges is None:
+            return None
+        # Later layers are visually on top, so query in reverse display order.
+        for gi in reversed(range(len(state.layer_names))):
+            layer = self._get_layer_by_name(state.layer_names[gi])
+            if layer is None or not bool(getattr(layer, "visible", True)):
+                continue
+            idx = self._picked_point_index(layer, event)
+            if idx is None:
+                continue
+            gene = self._gene_for_display_index(state, gi, idx)
+            if gene is not None:
+                return gene
+        return None
+
+    def _picked_point_index(self, layer, event) -> int | None:
+        get_value = getattr(layer, "get_value", None)
+        if get_value is None:
+            return None
+        position = getattr(event, "position", None)
+        if position is None:
+            return None
+        kwargs = {
+            "view_direction": getattr(event, "view_direction", None),
+            "dims_displayed": getattr(event, "dims_displayed", None),
+            "world": True,
+        }
+        for call_kwargs in (kwargs, {k: v for k, v in kwargs.items() if k != "world"}, {}):
+            try:
+                value = get_value(position, **call_kwargs)
+                return self._coerce_picked_point_index(value)
+            except TypeError:
+                continue
+            except Exception:
+                return None
+        return None
+
+    def _coerce_picked_point_index(self, value) -> int | None:
+        if value is None:
+            return None
+        if isinstance(value, (int, np.integer)):
+            return int(value) if int(value) >= 0 else None
+        if isinstance(value, np.ndarray):
+            if value.ndim == 0:
+                return self._coerce_picked_point_index(value.item())
+            values = value.tolist()
+        elif isinstance(value, (tuple, list)):
+            values = list(value)
+        else:
+            return None
+        for item in values:
+            idx = self._coerce_picked_point_index(item)
+            if idx is not None:
+                return idx
+        return None
+
+    def _gene_for_display_index(self, state: GeneInspectorState, group_index: int, point_index: int) -> str | None:
+        if state.group_display_ranges is None:
+            return None
+        if group_index < 0 or group_index >= len(state.group_display_ranges):
+            return None
+        idx = int(point_index)
+        for start, end, gene in state.group_display_ranges[group_index]:
+            if int(start) <= idx < int(end):
+                return str(gene)
+        return None
+
+    def _add_highlighted_gene(self, state: GeneInspectorState, gene: str):
+        new_gene = str(gene)
+        if state.highlighted_genes is None:
+            state.highlighted_genes = []
+        if new_gene in state.highlighted_genes:
+            return
+        state.highlighted_genes.append(new_gene)
+        entry = state.store.gene_offsets.get(new_gene)
+        if entry is not None:
+            self._apply_gene_group_sizes(state, {int(entry[0])})
+        self._set_gene_highlight_status(state)
+
+    def _clear_highlighted_genes(self, state: GeneInspectorState):
+        if not state.highlighted_genes:
+            return
+        groups: set[int] = set()
+        for gene in state.highlighted_genes:
+            entry = state.store.gene_offsets.get(str(gene))
+            if entry is not None:
+                groups.add(int(entry[0]))
+        state.highlighted_genes = []
+        self._apply_gene_group_sizes(state, groups)
+        self._set_gene_highlight_status(state)
+
+    def _discard_highlighted_genes(self, state: GeneInspectorState, genes: set[str]):
+        if not state.highlighted_genes:
+            return
+        removed = set(state.highlighted_genes) & set(genes)
+        if not removed:
+            return
+        groups: set[int] = set()
+        for gene in removed:
+            entry = state.store.gene_offsets.get(str(gene))
+            if entry is not None:
+                groups.add(int(entry[0]))
+        state.highlighted_genes = [gene for gene in state.highlighted_genes if gene not in removed]
+        self._apply_gene_group_sizes(state, groups)
+        self._set_gene_highlight_status(state)
+
+    def _apply_gene_group_sizes(self, state: GeneInspectorState, group_indices: set[int]):
+        if state.group_display_ranges is None:
+            return
+        for gi in sorted(group_indices):
+            if gi < 0 or gi >= len(state.layer_names):
+                continue
+            layer = self._get_layer_by_name(state.layer_names[gi])
+            if layer is None:
+                continue
+            n_points = len(getattr(layer, "data", ()))
+            ranges = state.group_display_ranges[gi] if gi < len(state.group_display_ranges) else []
+            sizes = self._gene_group_size_array(state, n_points, ranges)
+            try:
+                layer.size = sizes if sizes is not None else float(state.spot_size)
+            except Exception:
+                pass
+
+    def _set_gene_highlight_status(self, state: GeneInspectorState):
+        highlighted_genes = list(state.highlighted_genes or [])
+        if not highlighted_genes:
+            self._set_status("Click on any transcript to highlight that gene")
+            return
+        lines = [self._gene_highlight_status_line(state, gene) for gene in highlighted_genes]
+        lines.append("<br>Click in empty space to deselect all genes.")
+        self._set_status("".join(lines))
+
+    def _gene_highlight_status_line(self, state: GeneInspectorState, gene: str) -> str:
+        visual = state.gene_visuals.get(gene)
+        symbol = getattr(visual, "symbol", state.store.gene_symbol(gene) or "disc")
+        rgba = getattr(visual, "rgba", (1.0, 1.0, 1.0, 1.0))
+        glyph = GENE_STATUS_SYMBOL_GLYPHS.get(str(symbol), "●")
+        rgb = tuple(max(0, min(255, int(round(float(v) * 255)))) for v in rgba[:3])
+        color = f"rgb({rgb[0]},{rgb[1]},{rgb[2]})"
+        count = state.store.full_gene_count(gene)
+        return (
+            f"<span style='color:{color}; font-size:14pt'>{html.escape(glyph)}</span> "
+            f"{html.escape(str(gene))}: {count:,} counts<br>"
+        )
+
     def set_gene_visible(self, dataset_name: str, gene: str, on: bool):
         state = self._gene_inspector_states.get(str(dataset_name).upper())
         if state is None:
@@ -3958,6 +4185,7 @@ class ComparisonViewerController:
             state.enabled_genes.add(gene)
         else:
             state.enabled_genes.discard(gene)
+            self._discard_highlighted_genes(state, {gene})
         self._schedule_gene_group_rebuild(state, entry[0])
 
     def set_all_genes_visible(self, dataset_name: str, on: bool):
@@ -3971,6 +4199,7 @@ class ComparisonViewerController:
             }
         else:
             state.enabled_genes = set()
+            self._clear_highlighted_genes(state)
         self._rebuild_gene_group_layers(state, group_indices=None)
 
     def set_gene_spot_size(self, dataset_name: str, size: float):
@@ -3978,6 +4207,9 @@ class ComparisonViewerController:
         if state is None:
             return
         state.spot_size = float(size)
+        if state.highlighted_genes:
+            self._apply_gene_group_sizes(state, set(range(len(state.layer_names))))
+            return
         for name in state.layer_names:
             layer = self._get_layer_by_name(name)
             if layer is not None:
@@ -4007,6 +4239,7 @@ class ComparisonViewerController:
         state.show_controls = bool(on)
         if not on:
             # Turning controls off hides any control genes that were enabled.
+            self._discard_highlighted_genes(state, set(state.store.control_genes))
             state.enabled_genes -= set(state.store.control_genes)
             self._rebuild_gene_group_layers(state, group_indices=None)
 
