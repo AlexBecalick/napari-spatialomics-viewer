@@ -72,16 +72,19 @@ try:
         QComboBox,
         QDoubleSpinBox,
         QFileDialog,
+        QFrame,
         QHBoxLayout,
         QLabel,
         QLineEdit,
         QListWidget,
         QListWidgetItem,
         QMessageBox,
+        QProgressBar,
         QPushButton,
         QScrollArea,
         QSizePolicy,
         QSlider,
+        QTabWidget,
         QVBoxLayout,
         QWidget,
     )
@@ -116,38 +119,29 @@ from .utils import (
     CorticalDepthShapeInput,
     DERIVED_CACHE_ATTR,
     assign_gene_visuals,
-    assignment_mask,
     affine_matrix_from_px_to_um,
     build_binned_label_color_dict,
     build_cortical_depth_annotation_geojson,
     build_gene_point_groups,
-    build_transcript_spatial_index,
     build_napari_affine_from_px_to_um,
     cellpose_quantification_features,
     cellpose_quantification_table_available,
     channel_labels,
-    compute_transcript_density_array,
     derived_image_pyramid_cache_key,
     derived_label_pyramid_cache_key,
     derived_outline_cache_key,
-    derived_transcript_density_cache_key,
     ensure_cyx,
     first_existing_col,
-    geometry_to_napari_bounding_boxes,
-    geometry_to_napari_centroids,
-    geometry_to_napari_polygons,
     get_scale0_dataarray,
     image_scale_dataarrays,
     is_derived_cache_key,
     label_outline_mask_chunk,
     layer_name_prefix,
     load_cellpose_quantification_values,
-    load_points_dataframe,
     make_layer_name,
     matching_layer_names,
     pixel_window_global_bounds,
     query_geometries_for_bounds,
-    query_transcript_spatial_index,
     rasterize_geometries_chunk,
     resolve_dataset_mask_affine,
     resolve_gene_column,
@@ -190,22 +184,6 @@ class DatasetConfig:
     xenium_spec_path: Path | None = None
 
 
-@dataclass
-class StreamedTranscriptLayerState:
-    dataset: str
-    points_key: str
-    assigned_layer_name: str
-    unassigned_layer_name: str
-    timer: QTimer
-    view_percent: int
-    point_index: object | None
-    density_layer_names: list[str]
-    generation: int = 0
-    updating: bool = False
-    pending: bool = False
-    worker: object | None = None
-    camera_callback: object | None = None
-
 
 @dataclass
 class GeneInspectorState:
@@ -231,21 +209,6 @@ GENE_SPOT_SIZE_STEP = 0.1
 DEFAULT_GENE_MAX_RENDER_POINTS = 40_000_000
 GENE_REBUILD_DEBOUNCE_MS = 60
 
-FAST_DEFAULT_MAX_TRANSCRIPTS = 200_000
-FAST_DEFAULT_MAX_SHAPES_PER_LAYER = 20_000
-DEFAULT_TRANSCRIPT_VIEW_PERCENT = 0
-DEFAULT_TRANSCRIPT_VIEW_MARGIN_FRACTION = 0.20
-DEFAULT_TRANSCRIPT_STREAM_DEBOUNCE_MS = 300
-DEFAULT_TRANSCRIPT_DENSITY_BIN_UM = 2.0
-TRANSCRIPT_DENSITY_PYRAMID_NORMALIZATION = "mean_v1"
-DEFAULT_TRANSCRIPT_DENSITY_MAX_PIXELS = 25_000_000
-# Upper contrast limit for transcript density layers. Lower => brighter; 8 shows
-# typical transcript density clearly where the previous 35 looked very dim.
-DEFAULT_TRANSCRIPT_DENSITY_CONTRAST_MAX = 8.0
-DEFAULT_TRANSCRIPT_DETAIL_MAX_VIEW_SIZE = 1_500.0
-DEFAULT_TRANSCRIPT_DETAIL_MAX_POINTS = 300_000
-DEFAULT_TRANSCRIPT_INDEX_MAX_POINTS = 25_000_000
-DEFAULT_TRANSCRIPT_INDEX_TILE_UM = 250.0
 SYNTHETIC_IMAGE_PYRAMID_MIN_SIZE = 4096
 SYNTHETIC_IMAGE_PYRAMID_MAX_LEVELS = 10
 LABEL_CACHE_ATTR = "napari_compare_label_cache"
@@ -270,14 +233,15 @@ CORTICAL_DEPTH_FILL_COLORS = {
 CORTICAL_DEPTH_PIECE_ROLES = ("pia", "wm", "exclusion", "ribbon")
 
 
-def startup_selection(startup_mode: str, skip_images: bool, segmentation_source: str) -> tuple[str, ...] | None:
-    """Return the SpatialData read selection for startup loading."""
+def startup_selection(segmentation_source: str) -> tuple[str, ...]:
+    """Return the SpatialData element types to read when a dataset opens.
+
+    Points and segmentations are read (lazily) so their keys can populate the tab
+    lists; images are read separately (and defensively) so an image-less store
+    still opens. The ``--skip-*`` flags gate whether layers are *rendered* at
+    startup, not whether the metadata is read.
+    """
     seg = "labels" if str(segmentation_source).lower() == "labels" else "shapes"
-    mode = str(startup_mode).lower()
-    if mode == "full":
-        if skip_images:
-            return ("points", seg)
-        return None
     return ("points", seg)
 
 
@@ -641,25 +605,33 @@ def transparent_colormap(name: str, color, alpha: float = 1.0) -> Colormap:
     )
 
 
-class DatasetSwitcherWidget(QWidget):
-    """Dock widget with dataset controls and on-demand layer loading controls."""
+class ViewerControlPanel(QWidget):
+    """Right-dock control panel: tabbed controls with a shared progress bar.
 
-    # Thread-safe status updates: heavy work runs in napari thread_workers that
-    # call ``set_status`` from a background thread. Routing every update through a
-    # Qt signal marshals the actual widget mutation back onto the GUI thread.
+    Tabs (across the top): Gene inspector, Cell segmentation, Per cell statistics,
+    Draw tissue annotations, Images, Dataset. A busy progress bar plus a stage
+    label sit below the tabs and stay visible whatever tab is selected.
+    """
+
+    # Thread-safe status/progress updates: heavy work runs in napari
+    # thread_workers that call these from a background thread. Routing every
+    # update through a Qt signal marshals the actual widget mutation back onto
+    # the GUI thread.
     status_message = Signal(str)
+    progress_message = Signal(str, str, bool)  # (stage key, text, active)
 
     def __init__(
         self,
         datasets: list[str],
+        gene_inspector_widget,
         load_callback,
         load_selected_labels_callback,
         unload_selected_shapes_callback,
-        load_full_transcripts_callback,
-        set_transcript_view_percent_callback,
+        load_transcripts_callback,
         unload_transcripts_callback,
-        inspect_genes_callback,
-        load_images_callback,
+        load_selected_image_callback,
+        load_all_images_callback,
+        unload_selected_image_callback,
         load_cellpose_values_callback,
         remove_cellpose_values_callback,
         create_annotation_layers_callback,
@@ -670,18 +642,17 @@ class DatasetSwitcherWidget(QWidget):
         export_annotation_callback,
         export_separate_annotations_callback,
         initial_dataset: str = "MERSCOPE",
-        skip_images: bool = False,
-        transcript_view_percent: int = DEFAULT_TRANSCRIPT_VIEW_PERCENT,
     ):
         super().__init__()
+        self._gene_inspector_widget = gene_inspector_widget
         self._load_callback = load_callback
         self._load_selected_labels_callback = load_selected_labels_callback
         self._unload_selected_shapes_callback = unload_selected_shapes_callback
-        self._load_full_transcripts_callback = load_full_transcripts_callback
-        self._set_transcript_view_percent_callback = set_transcript_view_percent_callback
+        self._load_transcripts_callback = load_transcripts_callback
         self._unload_transcripts_callback = unload_transcripts_callback
-        self._inspect_genes_callback = inspect_genes_callback
-        self._load_images_callback = load_images_callback
+        self._load_selected_image_callback = load_selected_image_callback
+        self._load_all_images_callback = load_all_images_callback
+        self._unload_selected_image_callback = unload_selected_image_callback
         self._load_cellpose_values_callback = load_cellpose_values_callback
         self._remove_cellpose_values_callback = remove_cellpose_values_callback
         self._create_annotation_layers_callback = create_annotation_layers_callback
@@ -691,58 +662,56 @@ class DatasetSwitcherWidget(QWidget):
         self._validate_annotation_callback = validate_annotation_callback
         self._export_annotation_callback = export_annotation_callback
         self._export_separate_annotations_callback = export_separate_annotations_callback
-        self._skip_images = bool(skip_images)
 
+        self._active_stages: dict[str, str] = {}
+
+        # -- Dataset switcher (its own tab) ---------------------------------
         self._dataset_combo = QComboBox()
         self._dataset_combo.addItems(datasets)
         if initial_dataset in datasets:
             self._dataset_combo.setCurrentText(initial_dataset)
         self._dataset_combo.currentTextChanged.connect(self._on_dataset_changed)
-
         self._reload_button = QPushButton("Reload Dataset")
         self._reload_button.clicked.connect(self._on_reload_clicked)
 
+        # -- Cell segmentation ----------------------------------------------
         self._shape_list = QListWidget()
         self._shape_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self._shape_list.setMaximumHeight(120)
-        self._shape_list.setMinimumHeight(80)
-        self._shape_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-
-        self._load_selected_labels_button = QPushButton("Load Selected Labels (Outlines)")
+        self._shape_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._load_selected_labels_button = QPushButton("Load selected cell segmentation")
         self._load_selected_labels_button.clicked.connect(self._on_load_selected_labels)
-        self._unload_selected_shapes_button = QPushButton("Unload Selected Segmentations")
+        self._unload_selected_shapes_button = QPushButton("Unload selected cell segmentation")
         self._unload_selected_shapes_button.clicked.connect(self._on_unload_selected_shapes)
 
+        # -- Per cell statistics --------------------------------------------
         self._cellpose_channel_combo = QComboBox()
         self._cellpose_statistic_combo = QComboBox()
         self._cellpose_colormap_combo = QComboBox()
         self._cellpose_colormap_combo.addItems(["viridis", "magma", "inferno", "plasma", "turbo", "gray"])
-        self._load_cellpose_values_button = QPushButton("Load Cellpose Value Overlay")
+        self._load_cellpose_values_button = QPushButton("Load per-cell statistic overlay")
         self._load_cellpose_values_button.clicked.connect(self._on_load_cellpose_values)
-        self._remove_cellpose_values_button = QPushButton("Remove Cellpose Value Overlay")
+        self._remove_cellpose_values_button = QPushButton("Unload per-cell statistic overlay")
         self._remove_cellpose_values_button.clicked.connect(self._on_remove_cellpose_values)
         self.set_cellpose_value_options([], [], enabled=False)
 
-        self._load_full_tx_button = QPushButton("Load Full Transcripts (Viewport)")
-        self._load_full_tx_button.clicked.connect(self._on_load_full_transcripts)
-        self._unload_tx_button = QPushButton("Unload Transcripts")
-        self._unload_tx_button.clicked.connect(self._on_unload_transcripts)
-        self._inspect_genes_button = QPushButton("Inspect Genes")
-        self._inspect_genes_button.clicked.connect(self._on_inspect_genes)
-        self._tx_percent_slider = QSlider(Qt.Horizontal)
-        self._tx_percent_slider.setRange(0, 100)
-        self._tx_percent_slider.setSingleStep(1)
-        self._tx_percent_slider.setPageStep(10)
-        self._tx_percent_slider.setValue(int(transcript_view_percent))
-        self._tx_percent_slider.valueChanged.connect(self._on_tx_percent_changed)
-        self._tx_percent_label = QLabel()
-        self._tx_percent_label.setWordWrap(True)
-        self._update_tx_percent_label(self._tx_percent_slider.value())
+        # -- Transcripts (Gene inspector tab) -------------------------------
+        self._load_transcripts_button = QPushButton("Load / reload transcripts")
+        self._load_transcripts_button.clicked.connect(self._on_load_transcripts)
+        self._unload_transcripts_button = QPushButton("Unload transcripts")
+        self._unload_transcripts_button.clicked.connect(self._on_unload_transcripts)
 
-        self._load_images_button = QPushButton("Load Images")
-        self._load_images_button.setEnabled(not self._skip_images)
-        self._load_images_button.clicked.connect(self._on_load_images)
+        # -- Images ----------------------------------------------------------
+        self._image_list = QListWidget()
+        self._image_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self._image_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._load_selected_image_button = QPushButton("Load selected image(s)")
+        self._load_selected_image_button.clicked.connect(self._on_load_selected_image)
+        self._load_all_images_button = QPushButton("Load all images")
+        self._load_all_images_button.clicked.connect(self._on_load_all_images)
+        self._unload_selected_image_button = QPushButton("Unload selected image(s)")
+        self._unload_selected_image_button.clicked.connect(self._on_unload_selected_image)
 
+        # -- Draw tissue annotations (cortical depth) -----------------------
         self._create_annotations_button = QPushButton("Create Drawing Layers")
         self._create_annotations_button.clicked.connect(self._on_create_annotations)
         self._piece_combo = QComboBox()
@@ -762,76 +731,139 @@ class DatasetSwitcherWidget(QWidget):
         self._export_separate_annotations_button = QPushButton("Export Separate GeoJSONs")
         self._export_separate_annotations_button.clicked.connect(self._on_export_separate_annotations)
 
+        # -- Progress + status (shared, below the tabs) ---------------------
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setRange(0, 0)  # indeterminate "busy" animation
+        self._progress_bar.setTextVisible(False)
+        self._progress_bar.setVisible(False)
+        self._progress_label = QLabel("")
+        self._progress_label.setWordWrap(True)
         self._status_label = QLabel("Ready")
         self._status_label.setWordWrap(True)
         self.status_message.connect(self._on_status_message)
+        self.progress_message.connect(self._on_progress_message)
 
+        # -- Assemble tabs ---------------------------------------------------
+        self._tabs = QTabWidget()
+        self._tabs.setTabPosition(QTabWidget.North)
+        self._tabs.setUsesScrollButtons(True)  # scroll tab bar when it overflows
+        self._tabs.setDocumentMode(True)
+        self._tabs.addTab(self._build_genes_tab(), "Gene inspector")
+        self._tabs.addTab(self._build_segmentation_tab(), "Cell segmentation")
+        self._tabs.addTab(self._build_statistics_tab(), "Per cell statistics")
+        self._tabs.addTab(self._build_annotations_tab(), "Draw tissue annotations")
+        self._tabs.addTab(self._build_images_tab(), "Images")
+        self._tabs.addTab(self._build_dataset_tab(), "Dataset")
+        self._tabs.setCurrentIndex(0)
+
+        outer = QVBoxLayout()
+        outer.setContentsMargins(4, 4, 4, 4)
+        outer.setSpacing(4)
+        outer.addWidget(self._tabs, stretch=1)
+        outer.addWidget(self._progress_bar)
+        outer.addWidget(self._progress_label)
+        outer.addWidget(self._status_label)
+        self.setLayout(outer)
+        self.setMinimumWidth(280)
+
+    # -- tab builders -------------------------------------------------------
+    def _scrollable(self, layout) -> QScrollArea:
         content = QWidget()
-        root = QVBoxLayout()
-        root.setContentsMargins(8, 8, 8, 8)
-        root.setSpacing(8)
-        root.addWidget(QLabel("Dataset"))
-        root.addWidget(self._dataset_combo)
-        root.addWidget(self._reload_button)
-        root.addWidget(QLabel("Segmentations"))
-        root.addWidget(self._shape_list)
-
-        root.addWidget(self._load_selected_labels_button)
-        root.addWidget(self._unload_selected_shapes_button)
-
-        root.addWidget(QLabel("Cell Mask Values"))
-        root.addWidget(QLabel("Channel"))
-        root.addWidget(self._cellpose_channel_combo)
-        root.addWidget(QLabel("Statistic"))
-        root.addWidget(self._cellpose_statistic_combo)
-        root.addWidget(QLabel("Colormap"))
-        root.addWidget(self._cellpose_colormap_combo)
-        root.addWidget(self._load_cellpose_values_button)
-        root.addWidget(self._remove_cellpose_values_button)
-
-        root.addWidget(QLabel("Transcripts"))
-        root.addWidget(self._load_full_tx_button)
-        root.addWidget(self._unload_tx_button)
-        root.addWidget(self._inspect_genes_button)
-        tx_percent_row = QHBoxLayout()
-        tx_percent_row.addWidget(QLabel("Viewport %"))
-        tx_percent_row.addWidget(self._tx_percent_slider)
-        root.addLayout(tx_percent_row)
-        root.addWidget(self._tx_percent_label)
-
-        if not self._skip_images:
-            root.addWidget(self._load_images_button)
-
-        root.addWidget(QLabel("Cortical Depth Annotations"))
-        root.addWidget(self._create_annotations_button)
-        root.addWidget(QLabel("Current Tissue Piece"))
-        root.addWidget(self._piece_combo)
-        piece_row = QHBoxLayout()
-        piece_row.addWidget(self._new_piece_button)
-        piece_row.addWidget(self._apply_piece_button)
-        root.addLayout(piece_row)
-        root.addWidget(self._snap_side_edges_button)
-        root.addWidget(self._validate_annotations_button)
-        root.addWidget(self._export_annotations_button)
-        root.addWidget(self._export_separate_annotations_button)
-
-        root.addWidget(self._status_label)
-        root.addStretch(1)
-        content.setLayout(root)
-
+        content.setLayout(layout)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.NoFrame)
         scroll.setWidget(content)
+        return scroll
 
-        outer = QVBoxLayout()
-        outer.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(scroll)
-        self.setLayout(outer)
-        self.setMinimumWidth(220)
-        self.setMaximumWidth(340)
-        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+    def _build_genes_tab(self) -> QWidget:
+        layout = QVBoxLayout()
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+        row = QHBoxLayout()
+        row.addWidget(self._load_transcripts_button)
+        row.addWidget(self._unload_transcripts_button)
+        layout.addLayout(row)
+        # The gene inspector widget provides the per-gene list + spot controls.
+        if self._gene_inspector_widget is not None:
+            layout.addWidget(self._gene_inspector_widget, stretch=1)
+        else:
+            layout.addStretch(1)
+        tab = QWidget()
+        tab.setLayout(layout)
+        return tab
 
+    def _build_segmentation_tab(self) -> QWidget:
+        layout = QVBoxLayout()
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+        layout.addWidget(QLabel("Cell segmentations"))
+        layout.addWidget(self._shape_list, stretch=1)
+        layout.addWidget(self._load_selected_labels_button)
+        layout.addWidget(self._unload_selected_shapes_button)
+        tab = QWidget()
+        tab.setLayout(layout)
+        return tab
+
+    def _build_statistics_tab(self) -> QWidget:
+        layout = QVBoxLayout()
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+        layout.addWidget(QLabel("Per-cell statistics overlay"))
+        layout.addWidget(QLabel("Channel"))
+        layout.addWidget(self._cellpose_channel_combo)
+        layout.addWidget(QLabel("Statistic"))
+        layout.addWidget(self._cellpose_statistic_combo)
+        layout.addWidget(QLabel("Colormap"))
+        layout.addWidget(self._cellpose_colormap_combo)
+        layout.addWidget(self._load_cellpose_values_button)
+        layout.addWidget(self._remove_cellpose_values_button)
+        layout.addStretch(1)
+        return self._scrollable(layout)
+
+    def _build_annotations_tab(self) -> QWidget:
+        layout = QVBoxLayout()
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+        layout.addWidget(QLabel("Cortical Depth Annotations"))
+        layout.addWidget(self._create_annotations_button)
+        layout.addWidget(QLabel("Current Tissue Piece"))
+        layout.addWidget(self._piece_combo)
+        piece_row = QHBoxLayout()
+        piece_row.addWidget(self._new_piece_button)
+        piece_row.addWidget(self._apply_piece_button)
+        layout.addLayout(piece_row)
+        layout.addWidget(self._snap_side_edges_button)
+        layout.addWidget(self._validate_annotations_button)
+        layout.addWidget(self._export_annotations_button)
+        layout.addWidget(self._export_separate_annotations_button)
+        layout.addStretch(1)
+        return self._scrollable(layout)
+
+    def _build_images_tab(self) -> QWidget:
+        layout = QVBoxLayout()
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+        layout.addWidget(QLabel("Images"))
+        layout.addWidget(self._image_list, stretch=1)
+        layout.addWidget(self._load_selected_image_button)
+        layout.addWidget(self._load_all_images_button)
+        layout.addWidget(self._unload_selected_image_button)
+        tab = QWidget()
+        tab.setLayout(layout)
+        return tab
+
+    def _build_dataset_tab(self) -> QWidget:
+        layout = QVBoxLayout()
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+        layout.addWidget(QLabel("Dataset"))
+        layout.addWidget(self._dataset_combo)
+        layout.addWidget(self._reload_button)
+        layout.addStretch(1)
+        return self._scrollable(layout)
+
+    # -- public API ---------------------------------------------------------
     @property
     def current_dataset(self) -> str:
         return str(self._dataset_combo.currentText())
@@ -840,12 +872,32 @@ class DatasetSwitcherWidget(QWidget):
         # Safe to call from any thread; the queued signal hops to the GUI thread.
         self.status_message.emit(str(text))
 
+    def set_progress(self, key: str, text: str, active: bool):
+        # Safe to call from any thread; the queued signal hops to the GUI thread.
+        self.progress_message.emit(str(key), str(text), bool(active))
+
     def _on_status_message(self, text: str):
         self._status_label.setText(str(text))
+
+    def _on_progress_message(self, key: str, text: str, active: bool):
+        if active:
+            self._active_stages[key] = text
+        else:
+            self._active_stages.pop(key, None)
+        if self._active_stages:
+            self._progress_bar.setVisible(True)
+            self._progress_label.setText(" | ".join(v for v in self._active_stages.values() if v))
+        else:
+            self._progress_bar.setVisible(False)
+            self._progress_label.setText("")
 
     def set_shape_keys(self, keys: list[str]):
         self._shape_list.clear()
         self._shape_list.addItems([str(k) for k in keys])
+
+    def set_image_keys(self, keys: list[str]):
+        self._image_list.clear()
+        self._image_list.addItems([str(k) for k in keys])
 
     def set_cellpose_value_options(self, channels: list[str], statistics: list[str], enabled: bool):
         channel_current = str(self._cellpose_channel_combo.currentText())
@@ -879,20 +931,14 @@ class DatasetSwitcherWidget(QWidget):
     def selected_shape_keys(self) -> list[str]:
         return [str(item.text()) for item in self._shape_list.selectedItems()]
 
-    def transcript_view_percent(self) -> int:
-        return int(self._tx_percent_slider.value())
+    def selected_image_keys(self) -> list[str]:
+        return [str(item.text()) for item in self._image_list.selectedItems()]
 
     def current_annotation_piece(self) -> str:
         text = str(self._piece_combo.currentText()).strip()
         return text or CORTICAL_DEPTH_DEFAULT_PIECE_ID
 
-    def _update_tx_percent_label(self, value: int):
-        if int(value) <= 0:
-            text = "Auto: load as many viewport transcripts as the display cap allows."
-        else:
-            text = f"Manual: load {int(value)}% of transcripts in the current viewport."
-        self._tx_percent_label.setText(text)
-
+    # -- event handlers -----------------------------------------------------
     def _on_dataset_changed(self, text: str):
         if not text:
             return
@@ -915,26 +961,32 @@ class DatasetSwitcherWidget(QWidget):
             return
         self._unload_selected_shapes_callback(self.current_dataset, keys)
 
-    def _on_load_full_transcripts(self):
-        self._load_full_transcripts_callback(self.current_dataset, self.transcript_view_percent())
+    def _on_load_transcripts(self):
+        self._load_transcripts_callback(self.current_dataset)
 
     def _on_unload_transcripts(self):
         self._unload_transcripts_callback(self.current_dataset)
 
-    def _on_inspect_genes(self):
-        self._inspect_genes_callback(self.current_dataset)
+    def _on_load_selected_image(self):
+        keys = self.selected_image_keys()
+        if not keys:
+            self.set_status("No image selected.")
+            return
+        self._load_selected_image_callback(self.current_dataset, keys)
 
-    def _on_tx_percent_changed(self, value: int):
-        value = int(value)
-        self._update_tx_percent_label(value)
-        self._set_transcript_view_percent_callback(self.current_dataset, value)
+    def _on_load_all_images(self):
+        self._load_all_images_callback(self.current_dataset)
 
-    def _on_load_images(self):
-        self._load_images_callback(self.current_dataset)
+    def _on_unload_selected_image(self):
+        keys = self.selected_image_keys()
+        if not keys:
+            self.set_status("No image selected.")
+            return
+        self._unload_selected_image_callback(self.current_dataset, keys)
 
     def _on_load_cellpose_values(self):
         if not self._load_cellpose_values_button.isEnabled():
-            self.set_status("Cellpose value overlay is not available for this dataset.")
+            self.set_status("Per-cell statistic overlay is not available for this dataset.")
             return
         self._load_cellpose_values_callback(
             self.current_dataset,
@@ -1214,11 +1266,13 @@ class GeneInspectorWidget(QWidget):
         self._suppress = False
 
         self._title = QLabel("Gene Inspector")
-        self._status_label = QLabel("Click “Inspect Genes” to load the gene panel.")
+        self._status_label = QLabel(
+            "Transcripts load automatically. Use “Load / reload transcripts” to rebuild the gene panel."
+        )
         self._status_label.setWordWrap(True)
         self.status_message.connect(self._status_label.setText)
 
-        self._close_button = QPushButton("Close Gene Inspector")
+        self._close_button = QPushButton("Unload transcripts")
         self._close_button.clicked.connect(self._on_close)
 
         self._spot_slider = QSlider(Qt.Horizontal)
@@ -1458,27 +1512,26 @@ class ComparisonViewerController:
         self.args = args
         self.active_dataset: str | None = None
         self._status_callback = None
+        self._progress_callback = None
         self._shape_keys_callback = None
+        self._image_keys_callback = None
         self._cellpose_value_options_callback = None
         self._current_cortical_depth_piece_id = CORTICAL_DEPTH_DEFAULT_PIECE_ID
         self._active_sdata = None
         self._active_images_sdata = None
         self._segmentation_keys: list[str] = []
+        self._image_keys: list[str] = []
         self._x_transform: tuple[float, float, float] | None = None
         self._y_transform: tuple[float, float, float] | None = None
-        self._streamed_transcript_states: dict[str, StreamedTranscriptLayerState] = {}
         self._cellpose_value_generation = 0
         self._cellpose_value_worker: object | None = None
-        # Background build bookkeeping for the heavy transcript / label pipelines
-        # that now run in napari thread_workers so the UI stays responsive.
-        self._transcript_build_generation = 0
-        self._transcript_build_worker: object | None = None
+        # Background build bookkeeping for the heavy label / image pipelines
+        # that run in napari thread_workers so the UI stays responsive.
         self._label_build_generation = 0
         self._label_build_worker: object | None = None
         self._image_build_generation = 0
         self._image_build_worker: object | None = None
-        self._canvas_size: tuple[int, int] | None = None
-        # Per-gene "Inspect Genes" renderer.
+        # Per-gene transcript renderer (the default + only transcript view).
         self._gene_inspector_states: dict[str, GeneInspectorState] = {}
         self._gene_build_generation = 0
         self._gene_build_worker: object | None = None
@@ -1487,11 +1540,17 @@ class ComparisonViewerController:
     def set_status_callback(self, fn):
         self._status_callback = fn
 
+    def set_progress_callback(self, fn):
+        self._progress_callback = fn
+
     def set_gene_inspector_widget(self, widget):
         self._gene_inspector_widget = widget
 
     def set_shape_keys_callback(self, fn):
         self._shape_keys_callback = fn
+
+    def set_image_keys_callback(self, fn):
+        self._image_keys_callback = fn
 
     def set_cellpose_value_options_callback(self, fn):
         self._cellpose_value_options_callback = fn
@@ -1500,9 +1559,29 @@ class ComparisonViewerController:
         if self._status_callback is not None:
             self._status_callback(text)
 
+    def _begin_progress(self, key: str, text: str):
+        """Mark a loading stage as active (shows the busy bar + stage text)."""
+        self._set_status(text)
+        if self._progress_callback is not None:
+            self._progress_callback(str(key), str(text), True)
+
+    def _end_progress(self, key: str):
+        """Mark a loading stage as finished (hides the busy bar when idle)."""
+        if self._progress_callback is not None:
+            self._progress_callback(str(key), "", False)
+
+    def _reset_progress(self):
+        """Clear all loading stages (e.g. when switching datasets)."""
+        for key in ("dataset", "images", "masks", "transcripts"):
+            self._end_progress(key)
+
     def _publish_shape_keys(self):
         if self._shape_keys_callback is not None:
             self._shape_keys_callback(list(self._segmentation_keys))
+
+    def _publish_image_keys(self):
+        if self._image_keys_callback is not None:
+            self._image_keys_callback(list(self._image_keys))
 
     def _publish_cellpose_value_options(self):
         if self._cellpose_value_options_callback is None:
@@ -1538,34 +1617,9 @@ class ComparisonViewerController:
         return "labels" if self._segmentation_source() == "labels" else "polygons"
 
     def _clear_layers(self):
-        self._clear_streamed_transcript_states()
         self._clear_gene_inspector_states()
         for layer in list(self.viewer.layers):
             self.viewer.layers.remove(layer)
-
-    def _clear_streamed_transcript_states(self):
-        # Invalidate any in-flight background transcript build so a stale result
-        # cannot install layers/state after the dataset was cleared.
-        self._transcript_build_generation += 1
-        self._transcript_build_worker = None
-        for state in list(self._streamed_transcript_states.values()):
-            try:
-                state.timer.stop()
-            except Exception:
-                pass
-            self._disconnect_transcript_camera_callback(state)
-        self._streamed_transcript_states.clear()
-
-    def _disconnect_transcript_camera_callback(self, state: StreamedTranscriptLayerState):
-        callback = getattr(state, "camera_callback", None)
-        if callback is None:
-            return
-        for events in (self.viewer.camera.events.zoom, self.viewer.camera.events.center):
-            try:
-                events.disconnect(callback)
-            except Exception:
-                pass
-        state.camera_callback = None
 
     def _resolve_optional_transform_paths(self, ds: str, cfg: DatasetConfig) -> tuple[Path | None, Path | None]:
         """Resolve optional transform/spec paths from explicit args or common defaults."""
@@ -1607,39 +1661,6 @@ class ComparisonViewerController:
         names = [str(layer.name) for layer in self.viewer.layers]
         for layer_name in matching_layer_names(names, prefix):
             self._remove_layer_by_name(layer_name)
-
-    def _add_points_layer(
-        self,
-        coords: np.ndarray,
-        name: str,
-        color,
-        visible: bool,
-        size: float | None = None,
-        opacity: float | None = None,
-    ):
-        """Add a points layer with napari-version-compatible color kwargs."""
-        common_kwargs = dict(
-            size=self.args.point_size if size is None else size,
-            opacity=self.args.point_opacity if opacity is None else opacity,
-            visible=visible,
-        )
-        try:
-            return self.viewer.add_points(
-                coords,
-                name=name,
-                face_color=color,
-                edge_color=color,
-                **common_kwargs,
-            )
-        except TypeError:
-            # Newer napari versions renamed edge_color -> border_color.
-            return self.viewer.add_points(
-                coords,
-                name=name,
-                face_color=color,
-                border_color=color,
-                **common_kwargs,
-            )
 
     def _cortical_depth_layer_name(self, ds: str, role: str) -> str:
         return make_layer_name(ds, CORTICAL_DEPTH_LAYER_TYPE, role)
@@ -1916,12 +1937,53 @@ class ComparisonViewerController:
         return self.active_dataset == ds and self._active_sdata is not None
 
     def _ensure_images_loaded(self, ds: str):
-        if self.args.skip_images:
-            raise RuntimeError("Image loading is disabled by --skip-images.")
         if self._active_images_sdata is not None and len(self._active_images_sdata.images) > 0:
             return
         cfg = self.datasets[ds]
         self._active_images_sdata = sd.read_zarr(str(cfg.zarr_path), selection=("images",))
+
+    def _startup_segmentation_keys(self) -> list[str]:
+        """Segmentation keys to auto-load at startup (Cellpose + ProSeg masks).
+
+        Both platforms write ``MOSAIK_cellpose`` and ``MOSAIK_proseg`` (see the
+        MerXen ``segment`` stage). Prefer those exact keys; otherwise fall back to
+        the first key containing the token so aligned/variant names still resolve.
+        Each mask is skipped when its ``--skip-*`` flag is set.
+        """
+        keys = list(self._segmentation_keys)
+        selected: list[str] = []
+        for token, skip in (
+            ("cellpose", bool(getattr(self.args, "skip_cellpose", False))),
+            ("proseg", bool(getattr(self.args, "skip_proseg", False))),
+        ):
+            if skip:
+                continue
+            exact = f"MOSAIK_{token}"
+            if exact in keys:
+                selected.append(exact)
+                continue
+            match = next((k for k in keys if token in k.lower()), None)
+            if match is not None:
+                selected.append(match)
+        return list(dict.fromkeys(selected))
+
+    def _start_startup_autoload(self, ds: str):
+        """Kick off the default background loads once dataset metadata is ready.
+
+        Images, Cellpose+ProSeg masks and per-gene transcripts each load in their
+        own napari thread_worker, so this returns immediately and the UI stays
+        responsive while the busy progress bar tracks each stage. Cell-mask value
+        overlays are intentionally NOT loaded here (on-demand only).
+        """
+        if not bool(getattr(self.args, "skip_images", False)) and self._image_keys:
+            self.load_images_on_demand(ds)
+
+        mask_keys = self._startup_segmentation_keys()
+        if mask_keys:
+            self.load_selected_labels(ds, mask_keys)
+
+        if not bool(getattr(self.args, "skip_transcripts", False)):
+            self.open_gene_inspector(ds)
 
     def load_dataset(self, dataset_name: str, force: bool = False):
         ds = str(dataset_name).upper()
@@ -1932,29 +1994,36 @@ class ComparisonViewerController:
         if (self.active_dataset == ds) and (not force):
             return
 
+        self._reset_progress()
         mem_before = memory_snapshot_gb()
         t0 = time.time()
         cfg = self.datasets[ds]
 
         try:
-            self._set_status(f"Loading {ds}...")
+            self._begin_progress("dataset", f"Loading {ds} metadata...")
             log.info("[%s] Loading dataset from %s", ds, cfg.zarr_path)
 
             self._clear_layers()
             gc.collect()
+            self.active_dataset = None
             self._segmentation_keys = []
+            self._image_keys = []
             self._publish_shape_keys()
+            self._publish_image_keys()
             if self._cellpose_value_options_callback is not None:
                 self._cellpose_value_options_callback([], [], False)
 
-            selection = startup_selection(
-                self.args.startup_mode,
-                self.args.skip_images,
-                self._segmentation_source(),
-            )
+            selection = startup_selection(self._segmentation_source())
             sdata = sd.read_zarr(str(cfg.zarr_path), selection=selection)
             self._active_sdata = sdata
-            self._active_images_sdata = sdata if len(getattr(sdata, "images", {})) > 0 else None
+            # Read images as a separate element so their keys populate the Images
+            # tab even when auto-load is skipped; tolerate image-less stores.
+            self._active_images_sdata = None
+            try:
+                self._ensure_images_loaded(ds)
+            except Exception as exc:
+                log.warning("[%s] Could not read images element (%s); continuing without images.", ds, exc)
+                self._active_images_sdata = None
             ms_tf_path, xe_spec_path = self._resolve_optional_transform_paths(ds, cfg)
             x_transform, y_transform = resolve_dataset_mask_affine(
                 ds,
@@ -1977,55 +2046,29 @@ class ComparisonViewerController:
                     )
             else:
                 self._segmentation_keys = sorted(str(k) for k in sdata.shapes.keys())
+            images_source = self._active_images_sdata
+            self._image_keys = sorted(
+                str(k)
+                for k in getattr(images_source, "images", {}).keys()
+                if not is_derived_cache_key(str(k))
+            )
             self._publish_shape_keys()
+            self._publish_image_keys()
             self._publish_cellpose_value_options()
-
-            if self.args.startup_mode == "full":
-                img_stats = self._add_image_layers(ds, sdata, x_transform, y_transform)
-                shape_stats = self._add_shape_layers(ds, sdata)
-                tx_stats = self._load_startup_transcripts()
-            else:
-                img_stats = {
-                    "layers": 0,
-                    "failed_keys": 0,
-                    "skipped": bool(self.args.skip_images),
-                    "deferred": not bool(self.args.skip_images),
-                }
-                shape_stats = {"layers": 0, "units": 0}
-                tx_stats = self._load_startup_transcripts()
 
             elapsed = time.time() - t0
             mem_after = memory_snapshot_gb()
-
-            image_summary = f"images={img_stats['layers']}"
-            if img_stats.get("deferred", False):
-                image_summary = "images=deferred"
-            elif img_stats.get("skipped", False):
-                image_summary = "images=skipped"
-            elif img_stats.get("failed_keys", 0) > 0:
-                image_summary = (
-                    f"images={img_stats['layers']} "
-                    f"(failed_keys={img_stats['failed_keys']})"
-                )
-
-            if tx_stats.get("streamed"):
-                tx_summary = "tx=streaming (density + viewport detail)"
-            else:
-                tx_summary = (
-                    f"tx_total={tx_stats['total']:,} assigned={tx_stats['assigned']:,} "
-                    f"unassigned={tx_stats['unassigned']:,}"
-                )
-
             summary = (
-                f"{ds} loaded in {elapsed:.1f}s ({self.args.startup_mode} startup) | "
-                f"{image_summary} | "
-                f"{self._segmentation_layer_type()}_layers={shape_stats['layers']} "
-                f"{self._segmentation_unit_name()}={shape_stats['units']:,} | "
-                f"{tx_summary} | "
-                f"RSS {mem_before['rss_gb']:.1f}->{mem_after['rss_gb']:.1f} GB"
+                f"{ds} metadata loaded in {elapsed:.1f}s | "
+                f"images={len(self._image_keys)} "
+                f"{self._segmentation_layer_type()}_keys={len(self._segmentation_keys)} | "
+                f"RSS {mem_before['rss_gb']:.1f}->{mem_after['rss_gb']:.1f} GB | starting background loads..."
             )
-            self._set_status(summary)
             log.info(summary)
+            self._set_status(summary)
+
+            # Kick off the default background loads (images / masks / transcripts).
+            self._start_startup_autoload(ds)
 
         except Exception as exc:
             self._set_status(f"Failed to load {ds}: {exc}")
@@ -2034,9 +2077,13 @@ class ComparisonViewerController:
             self._active_sdata = None
             self._active_images_sdata = None
             self._segmentation_keys = []
+            self._image_keys = []
             self._publish_shape_keys()
+            self._publish_image_keys()
             if self._cellpose_value_options_callback is not None:
                 self._cellpose_value_options_callback([], [], False)
+        finally:
+            self._end_progress("dataset")
 
     def _pyramid_levels_from_element(self, elem) -> list[object]:
         """Return the (c, y, x) DataArrays of a stored image element, coarsest last."""
@@ -2129,7 +2176,7 @@ class ComparisonViewerController:
                 return extended, "materialized"
         return stored, "single"
 
-    def _prime_image_pyramid_caches(self, ds: str, sdata) -> None:
+    def _prime_image_pyramid_caches(self, ds: str, sdata, only_keys: set[str] | None = None) -> None:
         """Pre-build materialized pyramids for single-scale images (worker-thread safe)."""
         if da is None or sdata is None:
             return
@@ -2137,6 +2184,8 @@ class ComparisonViewerController:
             image_keys = [str(k) for k in sdata.images.keys() if not is_derived_cache_key(str(k))]
         except Exception:
             return
+        if only_keys is not None:
+            image_keys = [k for k in image_keys if k in only_keys]
         for image_key in image_keys:
             try:
                 if len(image_scale_dataarrays(sdata.images[image_key])) > 1:
@@ -2162,11 +2211,7 @@ class ComparisonViewerController:
                 return {label}
         return {labels[0]} if labels else set()
 
-    def _add_image_layers(self, ds: str, sdata, x_transform, y_transform) -> dict[str, int]:
-        if getattr(self.args, "skip_images", False):
-            log.info("[%s] Image loading skipped (--skip-images).", ds)
-            return {"layers": 0, "failed_keys": 0, "skipped": True}
-
+    def _add_image_layers(self, ds: str, sdata, x_transform, y_transform, only_keys: set[str] | None = None) -> dict[str, int]:
         visible = not self.args.hide_images
         total_layers = 0
         failed_keys = 0
@@ -2176,6 +2221,9 @@ class ComparisonViewerController:
         except Exception as exc:
             log.warning("[%s] Could not enumerate images; skipping image loading (%s)", ds, exc)
             return {"layers": 0, "failed_keys": 0, "skipped": True}
+
+        if only_keys is not None:
+            image_keys = [k for k in image_keys if k in only_keys]
 
         if len(image_keys) == 0:
             log.info("[%s] No images found in SpatialData; continuing without image layers.", ds)
@@ -2271,94 +2319,6 @@ class ComparisonViewerController:
                 continue
 
         return {"layers": total_layers, "failed_keys": failed_keys, "skipped": False}
-
-    def _add_shape_layer(
-        self,
-        shape_key: str,
-        cap: int | None = None,
-        simplify_tolerance: float | None = None,
-        render_mode: str | None = None,
-    ) -> int:
-        if self._segmentation_source() == "labels":
-            return self._add_label_layer(shape_key)
-
-        if self._active_sdata is None or self.active_dataset is None:
-            return 0
-        ds = self.active_dataset
-        if shape_key not in self._active_sdata.shapes:
-            raise KeyError(f"Shape key '{shape_key}' not found in current dataset.")
-
-        layer_name = make_layer_name(ds, self._segmentation_layer_type(), shape_key)
-        self._remove_layer_by_name(layer_name)
-        gc.collect()
-
-        gdf = self._active_sdata.shapes[shape_key]
-        edge_color = np.asarray(
-            stable_layer_color(shape_key, alpha=self.args.shape_opacity),
-            dtype=float,
-        )
-        mode = str(render_mode or self.args.shape_render_mode).lower()
-
-        if mode == "centroid":
-            coords = geometry_to_napari_centroids(gdf.geometry, max_shapes=cap)
-            if len(coords) == 0:
-                log.info("[%s] shapes[%s] has no drawable centroids", ds, shape_key)
-                return 0
-            self._add_points_layer(
-                coords,
-                name=layer_name,
-                color=edge_color,
-                visible=not self.args.hide_shapes,
-                size=self.args.shape_centroid_size,
-                opacity=self.args.shape_opacity,
-            )
-            units = int(len(coords))
-        else:
-            if mode == "bbox":
-                shape_data = geometry_to_napari_bounding_boxes(gdf.geometry, max_shapes=cap)
-                shape_type = "rectangle"
-            else:
-                shape_data = geometry_to_napari_polygons(
-                    gdf.geometry,
-                    max_shapes=cap,
-                    simplify_tolerance=simplify_tolerance,
-                    max_vertices_per_polygon=self.args.shape_max_vertices_per_polygon,
-                )
-                shape_type = mode
-
-            if len(shape_data) == 0:
-                log.info("[%s] shapes[%s] has no drawable geometries", ds, shape_key)
-                return 0
-
-            kwargs = dict(
-                shape_type=shape_type,
-                name=layer_name,
-                edge_color=edge_color,
-                edge_width=self.args.shape_edge_width,
-                visible=not self.args.hide_shapes,
-            )
-            if shape_type in ("polygon", "rectangle"):
-                kwargs["face_color"] = "transparent"
-            self.viewer.add_shapes(shape_data, **kwargs)
-            units = int(len(shape_data))
-
-        limit_note = f", capped at {cap:,}" if cap is not None else ""
-        simplify_note = f", simplify={simplify_tolerance}" if simplify_tolerance else ""
-        vertex_note = ""
-        if mode in ("path", "polygon") and self.args.shape_max_vertices_per_polygon is not None:
-            vertex_note = f", max_vertices={self.args.shape_max_vertices_per_polygon}"
-        mode_note = f", mode={mode}"
-        log.info(
-            "[%s] Added shape layer %s with %s geometries%s%s%s%s",
-            ds,
-            shape_key,
-            f"{units:,}",
-            limit_note,
-            simplify_note,
-            vertex_note,
-            mode_note,
-        )
-        return units
 
     def _label_key_for_shape_key(self, shape_key: str) -> str:
         shape_key = str(shape_key)
@@ -2952,30 +2912,6 @@ class ComparisonViewerController:
         )
         return 1
 
-    def _add_label_layer(self, label_key: str, layer_dataset: str | None = None) -> int:
-        if self._active_sdata is None or self.active_dataset is None:
-            return 0
-        ds = layer_dataset or self.active_dataset
-        prepared = self._prepare_label_outline_display(label_key)
-        return self._finish_label_layer(ds, label_key, prepared)
-
-    def _add_shape_layers(self, ds: str, sdata) -> dict[str, int]:
-        total_layers = 0
-        total_units = 0
-
-        del ds, sdata
-        for shape_key in self._segmentation_keys:
-            added = self._add_shape_layer(
-                shape_key,
-                cap=self.args.max_shapes_per_layer,
-                simplify_tolerance=self.args.shape_simplify_tolerance,
-            )
-            if added > 0:
-                total_layers += 1
-                total_units += added
-
-        return {"layers": total_layers, "units": total_units}
-
     def _resolve_points_columns(self):
         if self._active_sdata is None or self.active_dataset is None:
             raise RuntimeError("No active dataset.")
@@ -2992,615 +2928,6 @@ class ComparisonViewerController:
             raise KeyError(f"Could not resolve x/y columns in points[{points_key}]")
         return points_key, points_obj, x_col, y_col, assignment_col
 
-    def _transcript_coords_from_pdf(
-        self,
-        points_pdf,
-        x_col: str,
-        y_col: str,
-        assignment_col: str | None,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        if len(points_pdf) == 0:
-            empty = np.empty((0, 2), dtype=np.float32)
-            return empty, empty
-
-        if assignment_col is not None and assignment_col in points_pdf.columns:
-            assigned_mask = assignment_mask(points_pdf[assignment_col]).to_numpy(dtype=bool, copy=False)
-        else:
-            assigned_mask = np.ones(len(points_pdf), dtype=bool)
-
-        x_vals = points_pdf[x_col].to_numpy(dtype=np.float32, copy=False)
-        y_vals = points_pdf[y_col].to_numpy(dtype=np.float32, copy=False)
-        good = np.isfinite(x_vals) & np.isfinite(y_vals)
-        if not np.all(good):
-            x_vals = x_vals[good]
-            y_vals = y_vals[good]
-            assigned_mask = assigned_mask[good]
-
-        assigned_coords = np.column_stack([y_vals[assigned_mask], x_vals[assigned_mask]]).astype(
-            np.float32,
-            copy=False,
-        )
-        unassigned_coords = np.column_stack([y_vals[~assigned_mask], x_vals[~assigned_mask]]).astype(
-            np.float32,
-            copy=False,
-        )
-        return assigned_coords, unassigned_coords
-
-    def _compute_transcript_view_payload(
-        self,
-        state: StreamedTranscriptLayerState,
-        bounds: tuple[float, float, float, float] | None,
-        view_percent: int,
-    ) -> dict[str, object]:
-        empty = np.empty((0, 2), dtype=np.float32)
-        if state.point_index is None or bounds is None:
-            return {
-                "assigned_coords": empty,
-                "unassigned_coords": empty,
-                "total_in_view": 0,
-                "loaded": 0,
-                "assigned": 0,
-                "unassigned": 0,
-                "loaded_fraction": 0.0,
-                "bounds": bounds,
-                "view_percent": int(view_percent),
-                "detail_enabled": False,
-                "detail_reason": "density-only",
-                "view_margin_fraction": 0.0,
-            }
-
-        view_width = float(bounds[2] - bounds[0])
-        view_height = float(bounds[3] - bounds[1])
-        if max(view_width, view_height) > float(self.args.transcript_detail_max_view_size):
-            return {
-                "assigned_coords": empty,
-                "unassigned_coords": empty,
-                "total_in_view": 0,
-                "loaded": 0,
-                "assigned": 0,
-                "unassigned": 0,
-                "loaded_fraction": 0.0,
-                "bounds": bounds,
-                "view_percent": int(view_percent),
-                "detail_enabled": False,
-                "detail_reason": "zoom-in",
-                "view_size": max(view_width, view_height),
-                "view_margin_fraction": 0.0,
-            }
-
-        query_bounds = self._expanded_view_bounds(bounds)
-        sample_percent = None if int(view_percent) <= 0 else float(view_percent)
-        result = query_transcript_spatial_index(
-            state.point_index,
-            bounds=query_bounds,
-            max_points=self.args.transcript_detail_max_points,
-            sample_percent=sample_percent,
-            random_state=self.args.random_state,
-        )
-        assigned_coords = result["assigned_coords"]
-        unassigned_coords = result["unassigned_coords"]
-        loaded = int(result["loaded"])
-        return {
-            "assigned_coords": assigned_coords,
-            "unassigned_coords": unassigned_coords,
-            "total_in_view": int(result["total_in_view"]),
-            "loaded": loaded,
-            "assigned": int(len(assigned_coords)),
-            "unassigned": int(len(unassigned_coords)),
-            "loaded_fraction": float(result["loaded_fraction"]),
-            "bounds": query_bounds,
-            "viewport_bounds": bounds,
-            "view_percent": int(view_percent),
-            "detail_enabled": True,
-            "detail_reason": "indexed",
-            "view_margin_fraction": float(self.args.transcript_view_margin_fraction),
-        }
-
-    def _set_points_layer_data(self, layer_name: str, coords: np.ndarray, color, visible: bool):
-        layer = self._get_layer_by_name(layer_name)
-        if layer is None:
-            self._add_points_layer(coords, name=layer_name, color=color, visible=visible)
-            return
-        layer.data = coords
-        layer.visible = bool(visible)
-
-    def _set_layers_visible(self, layer_names: list[str], visible: bool):
-        for layer_name in layer_names:
-            layer = self._get_layer_by_name(layer_name)
-            if layer is not None:
-                layer.visible = bool(visible)
-
-    def _transcript_state_key(self, ds: str) -> str:
-        return make_layer_name(ds, "transcripts", "viewport")
-
-    def _schedule_streamed_transcript_update(self, state_key: str, delay_ms: int | None = None):
-        state = self._streamed_transcript_states.get(state_key)
-        if state is None:
-            return
-        if state.updating:
-            state.pending = True
-            return
-        delay = int(self.args.transcript_stream_debounce_ms if delay_ms is None else delay_ms)
-        state.timer.start(max(0, delay))
-
-    def _apply_streamed_transcript_update(self, state_key: str, generation: int, payload: dict[str, object]):
-        state = self._streamed_transcript_states.get(state_key)
-        if state is None or state.generation != generation or self.active_dataset != state.dataset:
-            return
-
-        state.updating = False
-        state.worker = None
-        transcripts_visible = not self.args.hide_transcripts
-        detail_enabled = bool(payload.get("detail_enabled", False))
-        self._set_layers_visible(state.density_layer_names, transcripts_visible and not detail_enabled)
-        self._set_points_layer_data(
-            state.assigned_layer_name,
-            payload["assigned_coords"],
-            self.args.assigned_color,
-            transcripts_visible and detail_enabled,
-        )
-        self._set_points_layer_data(
-            state.unassigned_layer_name,
-            payload["unassigned_coords"],
-            self.args.unassigned_color,
-            transcripts_visible and detail_enabled,
-        )
-
-        loaded = int(payload["loaded"])
-        total_in_view = int(payload["total_in_view"])
-        mode = "auto" if int(payload["view_percent"]) <= 0 else f"{int(payload['view_percent'])}%"
-        if detail_enabled:
-            fraction = float(payload["loaded_fraction"]) * 100.0
-            margin = max(0.0, float(payload.get("view_margin_fraction", 0.0)))
-            margin_note = f", {margin * 100.0:.0f}% pan buffer" if margin > 0 else ""
-            cap_note = ""
-            if total_in_view > int(self.args.transcript_detail_max_points) and loaded >= int(self.args.transcript_detail_max_points):
-                cap_note = f", capped at {int(self.args.transcript_detail_max_points):,}"
-            self._set_status(
-                f"{state.dataset} transcript point detail ({mode}): showing {loaded:,}/{total_in_view:,} "
-                f"indexed points ({fraction:.1f}%{cap_note}{margin_note}); assigned={int(payload['assigned']):,}, "
-                f"unassigned={int(payload['unassigned']):,}."
-            )
-        else:
-            reason = str(payload.get("detail_reason", "density-only"))
-            if reason == "zoom-in":
-                self._set_status(
-                    f"{state.dataset} transcript density visible; zoom in below "
-                    f"{float(self.args.transcript_detail_max_view_size):.0f} um for point detail."
-                )
-            else:
-                self._set_status(f"{state.dataset} transcript density visible; point detail index unavailable.")
-
-        if state.pending:
-            state.pending = False
-            self._schedule_streamed_transcript_update(state_key, delay_ms=0)
-
-    def _handle_streamed_transcript_error(self, state_key: str, generation: int, exc):
-        state = self._streamed_transcript_states.get(state_key)
-        if state is None or state.generation != generation:
-            return
-        state.updating = False
-        state.worker = None
-        message = exc[1] if isinstance(exc, tuple) and len(exc) > 1 else exc
-        self._set_status(f"{state.dataset} transcript viewport update failed: {message}")
-        log.error("[%s] Transcript viewport update failed: %s", state.dataset, message)
-        if state.pending:
-            state.pending = False
-            self._schedule_streamed_transcript_update(state_key, delay_ms=0)
-
-    def _update_streamed_transcript_layer(self, state_key: str):
-        state = self._streamed_transcript_states.get(state_key)
-        if state is None or self.active_dataset != state.dataset:
-            return
-        if state.updating:
-            state.pending = True
-            return
-
-        bounds = self._current_view_bounds()
-        state.generation += 1
-        generation = state.generation
-        state.updating = True
-        state.pending = False
-        view_percent = int(state.view_percent)
-        mode = "auto" if view_percent <= 0 else f"{view_percent}%"
-        self._set_status(f"{state.dataset} updating viewport transcripts ({mode})...")
-
-        if thread_worker is None:
-            try:
-                payload = self._compute_transcript_view_payload(state, bounds, view_percent)
-            except Exception as exc:
-                self._handle_streamed_transcript_error(state_key, generation, exc)
-                return
-            self._apply_streamed_transcript_update(state_key, generation, payload)
-            return
-
-        def compute():
-            return self._compute_transcript_view_payload(state, bounds, view_percent)
-
-        worker_factory = thread_worker(compute)
-        worker = worker_factory()
-        worker.returned.connect(
-            lambda payload, key=state_key, gen=generation: self._apply_streamed_transcript_update(key, gen, payload)
-        )
-        worker.errored.connect(
-            lambda exc, key=state_key, gen=generation: self._handle_streamed_transcript_error(key, gen, exc)
-        )
-        state.worker = worker
-        worker.start()
-
-    def _ensure_transcript_density_cache(
-        self,
-        points_key: str,
-        points_obj,
-        x_col: str,
-        y_col: str,
-        assignment_col: str | None,
-    ) -> tuple[str, dict[str, object]]:
-        if self._active_sdata is None or self.active_dataset is None:
-            raise RuntimeError("No active dataset.")
-
-        requested_bin_um = float(self.args.transcript_density_bin_um)
-        cache_key = derived_transcript_density_cache_key(points_key, requested_bin_um)
-        expected = {
-            "kind": "transcript_density",
-            "points_key": str(points_key),
-            "x_col": str(x_col),
-            "y_col": str(y_col),
-            "assignment_col": None if assignment_col is None else str(assignment_col),
-            "requested_bin_um": float(requested_bin_um),
-            "max_pixels": int(self.args.transcript_density_max_pixels),
-            "pyramid_normalization": TRANSCRIPT_DENSITY_PYRAMID_NORMALIZATION,
-        }
-        if self._derived_cache_complete("images", cache_key, expected) and self._refresh_image_key_from_store(cache_key):
-            return cache_key, self._derived_cache_attrs("images", cache_key)
-
-        self._set_status(f"{self.active_dataset} building transcript density cache for {points_key}...")
-        density, density_meta = compute_transcript_density_array(
-            points_obj,
-            x_col=x_col,
-            y_col=y_col,
-            assignment_col=assignment_col,
-            bin_um=requested_bin_um,
-            max_pixels=int(self.args.transcript_density_max_pixels),
-        )
-        levels = lazy_density_pyramid(density)
-        if da is not None:
-            levels = [
-                da.asarray(level).rechunk(
-                    (
-                        1,
-                        min(1024, int(level.shape[1])),
-                        min(1024, int(level.shape[2])),
-                    )
-                )
-                for level in levels
-            ]
-        actual_bin_um = float(density_meta["actual_bin_um"])
-        min_x, min_y, _max_x, _max_y = (float(v) for v in density_meta["bounds"])
-        transform = Affine(
-            [
-                [actual_bin_um, 0.0, min_x],
-                [0.0, actual_bin_um, min_y],
-                [0.0, 0.0, 1.0],
-            ],
-            input_axes=("x", "y"),
-            output_axes=("x", "y"),
-        )
-        density_tree = self._datatree_from_levels(
-            levels,
-            dims=("c", "y", "x"),
-            channels=["assigned", "unassigned"],
-            transform=transform,
-            dtype=np.float32,
-        )
-        Image2DModel.validate(density_tree)
-        self._discard_derived_cache_before_write("images", cache_key)
-        self._active_sdata.images[cache_key] = density_tree
-        self._set_status(f"{self.active_dataset} writing transcript density pyramid for {points_key}...")
-        self._active_sdata.write_element(cache_key, overwrite=False)
-        attrs = {
-            **expected,
-            **density_meta,
-            "levels": int(len(levels)),
-        }
-        self._mark_derived_cache_complete("images", cache_key, attrs)
-        self._refresh_image_key_from_store(cache_key)
-        log.info(
-            "[%s] Built transcript density cache images[%s] from points[%s] shape=%s levels=%s bin=%s requested_bin=%s",
-            self.active_dataset,
-            cache_key,
-            points_key,
-            density.shape,
-            len(levels),
-            actual_bin_um,
-            requested_bin_um,
-        )
-        return cache_key, attrs
-
-    def _add_transcript_density_layers(self, cache_key: str, attrs: dict[str, object]) -> list[str]:
-        if self._active_sdata is None or self.active_dataset is None:
-            return []
-        if cache_key not in self._active_sdata.images and not self._refresh_image_key_from_store(cache_key):
-            raise KeyError(f"Transcript density cache '{cache_key}' not found.")
-
-        ds = self.active_dataset
-        image_elem = self._active_sdata.images[cache_key]
-        levels = self._raster_scale_levels(image_elem)
-        if len(levels) == 0:
-            raise ValueError(f"Transcript density cache {cache_key} has no readable levels.")
-
-        scale_levels = []
-        for scale_name, data in levels:
-            if len(getattr(data, "shape", ())) != 3:
-                continue
-            scale_levels.append((scale_name, data))
-        if len(scale_levels) == 0:
-            raise ValueError(f"Transcript density cache {cache_key} has no 3D c/y/x levels.")
-
-        napari_affine = self._napari_affine_from_element(image_elem)
-        visible = not self.args.hide_transcripts
-        layer_names: list[str] = []
-        channel_specs = [
-            ("assigned", 0, self.args.assigned_color),
-            ("unassigned", 1, self.args.unassigned_color),
-        ]
-        for label, channel_idx, color in channel_specs:
-            channel_levels = [data[channel_idx, :, :] for _scale_name, data in scale_levels]
-            ch_data = channel_levels if len(channel_levels) > 1 else channel_levels[0]
-            layer_name = make_layer_name(ds, "transcript_density", label)
-            self._remove_layer_by_name(layer_name)
-            self.viewer.add_image(
-                ch_data,
-                name=layer_name,
-                affine=napari_affine,
-                colormap=transparent_colormap(f"{cache_key}_{label}", color, alpha=1.0),
-                contrast_limits=(0.0, max(1.0, float(self.args.transcript_density_contrast_max))),
-                interpolation2d="nearest",
-                multiscale=len(channel_levels) > 1,
-                opacity=1.0,
-                blending="additive",
-                visible=visible,
-            )
-            layer_names.append(layer_name)
-        return layer_names
-
-    def _load_startup_transcripts(self) -> dict[str, object]:
-        """Load transcripts on dataset load per --transcripts-mode.
-
-        Defaults to the streamed hybrid layer (density pyramid always visible +
-        viewport point detail when zoomed in) rather than a fixed capped sample.
-        """
-        if str(getattr(self.args, "transcripts_mode", "streamed")).lower() == "capped":
-            return self._add_transcripts_layer(self.args.max_transcripts)
-        return self._add_streamed_transcripts_layer()
-
-    def _add_streamed_transcripts_layer(self, view_percent: int | None = None) -> dict[str, int | bool]:
-        if self._active_sdata is None or self.active_dataset is None:
-            return {"total": 0, "assigned": 0, "unassigned": 0, "streamed": True}
-        if len(getattr(self._active_sdata, "points", {})) == 0:
-            log.warning("[%s] No points available; skipping streamed transcript layers.", self.active_dataset)
-            return {"total": 0, "assigned": 0, "unassigned": 0, "streamed": True}
-
-        ds = self.active_dataset
-        points_key, points_obj, x_col, y_col, assignment_col = self._resolve_points_columns()
-        # _clear_streamed_transcript_states() bumps the build generation, so
-        # capture the new generation afterwards.
-        self._clear_streamed_transcript_states()
-        self._remove_layers_by_prefix(layer_name_prefix(ds, "transcripts"))
-        self._remove_layers_by_prefix(layer_name_prefix(ds, "transcript_density"))
-        gc.collect()
-
-        resolved_view_percent = (
-            int(self.args.transcript_view_percent) if view_percent is None else int(view_percent)
-        )
-        self._transcript_build_generation += 1
-        generation = self._transcript_build_generation
-        self._set_status(f"{ds} building transcript density + detail index for {points_key}...")
-
-        def compute():
-            # Heavy: builds/persists the density pyramid and the in-memory point
-            # index. Runs on a worker thread; only pure data is returned so the
-            # napari layer creation can happen back on the GUI thread.
-            t0 = time.time()
-            density_cache_key, density_attrs = self._ensure_transcript_density_cache(
-                points_key,
-                points_obj,
-                x_col,
-                y_col,
-                assignment_col,
-            )
-            self._set_status(f"{ds} building transcript point detail index for {points_key}...")
-            point_index = build_transcript_spatial_index(
-                points_obj,
-                x_col=x_col,
-                y_col=y_col,
-                assignment_col=assignment_col,
-                max_points=int(self.args.transcript_index_max_points),
-                tile_um=float(self.args.transcript_index_tile_um),
-                random_state=int(self.args.random_state),
-            )
-            return {
-                "points_key": points_key,
-                "density_cache_key": density_cache_key,
-                "density_attrs": density_attrs,
-                "point_index": point_index,
-                "view_percent": resolved_view_percent,
-                "build_seconds": time.time() - t0,
-            }
-
-        if thread_worker is None:
-            try:
-                payload = compute()
-            except Exception as exc:
-                self._handle_streamed_transcript_build_error(generation, ds, exc)
-                return {"total": 0, "assigned": 0, "unassigned": 0, "streamed": True}
-            self._apply_streamed_transcripts_build(generation, ds, payload)
-            return {"total": 0, "assigned": 0, "unassigned": 0, "streamed": True}
-
-        worker_factory = thread_worker(compute)
-        worker = worker_factory()
-        worker.returned.connect(
-            lambda payload, gen=generation, d=ds: self._apply_streamed_transcripts_build(gen, d, payload)
-        )
-        worker.errored.connect(
-            lambda exc, gen=generation, d=ds: self._handle_streamed_transcript_build_error(gen, d, exc)
-        )
-        self._transcript_build_worker = worker
-        worker.start()
-        return {"total": 0, "assigned": 0, "unassigned": 0, "streamed": True}
-
-    def _apply_streamed_transcripts_build(self, generation: int, ds: str, payload: dict[str, object]):
-        if generation != self._transcript_build_generation or self.active_dataset != ds:
-            return
-        self._transcript_build_worker = None
-
-        points_key = str(payload["points_key"])
-        density_cache_key = str(payload["density_cache_key"])
-        point_index = payload["point_index"]
-        density_layer_names = self._add_transcript_density_layers(
-            density_cache_key,
-            payload["density_attrs"],
-        )
-
-        assigned_layer_name = make_layer_name(ds, "transcripts", "assigned")
-        unassigned_layer_name = make_layer_name(ds, "transcripts", "unassigned")
-        visible = not self.args.hide_transcripts
-        empty = np.empty((0, 2), dtype=np.float32)
-        self._add_points_layer(
-            empty,
-            name=unassigned_layer_name,
-            color=self.args.unassigned_color,
-            visible=visible,
-        )
-        self._add_points_layer(
-            empty,
-            name=assigned_layer_name,
-            color=self.args.assigned_color,
-            visible=visible,
-        )
-
-        state_key = self._transcript_state_key(ds)
-        timer = QTimer()
-        timer.setSingleShot(True)
-        timer.timeout.connect(lambda key=state_key: self._update_streamed_transcript_layer(key))
-        state = StreamedTranscriptLayerState(
-            dataset=ds,
-            points_key=points_key,
-            assigned_layer_name=assigned_layer_name,
-            unassigned_layer_name=unassigned_layer_name,
-            timer=timer,
-            view_percent=int(payload["view_percent"]),
-            point_index=point_index,
-            density_layer_names=density_layer_names,
-        )
-
-        def schedule(_event=None, key=state_key):
-            self._schedule_streamed_transcript_update(key)
-
-        state.camera_callback = schedule
-        self._streamed_transcript_states[state_key] = state
-
-        try:
-            self.viewer.camera.events.zoom.connect(schedule)
-            self.viewer.camera.events.center.connect(schedule)
-        except Exception:
-            pass
-
-        self._schedule_streamed_transcript_update(state_key, delay_ms=0)
-        log.info(
-            "[%s] Added hybrid transcript layers from points[%s] density_cache=%s viewport_percent=%s "
-            "detail_max_points=%s indexed=%s build=%.1fs",
-            ds,
-            points_key,
-            density_cache_key,
-            state.view_percent,
-            self.args.transcript_detail_max_points,
-            0 if point_index is None else point_index.indexed_rows,
-            float(payload.get("build_seconds", 0.0)),
-        )
-
-    def _handle_streamed_transcript_build_error(self, generation: int, ds: str, exc):
-        if generation != self._transcript_build_generation:
-            return
-        self._transcript_build_worker = None
-        message = exc[1] if isinstance(exc, tuple) and len(exc) > 1 else exc
-        self._set_status(f"{ds} transcript build failed: {message}")
-        log.error("[%s] Transcript density/index build failed: %s", ds, message)
-
-    def _add_transcripts_layer(self, cap: int | None) -> dict[str, int]:
-        if self._active_sdata is None or self.active_dataset is None:
-            return {"total": 0, "assigned": 0, "unassigned": 0}
-
-        ds = self.active_dataset
-        sdata = self._active_sdata
-        self._clear_streamed_transcript_states()
-        self._remove_layers_by_prefix(layer_name_prefix(ds, "transcripts"))
-        self._remove_layers_by_prefix(layer_name_prefix(ds, "transcript_density"))
-
-        if len(sdata.points) == 0:
-            log.warning("[%s] No points available in SpatialData.", ds)
-            return {"total": 0, "assigned": 0, "unassigned": 0}
-
-        points_key, points_obj, x_col, y_col, assignment_col = self._resolve_points_columns()
-
-        points_pdf = load_points_dataframe(
-            points_obj,
-            x_col=x_col,
-            y_col=y_col,
-            assignment_col=assignment_col,
-            max_points=cap,
-            random_state=self.args.random_state,
-        )
-
-        if assignment_col is not None and assignment_col in points_pdf.columns:
-            assigned_mask = assignment_mask(points_pdf[assignment_col]).to_numpy(dtype=bool, copy=False)
-        else:
-            assigned_mask = np.ones(len(points_pdf), dtype=bool)
-
-        x_vals = points_pdf[x_col].to_numpy(dtype=np.float32, copy=False)
-        y_vals = points_pdf[y_col].to_numpy(dtype=np.float32, copy=False)
-
-        assigned_coords = np.column_stack([y_vals[assigned_mask], x_vals[assigned_mask]])
-        unassigned_coords = np.column_stack([y_vals[~assigned_mask], x_vals[~assigned_mask]])
-
-        visible = not self.args.hide_transcripts
-
-        if len(unassigned_coords) > 0:
-            self._add_points_layer(
-                unassigned_coords,
-                name=make_layer_name(ds, "transcripts", "unassigned"),
-                color=self.args.unassigned_color,
-                visible=visible,
-            )
-
-        if len(assigned_coords) > 0:
-            self._add_points_layer(
-                assigned_coords,
-                name=make_layer_name(ds, "transcripts", "assigned"),
-                color=self.args.assigned_color,
-                visible=visible,
-            )
-
-        total = int(len(points_pdf))
-        assigned = int(assigned_mask.sum())
-        unassigned = total - assigned
-
-        limit_note = ""
-        if cap is not None:
-            limit_note = f" (sampled/capped to {cap:,})"
-
-        log.info(
-            "[%s] Added transcripts from points[%s]: total=%s assigned=%s unassigned=%s%s",
-            ds,
-            points_key,
-            f"{total:,}",
-            f"{assigned:,}",
-            f"{unassigned:,}",
-            limit_note,
-        )
-
-        return {"total": total, "assigned": assigned, "unassigned": unassigned}
-
     def load_selected_labels(self, dataset_name: str, shape_keys: list[str]):
         if not self._ensure_dataset_is_active(dataset_name):
             self._set_status(f"Could not activate dataset {dataset_name}.")
@@ -3615,8 +2942,9 @@ class ComparisonViewerController:
         self._label_build_generation += 1
         generation = self._label_build_generation
         mem_before = memory_snapshot_gb()
-        self._set_status(
-            f"{ds} building label outline layer(s) for {len(keys)} segmentation(s)..."
+        self._begin_progress(
+            "masks",
+            f"{ds}: loading/computing cell segmentation ({', '.join(keys)})...",
         )
 
         def compute():
@@ -3664,6 +2992,7 @@ class ComparisonViewerController:
         if generation != self._label_build_generation or self.active_dataset != ds:
             return
         self._label_build_worker = None
+        self._end_progress("masks")
         added_layers = 0
         for spec in payload["specs"]:
             added = self._finish_label_layer(ds, str(spec["label_key"]), spec["prepared"])
@@ -3681,6 +3010,7 @@ class ComparisonViewerController:
         if generation != self._label_build_generation:
             return
         self._label_build_worker = None
+        self._end_progress("masks")
         message = exc[1] if isinstance(exc, tuple) and len(exc) > 1 else exc
         self._set_status(f"{ds} label outline build failed: {message}")
         log.error("[%s] Label outline build failed: %s", ds, message)
@@ -3969,62 +3299,6 @@ class ComparisonViewerController:
                 removed += 1
         self._set_status(f"{ds} removed {removed} Cellpose value overlay layer(s).")
 
-    def _get_canvas_size(self) -> tuple[int, int] | None:
-        """Return the canvas size in pixels, robust across napari versions.
-
-        napari has no stable public canvas-size API. We try the private
-        ``_qt_viewer`` first (the real attribute) so the common path never
-        touches the deprecated ``qt_viewer`` property, fall back to it if
-        needed, and cache the last good value so a future napari that renames or
-        removes either accessor keeps working.
-        """
-        window = getattr(self.viewer, "window", None)
-        if window is not None:
-            for attr in ("_qt_viewer", "qt_viewer"):
-                try:
-                    qt_viewer = getattr(window, attr, None)
-                except Exception:
-                    qt_viewer = None
-                canvas = getattr(qt_viewer, "canvas", None) if qt_viewer is not None else None
-                if canvas is None:
-                    continue
-                try:
-                    size = tuple(int(v) for v in canvas.size)
-                except Exception:
-                    continue
-                if len(size) >= 2 and size[0] > 0 and size[1] > 0:
-                    self._canvas_size = (int(size[0]), int(size[1]))
-                    return self._canvas_size
-        return self._canvas_size
-
-    def _current_view_bounds(self) -> tuple[float, float, float, float] | None:
-        try:
-            center = tuple(float(v) for v in self.viewer.camera.center)
-            zoom = float(self.viewer.camera.zoom)
-        except Exception:
-            return None
-
-        size = self._get_canvas_size()
-        if size is None or len(center) < 2 or len(size) < 2 or zoom <= 0:
-            return None
-
-        y_center = center[-2]
-        x_center = center[-1]
-        width_px, height_px = size[0], size[1]
-        half_x = max(width_px / (2.0 * zoom), 1.0)
-        half_y = max(height_px / (2.0 * zoom), 1.0)
-        return (x_center - half_x, y_center - half_y, x_center + half_x, y_center + half_y)
-
-    def _expanded_view_bounds(
-        self,
-        bounds: tuple[float, float, float, float],
-    ) -> tuple[float, float, float, float]:
-        margin = max(0.0, float(self.args.transcript_view_margin_fraction))
-        min_x, min_y, max_x, max_y = (float(v) for v in bounds)
-        pad_x = max(0.0, max_x - min_x) * margin
-        pad_y = max(0.0, max_y - min_y) * margin
-        return (min_x - pad_x, min_y - pad_y, max_x + pad_x, max_y + pad_y)
-
     def unload_selected_shapes(self, dataset_name: str, shape_keys: list[str]):
         if not self._ensure_dataset_is_active(dataset_name):
             self._set_status(f"Could not activate dataset {dataset_name}.")
@@ -4043,54 +3317,6 @@ class ComparisonViewerController:
                 if len(self.viewer.layers) < before:
                     removed += 1
         self._set_status(f"{ds} removed {removed} {self._segmentation_layer_type()} layer(s).")
-
-    def set_transcript_view_percent(self, dataset_name: str, percent: int):
-        percent = int(percent)
-        self.args.transcript_view_percent = percent
-        ds = str(dataset_name).upper()
-        state = self._streamed_transcript_states.get(self._transcript_state_key(ds))
-        if state is None:
-            return
-        state.view_percent = percent
-        if self.active_dataset == ds:
-            self._schedule_streamed_transcript_update(self._transcript_state_key(ds), delay_ms=0)
-
-    def load_full_transcripts(self, dataset_name: str, view_percent: int | None = None):
-        if not self._ensure_dataset_is_active(dataset_name):
-            self._set_status(f"Could not activate dataset {dataset_name}.")
-            return
-        if view_percent is not None:
-            self.args.transcript_view_percent = int(view_percent)
-        # The build now runs on a worker thread; status is driven by the build /
-        # apply callbacks, so we intentionally do not overwrite it here.
-        self._add_streamed_transcripts_layer(view_percent=view_percent)
-
-    def unload_transcripts(self, dataset_name: str):
-        """Fully unload streamed transcripts so pan/zoom cannot bring them back.
-
-        Tears down the streamed state (stops the debounce timer, disconnects the
-        camera pan/zoom callbacks, and cancels any in-flight build) and removes
-        the transcript point + density layers. Without this, deleting the layers
-        by hand left the camera callbacks alive, which recreated the points on
-        the next pan/zoom.
-        """
-        ds = str(dataset_name).upper()
-        # Bumps the build generation and disconnects camera callbacks for all
-        # streamed states, so a queued update or in-flight build cannot re-add
-        # layers after this returns.
-        self._clear_streamed_transcript_states()
-        removed = 0
-        for prefix in (layer_name_prefix(ds, "transcripts"), layer_name_prefix(ds, "transcript_density")):
-            names = [str(layer.name) for layer in self.viewer.layers]
-            for layer_name in matching_layer_names(names, prefix):
-                before = len(self.viewer.layers)
-                self._remove_layer_by_name(layer_name)
-                if len(self.viewer.layers) < before:
-                    removed += 1
-        self._set_status(
-            f"{ds} unloaded transcripts ({removed} layer(s) removed). "
-            "Use 'Load Full Transcripts' to bring them back."
-        )
 
     # ------------------------------------------------------------------
     # "Inspect Genes": per-gene transcript renderer
@@ -4119,19 +3345,15 @@ class ComparisonViewerController:
             self._set_status(f"{ds} has no gene/feature-name column in points[{points_key}].")
             return
 
-        # Tear down any prior gene inspector, then take over the transcript
-        # display by unloading the streamed density / assigned-unassigned layers.
-        self._teardown_gene_inspector(ds, restore=False)
-        self._clear_streamed_transcript_states()
-        self._remove_layers_by_prefix(layer_name_prefix(ds, "transcripts"))
-        self._remove_layers_by_prefix(layer_name_prefix(ds, "transcript_density"))
+        # Tear down any prior gene inspector layers before rebuilding.
+        self._teardown_gene_inspector(ds)
         gc.collect()
 
         self._gene_build_generation += 1
         generation = self._gene_build_generation
         max_points = int(getattr(self.args, "gene_max_render_points", DEFAULT_GENE_MAX_RENDER_POINTS))
         random_state = int(getattr(self.args, "random_state", 42))
-        self._set_status(f"{ds} building per-gene point store for {points_key}...")
+        self._begin_progress("transcripts", f"{ds}: building per-gene transcripts for {points_key}...")
 
         def compute():
             t0 = time.time()
@@ -4170,6 +3392,7 @@ class ComparisonViewerController:
         if generation != self._gene_build_generation or self.active_dataset != ds:
             return
         self._gene_build_worker = None
+        self._end_progress("transcripts")
         store = payload["store"]
         points_key = str(payload["points_key"])
         if store.total_points == 0 or not store.genes:
@@ -4245,6 +3468,7 @@ class ComparisonViewerController:
         if generation != self._gene_build_generation:
             return
         self._gene_build_worker = None
+        self._end_progress("transcripts")
         message = exc[1] if isinstance(exc, tuple) and len(exc) > 1 else exc
         self._set_status(f"{ds} inspect genes failed: {message}")
         log.error("[%s] Gene inspector build failed: %s", ds, message)
@@ -4394,11 +3618,12 @@ class ComparisonViewerController:
     def close_gene_inspector(self, dataset_name: str):
         ds = str(dataset_name).upper()
         had = ds in self._gene_inspector_states
-        self._teardown_gene_inspector(ds, restore=had and self.active_dataset == ds)
+        self._teardown_gene_inspector(ds)
+        self._end_progress("transcripts")
         if had:
-            self._set_status(f"{ds} closed gene inspector; restored transcript view.")
+            self._set_status(f"{ds} unloaded transcripts. Use 'Load transcripts' to bring them back.")
 
-    def _teardown_gene_inspector(self, ds: str, restore: bool):
+    def _teardown_gene_inspector(self, ds: str):
         ds = str(ds).upper()
         # Cancel any in-flight build so a stale result cannot install layers.
         self._gene_build_generation += 1
@@ -4412,8 +3637,6 @@ class ComparisonViewerController:
         self._remove_layers_by_prefix(layer_name_prefix(ds, "genes"))
         if self._gene_inspector_widget is not None and self._gene_inspector_widget.dataset == ds:
             self._gene_inspector_widget.clear()
-        if restore:
-            self._load_startup_transcripts()
 
     def _clear_gene_inspector_states(self):
         self._gene_build_generation += 1
@@ -4428,10 +3651,30 @@ class ComparisonViewerController:
         if self._gene_inspector_widget is not None:
             self._gene_inspector_widget.clear()
 
-    def load_images_on_demand(self, dataset_name: str):
-        if self.args.skip_images:
-            self._set_status("Image loading disabled (--skip-images).")
+    def load_selected_image(self, dataset_name: str, image_keys: list[str]):
+        keys = [str(k) for k in image_keys]
+        if not keys:
+            self._set_status("No image selected.")
             return
+        self.load_images_on_demand(dataset_name, image_keys=keys)
+
+    def unload_selected_images(self, dataset_name: str, image_keys: list[str]):
+        if not self._ensure_dataset_is_active(dataset_name):
+            self._set_status(f"Could not activate dataset {dataset_name}.")
+            return
+        ds = str(dataset_name).upper()
+        removed = 0
+        for image_key in [str(k) for k in image_keys]:
+            prefix = make_layer_name(ds, "image", image_key)
+            names = [str(layer.name) for layer in self.viewer.layers]
+            for layer_name in matching_layer_names(names, prefix):
+                before = len(self.viewer.layers)
+                self._remove_layer_by_name(layer_name)
+                if len(self.viewer.layers) < before:
+                    removed += 1
+        self._set_status(f"{ds} removed {removed} image layer(s).")
+
+    def load_images_on_demand(self, dataset_name: str, image_keys: list[str] | None = None):
         if not self._ensure_dataset_is_active(dataset_name):
             self._set_status(f"Could not activate dataset {dataset_name}.")
             return
@@ -4442,17 +3685,19 @@ class ComparisonViewerController:
             raise RuntimeError("Image transform is not initialized.")
 
         images_sdata = self._active_images_sdata
+        only_keys = set(str(k) for k in image_keys) if image_keys is not None else None
         self._image_build_generation += 1
         generation = self._image_build_generation
-        self._set_status(f"{ds} preparing image pyramids (this is a one-time cached build)...")
+        scope = "selected images" if only_keys is not None else "all images"
+        self._begin_progress("images", f"{ds}: computing image pyramids ({scope}; one-time cached build)...")
 
         def compute():
             # Heavy: streams full-resolution channels once to materialize small
             # coarse-level pyramids into the zarr. Runs on a worker thread so the
             # UI stays responsive; the layer creation happens on the GUI thread.
             t0 = time.time()
-            self._prime_image_pyramid_caches(ds, images_sdata)
-            return {"build_seconds": time.time() - t0}
+            self._prime_image_pyramid_caches(ds, images_sdata, only_keys=only_keys)
+            return {"build_seconds": time.time() - t0, "only_keys": only_keys}
 
         if thread_worker is None:
             try:
@@ -4478,8 +3723,16 @@ class ComparisonViewerController:
         if generation != self._image_build_generation or self.active_dataset != ds:
             return
         self._image_build_worker = None
-        self._remove_layers_by_prefix(layer_name_prefix(ds, "image"))
-        stats = self._add_image_layers(ds, self._active_images_sdata, self._x_transform, self._y_transform)
+        self._end_progress("images")
+        only_keys = payload.get("only_keys")
+        if only_keys is None:
+            self._remove_layers_by_prefix(layer_name_prefix(ds, "image"))
+        else:
+            for image_key in only_keys:
+                self._remove_layers_by_prefix(make_layer_name(ds, "image", image_key))
+        stats = self._add_image_layers(
+            ds, self._active_images_sdata, self._x_transform, self._y_transform, only_keys=only_keys
+        )
         self._set_status(
             f"{ds} loaded image layers={stats['layers']} (failed={stats['failed_keys']}); "
             f"pyramid build={float(payload.get('build_seconds', 0.0)):.1f}s."
@@ -4489,6 +3742,7 @@ class ComparisonViewerController:
         if generation != self._image_build_generation:
             return
         self._image_build_worker = None
+        self._end_progress("images")
         message = exc[1] if isinstance(exc, tuple) and len(exc) > 1 else exc
         self._set_status(f"{ds} image load failed: {message}")
         log.error("[%s] Image pyramid build/load failed: %s", ds, message)
@@ -4599,134 +3853,35 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--startup-mode",
-        default="fast",
-        choices=["fast", "full"],
-        help="Startup behavior: fast (on-demand layers) or full (eager legacy-style loading).",
-    )
-    parser.add_argument(
         "--segmentation-source",
         default="shapes",
         choices=["shapes", "labels"],
         help="Load segmentation layers from shapes (vector) or labels (raster masks).",
     )
+
+    # Startup auto-load controls. By default the viewer loads all images, the
+    # Cellpose + ProSeg cell segmentations, and all transcripts (per-gene points).
+    # Each --skip-* flag suppresses only the *startup* load of that layer type for
+    # low-RAM systems; the layer can still be loaded manually from its tab.
     parser.add_argument(
-        "--transcripts-mode",
-        default="streamed",
-        choices=["streamed", "capped"],
-        help=(
-            "How transcripts load on dataset load. 'streamed' (default): density pyramid "
-            "always visible plus full viewport point detail when zoomed in. 'capped': a fixed "
-            "sampled subset of --max-transcripts points."
-        ),
+        "--skip-images",
+        action="store_true",
+        help="Do not auto-load image layers at startup (load them manually from the Images tab).",
     )
     parser.add_argument(
-        "--max-transcripts",
-        default=None,
-        type=int,
-        help="Optional cap/sampling limit for transcripts per dataset load (used by --transcripts-mode capped).",
+        "--skip-cellpose",
+        action="store_true",
+        help="Do not auto-load the Cellpose segmentation at startup (load it manually from the Cell segmentation tab).",
     )
     parser.add_argument(
-        "--transcript-view-percent",
-        default=DEFAULT_TRANSCRIPT_VIEW_PERCENT,
-        type=int,
-        help=(
-            "Percentage of transcripts in the current viewport to show in streamed full-transcript mode. "
-            "Use 0 for auto, which loads up to --transcript-detail-max-points."
-        ),
+        "--skip-proseg",
+        action="store_true",
+        help="Do not auto-load the ProSeg segmentation at startup (load it manually from the Cell segmentation tab).",
     )
     parser.add_argument(
-        "--transcript-view-margin-fraction",
-        default=DEFAULT_TRANSCRIPT_VIEW_MARGIN_FRACTION,
-        type=float,
-        help=(
-            "Fraction of the current viewport width/height to add on each side when querying "
-            "zoomed-in transcript point detail."
-        ),
-    )
-    parser.add_argument(
-        "--transcript-max-view-points",
-        default=None,
-        type=int,
-        help="Deprecated alias for --transcript-detail-max-points.",
-    )
-    parser.add_argument(
-        "--transcript-stream-debounce-ms",
-        default=DEFAULT_TRANSCRIPT_STREAM_DEBOUNCE_MS,
-        type=int,
-        help="Delay after pan/zoom before refreshing viewport-streamed transcript layers.",
-    )
-    parser.add_argument(
-        "--transcript-density-bin-um",
-        default=DEFAULT_TRANSCRIPT_DENSITY_BIN_UM,
-        type=float,
-        help="Requested transcript density bin size in microns.",
-    )
-    parser.add_argument(
-        "--transcript-density-max-pixels",
-        default=DEFAULT_TRANSCRIPT_DENSITY_MAX_PIXELS,
-        type=int,
-        help="Maximum pixels per transcript density channel; bin size increases automatically above this.",
-    )
-    parser.add_argument(
-        "--transcript-density-contrast-max",
-        default=DEFAULT_TRANSCRIPT_DENSITY_CONTRAST_MAX,
-        type=float,
-        help=(
-            "Upper contrast limit for the rasterized transcript density layers (per-bin counts). "
-            "Lower values make transcripts appear brighter/denser; raise to dim them."
-        ),
-    )
-    parser.add_argument(
-        "--transcript-detail-max-view-size",
-        default=DEFAULT_TRANSCRIPT_DETAIL_MAX_VIEW_SIZE,
-        type=float,
-        help="Maximum viewport width/height in microns before transcript point detail is shown.",
-    )
-    parser.add_argument(
-        "--transcript-detail-max-points",
-        default=None,
-        type=int,
-        help="Maximum transcript points displayed in the zoomed-in detail overlay.",
-    )
-    parser.add_argument(
-        "--transcript-index-max-points",
-        default=DEFAULT_TRANSCRIPT_INDEX_MAX_POINTS,
-        type=int,
-        help="Maximum transcript points loaded into the in-memory detail index.",
-    )
-    parser.add_argument(
-        "--transcript-index-tile-um",
-        default=DEFAULT_TRANSCRIPT_INDEX_TILE_UM,
-        type=float,
-        help="Tile size in microns for the in-memory transcript detail index.",
-    )
-    parser.add_argument(
-        "--max-shapes-per-layer",
-        default=None,
-        type=int,
-        help="Optional cap for polygons per shape layer.",
-    )
-    parser.add_argument(
-        "--shape-simplify-tolerance",
-        default=0.0,
-        type=float,
-        help="Optional simplify tolerance for polygons before adding shape layers (0 disables simplification).",
-    )
-    parser.add_argument(
-        "--shape-render-mode",
-        default="path",
-        choices=["path", "polygon", "bbox", "centroid"],
-        help="Render capped segmentation loads as path, polygon, bbox, or centroid.",
-    )
-    parser.add_argument(
-        "--shape-max-vertices-per-polygon",
-        default=None,
-        type=int,
-        help=(
-            "Optional vertex cap per polygon for path/polygon rendering. "
-            "Useful for loading large uncapped segmentation layers approximately."
-        ),
+        "--skip-transcripts",
+        action="store_true",
+        help="Do not auto-load transcripts at startup (load them manually from the Gene inspector tab).",
     )
     parser.add_argument(
         "--label-chunk-size",
@@ -4770,13 +3925,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--random-state", default=42, type=int, help="Random seed used for sampling")
 
-    parser.add_argument("--point-size", default=2.0, type=float, help="Napari point size for transcript layers")
-    parser.add_argument("--point-opacity", default=0.50, type=float, help="Napari point opacity")
     parser.add_argument(
         "--gene-spot-size",
         default=DEFAULT_GENE_SPOT_SIZE,
         type=float,
-        help="Initial world-micron spot size for the Inspect Genes per-gene renderer",
+        help="Initial world-micron spot size for the per-gene transcript renderer",
     )
     parser.add_argument(
         "--gene-max-render-points",
@@ -4787,28 +3940,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--gene-hide-background",
         action="store_true",
-        help="Start the Inspect Genes view with background (unassigned) spots hidden",
+        help="Start the transcript view with background (unassigned) spots hidden",
     )
     parser.add_argument(
         "--gene-show-controls",
         action="store_true",
-        help="Start the Inspect Genes view with control/blank probes shown",
+        help="Start the transcript view with control/blank probes shown",
     )
-    parser.add_argument("--shape-edge-width", default=0.75, type=float, help="Shape layer edge width")
-    parser.add_argument("--shape-opacity", default=0.95, type=float, help="Shape layer edge alpha")
-    parser.add_argument("--shape-centroid-size", default=1.0, type=float, help="Point size for centroid segmentation rendering")
+    parser.add_argument("--shape-edge-width", default=0.75, type=float, help="Segmentation/annotation edge width")
+    parser.add_argument("--shape-opacity", default=0.95, type=float, help="Segmentation outline edge alpha")
     parser.add_argument("--image-opacity", default=1.0, type=float, help="Image layer opacity")
-    parser.add_argument("--assigned-color", default="yellow", help="Color for assigned transcript points")
-    parser.add_argument("--unassigned-color", default="#d62728", help="Color for unassigned transcript points")
 
     parser.add_argument("--hide-images", action="store_true", help="Start with image layers hidden")
-    parser.add_argument("--hide-shapes", action="store_true", help="Start with shape layers hidden")
-    parser.add_argument("--hide-transcripts", action="store_true", help="Start with transcript layers hidden")
-    parser.add_argument(
-        "--skip-images",
-        action="store_true",
-        help="Do not attempt to load image layers (useful for image-less zarr transfers).",
-    )
+    parser.add_argument("--hide-shapes", action="store_true", help="Start with segmentation layers hidden")
     parser.add_argument(
         "--gl-core-profile",
         action="store_true",
@@ -4822,39 +3966,6 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.merscope_zarr is None and args.xenium_zarr is None:
         parser.error("Pass at least one dataset path: --merscope-zarr and/or --xenium-zarr.")
-    if args.max_transcripts is None:
-        args.max_transcripts = FAST_DEFAULT_MAX_TRANSCRIPTS
-    if args.max_transcripts <= 0:
-        parser.error("--max-transcripts must be positive.")
-    if not 0 <= args.transcript_view_percent <= 100:
-        parser.error("--transcript-view-percent must be between 0 and 100.")
-    if args.transcript_view_margin_fraction < 0:
-        parser.error("--transcript-view-margin-fraction must be non-negative.")
-    if args.transcript_detail_max_points is None:
-        args.transcript_detail_max_points = (
-            args.transcript_max_view_points
-            if args.transcript_max_view_points is not None
-            else DEFAULT_TRANSCRIPT_DETAIL_MAX_POINTS
-        )
-    args.transcript_max_view_points = args.transcript_detail_max_points
-    if args.transcript_detail_max_points <= 0:
-        parser.error("--transcript-detail-max-points must be positive.")
-    if args.transcript_stream_debounce_ms < 0:
-        parser.error("--transcript-stream-debounce-ms must be non-negative.")
-    if args.transcript_density_bin_um <= 0:
-        parser.error("--transcript-density-bin-um must be positive.")
-    if args.transcript_density_max_pixels <= 0:
-        parser.error("--transcript-density-max-pixels must be positive.")
-    if args.transcript_density_contrast_max <= 0:
-        parser.error("--transcript-density-contrast-max must be positive.")
-    if args.transcript_detail_max_view_size <= 0:
-        parser.error("--transcript-detail-max-view-size must be positive.")
-    if args.transcript_index_max_points <= 0:
-        parser.error("--transcript-index-max-points must be positive.")
-    if args.transcript_index_tile_um <= 0:
-        parser.error("--transcript-index-tile-um must be positive.")
-    if args.max_shapes_per_layer is None:
-        args.max_shapes_per_layer = FAST_DEFAULT_MAX_SHAPES_PER_LAYER
     if args.label_chunk_size <= 0:
         parser.error("--label-chunk-size must be positive.")
     if args.label_contour_width < 0:
@@ -4908,29 +4019,8 @@ def main():
     log_environment_diagnostics(viewer)
     controller = ComparisonViewerController(viewer=viewer, datasets=datasets, args=args)
 
-    switcher = DatasetSwitcherWidget(
-        datasets=available_datasets,
-        load_callback=controller.load_dataset,
-        load_selected_labels_callback=controller.load_selected_labels,
-        unload_selected_shapes_callback=controller.unload_selected_shapes,
-        load_full_transcripts_callback=controller.load_full_transcripts,
-        set_transcript_view_percent_callback=controller.set_transcript_view_percent,
-        unload_transcripts_callback=controller.unload_transcripts,
-        inspect_genes_callback=controller.open_gene_inspector,
-        load_images_callback=controller.load_images_on_demand,
-        load_cellpose_values_callback=controller.load_cellpose_value_overlay,
-        remove_cellpose_values_callback=controller.remove_cellpose_value_overlay,
-        create_annotation_layers_callback=controller.create_cortical_depth_annotation_layers,
-        set_annotation_piece_callback=controller.set_cortical_depth_current_piece,
-        apply_annotation_piece_callback=controller.apply_cortical_depth_piece_to_selection,
-        snap_annotation_side_edges_callback=controller.snap_cortical_depth_side_edges,
-        validate_annotation_callback=controller.validate_cortical_depth_annotations,
-        export_annotation_callback=controller.export_cortical_depth_annotations,
-        export_separate_annotations_callback=controller.export_separate_cortical_depth_annotations,
-        initial_dataset=initial_dataset,
-        skip_images=args.skip_images,
-        transcript_view_percent=args.transcript_view_percent,
-    )
+    # The gene inspector widget is embedded as the "Gene inspector" tab of the
+    # control panel, so build it first and pass it in.
     gene_inspector = GeneInspectorWidget(
         close_callback=controller.close_gene_inspector,
         set_gene_visible_callback=controller.set_gene_visible,
@@ -4942,18 +4032,35 @@ def main():
         hide_background=args.gene_hide_background,
         show_controls=args.gene_show_controls,
     )
-    controller.set_status_callback(switcher.set_status)
-    controller.set_shape_keys_callback(switcher.set_shape_keys)
-    controller.set_cellpose_value_options_callback(switcher.set_cellpose_value_options)
+    panel = ViewerControlPanel(
+        datasets=available_datasets,
+        gene_inspector_widget=gene_inspector,
+        load_callback=controller.load_dataset,
+        load_selected_labels_callback=controller.load_selected_labels,
+        unload_selected_shapes_callback=controller.unload_selected_shapes,
+        load_transcripts_callback=controller.open_gene_inspector,
+        unload_transcripts_callback=controller.close_gene_inspector,
+        load_selected_image_callback=controller.load_selected_image,
+        load_all_images_callback=controller.load_images_on_demand,
+        unload_selected_image_callback=controller.unload_selected_images,
+        load_cellpose_values_callback=controller.load_cellpose_value_overlay,
+        remove_cellpose_values_callback=controller.remove_cellpose_value_overlay,
+        create_annotation_layers_callback=controller.create_cortical_depth_annotation_layers,
+        set_annotation_piece_callback=controller.set_cortical_depth_current_piece,
+        apply_annotation_piece_callback=controller.apply_cortical_depth_piece_to_selection,
+        snap_annotation_side_edges_callback=controller.snap_cortical_depth_side_edges,
+        validate_annotation_callback=controller.validate_cortical_depth_annotations,
+        export_annotation_callback=controller.export_cortical_depth_annotations,
+        export_separate_annotations_callback=controller.export_separate_cortical_depth_annotations,
+        initial_dataset=initial_dataset,
+    )
+    controller.set_status_callback(panel.set_status)
+    controller.set_progress_callback(panel.set_progress)
+    controller.set_shape_keys_callback(panel.set_shape_keys)
+    controller.set_image_keys_callback(panel.set_image_keys)
+    controller.set_cellpose_value_options_callback(panel.set_cellpose_value_options)
     controller.set_gene_inspector_widget(gene_inspector)
-    switcher_dock = viewer.window.add_dock_widget(switcher, area="right", name="Dataset Switcher")
-    gene_dock = viewer.window.add_dock_widget(gene_inspector, area="right", name="Gene Inspector")
-    # Tab the two right-side docks together and keep the switcher in front.
-    try:
-        viewer.window._qt_window.tabifyDockWidget(switcher_dock, gene_dock)
-        switcher_dock.raise_()
-    except Exception:
-        pass
+    viewer.window.add_dock_widget(panel, area="right", name="Viewer Controls")
 
     controller.load_dataset(initial_dataset, force=True)
     napari.run()

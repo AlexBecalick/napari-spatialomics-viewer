@@ -84,8 +84,7 @@ def _controller(store, qapp):
     args = types.SimpleNamespace(
         gene_spot_size=2.0, gene_max_render_points=40_000_000,
         gene_hide_background=False, gene_show_controls=False,
-        random_state=42, point_size=2.0, point_opacity=0.5,
-        assigned_color="yellow", unassigned_color="#d62728", hide_transcripts=False,
+        random_state=42,
     )
     ctrl = V.ComparisonViewerController(_FakeViewer(), {}, args)
     ctrl.active_dataset = "TEST"
@@ -160,7 +159,7 @@ def test_controller_toggle_background_controls_and_teardown(qapp):
     ctrl._flush_gene_group_rebuild("TEST")
     assert ctrl._get_layer_by_name(state.layer_names[gi]).symbol == store.group_symbols[gi]
 
-    ctrl._teardown_gene_inspector("TEST", restore=False)
+    ctrl._teardown_gene_inspector("TEST")
     assert [l for l in ctrl.viewer.layers if "genes" in str(l.name)] == []
 
 
