@@ -135,6 +135,7 @@ from .utils import (
     ensure_cyx,
     first_existing_col,
     get_scale0_dataarray,
+    gene_marker_symbol_label,
     image_scale_dataarrays,
     is_derived_cache_key,
     label_outline_mask_chunk,
@@ -198,6 +199,7 @@ class GeneInspectorState:
     layer_names: list[str]             # one napari Points layer per symbol group
     enabled_genes: set                 # genes currently shown
     spot_size: float
+    hide_assigned: bool = False
     hide_background: bool = False
     show_controls: bool = False
     rebuild_timer: QTimer | None = None
@@ -1461,7 +1463,9 @@ class GeneInspectorWidget(QWidget):
         set_spot_size_callback,
         set_hide_background_callback,
         set_show_controls_callback,
+        set_hide_assigned_callback=None,
         spot_size: float = DEFAULT_GENE_SPOT_SIZE,
+        hide_assigned: bool = False,
         hide_background: bool = False,
         show_controls: bool = False,
     ):
@@ -1471,6 +1475,7 @@ class GeneInspectorWidget(QWidget):
         self._set_all_genes_callback = set_all_genes_callback
         self._set_spot_size_callback = set_spot_size_callback
         self._set_hide_background_callback = set_hide_background_callback
+        self._set_hide_assigned_callback = set_hide_assigned_callback
         self._set_show_controls_callback = set_show_controls_callback
 
         self._dataset: str | None = None
@@ -1511,7 +1516,10 @@ class GeneInspectorWidget(QWidget):
         self._show_all_check = QCheckBox("Show all genes")
         self._show_all_check.setTristate(True)
         self._show_all_check.clicked.connect(self._on_show_all_clicked)
-        self._hide_bg_check = QCheckBox("Hide background (unassigned) spots")
+        self._hide_assigned_check = QCheckBox("Hide assigned spots")
+        self._hide_assigned_check.setChecked(bool(hide_assigned))
+        self._hide_assigned_check.toggled.connect(self._on_hide_assigned_toggled)
+        self._hide_bg_check = QCheckBox("Hide unassigned spots")
         self._hide_bg_check.setChecked(bool(hide_background))
         self._hide_bg_check.toggled.connect(self._on_hide_background_toggled)
         self._show_controls_check = QCheckBox("Show control / blank probes")
@@ -1538,6 +1546,7 @@ class GeneInspectorWidget(QWidget):
         spot_row.addWidget(self._spot_spin)
         root.addLayout(spot_row)
         root.addWidget(self._show_all_check)
+        root.addWidget(self._hide_assigned_check)
         root.addWidget(self._hide_bg_check)
         root.addWidget(self._show_controls_check)
         root.addWidget(self._filter_edit)
@@ -1577,6 +1586,7 @@ class GeneInspectorWidget(QWidget):
         gene_counts: dict,
         control_genes: set,
         enabled_genes: set,
+        hide_assigned: bool,
         hide_background: bool,
         show_controls: bool,
         spot_size: float,
@@ -1589,6 +1599,7 @@ class GeneInspectorWidget(QWidget):
             self._items.clear()
             self._dataset = str(dataset)
             self._control_genes = set(control_genes)
+            self._hide_assigned_check.setChecked(bool(hide_assigned))
             self._hide_bg_check.setChecked(bool(hide_background))
             self._show_controls_check.setChecked(bool(show_controls))
             self._set_spot_widgets(float(spot_size))
@@ -1686,6 +1697,12 @@ class GeneInspectorWidget(QWidget):
         if self._suppress or self._dataset is None:
             return
         self._set_hide_background_callback(self._dataset, bool(on))
+
+    def _on_hide_assigned_toggled(self, on: bool):
+        if self._suppress or self._dataset is None:
+            return
+        if self._set_hide_assigned_callback is not None:
+            self._set_hide_assigned_callback(self._dataset, bool(on))
 
     def _on_show_controls_toggled(self, on: bool):
         self._refresh_row_visibility()
@@ -3687,8 +3704,8 @@ class ComparisonViewerController:
     # ------------------------------------------------------------------
     # Per-gene transcript renderer
     # ------------------------------------------------------------------
-    def _gene_layer_name(self, ds: str, group_index: int) -> str:
-        return make_layer_name(ds, "genes", f"shape{group_index}")
+    def _gene_layer_name(self, ds: str, symbol: str) -> str:
+        return f"Genes | {gene_marker_symbol_label(symbol)}"
 
     def _resolve_gene_points_columns(self):
         points_key, points_obj, x_col, y_col, assignment_col = self._resolve_points_columns()
@@ -3766,6 +3783,7 @@ class ComparisonViewerController:
             return
 
         gene_visuals = assign_gene_visuals(store.genes)
+        hide_assigned = bool(getattr(self.args, "gene_hide_assigned", False))
         hide_background = bool(getattr(self.args, "gene_hide_background", False))
         show_controls = bool(getattr(self.args, "gene_show_controls", False))
         spot_size = float(getattr(self.args, "gene_spot_size", DEFAULT_GENE_SPOT_SIZE))
@@ -3781,6 +3799,7 @@ class ComparisonViewerController:
             layer_names=[],
             enabled_genes=enabled,
             spot_size=spot_size,
+            hide_assigned=hide_assigned,
             hide_background=hide_background,
             show_controls=show_controls,
             rebuild_timer=timer,
@@ -3795,7 +3814,7 @@ class ComparisonViewerController:
         # back to the default disc and can reset colours to white.
         for gi, symbol in enumerate(store.group_symbols):
             coords, colors = self._gene_group_arrays(state, gi)
-            layer_name = self._gene_layer_name(ds, gi)
+            layer_name = self._gene_layer_name(ds, symbol)
             self._create_gene_points_layer(layer_name, symbol, spot_size, coords, colors)
             state.layer_names.append(layer_name)
         layer_names = state.layer_names
@@ -3808,6 +3827,7 @@ class ComparisonViewerController:
                 dict(store.gene_counts),
                 set(store.control_genes),
                 set(enabled),
+                hide_assigned,
                 hide_background,
                 show_controls,
                 spot_size,
@@ -3851,10 +3871,12 @@ class ComparisonViewerController:
             if entry is None or entry[0] != gi:
                 continue
             _g, fg_start, fg_end, bg_end = entry
-            end = fg_end if state.hide_background else bg_end
-            if end > fg_start:
-                coord_slices.append(gcoords[fg_start:end])
-                color_slices.append(gcolors[fg_start:end])
+            if not state.hide_assigned and fg_end > fg_start:
+                coord_slices.append(gcoords[fg_start:fg_end])
+                color_slices.append(gcolors[fg_start:fg_end])
+            if not state.hide_background and bg_end > fg_end:
+                coord_slices.append(gcoords[fg_end:bg_end])
+                color_slices.append(gcolors[fg_end:bg_end])
         if coord_slices:
             return np.concatenate(coord_slices, axis=0), np.concatenate(color_slices, axis=0)
         return np.empty((0, 2), dtype=np.float32), np.empty((0, 4), dtype=np.float32)
@@ -3969,6 +3991,13 @@ class ComparisonViewerController:
         if state is None:
             return
         state.hide_background = bool(on)
+        self._rebuild_gene_group_layers(state, group_indices=None)
+
+    def set_gene_hide_assigned(self, dataset_name: str, on: bool):
+        state = self._gene_inspector_states.get(str(dataset_name).upper())
+        if state is None:
+            return
+        state.hide_assigned = bool(on)
         self._rebuild_gene_group_layers(state, group_indices=None)
 
     def set_gene_show_controls(self, dataset_name: str, on: bool):
@@ -4305,6 +4334,11 @@ def parse_args() -> argparse.Namespace:
         help="Cap on total per-gene points rendered at once; above this the store is uniformly subsampled",
     )
     parser.add_argument(
+        "--gene-hide-assigned",
+        action="store_true",
+        help="Start the transcript view with assigned spots hidden",
+    )
+    parser.add_argument(
         "--gene-hide-background",
         action="store_true",
         help="Start the transcript view with background (unassigned) spots hidden",
@@ -4395,7 +4429,9 @@ def main():
         set_spot_size_callback=controller.set_gene_spot_size,
         set_hide_background_callback=controller.set_gene_hide_background,
         set_show_controls_callback=controller.set_gene_show_controls,
+        set_hide_assigned_callback=controller.set_gene_hide_assigned,
         spot_size=args.gene_spot_size,
+        hide_assigned=args.gene_hide_assigned,
         hide_background=args.gene_hide_background,
         show_controls=args.gene_show_controls,
     )

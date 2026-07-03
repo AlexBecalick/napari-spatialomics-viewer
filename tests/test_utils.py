@@ -129,6 +129,15 @@ def test_layer_name_generation_and_matching():
     matches = matching_layer_names(names, prefix)
     assert matches == [base, with_suffix]
 
+    image_name = make_layer_name(ds, "image", "MERSCOPE_z_projection", "PolyT")
+    assert image_name == "Image | PolyT"
+    assert matching_layer_names([image_name, "Genes | Tailed arrow"], layer_name_prefix(ds, "image")) == [
+        image_name
+    ]
+    assert matching_layer_names(["Genes | Tailed arrow"], layer_name_prefix(ds, "genes")) == [
+        "Genes | Tailed arrow"
+    ]
+
 
 def test_derived_cache_key_naming_and_filtering():
     outline_key = derived_outline_cache_key("cell_boundaries", 2)

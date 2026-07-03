@@ -431,6 +431,8 @@ def pick_default_shape_key(shape_keys: Iterable[str]) -> str | None:
 
 def make_layer_name(dataset: str, layer_type: str, key: str, channel: str | None = None) -> str:
     """Build a standardized layer name for this viewer."""
+    if str(layer_type) == "image":
+        return " | ".join(["Image", str(channel if channel is not None else key)])
     parts = [str(dataset).upper(), str(layer_type), str(key)]
     if channel is not None:
         parts.append(str(channel))
@@ -439,6 +441,13 @@ def make_layer_name(dataset: str, layer_type: str, key: str, channel: str | None
 
 def layer_name_prefix(dataset: str, layer_type: str, key: str | None = None) -> str:
     """Build a prefix used to find/remove related layers."""
+    if str(layer_type) == "image":
+        parts = ["Image"]
+        if key is not None:
+            parts.append(str(key))
+        return " | ".join(parts)
+    if str(layer_type) == "genes":
+        return "Genes"
     parts = [str(dataset).upper(), str(layer_type)]
     if key is not None:
         parts.append(str(key))
@@ -453,6 +462,12 @@ def matching_layer_names(layer_names: Iterable[str], prefix: str) -> list[str]:
         if s == prefix or s.startswith(prefix + " | "):
             out.append(s)
     return out
+
+
+def gene_marker_symbol_label(symbol: str) -> str:
+    """Return a concise display label for a napari Points marker symbol."""
+    text = str(symbol)
+    return GENE_MARKER_SYMBOL_LABELS.get(text, text.replace("_", " ").capitalize())
 
 
 def build_cortical_depth_annotation_geojson(
@@ -1539,6 +1554,23 @@ GENE_MARKER_SYMBOLS = (
     "clobber",
     "tailed_arrow",
 )
+
+GENE_MARKER_SYMBOL_LABELS = {
+    "disc": "Disc",
+    "ring": "Ring",
+    "cross": "Cross",
+    "x": "X",
+    "square": "Square",
+    "diamond": "Diamond",
+    "triangle_up": "Triangle up",
+    "triangle_down": "Triangle down",
+    "star": "Star",
+    "arrow": "Arrow",
+    "hbar": "Horizontal bar",
+    "vbar": "Vertical bar",
+    "clobber": "Clobber",
+    "tailed_arrow": "Tailed arrow",
+}
 
 _CONTROL_GENE_PATTERNS = (
     "blank",
