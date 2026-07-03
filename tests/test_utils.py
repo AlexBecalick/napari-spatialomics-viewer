@@ -17,29 +17,21 @@ from napari_compare_xenium_merscope.utils import (
     CELLPOSE_QUANTIFICATION_TABLE_KEY,
     build_cortical_depth_annotation_geojson,
     build_binned_label_color_dict,
-    build_transcript_spatial_index,
     cellpose_quantification_features,
     cellpose_quantification_table_available,
     cellpose_value_clip_range,
-    compute_transcript_density_array,
     derived_outline_cache_key,
-    derived_transcript_density_cache_key,
-    geometry_to_napari_polygons,
-    geometry_to_napari_bounding_boxes,
-    geometry_to_napari_centroids,
     image_scale_dataarrays,
     ensure_cyx,
     is_derived_cache_key,
     label_outline_mask_chunk,
     layer_name_prefix,
     load_cellpose_quantification_values,
-    load_viewport_points_dataframe,
     make_layer_name,
     matching_layer_names,
     pixel_window_global_bounds,
     pick_default_shape_key,
     query_geometries_for_bounds,
-    query_transcript_spatial_index,
     rasterize_geometries_chunk,
     resolve_cellpose_quantification_feature,
     snap_cortical_depth_boundaries_to_edge,
@@ -140,13 +132,10 @@ def test_layer_name_generation_and_matching():
 
 def test_derived_cache_key_naming_and_filtering():
     outline_key = derived_outline_cache_key("cell_boundaries", 2)
-    density_key = derived_transcript_density_cache_key("transcripts", 4.0)
     weird_key = derived_outline_cache_key("foo/bar baz", 1)
 
     assert outline_key == "_napari_compare_outline__cell_boundaries__w2"
-    assert density_key == "_napari_compare_tx_density__transcripts__bin4"
     assert is_derived_cache_key(outline_key)
-    assert is_derived_cache_key(density_key)
     assert "/" not in weird_key
     assert not is_derived_cache_key("cell_boundaries")
 
@@ -427,47 +416,6 @@ def test_cortical_depth_snap_moves_boundary_endpoints_to_edge():
     assert np.allclose(snapped["wm"][0], np.asarray([[40.0, 0.0], [40.0, 100.0]]))
 
 
-def test_geometry_to_napari_polygons_cap_and_simplify():
-    p1 = _wavy_polygon(512)
-    p2 = _wavy_polygon(384)
-    p3 = _wavy_polygon(320)
-    mp = MultiPolygon([p2, p3])
-
-    all_polys = geometry_to_napari_polygons([p1, mp], max_shapes=None, simplify_tolerance=None)
-    capped_polys = geometry_to_napari_polygons([p1, mp], max_shapes=2, simplify_tolerance=None)
-    assert len(all_polys) == 3
-    assert len(capped_polys) == 2
-
-    raw = geometry_to_napari_polygons([p1], max_shapes=None, simplify_tolerance=None)[0]
-    simplified = geometry_to_napari_polygons([p1], max_shapes=None, simplify_tolerance=2.0)[0]
-    assert simplified.shape[0] < raw.shape[0]
-
-
-def test_geometry_to_napari_polygons_vertex_limit():
-    poly = _wavy_polygon(512)
-
-    limited = geometry_to_napari_polygons(
-        [poly],
-        max_shapes=None,
-        simplify_tolerance=None,
-        max_vertices_per_polygon=32,
-    )[0]
-
-    assert limited.shape[0] <= 32
-
-
-def test_geometry_to_lightweight_shape_representations():
-    poly = Polygon([(1.0, 2.0), (5.0, 2.0), (5.0, 7.0), (1.0, 7.0)])
-
-    boxes = geometry_to_napari_bounding_boxes([poly])
-    centroids = geometry_to_napari_centroids([poly])
-
-    assert boxes.shape == (1, 4, 2)
-    assert centroids.shape == (1, 2)
-    assert np.allclose(boxes[0], [[2.0, 1.0], [2.0, 5.0], [7.0, 5.0], [7.0, 1.0]])
-    assert np.allclose(centroids[0], [4.5, 3.0])
-
-
 def test_pixel_window_global_bounds_and_query():
     import geopandas as gpd
 
@@ -522,174 +470,6 @@ def test_label_outline_mask_chunk_marks_label_boundaries():
     assert np.all(outline[3:5, 3:5] == 0)
     assert outline[2, 2] == 1
     assert outline[5, 5] == 1
-
-
-def test_load_viewport_points_dataframe_filters_and_caps_pandas():
-    import pandas as pd
-
-    points = pd.DataFrame(
-        {
-            "x": np.arange(100, dtype=float),
-            "y": np.arange(100, dtype=float),
-            "assignment": np.arange(100),
-        }
-    )
-
-    sampled, total, fraction = load_viewport_points_dataframe(
-        points,
-        x_col="x",
-        y_col="y",
-        assignment_col="assignment",
-        bounds=(10.0, 10.0, 39.0, 39.0),
-        sample_percent=None,
-        max_points=7,
-        random_state=1,
-    )
-
-    assert total == 30
-    assert len(sampled) == 7
-    assert np.isclose(fraction, 7 / 30)
-    assert sampled["x"].between(10.0, 39.0).all()
-    assert sampled["y"].between(10.0, 39.0).all()
-
-
-def test_load_viewport_points_dataframe_percent_samples_dask():
-    import dask.dataframe as dd
-    import pandas as pd
-
-    points = pd.DataFrame(
-        {
-            "x": np.arange(200, dtype=float),
-            "y": np.arange(200, dtype=float),
-            "assignment": np.ones(200, dtype=int),
-        }
-    )
-    ddf = dd.from_pandas(points, npartitions=4)
-
-    sampled, total, fraction = load_viewport_points_dataframe(
-        ddf,
-        x_col="x",
-        y_col="y",
-        assignment_col="assignment",
-        bounds=(0.0, 0.0, 99.0, 99.0),
-        sample_percent=10,
-        max_points=50,
-        random_state=1,
-    )
-
-    assert total == 100
-    assert 1 <= len(sampled) <= 50
-    assert fraction <= 0.5
-    assert sampled["x"].between(0.0, 99.0).all()
-    assert sampled["y"].between(0.0, 99.0).all()
-
-
-def test_compute_transcript_density_array_pandas():
-    import pandas as pd
-
-    points = pd.DataFrame(
-        {
-            "x": [0.0, 1.0, 4.0],
-            "y": [0.0, 1.0, 0.0],
-            "assignment": [1, 0, 2],
-        }
-    )
-
-    density, meta = compute_transcript_density_array(
-        points,
-        x_col="x",
-        y_col="y",
-        assignment_col="assignment",
-        bin_um=2.0,
-        max_pixels=100,
-    )
-
-    assert density.shape == (2, 1, 2)
-    assert density.dtype == np.uint32
-    assert density[0, 0, 0] == 1
-    assert density[1, 0, 0] == 1
-    assert density[0, 0, 1] == 1
-    assert meta["total"] == 3
-    assert meta["assigned"] == 2
-    assert meta["unassigned"] == 1
-
-
-def test_compute_transcript_density_array_dask_adjusts_bin():
-    import dask.dataframe as dd
-    import pandas as pd
-
-    points = pd.DataFrame(
-        {
-            "x": np.linspace(0.0, 99.0, 100),
-            "y": np.linspace(0.0, 99.0, 100),
-            "assignment": np.ones(100, dtype=int),
-        }
-    )
-    ddf = dd.from_pandas(points, npartitions=4)
-
-    density, meta = compute_transcript_density_array(
-        ddf,
-        x_col="x",
-        y_col="y",
-        assignment_col="assignment",
-        bin_um=1.0,
-        max_pixels=25,
-    )
-
-    assert density.shape[1] * density.shape[2] <= 25
-    assert meta["actual_bin_um"] > 1.0
-    assert int(density.sum()) == 100
-
-
-def test_transcript_spatial_index_query_caps_and_splits_assignment():
-    import pandas as pd
-
-    points = pd.DataFrame(
-        {
-            "x": [0.0, 1.0, 2.0, 3.0, 10.0],
-            "y": [0.0, 1.0, 2.0, 3.0, 10.0],
-            "assignment": [1, 0, 2, 0, 1],
-        }
-    )
-    index = build_transcript_spatial_index(
-        points,
-        x_col="x",
-        y_col="y",
-        assignment_col="assignment",
-        max_points=10,
-        tile_um=2.0,
-        random_state=1,
-    )
-
-    result = query_transcript_spatial_index(
-        index,
-        bounds=(0.0, 0.0, 3.0, 3.0),
-        max_points=3,
-        sample_percent=None,
-        random_state=1,
-    )
-
-    assert result["total_in_view"] == 4
-    assert result["loaded"] == 3
-    assert result["assigned_coords"].shape[1] == 2
-    assert result["unassigned_coords"].shape[1] == 2
-
-
-def test_transcript_spatial_index_query_empty_view():
-    import pandas as pd
-
-    points = pd.DataFrame({"x": [0.0], "y": [0.0], "assignment": [1]})
-    index = build_transcript_spatial_index(points, "x", "y", "assignment", tile_um=2.0)
-
-    result = query_transcript_spatial_index(
-        index,
-        bounds=(10.0, 10.0, 11.0, 11.0),
-        max_points=10,
-    )
-
-    assert result["total_in_view"] == 0
-    assert result["loaded"] == 0
-    assert result["assigned_coords"].shape == (0, 2)
 
 
 class _ImageNode:
