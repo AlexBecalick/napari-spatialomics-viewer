@@ -716,6 +716,8 @@ class ViewerControlPanel(QWidget):
         validate_annotation_callback,
         export_annotation_callback,
         export_separate_annotations_callback,
+        load_paired_callback,
+        load_standalone_callback,
         initial_dataset: str = "MERSCOPE",
     ):
         super().__init__()
@@ -728,6 +730,8 @@ class ViewerControlPanel(QWidget):
         self._load_selected_image_callback = load_selected_image_callback
         self._load_all_images_callback = load_all_images_callback
         self._unload_selected_image_callback = unload_selected_image_callback
+        self._load_paired_callback = load_paired_callback
+        self._load_standalone_callback = load_standalone_callback
         self._load_cellpose_values_callback = load_cellpose_values_callback
         self._remove_cellpose_values_callback = remove_cellpose_values_callback
         self._create_annotation_layers_callback = create_annotation_layers_callback
@@ -739,8 +743,11 @@ class ViewerControlPanel(QWidget):
         self._export_separate_annotations_callback = export_separate_annotations_callback
 
         self._active_stages: dict[str, str] = {}
+        self._loaded_shape_keys: set[str] = set()
+        self._loaded_image_entries: set[tuple[str, str]] = set()
+        self._LOADED_TEXT_COLOR = QColor(0x3E, 0xCF, 0x6B)  # green for loaded rows
 
-        # -- Dataset switcher (its own tab) ---------------------------------
+        # -- Dataset loader (its own tab) -----------------------------------
         self._dataset_combo = QComboBox()
         self._dataset_combo.addItems(datasets)
         if initial_dataset in datasets:
@@ -748,6 +755,12 @@ class ViewerControlPanel(QWidget):
         self._dataset_combo.currentTextChanged.connect(self._on_dataset_changed)
         self._reload_button = QPushButton("Reload Dataset")
         self._reload_button.clicked.connect(self._on_reload_clicked)
+        self._load_paired_button = QPushButton("Load new paired dataset")
+        self._load_paired_button.clicked.connect(self._on_load_paired)
+        self._load_standalone_merscope_button = QPushButton("Load new standalone MERSCOPE dataset")
+        self._load_standalone_merscope_button.clicked.connect(self._on_load_standalone_merscope)
+        self._load_standalone_xenium_button = QPushButton("Load new standalone Xenium dataset")
+        self._load_standalone_xenium_button.clicked.connect(self._on_load_standalone_xenium)
 
         # -- Cell segmentation ----------------------------------------------
         self._shape_list = QListWidget()
@@ -837,7 +850,7 @@ class ViewerControlPanel(QWidget):
             ("Per cell statistics", self._build_statistics_tab),
             ("Draw tissue annotations", self._build_annotations_tab),
             ("Images", self._build_images_tab),
-            ("Dataset", self._build_dataset_tab),
+            ("Dataset loader", self._build_dataset_tab),
         ):
             self._add_tab(title, builder())
         if self._tab_group.buttons():
@@ -855,12 +868,25 @@ class ViewerControlPanel(QWidget):
         self.setLayout(outer)
         self.setMinimumWidth(240)
 
+    #: White background + black bold text so the tabs read as the main controls
+    #: on napari's dark theme; the checked tab gets a blue border/underline.
+    _TAB_BUTTON_STYLE = (
+        "QPushButton {"
+        " background: #ffffff; color: #000000; font-weight: bold;"
+        " border: 1px solid #b0b0b0; border-radius: 4px; padding: 4px 10px; }"
+        "QPushButton:hover { background: #eef2f7; }"
+        "QPushButton:checked {"
+        " background: #ffffff; color: #000000;"
+        " border: 2px solid #1a73e8; border-bottom: 3px solid #1a73e8; }"
+    )
+
     def _add_tab(self, title: str, widget: QWidget):
         """Add a wrapping tab button + its page to the stacked widget."""
         index = self._tab_stack.addWidget(widget)
         button = QPushButton(title)
         button.setCheckable(True)
         button.setCursor(Qt.PointingHandCursor)
+        button.setStyleSheet(self._TAB_BUTTON_STYLE)
         button.clicked.connect(lambda _checked=False, idx=index: self._tab_stack.setCurrentIndex(idx))
         self._tab_group.addButton(button, index)
         self._tab_bar_layout.addWidget(button)
@@ -943,7 +969,7 @@ class ViewerControlPanel(QWidget):
         layout = QVBoxLayout()
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
-        layout.addWidget(QLabel("Images"))
+        layout.addWidget(QLabel("Image channels"))
         layout.addWidget(self._image_list, stretch=1)
         layout.addWidget(self._load_selected_image_button)
         layout.addWidget(self._load_all_images_button)
@@ -956,9 +982,17 @@ class ViewerControlPanel(QWidget):
         layout = QVBoxLayout()
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(6)
-        layout.addWidget(QLabel("Dataset"))
+        layout.addWidget(QLabel("Current dataset"))
         layout.addWidget(self._dataset_combo)
         layout.addWidget(self._reload_button)
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setFrameShadow(QFrame.Sunken)
+        layout.addWidget(line)
+        layout.addWidget(QLabel("Open a different dataset"))
+        layout.addWidget(self._load_paired_button)
+        layout.addWidget(self._load_standalone_merscope_button)
+        layout.addWidget(self._load_standalone_xenium_button)
         layout.addStretch(1)
         return self._scrollable(layout)
 
@@ -992,11 +1026,51 @@ class ViewerControlPanel(QWidget):
 
     def set_shape_keys(self, keys: list[str]):
         self._shape_list.clear()
-        self._shape_list.addItems([str(k) for k in keys])
+        for key in keys:
+            self._shape_list.addItem(QListWidgetItem(str(key)))
+        self._apply_shape_key_colors()
 
-    def set_image_keys(self, keys: list[str]):
+    def set_loaded_shape_keys(self, keys: list[str]):
+        """Recolor the segmentations that currently have a loaded layer (green)."""
+        self._loaded_shape_keys = {str(k) for k in keys}
+        self._apply_shape_key_colors()
+
+    def _apply_shape_key_colors(self):
+        for i in range(self._shape_list.count()):
+            item = self._shape_list.item(i)
+            if str(item.text()) in self._loaded_shape_keys:
+                item.setForeground(self._LOADED_TEXT_COLOR)
+            else:
+                item.setData(Qt.ForegroundRole, None)  # reset to the theme default
+
+    def set_image_entries(self, entries: list[tuple[str, str, str]]):
+        """Populate the image list, one row per (image, channel).
+
+        ``entries`` is a list of ``(display_label, image_key, channel)``. The
+        image_key/channel pair is stashed on the item so selections map back to
+        the exact channel layer.
+        """
         self._image_list.clear()
-        self._image_list.addItems([str(k) for k in keys])
+        for label, image_key, channel in entries:
+            item = QListWidgetItem(str(label))
+            item.setData(Qt.UserRole, (str(image_key), str(channel)))
+            self._image_list.addItem(item)
+        self._apply_image_entry_colors()
+
+    def set_loaded_image_entries(self, entries):
+        """Recolor the image channels that currently have a loaded layer (green)."""
+        self._loaded_image_entries = {(str(k), str(c)) for k, c in entries}
+        self._apply_image_entry_colors()
+
+    def _apply_image_entry_colors(self):
+        for i in range(self._image_list.count()):
+            item = self._image_list.item(i)
+            data = item.data(Qt.UserRole)
+            key = (str(data[0]), str(data[1])) if data else None
+            if key in self._loaded_image_entries:
+                item.setForeground(self._LOADED_TEXT_COLOR)
+            else:
+                item.setData(Qt.ForegroundRole, None)  # reset to the theme default
 
     def set_cellpose_value_options(self, channels: list[str], statistics: list[str], enabled: bool):
         channel_current = str(self._cellpose_channel_combo.currentText())
@@ -1030,12 +1104,28 @@ class ViewerControlPanel(QWidget):
     def selected_shape_keys(self) -> list[str]:
         return [str(item.text()) for item in self._shape_list.selectedItems()]
 
-    def selected_image_keys(self) -> list[str]:
-        return [str(item.text()) for item in self._image_list.selectedItems()]
+    def selected_image_entries(self) -> list[tuple[str, str]]:
+        entries: list[tuple[str, str]] = []
+        for item in self._image_list.selectedItems():
+            data = item.data(Qt.UserRole)
+            if data:
+                entries.append((str(data[0]), str(data[1])))
+        return entries
 
     def current_annotation_piece(self) -> str:
         text = str(self._piece_combo.currentText()).strip()
         return text or CORTICAL_DEPTH_DEFAULT_PIECE_ID
+
+    def set_datasets(self, names: list[str], initial: str | None = None):
+        """Repopulate the current-dataset dropdown after loading new stores."""
+        self._dataset_combo.blockSignals(True)
+        try:
+            self._dataset_combo.clear()
+            self._dataset_combo.addItems([str(n) for n in names])
+            if initial and initial in names:
+                self._dataset_combo.setCurrentText(str(initial))
+        finally:
+            self._dataset_combo.blockSignals(False)
 
     # -- event handlers -----------------------------------------------------
     def _on_dataset_changed(self, text: str):
@@ -1045,6 +1135,31 @@ class ViewerControlPanel(QWidget):
 
     def _on_reload_clicked(self):
         self._load_callback(self.current_dataset, True)
+
+    def _browse_zarr(self, title: str) -> str | None:
+        path = QFileDialog.getExistingDirectory(self, title, "")
+        return path or None
+
+    def _on_load_paired(self):
+        merscope_path = self._browse_zarr("Select the MERSCOPE .zarr store")
+        if not merscope_path:
+            return
+        xenium_path = self._browse_zarr("Select the Xenium .zarr store")
+        if not xenium_path:
+            return
+        self._load_paired_callback(merscope_path, xenium_path)
+
+    def _on_load_standalone_merscope(self):
+        path = self._browse_zarr("Select the MERSCOPE .zarr store")
+        if not path:
+            return
+        self._load_standalone_callback("MERSCOPE", path)
+
+    def _on_load_standalone_xenium(self):
+        path = self._browse_zarr("Select the Xenium .zarr store")
+        if not path:
+            return
+        self._load_standalone_callback("XENIUM", path)
 
     def _on_load_selected_labels(self):
         keys = self.selected_shape_keys()
@@ -1067,21 +1182,21 @@ class ViewerControlPanel(QWidget):
         self._unload_transcripts_callback(self.current_dataset)
 
     def _on_load_selected_image(self):
-        keys = self.selected_image_keys()
-        if not keys:
-            self.set_status("No image selected.")
+        entries = self.selected_image_entries()
+        if not entries:
+            self.set_status("No image channel selected.")
             return
-        self._load_selected_image_callback(self.current_dataset, keys)
+        self._load_selected_image_callback(self.current_dataset, entries)
 
     def _on_load_all_images(self):
         self._load_all_images_callback(self.current_dataset)
 
     def _on_unload_selected_image(self):
-        keys = self.selected_image_keys()
-        if not keys:
-            self.set_status("No image selected.")
+        entries = self.selected_image_entries()
+        if not entries:
+            self.set_status("No image channel selected.")
             return
-        self._unload_selected_image_callback(self.current_dataset, keys)
+        self._unload_selected_image_callback(self.current_dataset, entries)
 
     def _on_load_cellpose_values(self):
         if not self._load_cellpose_values_button.isEnabled():
@@ -1613,13 +1728,17 @@ class ComparisonViewerController:
         self._status_callback = None
         self._progress_callback = None
         self._shape_keys_callback = None
-        self._image_keys_callback = None
+        self._loaded_shape_keys_callback = None
+        self._image_entries_callback = None
+        self._loaded_image_entries_callback = None
+        self._datasets_changed_callback = None
         self._cellpose_value_options_callback = None
         self._current_cortical_depth_piece_id = CORTICAL_DEPTH_DEFAULT_PIECE_ID
         self._active_sdata = None
         self._active_images_sdata = None
         self._segmentation_keys: list[str] = []
         self._image_keys: list[str] = []
+        self._image_channels: list[tuple[str, str]] = []
         self._x_transform: tuple[float, float, float] | None = None
         self._y_transform: tuple[float, float, float] | None = None
         self._cellpose_value_generation = 0
@@ -1648,8 +1767,17 @@ class ComparisonViewerController:
     def set_shape_keys_callback(self, fn):
         self._shape_keys_callback = fn
 
-    def set_image_keys_callback(self, fn):
-        self._image_keys_callback = fn
+    def set_loaded_shape_keys_callback(self, fn):
+        self._loaded_shape_keys_callback = fn
+
+    def set_image_entries_callback(self, fn):
+        self._image_entries_callback = fn
+
+    def set_loaded_image_entries_callback(self, fn):
+        self._loaded_image_entries_callback = fn
+
+    def set_datasets_changed_callback(self, fn):
+        self._datasets_changed_callback = fn
 
     def set_cellpose_value_options_callback(self, fn):
         self._cellpose_value_options_callback = fn
@@ -1678,9 +1806,74 @@ class ComparisonViewerController:
         if self._shape_keys_callback is not None:
             self._shape_keys_callback(list(self._segmentation_keys))
 
-    def _publish_image_keys(self):
-        if self._image_keys_callback is not None:
-            self._image_keys_callback(list(self._image_keys))
+    def _segmentation_key_is_loaded(self, shape_key: str) -> bool:
+        """True if any layer for this segmentation key is currently present."""
+        if self.active_dataset is None:
+            return False
+        ds = self.active_dataset
+        candidates = (
+            make_layer_name(ds, self._segmentation_layer_type(), shape_key),
+            make_layer_name(ds, "labels", shape_key),
+            make_layer_name(ds, "labels", self._label_key_for_shape_key(shape_key)),
+        )
+        return any(self._get_layer_by_name(name) is not None for name in candidates)
+
+    def _publish_loaded_segmentation_keys(self):
+        if self._loaded_shape_keys_callback is None:
+            return
+        loaded = [k for k in self._segmentation_keys if self._segmentation_key_is_loaded(k)]
+        self._loaded_shape_keys_callback(loaded)
+
+    def _enumerate_image_channels(self) -> list[tuple[str, str]]:
+        """List (image_key, channel) pairs for every image element.
+
+        Both MERSCOPE (``MERSCOPE_z_projection``) and Xenium (``morphology_focus``
+        et al.) store images as SpatialData image elements with a ``c`` channel
+        coordinate, so channel names come from the same ``channel_labels`` path.
+        """
+        entries: list[tuple[str, str]] = []
+        images_sdata = self._active_images_sdata
+        if images_sdata is None:
+            return entries
+        try:
+            image_keys = [str(k) for k in images_sdata.images.keys() if not is_derived_cache_key(str(k))]
+        except Exception:
+            return entries
+        for image_key in sorted(image_keys):
+            try:
+                base = ensure_cyx(get_scale0_dataarray(images_sdata.images[image_key]))
+                channels = channel_labels(base)
+            except Exception as exc:
+                log.warning("[%s] Could not read channels for image '%s' (%s)", self.active_dataset, image_key, exc)
+                continue
+            for channel in channels:
+                entries.append((image_key, str(channel)))
+        return entries
+
+    def _publish_image_entries(self):
+        if self._image_entries_callback is None:
+            return
+        entries = self._image_channels
+        # Disambiguate identical channel names that appear under >1 image key.
+        counts: dict[str, int] = {}
+        for _key, channel in entries:
+            counts[channel] = counts.get(channel, 0) + 1
+        display = [
+            (channel if counts.get(channel, 0) <= 1 else f"{image_key}: {channel}", image_key, channel)
+            for image_key, channel in entries
+        ]
+        self._image_entries_callback(display)
+
+    def _publish_loaded_image_entries(self):
+        if self._loaded_image_entries_callback is None:
+            return
+        ds = self.active_dataset
+        loaded = [
+            (image_key, channel)
+            for image_key, channel in self._image_channels
+            if ds is not None and self._get_layer_by_name(make_layer_name(ds, "image", image_key, channel)) is not None
+        ]
+        self._loaded_image_entries_callback(loaded)
 
     def _publish_cellpose_value_options(self):
         if self._cellpose_value_options_callback is None:
@@ -2107,8 +2300,11 @@ class ComparisonViewerController:
             self.active_dataset = None
             self._segmentation_keys = []
             self._image_keys = []
+            self._image_channels = []
             self._publish_shape_keys()
-            self._publish_image_keys()
+            self._publish_loaded_segmentation_keys()
+            self._publish_image_entries()
+            self._publish_loaded_image_entries()
             if self._cellpose_value_options_callback is not None:
                 self._cellpose_value_options_callback([], [], False)
 
@@ -2151,8 +2347,11 @@ class ComparisonViewerController:
                 for k in getattr(images_source, "images", {}).keys()
                 if not is_derived_cache_key(str(k))
             )
+            self._image_channels = self._enumerate_image_channels()
             self._publish_shape_keys()
-            self._publish_image_keys()
+            self._publish_loaded_segmentation_keys()
+            self._publish_image_entries()
+            self._publish_loaded_image_entries()
             self._publish_cellpose_value_options()
 
             elapsed = time.time() - t0
@@ -2177,12 +2376,68 @@ class ComparisonViewerController:
             self._active_images_sdata = None
             self._segmentation_keys = []
             self._image_keys = []
+            self._image_channels = []
             self._publish_shape_keys()
-            self._publish_image_keys()
+            self._publish_loaded_segmentation_keys()
+            self._publish_image_entries()
+            self._publish_loaded_image_entries()
             if self._cellpose_value_options_callback is not None:
                 self._cellpose_value_options_callback([], [], False)
         finally:
             self._end_progress("dataset")
+
+    def _build_dataset_config(self, platform: str, zarr_path: Path) -> DatasetConfig:
+        return DatasetConfig(
+            name=platform,
+            zarr_path=zarr_path,
+            merscope_transform_path=getattr(self.args, "merscope_transform_path", None),
+            xenium_spec_path=getattr(self.args, "xenium_spec_path", None),
+        )
+
+    def _replace_datasets(self, datasets: dict[str, DatasetConfig], initial: str):
+        """Swap in a freshly browsed set of datasets and load the initial one."""
+        self._clear_layers()
+        self.active_dataset = None
+        self._active_sdata = None
+        self._active_images_sdata = None
+        self.datasets = datasets
+        if self._datasets_changed_callback is not None:
+            self._datasets_changed_callback(list(datasets.keys()), initial)
+        self.load_dataset(initial, force=True)
+
+    def load_paired_dataset(self, merscope_path, xenium_path):
+        """Open a MERSCOPE + Xenium pair browsed from the Dataset loader tab."""
+        try:
+            merscope_path = Path(merscope_path)
+            xenium_path = Path(xenium_path)
+            for label, path in (("MERSCOPE", merscope_path), ("Xenium", xenium_path)):
+                if not path.exists():
+                    raise FileNotFoundError(f"{label} zarr path not found: {path}")
+                validate_spatialdata_store_compatibility(path)
+            datasets = {
+                "MERSCOPE": self._build_dataset_config("MERSCOPE", merscope_path),
+                "XENIUM": self._build_dataset_config("XENIUM", xenium_path),
+            }
+        except Exception as exc:
+            self._set_status(f"Could not open paired dataset: {exc}")
+            log.exception("Failed to open paired dataset")
+            return
+        self._replace_datasets(datasets, initial="MERSCOPE")
+
+    def load_standalone_dataset(self, platform: str, path):
+        """Open a single MERSCOPE or Xenium store browsed from the loader tab."""
+        platform = str(platform).upper()
+        try:
+            path = Path(path)
+            if not path.exists():
+                raise FileNotFoundError(f"{platform} zarr path not found: {path}")
+            validate_spatialdata_store_compatibility(path)
+            datasets = {platform: self._build_dataset_config(platform, path)}
+        except Exception as exc:
+            self._set_status(f"Could not open {platform} dataset: {exc}")
+            log.exception("Failed to open standalone %s dataset", platform)
+            return
+        self._replace_datasets(datasets, initial=platform)
 
     def _pyramid_levels_from_element(self, elem) -> list[object]:
         """Return the (c, y, x) DataArrays of a stored image element, coarsest last."""
@@ -2310,7 +2565,9 @@ class ComparisonViewerController:
                 return {label}
         return {labels[0]} if labels else set()
 
-    def _add_image_layers(self, ds: str, sdata, x_transform, y_transform, only_keys: set[str] | None = None) -> dict[str, int]:
+    def _add_image_layers(
+        self, ds: str, sdata, x_transform, y_transform, only_channels: set[tuple[str, str]] | None = None
+    ) -> dict[str, int]:
         visible = not self.args.hide_images
         total_layers = 0
         failed_keys = 0
@@ -2321,8 +2578,9 @@ class ComparisonViewerController:
             log.warning("[%s] Could not enumerate images; skipping image loading (%s)", ds, exc)
             return {"layers": 0, "failed_keys": 0, "skipped": True}
 
-        if only_keys is not None:
-            image_keys = [k for k in image_keys if k in only_keys]
+        if only_channels is not None:
+            wanted_keys = {k for k, _c in only_channels}
+            image_keys = [k for k in image_keys if k in wanted_keys]
 
         if len(image_keys) == 0:
             log.info("[%s] No images found in SpatialData; continuing without image layers.", ds)
@@ -2356,6 +2614,8 @@ class ComparisonViewerController:
                 )
 
                 for chan_idx, chan_name in enumerate(labels):
+                    if only_channels is not None and (image_key, str(chan_name)) not in only_channels:
+                        continue
                     layer_name = make_layer_name(ds, "image", image_key, chan_name)
                     channel_levels = [
                         image_cyx.isel(c=chan_idx).data
@@ -2369,7 +2629,12 @@ class ComparisonViewerController:
                     multiscale = len(channel_levels) > 1
                     ch_data = channel_levels if multiscale else channel_levels[0]
                     cmap = image_colormap_for_channel(chan_name, chan_idx)
-                    chan_visible = visible and (chan_name in default_visible)
+                    # Explicitly-selected channels are shown; the startup "all"
+                    # load only shows the default (DAPI-like) channel.
+                    if only_channels is not None:
+                        chan_visible = visible
+                    else:
+                        chan_visible = visible and (chan_name in default_visible)
 
                     add_kwargs = dict(
                         name=layer_name,
@@ -3097,6 +3362,7 @@ class ComparisonViewerController:
             added = self._finish_label_layer(ds, str(spec["label_key"]), spec["prepared"])
             if added > 0:
                 added_layers += 1
+        self._publish_loaded_segmentation_keys()
         mem_after = memory_snapshot_gb()
         self._set_status(
             f"{ds} loaded label outline layer(s)={added_layers}, "
@@ -3415,10 +3681,11 @@ class ComparisonViewerController:
                 self._remove_layer_by_name(name)
                 if len(self.viewer.layers) < before:
                     removed += 1
+        self._publish_loaded_segmentation_keys()
         self._set_status(f"{ds} removed {removed} {self._segmentation_layer_type()} layer(s).")
 
     # ------------------------------------------------------------------
-    # "Inspect Genes": per-gene transcript renderer
+    # Per-gene transcript renderer
     # ------------------------------------------------------------------
     def _gene_layer_name(self, ds: str, group_index: int) -> str:
         return make_layer_name(ds, "genes", f"shape{group_index}")
@@ -3750,30 +4017,29 @@ class ComparisonViewerController:
         if self._gene_inspector_widget is not None:
             self._gene_inspector_widget.clear()
 
-    def load_selected_image(self, dataset_name: str, image_keys: list[str]):
-        keys = [str(k) for k in image_keys]
-        if not keys:
-            self._set_status("No image selected.")
+    def load_selected_image(self, dataset_name: str, image_channels):
+        entries = [(str(k), str(c)) for k, c in image_channels]
+        if not entries:
+            self._set_status("No image channel selected.")
             return
-        self.load_images_on_demand(dataset_name, image_keys=keys)
+        self.load_images_on_demand(dataset_name, image_channels=entries)
 
-    def unload_selected_images(self, dataset_name: str, image_keys: list[str]):
+    def unload_selected_images(self, dataset_name: str, image_channels):
         if not self._ensure_dataset_is_active(dataset_name):
             self._set_status(f"Could not activate dataset {dataset_name}.")
             return
         ds = str(dataset_name).upper()
         removed = 0
-        for image_key in [str(k) for k in image_keys]:
-            prefix = make_layer_name(ds, "image", image_key)
-            names = [str(layer.name) for layer in self.viewer.layers]
-            for layer_name in matching_layer_names(names, prefix):
-                before = len(self.viewer.layers)
-                self._remove_layer_by_name(layer_name)
-                if len(self.viewer.layers) < before:
-                    removed += 1
-        self._set_status(f"{ds} removed {removed} image layer(s).")
+        for image_key, channel in [(str(k), str(c)) for k, c in image_channels]:
+            name = make_layer_name(ds, "image", image_key, channel)
+            before = len(self.viewer.layers)
+            self._remove_layer_by_name(name)
+            if len(self.viewer.layers) < before:
+                removed += 1
+        self._publish_loaded_image_entries()
+        self._set_status(f"{ds} removed {removed} image channel layer(s).")
 
-    def load_images_on_demand(self, dataset_name: str, image_keys: list[str] | None = None):
+    def load_images_on_demand(self, dataset_name: str, image_channels=None):
         if not self._ensure_dataset_is_active(dataset_name):
             self._set_status(f"Could not activate dataset {dataset_name}.")
             return
@@ -3784,10 +4050,11 @@ class ComparisonViewerController:
             raise RuntimeError("Image transform is not initialized.")
 
         images_sdata = self._active_images_sdata
-        only_keys = set(str(k) for k in image_keys) if image_keys is not None else None
+        only_channels = {(str(k), str(c)) for k, c in image_channels} if image_channels is not None else None
+        only_keys = {k for k, _c in only_channels} if only_channels is not None else None
         self._image_build_generation += 1
         generation = self._image_build_generation
-        scope = "selected images" if only_keys is not None else "all images"
+        scope = "selected channels" if only_channels is not None else "all images"
         self._begin_progress("images", f"{ds}: computing image pyramids ({scope}; one-time cached build)...")
 
         def compute():
@@ -3796,7 +4063,7 @@ class ComparisonViewerController:
             # UI stays responsive; the layer creation happens on the GUI thread.
             t0 = time.time()
             self._prime_image_pyramid_caches(ds, images_sdata, only_keys=only_keys)
-            return {"build_seconds": time.time() - t0, "only_keys": only_keys}
+            return {"build_seconds": time.time() - t0, "only_channels": only_channels}
 
         if thread_worker is None:
             try:
@@ -3823,15 +4090,16 @@ class ComparisonViewerController:
             return
         self._image_build_worker = None
         self._end_progress("images")
-        only_keys = payload.get("only_keys")
-        if only_keys is None:
+        only_channels = payload.get("only_channels")
+        if only_channels is None:
             self._remove_layers_by_prefix(layer_name_prefix(ds, "image"))
         else:
-            for image_key in only_keys:
-                self._remove_layers_by_prefix(make_layer_name(ds, "image", image_key))
+            for image_key, channel in only_channels:
+                self._remove_layer_by_name(make_layer_name(ds, "image", image_key, channel))
         stats = self._add_image_layers(
-            ds, self._active_images_sdata, self._x_transform, self._y_transform, only_keys=only_keys
+            ds, self._active_images_sdata, self._x_transform, self._y_transform, only_channels=only_channels
         )
+        self._publish_loaded_image_entries()
         self._set_status(
             f"{ds} loaded image layers={stats['layers']} (failed={stats['failed_keys']}); "
             f"pyramid build={float(payload.get('build_seconds', 0.0)):.1f}s."
@@ -4151,12 +4419,17 @@ def main():
         validate_annotation_callback=controller.validate_cortical_depth_annotations,
         export_annotation_callback=controller.export_cortical_depth_annotations,
         export_separate_annotations_callback=controller.export_separate_cortical_depth_annotations,
+        load_paired_callback=controller.load_paired_dataset,
+        load_standalone_callback=controller.load_standalone_dataset,
         initial_dataset=initial_dataset,
     )
     controller.set_status_callback(panel.set_status)
     controller.set_progress_callback(panel.set_progress)
     controller.set_shape_keys_callback(panel.set_shape_keys)
-    controller.set_image_keys_callback(panel.set_image_keys)
+    controller.set_loaded_shape_keys_callback(panel.set_loaded_shape_keys)
+    controller.set_image_entries_callback(panel.set_image_entries)
+    controller.set_loaded_image_entries_callback(panel.set_loaded_image_entries)
+    controller.set_datasets_changed_callback(panel.set_datasets)
     controller.set_cellpose_value_options_callback(panel.set_cellpose_value_options)
     controller.set_gene_inspector_widget(gene_inspector)
     viewer.window.add_dock_widget(panel, area="right", name="Viewer Controls")

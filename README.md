@@ -69,17 +69,27 @@ napari-compare-xenium-merscope \
 
 ### Tabs
 
+The tab buttons across the top have a white background and bold black text so
+they stand out as the main controls, and they wrap onto extra rows on a narrow
+dock so every full name stays readable.
+
 - **Gene inspector** — the transcript view (see below). **Load / reload
   transcripts** rebuilds the per-gene points; **Unload transcripts** frees them.
-- **Cell segmentation** — a list of every segmentation key. Select one or more
-  and use **Load selected cell segmentation** / **Unload selected cell
-  segmentation**. Cellpose and ProSeg load automatically at startup.
+- **Cell segmentation** — a list of every segmentation key; currently-loaded
+  segmentations are shown in **green**. Select one or more and use **Load
+  selected cell segmentation** / **Unload selected cell segmentation**. Cellpose
+  and ProSeg load automatically at startup.
 - **Per cell statistics** — Channel / Statistic / Colormap dropdowns plus
   **Load / Unload per-cell statistic overlay** (MERSCOPE Cellpose quantification).
 - **Draw tissue annotations** — the cortical-depth drawing tools (see below).
-- **Images** — a list of every image key with **Load selected image(s)**,
-  **Load all images**, and **Unload selected image(s)**.
-- **Dataset** — the MERSCOPE/XENIUM switcher and **Reload Dataset**.
+- **Images** — a list of every individual image **channel** (across all image
+  elements, for both MERSCOPE and Xenium); currently-loaded channels are shown in
+  **green**. Use **Load selected image(s)**, **Load all images**, and **Unload
+  selected image(s)**.
+- **Dataset loader** — the MERSCOPE/XENIUM switcher for the currently open
+  stores, **Reload Dataset**, and buttons to open a different dataset: **Load new
+  paired dataset** (browse for a MERSCOPE store then a Xenium store) or **Load new
+  standalone MERSCOPE / Xenium dataset** (browse for a single store).
 
 Segmentations display as memory-efficient label outlines. If a matching label
 element is already present in the SpatialData store, it is loaded lazily. If it
