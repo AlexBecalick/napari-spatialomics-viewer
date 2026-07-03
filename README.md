@@ -1,6 +1,6 @@
 # napari-compare-xenium-merscope
 
-Standalone Napari viewer for comparing MERSCOPE and Xenium SpatialData `.zarr` outputs.
+Napari-based viewer for visualising MERSCOPE and Xenium SpatialData `.zarr` outputs.
 
 The viewer opens a single Napari window with a tabbed control panel (tabs across
 the top of the right-hand dock): **Gene inspector**, **Cell segmentation**, **Per
@@ -12,27 +12,20 @@ pyramids, cell masks, transcripts, …).
 
 ## Install
 
-The most reproducible setup mirrors the environment used by the original MOSAIK viewer:
+Begin by starting in the root folder of the repository and create a new conda environment from the provided environment file:
 
 ```bash
 conda env create -f environment.yml
 conda activate napari-compare-xenium-merscope
 ```
 
-If you already created the environment before `spatialdata==0.7.3a1` was pinned, update it in place:
-
-```bash
-conda activate napari-compare-xenium-merscope
-pip install --upgrade --pre "spatialdata==0.7.3a1"
-```
-
-For an existing Python environment:
+For updating an existing Python environment after pulling any new changes to the repo:
 
 ```bash
 pip install -e .
 ```
 
-## Run
+## Then Run
 
 ```bash
 napari-compare-xenium-merscope \
