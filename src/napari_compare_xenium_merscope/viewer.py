@@ -64,10 +64,11 @@ except ImportError:
     sys.exit(1)
 
 try:
-    from qtpy.QtCore import QPointF, QRectF, Qt, QTimer, Signal
+    from qtpy.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
     from qtpy.QtGui import QBrush, QColor, QIcon, QPainter, QPen, QPixmap, QPolygonF
     from qtpy.QtWidgets import (
         QAbstractItemView,
+        QButtonGroup,
         QCheckBox,
         QComboBox,
         QDoubleSpinBox,
@@ -75,6 +76,7 @@ try:
         QFrame,
         QHBoxLayout,
         QLabel,
+        QLayout,
         QLineEdit,
         QListWidget,
         QListWidgetItem,
@@ -84,7 +86,7 @@ try:
         QScrollArea,
         QSizePolicy,
         QSlider,
-        QTabWidget,
+        QStackedWidget,
         QVBoxLayout,
         QWidget,
     )
@@ -605,10 +607,83 @@ def transparent_colormap(name: str, color, alpha: float = 1.0) -> Colormap:
     )
 
 
+class FlowLayout(QLayout):
+    """A layout that lays widgets left-to-right and wraps to new rows as needed.
+
+    Used for the tab buttons so every button keeps its full-text width (nothing is
+    elided) and the row simply wraps onto additional rows when the dock is narrow.
+    Adapted from the canonical Qt FlowLayout example.
+    """
+
+    def __init__(self, parent=None, margin: int = 0, hspacing: int = 4, vspacing: int = 4):
+        super().__init__(parent)
+        self._items: list = []
+        self._hspace = hspacing
+        self._vspace = vspacing
+        self.setContentsMargins(margin, margin, margin, margin)
+
+    def addItem(self, item):  # noqa: N802 (Qt override)
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index):  # noqa: N802
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index):  # noqa: N802
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self):  # noqa: N802
+        return Qt.Orientations(Qt.Orientation(0))
+
+    def hasHeightForWidth(self) -> bool:  # noqa: N802
+        return True
+
+    def heightForWidth(self, width: int) -> int:  # noqa: N802
+        return self._do_layout(QRect(0, 0, width, 0), test_only=True)
+
+    def setGeometry(self, rect):  # noqa: N802
+        super().setGeometry(rect)
+        self._do_layout(rect, test_only=False)
+
+    def sizeHint(self):  # noqa: N802
+        return self.minimumSize()
+
+    def minimumSize(self):  # noqa: N802
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        margins = self.contentsMargins()
+        size += QSize(margins.left() + margins.right(), margins.top() + margins.bottom())
+        return size
+
+    def _do_layout(self, rect, test_only: bool) -> int:
+        margins = self.contentsMargins()
+        x = rect.x() + margins.left()
+        y = rect.y() + margins.top()
+        right = rect.right() - margins.right()
+        line_height = 0
+        for item in self._items:
+            hint = item.sizeHint()
+            w, h = hint.width(), hint.height()
+            next_x = x + w + self._hspace
+            if next_x - self._hspace > right and line_height > 0:
+                x = rect.x() + margins.left()
+                y = y + line_height + self._vspace
+                next_x = x + w + self._hspace
+                line_height = 0
+            if not test_only:
+                item.setGeometry(QRect(QPoint(x, y), QSize(w, h)))
+            x = next_x
+            line_height = max(line_height, h)
+        return y + line_height - rect.y() + margins.bottom()
+
+
 class ViewerControlPanel(QWidget):
     """Right-dock control panel: tabbed controls with a shared progress bar.
 
-    Tabs (across the top): Gene inspector, Cell segmentation, Per cell statistics,
+    Tabs (a wrapping button bar across the top): Gene inspector, Cell segmentation, Per cell statistics,
     Draw tissue annotations, Images, Dataset. A busy progress bar plus a stage
     label sit below the tabs and stay visible whatever tab is selected.
     """
@@ -744,27 +819,51 @@ class ViewerControlPanel(QWidget):
         self.progress_message.connect(self._on_progress_message)
 
         # -- Assemble tabs ---------------------------------------------------
-        self._tabs = QTabWidget()
-        self._tabs.setTabPosition(QTabWidget.North)
-        self._tabs.setUsesScrollButtons(True)  # scroll tab bar when it overflows
-        self._tabs.setDocumentMode(True)
-        self._tabs.addTab(self._build_genes_tab(), "Gene inspector")
-        self._tabs.addTab(self._build_segmentation_tab(), "Cell segmentation")
-        self._tabs.addTab(self._build_statistics_tab(), "Per cell statistics")
-        self._tabs.addTab(self._build_annotations_tab(), "Draw tissue annotations")
-        self._tabs.addTab(self._build_images_tab(), "Images")
-        self._tabs.addTab(self._build_dataset_tab(), "Dataset")
-        self._tabs.setCurrentIndex(0)
+        # A wrapping button bar (each button keeps its full-text width and wraps
+        # onto extra rows on narrow docks) drives a QStackedWidget, so tab names
+        # are never truncated regardless of dock width.
+        self._tab_group = QButtonGroup(self)
+        self._tab_group.setExclusive(True)
+        self._tab_bar = QWidget()
+        self._tab_bar_layout = FlowLayout(self._tab_bar, margin=0, hspacing=4, vspacing=4)
+        _tab_bar_policy = self._tab_bar.sizePolicy()
+        _tab_bar_policy.setHeightForWidth(True)
+        _tab_bar_policy.setVerticalPolicy(QSizePolicy.Minimum)
+        self._tab_bar.setSizePolicy(_tab_bar_policy)
+        self._tab_stack = QStackedWidget()
+        for title, builder in (
+            ("Gene inspector", self._build_genes_tab),
+            ("Cell segmentation", self._build_segmentation_tab),
+            ("Per cell statistics", self._build_statistics_tab),
+            ("Draw tissue annotations", self._build_annotations_tab),
+            ("Images", self._build_images_tab),
+            ("Dataset", self._build_dataset_tab),
+        ):
+            self._add_tab(title, builder())
+        if self._tab_group.buttons():
+            self._tab_group.buttons()[0].setChecked(True)
+            self._tab_stack.setCurrentIndex(0)
 
         outer = QVBoxLayout()
         outer.setContentsMargins(4, 4, 4, 4)
         outer.setSpacing(4)
-        outer.addWidget(self._tabs, stretch=1)
+        outer.addWidget(self._tab_bar)
+        outer.addWidget(self._tab_stack, stretch=1)
         outer.addWidget(self._progress_bar)
         outer.addWidget(self._progress_label)
         outer.addWidget(self._status_label)
         self.setLayout(outer)
-        self.setMinimumWidth(280)
+        self.setMinimumWidth(240)
+
+    def _add_tab(self, title: str, widget: QWidget):
+        """Add a wrapping tab button + its page to the stacked widget."""
+        index = self._tab_stack.addWidget(widget)
+        button = QPushButton(title)
+        button.setCheckable(True)
+        button.setCursor(Qt.PointingHandCursor)
+        button.clicked.connect(lambda _checked=False, idx=index: self._tab_stack.setCurrentIndex(idx))
+        self._tab_group.addButton(button, index)
+        self._tab_bar_layout.addWidget(button)
 
     # -- tab builders -------------------------------------------------------
     def _scrollable(self, layout) -> QScrollArea:
