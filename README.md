@@ -2,7 +2,13 @@
 
 Standalone Napari viewer for comparing MERSCOPE and Xenium SpatialData `.zarr` outputs.
 
-The viewer opens a single Napari window with a dataset switcher. It can show image channels, segmentation layers from `shapes` or `labels`, and assigned/unassigned transcript points.
+The viewer opens a single Napari window with a tabbed control panel (tabs across
+the top of the right-hand dock): **Gene inspector**, **Cell segmentation**, **Per
+cell statistics**, **Draw tissue annotations**, **Images**, and **Dataset**. On
+startup it automatically loads all image channels, the Cellpose and ProSeg cell
+segmentations, and all transcripts (rendered as per-gene coloured points). A busy
+progress bar with a stage label below the tabs shows what is loading (image
+pyramids, cell masks, transcripts, …).
 
 ## Install
 
@@ -41,37 +47,41 @@ napari-compare-xenium-merscope --merscope-zarr /path/to/merscope.zarr
 napari-compare-xenium-merscope --xenium-zarr /path/to/xenium.zarr
 ```
 
-Useful options:
+### Default startup and low-RAM flags
+
+By default the viewer eagerly loads everything: all image channels, the Cellpose
+and ProSeg segmentations (shown as lazy label outlines), and all transcripts as
+per-gene points. Per-cell statistic overlays are **not** loaded automatically.
+
+On low-memory systems you can suppress the startup load of any layer type; each
+`--skip-*` flag only skips the *automatic* load — you can still load that layer
+manually from its tab.
 
 ```bash
 napari-compare-xenium-merscope \
   --merscope-zarr /path/to/merscope.zarr \
   --xenium-zarr /path/to/xenium.zarr \
-  --startup-mode fast \
-  --max-transcripts 200000 \
-  --max-shapes-per-layer 20000
+  --skip-images \       # don't auto-load images (load from the Images tab)
+  --skip-cellpose \     # don't auto-load the Cellpose mask
+  --skip-proseg \       # don't auto-load the ProSeg mask
+  --skip-transcripts    # don't auto-load transcripts (load from the Gene inspector tab)
 ```
 
-Fast startup loads transcripts and lists available segmentations, but does not
-add polygon layers by default. Use **Load Selected Segmentations (Capped)** for
-a capped preview, **Load Selected Segmentations (All: bbox)** for selected full
-segmentation layers in a lightweight bounding-box representation, or
-**Load All Segmentations (Capped)** when you want a bounded
-overview of every segmentation key.
+### Tabs
 
-For exact polygon boundaries without loading a whole Cellpose layer into RAM,
-select one or more segmentation keys and use **Stream Selected Polygons**. This
-adds a bounding-box overview and refreshes an exact polygon detail layer when
-the current view is small enough. Tune this with:
+- **Gene inspector** — the transcript view (see below). **Load / reload
+  transcripts** rebuilds the per-gene points; **Unload transcripts** frees them.
+- **Cell segmentation** — a list of every segmentation key. Select one or more
+  and use **Load selected cell segmentation** / **Unload selected cell
+  segmentation**. Cellpose and ProSeg load automatically at startup.
+- **Per cell statistics** — Channel / Statistic / Colormap dropdowns plus
+  **Load / Unload per-cell statistic overlay** (MERSCOPE Cellpose quantification).
+- **Draw tissue annotations** — the cortical-depth drawing tools (see below).
+- **Images** — a list of every image key with **Load selected image(s)**,
+  **Load all images**, and **Unload selected image(s)**.
+- **Dataset** — the MERSCOPE/XENIUM switcher and **Reload Dataset**.
 
-```bash
-napari-compare-xenium-merscope ... \
-  --stream-shapes-max-view-size 2500 \
-  --stream-shapes-max-polygons 2500
-```
-
-For the most memory-efficient full segmentation display, select one or more
-shape keys and use **Load Selected Labels (Outlines)**. If a matching label
+Segmentations display as memory-efficient label outlines. If a matching label
 element is already present in the SpatialData store, it is loaded lazily. If it
 is missing, the viewer rasterizes the selected polygon layer chunk by chunk,
 saves it back to `labels/<shape-key>_labels` in the zarr, and then displays the
@@ -89,34 +99,15 @@ napari-compare-xenium-merscope ... --label-chunk-size 1024
 napari-compare-xenium-merscope ... --label-contour-width 2
 ```
 
-Very large Cellpose layers can contain tens of millions of boundary vertices.
-The uncapped selected-load button uses `--full-shape-render-mode bbox` by
-default to avoid materializing every vertex in a Napari `Shapes` layer. Other
-options are:
+## Transcripts (Gene inspector)
 
-```bash
-# Lightest full-layer view.
-napari-compare-xenium-merscope ... --full-shape-render-mode centroid
-
-# Approximate full outlines with at most 64 vertices per polygon.
-napari-compare-xenium-merscope ... \
-  --full-shape-render-mode path \
-  --shape-max-vertices-per-polygon 64
-
-# Exact full outlines; highest memory use.
-napari-compare-xenium-merscope ... --full-shape-render-mode path
-```
-
-## Inspect genes
-
-Click **Inspect Genes** in the Transcripts section of the right dock to open the
-**Gene Inspector** panel. It loads the full gene panel for the current dataset,
-alphabetically, and gives every gene a unique **colour + marker shape** shown as a
-large icon beside its name. Unlike the default assigned/unassigned view, this
-renders *all* transcripts as real points coloured by gene (no density raster or
-viewport sampling) — feasible because a typical section is ~10-20M transcripts.
-Opening it takes over the transcript display; **Close Gene Inspector** restores the
-default density/assigned-unassigned view.
+Transcripts render as real points coloured by gene — not a density raster or a
+viewport-sampled subset — because a typical section (~10-20M transcripts) fits in
+memory as points. The **Gene inspector** tab loads the full gene panel for the
+current dataset alphabetically and gives every gene a unique **colour + marker
+shape** shown as a large icon beside its name. Assigned and unassigned transcripts
+are shown by default; control/blank probes are hidden. Use **Load / reload
+transcripts** to rebuild the panel and **Unload transcripts** to free the points.
 
 Genes are grouped by marker shape into at most 14 napari Points layers, so per-gene
 toggles stay fast even with hundreds of genes. The panel offers:
@@ -148,7 +139,7 @@ The SpatialData stores should contain points for transcripts, images for channel
 For a complete step-by-step workflow, see
 [docs/cortical_depth_annotation_guide.md](docs/cortical_depth_annotation_guide.md).
 
-The right-side dock has a **Cortical Depth Annotations** section. Click
+The **Draw tissue annotations** tab holds the cortical-depth tools. Click
 **Create Drawing Layers** to add one editable napari Shapes layer for each
 MerXen cortical-depth input role. Draw in the same visible coordinate frame as
 the SpatialData cells/transcripts, then click **Validate Annotations** or
