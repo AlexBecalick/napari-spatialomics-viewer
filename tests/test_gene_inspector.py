@@ -16,7 +16,11 @@ import pandas as pd
 import pytest
 
 from napari_compare_xenium_merscope import viewer as V
-from napari_compare_xenium_merscope.utils import GENE_MARKER_SYMBOLS, build_gene_point_groups
+from napari_compare_xenium_merscope.utils import (
+    GENE_MARKER_SYMBOLS,
+    build_gene_point_groups,
+    gene_marker_symbol_label,
+)
 
 
 @pytest.fixture(scope="module")
@@ -120,6 +124,9 @@ def test_controller_toggle_background_controls_and_teardown(qapp):
     ctrl._flush_gene_group_rebuild("TEST")
     ctrl.set_gene_hide_background("TEST", True)
     assert _total(ctrl, state) == 7
+    ctrl.set_gene_hide_assigned("TEST", True)
+    assert _total(ctrl, state) == 0
+    ctrl.set_gene_hide_assigned("TEST", False)
 
     # Show controls + all genes + background on: 6 + 3 + 2.
     ctrl.set_gene_hide_background("TEST", False)
@@ -160,7 +167,7 @@ def test_controller_toggle_background_controls_and_teardown(qapp):
     assert ctrl._get_layer_by_name(state.layer_names[gi]).symbol == store.group_symbols[gi]
 
     ctrl._teardown_gene_inspector("TEST")
-    assert [l for l in ctrl.viewer.layers if "genes" in str(l.name)] == []
+    assert [l for l in ctrl.viewer.layers if "Genes" in str(l.name)] == []
 
 
 def test_marker_pixmaps_render_for_all_symbols(qapp):
@@ -179,13 +186,16 @@ def test_gene_inspector_widget_populate_and_callbacks(qapp):
         set_spot_size_callback=lambda *a: calls.append(("size", a)),
         set_hide_background_callback=lambda *a: calls.append(("bg", a)),
         set_show_controls_callback=lambda *a: calls.append(("ctrl", a)),
+        set_hide_assigned_callback=lambda *a: calls.append(("assigned", a)),
     )
     from napari_compare_xenium_merscope.utils import assign_gene_visuals
 
     w.populate("TEST", list(store.genes), assign_gene_visuals(store.genes),
                dict(store.gene_counts), set(store.control_genes),
-               {"AAA", "BBB"}, False, False, 2.0)
+               {"AAA", "BBB"}, False, False, False, 2.0)
     assert len(w._checkboxes) == 3
+    assert w._hide_assigned_check.text() == "Hide assigned spots"
+    assert w._hide_bg_check.text() == "Hide unassigned spots"
     assert w._items["Blank-1"].isHidden()      # control hidden by default
     assert not w._items["AAA"].isHidden()
     assert w._checkboxes["AAA"].isChecked()
@@ -197,3 +207,17 @@ def test_gene_inspector_widget_populate_and_callbacks(qapp):
     w._show_controls_check.setChecked(True)
     assert not w._items["Blank-1"].isHidden()
     assert ("ctrl", ("TEST", True)) in calls
+
+    w._hide_assigned_check.setChecked(True)
+    assert ("assigned", ("TEST", True)) in calls
+
+
+def test_gene_layer_names_use_marker_symbol_labels(qapp):
+    store = _demo_store()
+    ctrl = _controller(store, qapp)
+    state = ctrl._gene_inspector_states["TEST"]
+
+    assert state.layer_names == [
+        f"Genes | {gene_marker_symbol_label(symbol)}"
+        for symbol in store.group_symbols
+    ]
