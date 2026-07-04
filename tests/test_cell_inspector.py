@@ -339,6 +339,33 @@ def test_pick_cell_from_event_uses_proseg_shapes(qapp):
     assert ctrl._pick_cell_from_event(_event(50.0, 50.0)) is None
 
 
+def test_cell_picking_gated_on_proseg_layer_visibility(qapp):
+    ctrl = _controller(qapp)
+    seg = _FakeImageLayer(
+        "TEST | labels | MOSAIK_proseg_labels", np.zeros((4, 4)),
+        [[0.2, 0, 0], [0, 0.2, 0], [0, 0, 1]],
+    )
+    ctrl.viewer.layers.append(seg)
+
+    # Visible ProSeg layer -> a click inside a mask highlights the cell.
+    ctrl._on_viewer_mouse_press(ctrl.viewer, _event(5.0, 5.0))
+    assert ctrl._selected_cells.get("TEST")
+
+    # Hiding the ProSeg layer drops current highlights...
+    seg.visible = False
+    ctrl._on_segmentation_visibility_changed()
+    assert not ctrl._selected_cells
+
+    # ...and while hidden, clicks no longer highlight cells.
+    ctrl._on_viewer_mouse_press(ctrl.viewer, _event(5.0, 5.0))
+    assert not ctrl._selected_cells.get("TEST")
+
+    # Showing it again re-enables click-to-highlight.
+    seg.visible = True
+    ctrl._on_viewer_mouse_press(ctrl.viewer, _event(5.0, 5.0))
+    assert ctrl._selected_cells.get("TEST")
+
+
 def test_add_cell_selection_draws_layers_and_populates_overlay(qapp):
     ctrl = _controller(qapp)
     _cid, geom = ctrl._pick_cell_from_event(_event(5.0, 5.0))

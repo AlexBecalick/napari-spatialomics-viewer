@@ -383,6 +383,30 @@ def test_widget_alphabetical_appends_celltype_labels(qapp):
     assert "Neuron / L2/3 IT" in w._checkboxes["SLC17A7"].text()
 
 
+def test_move_gene_layers_to_bottom(qapp):
+    store = _demo_store()
+    ctrl = _controller(store, qapp)
+    state = ctrl._gene_inspector_states["TEST"]
+
+    class _MoveLayerList(list):
+        def __init__(self, *a):
+            super().__init__(*a)
+            self.moved = None
+
+        def move_multiple(self, sources, dest):
+            self.moved = (list(sources), dest)
+
+    # An image on top of the (already-created) gene layers, in list order.
+    layers = _MoveLayerList(
+        [ctrl._get_layer_by_name(n) for n in state.layer_names]
+        + [types.SimpleNamespace(name="Image | DAPI")]
+    )
+    ctrl.viewer.layers = layers
+    ctrl._move_gene_layers_to_bottom(state)
+    # The gene layers (indices 0..n-1) are moved as a block to the bottom (0).
+    assert layers.moved == (list(range(len(state.layer_names))), 0)
+
+
 def test_gene_layer_names_use_marker_symbol_labels(qapp):
     store = _demo_store()
     ctrl = _controller(store, qapp)

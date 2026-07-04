@@ -2781,20 +2781,25 @@ class ComparisonViewerController:
     def _start_startup_autoload(self, ds: str):
         """Kick off the default background loads once dataset metadata is ready.
 
-        Images, Cellpose+ProSeg masks and per-gene transcripts each load in their
-        own napari thread_worker, so this returns immediately and the UI stays
-        responsive while the busy progress bar tracks each stage. Cell-mask value
-        overlays are intentionally NOT loaded here (on-demand only).
+        Transcripts, images and Cellpose+ProSeg masks each load in their own napari
+        thread_worker, so this returns immediately and the UI stays responsive while
+        the busy progress bar tracks each stage. Cell-mask value overlays are
+        intentionally NOT loaded here (on-demand only).
+
+        Order matters for the napari layer list (last added sits on top): transcripts
+        are requested first and their layers are pinned to the bottom (see
+        :meth:`_apply_gene_inspector_build`), so the long gene-layer list stays at the
+        bottom-left with images and masks stacked above it.
         """
+        if not bool(getattr(self.args, "skip_transcripts", False)):
+            self.open_gene_inspector(ds)
+
         if not bool(getattr(self.args, "skip_images", False)) and self._image_keys:
             self.load_images_on_demand(ds)
 
         mask_keys = self._startup_segmentation_keys()
         if mask_keys:
             self.load_selected_labels(ds, mask_keys)
-
-        if not bool(getattr(self.args, "skip_transcripts", False)):
-            self.open_gene_inspector(ds)
 
     def load_dataset(self, dataset_name: str, force: bool = False):
         ds = str(dataset_name).upper()
@@ -3808,7 +3813,7 @@ class ComparisonViewerController:
         layer_color = np.asarray(stable_layer_color(label_key, alpha=1.0), dtype=np.float32)
         color_map = transparent_colormap(f"{label_key}_outline", layer_color, alpha=float(self.args.shape_opacity))
 
-        self.viewer.add_image(
+        seg_layer = self.viewer.add_image(
             prepared["outline_data"],
             name=layer_name,
             affine=prepared["napari_affine"],
@@ -3820,6 +3825,12 @@ class ComparisonViewerController:
             blending="additive",
             visible=not self.args.hide_shapes,
         )
+        # Hiding the ProSeg (cell-inspector) layer disables cell picking and drops
+        # any current highlights; showing it re-enables clicking.
+        try:
+            seg_layer.events.visible.connect(self._on_segmentation_visibility_changed)
+        except Exception:
+            pass
         log.info(
             "[%s] Added label outline layer %s from cache=%s shape=%s dtype=%s levels=%s width=%s source=cache",
             ds,
@@ -4388,6 +4399,11 @@ class ComparisonViewerController:
             self._create_gene_points_layer(layer_name, symbol, spot_size, coords, colors, sizes)
             state.layer_names.append(layer_name)
         layer_names = state.layer_names
+        # Pin the (long) gene-layer block to the bottom of the layer list so it
+        # stays below images and masks regardless of which background load finishes
+        # first. Layers added later by napari sit on top, so without this the
+        # slow-to-build transcripts would land at the top.
+        self._move_gene_layers_to_bottom(state)
 
         if self._gene_inspector_widget is not None:
             self._populate_gene_inspector(state)
@@ -4480,6 +4496,30 @@ class ComparisonViewerController:
                 pass
         return layer
 
+    def _move_gene_layers_to_bottom(self, state: GeneInspectorState):
+        """Move this dataset's gene Points layers to the bottom of the layer list.
+
+        Preserves their relative order (first symbol group lowest). Silently no-ops
+        when the layer list doesn't support reordering (e.g. the test fake viewer).
+        """
+        layers = self.viewer.layers
+        names = list(state.layer_names)
+        try:
+            indices = [i for i, layer in enumerate(layers) if str(getattr(layer, "name", "")) in set(names)]
+            if not indices:
+                return
+            if hasattr(layers, "move_multiple"):
+                layers.move_multiple(sorted(indices), 0)
+            elif hasattr(layers, "move"):
+                # Move each gene layer to the front, last-to-first, so the final
+                # bottom block keeps the original symbol-group order.
+                for name in reversed(names):
+                    src = next((i for i, layer in enumerate(layers) if str(getattr(layer, "name", "")) == name), None)
+                    if src is not None:
+                        layers.move(src, 0)
+        except Exception as exc:  # pragma: no cover - defensive; ordering is cosmetic
+            log.debug("Could not reorder gene layers to bottom: %s", exc)
+
     def _set_gene_layer_data(self, layer, coords, colors, symbol, spot_size, sizes=None):
         layer.data = coords
         try:
@@ -4554,11 +4594,13 @@ class ComparisonViewerController:
                 return
 
         # 2) Otherwise a click inside a segmentation mask adds it to the set of
-        #    highlighted cells (existing highlights are kept).
-        picked = self._pick_cell_from_event(event)
-        if picked is not None:
-            self._add_cell_selection(ds, picked[0], picked[1])
-            return
+        #    highlighted cells (existing highlights are kept) -- but only while the
+        #    gating segmentation layer (ProSeg) is visible.
+        if self._cell_inspector_pickable():
+            picked = self._pick_cell_from_event(event)
+            if picked is not None:
+                self._add_cell_selection(ds, picked[0], picked[1])
+                return
 
         # 3) A click in empty space only clears transcript-gene highlights; the
         #    selected cells stay highlighted so the user can pan/zoom freely.
@@ -4596,6 +4638,51 @@ class ComparisonViewerController:
                 if preferred in key.lower():
                     return key
         return shape_keys[0]
+
+    def _cell_inspector_layer(self):
+        """Return the rendered napari layer whose visibility gates cell picking.
+
+        This is the layer for the same segmentation the click hit-test uses
+        (ProSeg first, per :meth:`_cell_inspector_shape_key`), or ``None`` if it
+        isn't currently loaded.
+        """
+        shape_key = self._cell_inspector_shape_key()
+        if shape_key is None or self.active_dataset is None:
+            return None
+        ds = str(self.active_dataset).upper()
+        try:
+            label_key = self._label_key_for_shape_key(shape_key)
+        except Exception:
+            label_key = f"{shape_key}_labels"
+        try:
+            seg_type = self._segmentation_layer_type()
+        except Exception:
+            seg_type = "labels"
+        for name in (
+            make_layer_name(ds, "labels", label_key),
+            make_layer_name(ds, "labels", shape_key),
+            make_layer_name(ds, seg_type, shape_key),
+        ):
+            layer = self._get_layer_by_name(name)
+            if layer is not None:
+                return layer
+        return None
+
+    def _cell_inspector_pickable(self) -> bool:
+        """Cells are clickable unless the gating segmentation layer is hidden.
+
+        Only blocks when that layer is present *and* not visible; if no such layer
+        is loaded there is nothing to hide, so picking behaves as before.
+        """
+        layer = self._cell_inspector_layer()
+        return layer is None or bool(getattr(layer, "visible", True))
+
+    def _on_segmentation_visibility_changed(self, _event=None):
+        """Clear highlighted cells when the gating segmentation layer is hidden."""
+        layer = self._cell_inspector_layer()
+        if layer is not None and not bool(getattr(layer, "visible", True)):
+            if any(self._selected_cells.values()):
+                self._clear_all_cell_selections()
 
     def _pick_cell_from_event(self, event):
         """Return ``(cell_id, geometry)`` for the mask under the click, or None."""
