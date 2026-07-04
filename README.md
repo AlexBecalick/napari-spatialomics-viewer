@@ -167,6 +167,37 @@ napari-compare-xenium-merscope ... \
   --gene-max-render-points 40000000 # subsample cap for very large panels
 ```
 
+### Zoomed-out appearance (spots and outlines)
+
+Transcript spots have a real micron size and scale with zoom. napari otherwise
+clamps every spot to a **2px minimum on screen**, so when zoomed out millions of
+spots stay 2px and blanket the view into a solid mass. Two defaults address this:
+
+- `--gene-min-canvas-px` (default `0`) drops that minimum so spots shrink with
+  zoom instead of staying a fixed 2px. Raise it (e.g. `1`) if you want spots more
+  visible at extreme zoom-out.
+- `--gene-antialiasing` (default `1`) lets sub-pixel spots contribute partial
+  opacity, so dense regions read darker than sparse ones and tissue structure
+  (e.g. cortical layering) shows through when zoomed out. Set `--gene-antialiasing 0`
+  for hard-edged spots if antialiasing costs too much on your GPU.
+
+Label outlines are rasterised, so a downsampled multiscale level can make thin
+outlines look thick and blocky (merging into blocks of colour) when zoomed out.
+`--label-interpolation` (default `linear`) anti-aliases the outlines on screen so
+they stay thin and fade rather than blocking up; use `nearest` for crisper — but
+blockier when zoomed out — outlines. In the default `linear` mode the outlines
+automatically switch to crisp `nearest` interpolation once you zoom in far enough
+that the field of view is ≤ ~150 µm (so single-cell close-ups stay sharp), and
+back to `linear` when you zoom out. All of these are display-only settings with no
+material performance cost (antialiasing aside).
+
+### Scale bar
+
+A scale bar sits in the bottom-right corner of the canvas. Its length is fixed at
+about a quarter of the canvas width; as you zoom, the **bar stays the same size**
+and only its **label** changes to show how many microns it currently spans (large
+bold white text with a black outline).
+
 ## Data Assumptions
 
 MERSCOPE inputs may include `micron_to_mosaic_pixel_transform.csv` inside the zarr directory. If missing, the viewer falls back to `0.108 um/px`.

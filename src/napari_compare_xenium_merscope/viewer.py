@@ -65,8 +65,19 @@ except ImportError:
     sys.exit(1)
 
 try:
-    from qtpy.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
-    from qtpy.QtGui import QBrush, QColor, QFont, QIcon, QPainter, QPen, QPixmap, QPolygonF
+    from qtpy.QtCore import QEvent, QObject, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
+    from qtpy.QtGui import (
+        QBrush,
+        QColor,
+        QFont,
+        QFontMetricsF,
+        QIcon,
+        QPainter,
+        QPainterPath,
+        QPen,
+        QPixmap,
+        QPolygonF,
+    )
     from qtpy.QtWidgets import (
         QAbstractItemView,
         QButtonGroup,
@@ -230,6 +241,10 @@ class GeneInspectorState:
 
 DEFAULT_GENE_SPOT_SIZE = 0.5
 GENE_HIGHLIGHT_SPOT_SIZE = 2.0
+#: When the (smaller) visible field of view is at or below this many microns, the
+#: label outlines switch to crisp nearest-neighbour interpolation; above it they
+#: use anti-aliased linear interpolation. Only active with --label-interpolation linear.
+LABEL_CRISP_ZOOM_UM = 150.0
 GENE_SPOT_SIZE_MIN = 0.1
 GENE_SPOT_SIZE_MAX = 5.0
 GENE_SPOT_SIZE_STEP = 0.1
@@ -2217,6 +2232,111 @@ class CellInfoOverlay(QWidget):
         return panels
 
 
+class _WidgetResizeRelay(QObject):
+    """Forwards a parent widget's resize events to a callback (event filter)."""
+
+    def __init__(self, callback):
+        super().__init__()
+        self._callback = callback
+
+    def eventFilter(self, _obj, event):  # noqa: N802 (Qt override)
+        if event.type() == QEvent.Resize:
+            try:
+                self._callback()
+            except Exception:
+                pass
+        return False
+
+
+class ScaleBarOverlay(QWidget):
+    """Bottom-right canvas overlay: a fixed-length bar labelled with the micron
+    distance it currently spans.
+
+    The bar is a fixed fraction of the canvas width and never changes size; only
+    the label changes as the camera zooms. The label is large, bold, white with a
+    black outline so it reads over any background.
+    """
+
+    def __init__(self, parent=None, width_fraction: float = 0.25, margin: int = 28):
+        super().__init__(parent)
+        self._um_per_px: float | None = None
+        self._width_fraction = float(width_fraction)
+        self._margin = int(margin)
+        self._bar_px = 100
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        self.reposition()
+
+    def set_um_per_px(self, um_per_px: float | None):
+        self._um_per_px = float(um_per_px) if um_per_px and um_per_px > 0 else None
+        self.update()
+
+    def reposition(self):
+        """Size the bar to a quarter of the canvas width and pin bottom-right."""
+        parent = self.parentWidget()
+        if parent is None:
+            return
+        pw, ph = int(parent.width()), int(parent.height())
+        self._bar_px = max(20, int(pw * self._width_fraction))
+        pad = 6
+        w = self._bar_px + 2 * pad
+        h = 66
+        self.setGeometry(max(0, pw - self._margin - w), max(0, ph - self._margin - h), w, h)
+        self.update()
+
+    @staticmethod
+    def _format_um(um: float) -> str:
+        if um >= 100:
+            return f"{um:.0f} µm"
+        if um >= 10:
+            return f"{um:.1f} µm"
+        return f"{um:.2f} µm"
+
+    def paintEvent(self, _event):  # noqa: N802 (Qt override)
+        if self._um_per_px is None:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        pad = 6
+        x0, x1 = pad, pad + self._bar_px
+        bar_y = self.height() - 12
+        tick = 7
+        # Draw the bar + end ticks twice: a thick black outline then a white line.
+        for color, width in ((QColor(0, 0, 0), 7), (QColor(255, 255, 255), 3)):
+            pen = QPen(color)
+            pen.setWidth(width)
+            pen.setCapStyle(Qt.FlatCap)
+            painter.setPen(pen)
+            painter.drawLine(x0, bar_y, x1, bar_y)
+            painter.drawLine(x0, bar_y - tick, x0, bar_y + tick)
+            painter.drawLine(x1, bar_y - tick, x1, bar_y + tick)
+
+        text = self._format_um(self._bar_px * self._um_per_px)
+        font = QFont()
+        font.setBold(True)
+        font.setPointSize(22)
+        metrics = QFontMetricsF(font)
+        tx = x0 + (self._bar_px - metrics.horizontalAdvance(text)) / 2.0
+        ty = bar_y - tick - 8.0  # text baseline sits just above the bar
+        path = QPainterPath()
+        path.addText(tx, ty, font, text)
+        # Draw the outline first (black stroke, no fill), then the white glyph
+        # fill on top. A stroked pen is centred on the glyph edge, so filling
+        # white afterwards covers the inner half and leaves only a thin outer
+        # black outline -- keeping the white interior fully visible.
+        outline = QPen(QColor(0, 0, 0))
+        outline.setWidthF(5.0)
+        outline.setJoinStyle(Qt.RoundJoin)
+        painter.setPen(outline)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawPath(path)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor(255, 255, 255)))
+        painter.drawPath(path)
+        painter.end()
+
+
 class ComparisonViewerController:
     """Coordinate loading/clearing napari layers for each dataset."""
 
@@ -2263,6 +2383,9 @@ class ComparisonViewerController:
         self._cell_info_overlay: CellInfoOverlay | None = None
         self._cell_info_dock = None
         self._suppress_dock_visibility = False
+        # Bottom-right micron scale bar overlay + its canvas-resize relay.
+        self._scale_bar: ScaleBarOverlay | None = None
+        self._canvas_resize_relay: _WidgetResizeRelay | None = None
         self._install_gene_pick_callback()
 
     def set_status_callback(self, fn):
@@ -2282,6 +2405,94 @@ class ComparisonViewerController:
             callbacks.append(self._on_viewer_mouse_press)
         except Exception as exc:
             log.debug("Could not install transcript pick callback: %s", exc)
+
+    # -- Canvas overlays: micron scale bar + zoom-aware outline crispness ------
+    def install_canvas_overlays(self):
+        """Attach the bottom-right scale bar and start tracking camera zoom.
+
+        Best-effort: if the napari canvas widget can't be reached (headless / a
+        future napari layout change) the scale bar is skipped without error.
+        """
+        native = self._canvas_native_widget()
+        if native is not None:
+            try:
+                self._scale_bar = ScaleBarOverlay(native)
+                self._scale_bar.show()
+                self._scale_bar.raise_()
+                self._canvas_resize_relay = _WidgetResizeRelay(self._on_canvas_geometry_changed)
+                native.installEventFilter(self._canvas_resize_relay)
+            except Exception as exc:
+                log.debug("Scale bar overlay unavailable: %s", exc)
+                self._scale_bar = None
+        try:
+            self.viewer.camera.events.zoom.connect(self._on_camera_zoom)
+        except Exception as exc:
+            log.debug("Could not connect camera zoom for overlays: %s", exc)
+        self._on_camera_zoom()
+
+    def _canvas_native_widget(self):
+        try:
+            return self.viewer.window._qt_viewer.canvas.native
+        except Exception:
+            return None
+
+    def _canvas_size_px(self) -> tuple[float, float] | None:
+        try:
+            size = self.viewer.window._qt_viewer.canvas.size
+            w, h = float(size[0]), float(size[1])
+            if w > 0 and h > 0:
+                return (w, h)
+        except Exception:
+            pass
+        native = self._canvas_native_widget()
+        if native is not None:
+            try:
+                w, h = float(native.width()), float(native.height())
+                if w > 0 and h > 0:
+                    return (w, h)
+            except Exception:
+                pass
+        return None
+
+    def _um_per_canvas_px(self) -> float | None:
+        camera = getattr(self.viewer, "camera", None)
+        zoom = float(getattr(camera, "zoom", 0.0) or 0.0) if camera is not None else 0.0
+        return (1.0 / zoom) if zoom > 0 else None
+
+    def _on_canvas_geometry_changed(self):
+        if self._scale_bar is not None:
+            self._scale_bar.reposition()
+        self._on_camera_zoom()
+
+    def _on_camera_zoom(self, *_):
+        um_per_px = self._um_per_canvas_px()
+        if self._scale_bar is not None:
+            self._scale_bar.set_um_per_px(um_per_px)
+        self._apply_label_zoom_interpolation(um_per_px)
+
+    def _apply_label_zoom_interpolation(self, um_per_px: float | None = None):
+        """Crisp (nearest) outlines when zoomed in past the threshold, else linear.
+
+        Only runs when the outline mode is the default 'linear'; an explicit
+        --label-interpolation nearest keeps outlines crisp at every zoom.
+        """
+        if str(getattr(self.args, "label_interpolation", "linear")) != "linear":
+            return
+        if um_per_px is None:
+            um_per_px = self._um_per_canvas_px()
+        size = self._canvas_size_px()
+        if um_per_px is None or size is None:
+            return
+        visible_um = min(size) * um_per_px
+        mode = "nearest" if visible_um <= LABEL_CRISP_ZOOM_UM else "linear"
+        for layer in list(self.viewer.layers):
+            name = str(getattr(layer, "name", ""))
+            if " | labels | " in name and hasattr(layer, "interpolation2d"):
+                try:
+                    if layer.interpolation2d != mode:
+                        layer.interpolation2d = mode
+                except Exception:
+                    pass
 
     def set_shape_keys_callback(self, fn):
         self._shape_keys_callback = fn
@@ -2781,25 +2992,27 @@ class ComparisonViewerController:
     def _start_startup_autoload(self, ds: str):
         """Kick off the default background loads once dataset metadata is ready.
 
-        Transcripts, images and Cellpose+ProSeg masks each load in their own napari
-        thread_worker, so this returns immediately and the UI stays responsive while
-        the busy progress bar tracks each stage. Cell-mask value overlays are
-        intentionally NOT loaded here (on-demand only).
+        Images, Cellpose+ProSeg masks and per-gene transcripts each load in their
+        own napari thread_worker, so this returns immediately and the UI stays
+        responsive while the busy progress bar tracks each stage. Cell-mask value
+        overlays are intentionally NOT loaded here (on-demand only).
 
-        Order matters for the napari layer list (last added sits on top): transcripts
-        are requested first and their layers are pinned to the bottom (see
-        :meth:`_apply_gene_inspector_build`), so the long gene-layer list stays at the
-        bottom-left with images and masks stacked above it.
+        Images are requested first so the camera auto-fits to the image extent (the
+        tight tissue bounding box) rather than the transcript point cloud. The long
+        gene-layer list is still kept at the bottom of the layer list -- not via
+        load order, but by explicitly pinning it there once built (see
+        :meth:`_move_gene_layers_to_bottom`), so this ordering and the list ordering
+        are independent.
         """
-        if not bool(getattr(self.args, "skip_transcripts", False)):
-            self.open_gene_inspector(ds)
-
         if not bool(getattr(self.args, "skip_images", False)) and self._image_keys:
             self.load_images_on_demand(ds)
 
         mask_keys = self._startup_segmentation_keys()
         if mask_keys:
             self.load_selected_labels(ds, mask_keys)
+
+        if not bool(getattr(self.args, "skip_transcripts", False)):
+            self.open_gene_inspector(ds)
 
     def load_dataset(self, dataset_name: str, force: bool = False):
         ds = str(dataset_name).upper()
@@ -3819,7 +4032,7 @@ class ComparisonViewerController:
             affine=prepared["napari_affine"],
             colormap=color_map,
             contrast_limits=(0.0, 1.0),
-            interpolation2d="nearest",
+            interpolation2d=str(getattr(self.args, "label_interpolation", "linear")),
             multiscale=n_levels > 1,
             opacity=self.args.shape_opacity,
             blending="additive",
@@ -3831,6 +4044,9 @@ class ComparisonViewerController:
             seg_layer.events.visible.connect(self._on_segmentation_visibility_changed)
         except Exception:
             pass
+        # Give the new outline the crisp/linear interpolation matching the current
+        # zoom (a fresh layer would otherwise start at the base 'linear' setting).
+        self._apply_label_zoom_interpolation()
         log.info(
             "[%s] Added label outline layer %s from cache=%s shape=%s dtype=%s levels=%s width=%s source=cache",
             ds,
@@ -4489,11 +4705,20 @@ class ComparisonViewerController:
             layer = self.viewer.add_points(coords, face_color=colors, border_color=colors, **kwargs)
         except TypeError:
             layer = self.viewer.add_points(coords, face_color=colors, edge_color=colors, **kwargs)
-        for attr, value in (("antialiasing", 0), ("border_width", 0.0), ("symbol", str(symbol))):
+        # Antialiasing lets sub-pixel spots contribute partial opacity so density
+        # structure shows when zoomed out; the min canvas-size floor is dropped so
+        # spots actually shrink with zoom instead of staying a fixed 2px blanket.
+        antialiasing = float(getattr(self.args, "gene_antialiasing", 1.0))
+        min_px = float(getattr(self.args, "gene_min_canvas_px", 0.0))
+        for attr, value in (("antialiasing", antialiasing), ("border_width", 0.0), ("symbol", str(symbol))):
             try:
                 setattr(layer, attr, value)
             except Exception:
                 pass
+        try:
+            layer.canvas_size_limits = (min_px, 10000.0)
+        except Exception:
+            pass
         return layer
 
     def _move_gene_layers_to_bottom(self, state: GeneInspectorState):
@@ -5673,6 +5898,17 @@ def parse_args() -> argparse.Namespace:
         help="Outline width in pixels for generated label outline display.",
     )
     parser.add_argument(
+        "--label-interpolation",
+        default="linear",
+        choices=("linear", "nearest"),
+        help=(
+            "Screen interpolation for label-outline layers. 'linear' anti-aliases "
+            "the outlines when zoomed out so they stay thin and fade rather than "
+            "merging into blocks of colour; 'nearest' is crisper up close but blocky "
+            "when zoomed out."
+        ),
+    )
+    parser.add_argument(
         "--overwrite-labels",
         action="store_true",
         help="Rebuild cached label elements even if labels with the same keys already exist.",
@@ -5728,6 +5964,28 @@ def parse_args() -> argparse.Namespace:
         "--gene-show-controls",
         action="store_true",
         help="Start the transcript view with control/blank probes shown",
+    )
+    parser.add_argument(
+        "--gene-min-canvas-px",
+        default=0.0,
+        type=float,
+        help=(
+            "Minimum on-screen size (canvas pixels) for transcript spots. napari's "
+            "default of 2 keeps zoomed-out spots at 2px so millions of them blanket "
+            "the view into a solid mass; 0 lets spots shrink with zoom so density "
+            "structure shows through."
+        ),
+    )
+    parser.add_argument(
+        "--gene-antialiasing",
+        default=1.0,
+        type=float,
+        help=(
+            "Antialiasing width (px) for transcript spots. >0 lets sub-pixel spots "
+            "contribute partial opacity, so dense regions read darker than sparse "
+            "ones (density structure appears when zoomed out). Set 0 for hard-edged "
+            "spots if antialiasing costs too much performance."
+        ),
     )
     parser.add_argument("--shape-edge-width", default=0.75, type=float, help="Segmentation/annotation edge width")
     parser.add_argument("--shape-opacity", default=0.95, type=float, help="Segmentation outline edge alpha")
@@ -5853,6 +6111,7 @@ def main():
     controller.set_gene_inspector_widget(gene_inspector)
     viewer.window.add_dock_widget(panel, area="right", name="Viewer Controls")
 
+    controller.install_canvas_overlays()
     controller.load_dataset(initial_dataset, force=True)
     napari.run()
 
