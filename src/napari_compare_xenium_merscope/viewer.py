@@ -66,7 +66,7 @@ except ImportError:
 
 try:
     from qtpy.QtCore import QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
-    from qtpy.QtGui import QBrush, QColor, QIcon, QPainter, QPen, QPixmap, QPolygonF
+    from qtpy.QtGui import QBrush, QColor, QFont, QIcon, QPainter, QPen, QPixmap, QPolygonF
     from qtpy.QtWidgets import (
         QAbstractItemView,
         QButtonGroup,
@@ -119,9 +119,18 @@ from .utils import (
     CORTICAL_DEPTH_ROLE_ORDER,
     CORTICAL_DEPTH_ROLE_SPECS,
     GeneVisual,
+    CellTranscriptIndex,
     CorticalDepthShapeInput,
     DERIVED_CACHE_ATTR,
     assign_gene_visuals,
+    build_cell_type_gene_visuals,
+    load_cell_type_marker_reference,
+    build_cell_transcript_index,
+    darken_rgba,
+    mean_intensity_in_polygon,
+    normalize_cell_key,
+    pick_cell_at_point,
+    ranked_gene_counts,
     affine_matrix_from_px_to_um,
     build_binned_label_color_dict,
     build_cortical_depth_annotation_geojson,
@@ -207,6 +216,16 @@ class GeneInspectorState:
     pending_groups: set | None = None
     highlighted_genes: list | None = None
     group_display_ranges: list[list[tuple[int, int, str]]] | None = None
+    #: Cell-type marker metadata + the two precomputed visual schemes. When
+    #: ``reference`` is None the panel has no metadata and only flat A–Z ordering
+    #: (the legacy rainbow) is offered. ``ordering`` is the list layout the user
+    #: picked (coarse/fine/alphabetical); ``color_kind`` is which scheme's colours
+    #: are currently painted on the points (A–Z keeps whichever was last applied).
+    reference: dict | None = None
+    coarse_scheme: object | None = None       # utils.GeneVisualScheme
+    fine_scheme: object | None = None          # utils.GeneVisualScheme
+    ordering: str = "coarse"
+    color_kind: str = "coarse"
 
 
 DEFAULT_GENE_SPOT_SIZE = 0.5
@@ -255,6 +274,35 @@ CORTICAL_DEPTH_FILL_COLORS = {
     "ribbon": [0.0, 0.8, 0.5, 0.12],
 }
 CORTICAL_DEPTH_PIECE_ROLES = ("pia", "wm", "exclusion", "ribbon")
+
+# -- Cell inspector (click a segmentation mask to summarise its cell) --------
+CELL_INSPECTOR_BOUNDARY_LAYER = "Cell inspector | selected boundary"
+CELL_INSPECTOR_LINKS_LAYER = "Cell inspector | transcript links"
+#: Distinct border colours cycled across simultaneously-highlighted cells; each
+#: cell's boundary and its Cell ID text in the bottom bar share the same colour.
+CELL_HIGHLIGHT_COLORS = (
+    "#ffe14d",  # yellow
+    "#4dd2ff",  # cyan
+    "#ff6ec7",  # pink
+    "#7cff4d",  # green
+    "#ff9f40",  # orange
+    "#b48cff",  # violet
+    "#ff5d5d",  # red
+    "#4dffd0",  # teal
+)
+#: The selected-cell outline is drawn in micron (data) units so it scales with
+#: zoom exactly like the rasterised mask outlines. Its width is the mask outline
+#: width scaled by this factor, so it always reads as marginally thicker than the
+#: surrounding cells' outlines. The fallback (in microns) is only used when no
+#: mask outline layer is loaded to measure against.
+CELL_BOUNDARY_WIDTH_FACTOR = 1.6
+CELL_BOUNDARY_FALLBACK_WIDTH_UM = 0.3
+CELL_LINK_COLOR = (1.0, 1.0, 1.0, 0.35)
+CELL_LINK_WIDTH = 0.25
+CELL_PIE_SLICE_DARKEN = 0.6
+#: Cell masks whose GeoDataFrames are preferred targets for a mask click, most
+#: specific first. ProSeg is the primary target named in the feature request.
+CELL_INSPECTOR_SHAPE_PREFERENCE = ("proseg", "cellpose", "cell")
 
 
 def startup_selection(segmentation_source: str) -> tuple[str, ...]:
@@ -1464,6 +1512,16 @@ def make_gene_marker_pixmap(rgba, symbol: str, px: int = 20) -> QPixmap:
     return pm
 
 
+class _GroupHeaderLabel(QLabel):
+    """A gene-group heading that emits ``clicked`` when pressed."""
+
+    clicked = Signal()
+
+    def mousePressEvent(self, event):  # noqa: N802 (Qt override)
+        self.clicked.emit()
+        super().mousePressEvent(event)
+
+
 class GeneInspectorWidget(QWidget):
     """Right-dock panel listing every gene with a colour+shape marker and toggle."""
 
@@ -1484,6 +1542,8 @@ class GeneInspectorWidget(QWidget):
         set_hide_background_callback,
         set_show_controls_callback,
         set_hide_assigned_callback=None,
+        set_ordering_callback=None,
+        set_genes_visible_callback=None,
         spot_size: float = DEFAULT_GENE_SPOT_SIZE,
         hide_assigned: bool = False,
         hide_background: bool = False,
@@ -1497,11 +1557,17 @@ class GeneInspectorWidget(QWidget):
         self._set_hide_background_callback = set_hide_background_callback
         self._set_hide_assigned_callback = set_hide_assigned_callback
         self._set_show_controls_callback = set_show_controls_callback
+        self._set_ordering_callback = set_ordering_callback
+        self._set_genes_visible_callback = set_genes_visible_callback
 
         self._dataset: str | None = None
         self._checkboxes: dict[str, QCheckBox] = {}
         self._items: dict[str, QListWidgetItem] = {}
+        #: (header item, group title, genes-in-group) so filtering can hide a
+        #: header once all of its genes are filtered/hidden.
+        self._headers: list[tuple[QListWidgetItem, str, list[str]]] = []
         self._control_genes: set[str] = set()
+        self._ordering = "coarse"
         self._suppress = False
 
         self._title = QLabel("Gene Inspector")
@@ -1546,13 +1612,34 @@ class GeneInspectorWidget(QWidget):
         self._show_controls_check.setChecked(bool(show_controls))
         self._show_controls_check.toggled.connect(self._on_show_controls_toggled)
 
+        # -- Ordering of the gene list (grouped by cell type, or flat A–Z) ----
+        self._order_label = QLabel("Order genes by")
+        self._order_group = QButtonGroup(self)
+        self._order_group.setExclusive(True)
+        self._order_coarse_btn = QPushButton("Broad cell type")
+        self._order_fine_btn = QPushButton("Fine cell type")
+        self._order_alpha_btn = QPushButton("A–Z")
+        self._order_buttons = {
+            "coarse": self._order_coarse_btn,
+            "fine": self._order_fine_btn,
+            "alphabetical": self._order_alpha_btn,
+        }
+        for kind, button in self._order_buttons.items():
+            button.setCheckable(True)
+            button.setCursor(Qt.PointingHandCursor)
+            button.clicked.connect(lambda _checked=False, k=kind: self._on_ordering_clicked(k))
+            self._order_group.addButton(button)
+        self._order_coarse_btn.setChecked(True)
+
         self._filter_edit = QLineEdit()
         self._filter_edit.setPlaceholderText("Filter genes…")
         self._filter_edit.textChanged.connect(self._apply_filter)
 
         self._gene_list = QListWidget()
         self._gene_list.setSelectionMode(QAbstractItemView.NoSelection)
-        self._gene_list.setUniformItemSizes(True)
+        # Rows are not a uniform height: the group headings are taller than the
+        # gene rows, so each item must be sized from its own widget.
+        self._gene_list.setUniformItemSizes(False)
         self._gene_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         root = QVBoxLayout()
@@ -1569,6 +1656,12 @@ class GeneInspectorWidget(QWidget):
         root.addWidget(self._hide_assigned_check)
         root.addWidget(self._hide_bg_check)
         root.addWidget(self._show_controls_check)
+        root.addWidget(self._order_label)
+        order_row = QHBoxLayout()
+        order_row.addWidget(self._order_coarse_btn)
+        order_row.addWidget(self._order_fine_btn)
+        order_row.addWidget(self._order_alpha_btn)
+        root.addLayout(order_row)
         root.addWidget(self._filter_edit)
         root.addWidget(self._gene_list, stretch=1)
         root.addWidget(self._status_label)
@@ -1589,6 +1682,7 @@ class GeneInspectorWidget(QWidget):
             self._gene_list.clear()
             self._checkboxes.clear()
             self._items.clear()
+            self._headers = []
             self._control_genes = set()
             self._dataset = None
             self._show_all_check.setCheckState(Qt.Unchecked)
@@ -1598,38 +1692,91 @@ class GeneInspectorWidget(QWidget):
     def spot_size(self) -> float:
         return self._slider_to_spot_size(self._spot_slider.value())
 
+    def set_ordering_available(self, available: bool, ordering: str = "coarse"):
+        """Enable/disable the broad/fine ordering buttons (off with no reference)."""
+        self._ordering = str(ordering)
+        for kind, button in self._order_buttons.items():
+            button.blockSignals(True)
+            # A–Z always works; broad/fine only when a marker reference exists.
+            button.setEnabled(bool(available) or kind == "alphabetical")
+            button.setChecked(kind == self._ordering)
+            button.blockSignals(False)
+        self._order_label.setVisible(True)
+
     def populate(
         self,
         dataset: str,
-        genes: list[str],
+        layout: list[tuple],
         gene_visuals: dict,
         gene_counts: dict,
         control_genes: set,
         enabled_genes: set,
+        labels: dict,
+        ordering: str,
         hide_assigned: bool,
         hide_background: bool,
         show_controls: bool,
         spot_size: float,
     ):
-        """Build the gene rows for ``dataset`` (called on the GUI thread)."""
+        """Build the gene rows for ``dataset`` (called on the GUI thread).
+
+        ``layout`` is an ordered list of ``("header", title, rgba)`` and
+        ``("gene", name)`` entries. In A–Z (flat) mode there are no headers and
+        each row is annotated with its ``labels[name]`` broad/fine text.
+        """
         self._suppress = True
         try:
             self._gene_list.clear()
             self._checkboxes.clear()
             self._items.clear()
+            self._headers = []
             self._dataset = str(dataset)
+            self._ordering = str(ordering)
             self._control_genes = set(control_genes)
             self._hide_assigned_check.setChecked(bool(hide_assigned))
             self._hide_bg_check.setChecked(bool(hide_background))
             self._show_controls_check.setChecked(bool(show_controls))
             self._set_spot_widgets(float(spot_size))
 
-            for gene in genes:
+            pending_header: tuple | None = None
+            header_genes: list[str] = []
+
+            def _finalize_header():
+                if pending_header is None:
+                    return
+                item, widget, title = pending_header
+                genes = list(header_genes)
+                self._headers.append((item, title, genes))
+                # Clicking a heading selects/deselects every gene beneath it.
+                widget.clicked.connect(lambda gs=genes: self._on_header_clicked(gs))
+
+            for entry in layout:
+                if entry[0] == "header":
+                    _finalize_header()
+                    _, title, rgba = entry
+                    item = QListWidgetItem()
+                    item.setFlags(Qt.NoItemFlags)
+                    widget = self._make_header_widget(str(title), rgba)
+                    # Reserve extra height so the heading isn't crowded by the gene
+                    # rows above/below (the stylesheet top margin isn't counted in
+                    # the label's own sizeHint).
+                    hint = widget.sizeHint()
+                    item.setSizeHint(QSize(hint.width(), hint.height() + 14))
+                    self._gene_list.addItem(item)
+                    self._gene_list.setItemWidget(item, widget)
+                    pending_header = (item, widget, str(title))
+                    header_genes = []
+                    continue
+
+                gene = str(entry[1])
                 visual = gene_visuals.get(gene)
                 symbol = getattr(visual, "symbol", "disc")
                 rgba = getattr(visual, "rgba", (1.0, 1.0, 1.0, 1.0))
                 count = int(gene_counts.get(gene, 0))
-                check = QCheckBox(f"{gene}    ({count:,})")
+                text = f"{gene}    ({count:,})"
+                if str(ordering) == "alphabetical" and labels.get(gene):
+                    text = f"{text}    ·  {labels[gene]}"
+                check = QCheckBox(text)
                 check.setIcon(QIcon(make_gene_marker_pixmap(rgba, symbol, px=22)))
                 check.setChecked(gene in enabled_genes)
                 check.toggled.connect(lambda on, g=gene: self._on_gene_toggled(g, on))
@@ -1639,11 +1786,30 @@ class GeneInspectorWidget(QWidget):
                 self._gene_list.setItemWidget(item, check)
                 self._checkboxes[gene] = check
                 self._items[gene] = item
+                header_genes.append(gene)
+
+            _finalize_header()
 
             self._refresh_row_visibility()
             self._refresh_show_all_state()
         finally:
             self._suppress = False
+
+    def _make_header_widget(self, title: str, rgba) -> QLabel:
+        """A clickable, bold group heading with a colour cue from the group's shade.
+
+        Clicking the heading toggles every (currently visible) gene under it.
+        """
+        label = _GroupHeaderLabel(title)
+        label.setCursor(Qt.PointingHandCursor)
+        label.setToolTip("Click to show / hide all genes in this group")
+        r, g, b = (int(round(255 * float(c))) for c in (rgba[:3] if rgba else (0.6, 0.6, 0.6)))
+        label.setStyleSheet(
+            "QLabel { font-weight: bold; font-size: 13pt; color: #f0f0f0; margin-top: 6px;"
+            f" padding: 4px 4px 4px 8px; border-left: 7px solid rgb({r}, {g}, {b}); }}"
+            "QLabel:hover { color: #ffffff; background: rgba(255, 255, 255, 20); }"
+        )
+        return label
 
     # -- helpers ------------------------------------------------------------
     def _spot_size_to_slider(self, um: float) -> int:
@@ -1675,6 +1841,12 @@ class GeneInspectorWidget(QWidget):
                 bool(needle) and needle not in gene.lower()
             )
             item.setHidden(hidden)
+        # A group heading disappears once every gene beneath it is hidden.
+        for header_item, _title, genes in self._headers:
+            any_visible = any(
+                g in self._items and not self._items[g].isHidden() for g in genes
+            )
+            header_item.setHidden(not any_visible)
 
     def _refresh_show_all_state(self):
         eligible = self._eligible_genes()
@@ -1731,6 +1903,35 @@ class GeneInspectorWidget(QWidget):
             return
         self._set_show_controls_callback(self._dataset, bool(on))
 
+    def _on_ordering_clicked(self, kind: str):
+        if kind == self._ordering:
+            return
+        self._ordering = str(kind)
+        if self._suppress or self._dataset is None or self._set_ordering_callback is None:
+            return
+        self._set_ordering_callback(self._dataset, str(kind))
+
+    def _on_header_clicked(self, genes: list[str]):
+        """Toggle every currently-visible gene under a group heading at once."""
+        if self._suppress or self._dataset is None or self._set_genes_visible_callback is None:
+            return
+        visible = [
+            g for g in genes
+            if g in self._checkboxes and g in self._items and not self._items[g].isHidden()
+        ]
+        if not visible:
+            return
+        # If any visible gene is off, turn the group on; otherwise turn it all off.
+        turn_on = not all(self._checkboxes[g].isChecked() for g in visible)
+        self._suppress = True
+        try:
+            for g in visible:
+                self._checkboxes[g].setChecked(turn_on)
+        finally:
+            self._suppress = False
+        self._refresh_show_all_state()
+        self._set_genes_visible_callback(self._dataset, visible, turn_on)
+
     def _emit_spot_size(self, um: float):
         self._set_spot_widgets(um)
         if self._suppress or self._dataset is None:
@@ -1752,6 +1953,268 @@ class GeneInspectorWidget(QWidget):
 
     def _apply_filter(self, _text: str):
         self._refresh_row_visibility()
+
+
+class CellInfoPieChart(QWidget):
+    """Pie chart of a cell's transcripts, one slice per gene.
+
+    Each slice is drawn in the gene's transcript colour darkened a shade, with
+    the gene's marker glyph placed just inside the slice's outer edge.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._slices: list[dict] = []
+        self.setMinimumSize(150, 150)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+    def set_slices(self, slices: list[dict]):
+        """``slices``: list of ``{count, rgba, glyph}`` (highest count first)."""
+        self._slices = list(slices or [])
+        self.update()
+
+    def sizeHint(self):  # noqa: N802 (Qt override)
+        return QSize(180, 180)
+
+    def paintEvent(self, _event):  # noqa: N802 (Qt override)
+        total = sum(max(0, int(s.get("count", 0))) for s in self._slices)
+        if total <= 0:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        side = min(self.width(), self.height()) - 12
+        if side <= 0:
+            painter.end()
+            return
+        left = (self.width() - side) / 2.0
+        top = (self.height() - side) / 2.0
+        rect = QRectF(left, top, side, side)
+        cx, cy = rect.center().x(), rect.center().y()
+        radius = side / 2.0
+
+        start_deg = 90.0  # start at 12 o'clock, sweep clockwise
+        glyph_font = QFont()
+        glyph_font.setPointSizeF(max(7.0, side * 0.055))
+        painter.setFont(glyph_font)
+        for entry in self._slices:
+            count = max(0, int(entry.get("count", 0)))
+            if count <= 0:
+                continue
+            span_deg = 360.0 * count / total
+            rgba = entry.get("rgba", (0.6, 0.6, 0.6, 1.0))
+            color = QColor.fromRgbF(
+                float(rgba[0]), float(rgba[1]), float(rgba[2]),
+                float(rgba[3]) if len(rgba) >= 4 else 1.0,
+            )
+            painter.setBrush(QBrush(color))
+            painter.setPen(QPen(QColor(20, 20, 20), 1))
+            painter.drawPie(rect, int(round(start_deg * 16)), int(round(-span_deg * 16)))
+
+            glyph = str(entry.get("glyph", ""))
+            if glyph:
+                mid_deg = start_deg - span_deg / 2.0
+                mid_rad = np.deg2rad(mid_deg)
+                gx = cx + np.cos(mid_rad) * radius * 0.72
+                gy = cy - np.sin(mid_rad) * radius * 0.72
+                painter.setPen(QPen(QColor(255, 255, 255)))
+                painter.drawText(
+                    QRectF(gx - 12, gy - 12, 24, 24),
+                    Qt.AlignCenter,
+                    glyph,
+                )
+            start_deg -= span_deg
+        painter.end()
+
+
+def _cell_summary_html(cell: dict) -> str:
+    area_um2 = cell.get("area")
+    area_text = f"{area_um2:,.1f} µm²" if area_um2 is not None else "n/a"
+    lines = [
+        f"<b>Total transcripts:</b> {int(cell.get('total', 0)):,}",
+        f"<b>Area:</b> {area_text}",
+    ]
+    intensity_rows = cell.get("intensities") or []
+    if intensity_rows:
+        lines.append("<b>Mean intensity:</b>")
+        for channel, value in intensity_rows:
+            value_text = f"{value:,.1f}" if value is not None else "n/a"
+            lines.append(f"&nbsp;&nbsp;{html.escape(str(channel))}: {value_text}")
+    else:
+        lines.append("<b>Mean intensity:</b> no image channels loaded")
+    return "<br>".join(lines)
+
+
+def _cell_gene_list_html(cell: dict) -> str:
+    lines = []
+    for row in cell.get("gene_rows", []):
+        rgba = row.get("rgba", (1.0, 1.0, 1.0, 1.0))
+        rgb = tuple(max(0, min(255, int(round(float(v) * 255)))) for v in rgba[:3])
+        color = f"rgb({rgb[0]},{rgb[1]},{rgb[2]})"
+        glyph = html.escape(str(row.get("glyph", "")))
+        gene = html.escape(str(row.get("gene", "")))
+        count = int(row.get("count", 0))
+        lines.append(
+            f"<div style='margin:2px 0;'>"
+            f"<span style='color:{color}; font-size:13pt;'>{glyph}</span> "
+            f"<b>{gene}</b> "
+            f"<span style='color:#9aa4b2;'>{count:,}</span></div>"
+        )
+    return "".join(lines) or "<i>No transcripts assigned</i>"
+
+
+class _CellPanel(QWidget):
+    """One selected cell's column: coloured Cell ID + summary, pie, gene list.
+
+    The pie and title/summary are pinned to the top; the gene list fills the
+    remaining panel height and scrolls internally, so a long gene list never
+    pushes the pie down or makes the panel taller than the visible window.
+    """
+
+    def __init__(self, cell: dict, parent=None):
+        super().__init__(parent)
+        self.setObjectName("CellPanel")
+        self.setStyleSheet(" QLabel { background: transparent; }")
+        # Fill the row's (viewport) height so the gene list can size to it.
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        color = str(cell.get("color", "#ffffff"))
+
+        outer = QHBoxLayout()
+        outer.setContentsMargins(10, 2, 10, 2)
+        outer.setSpacing(12)
+
+        # -- Left: Cell ID (in the cell's highlight colour) + summary -------
+        left = QVBoxLayout()
+        left.setSpacing(8)
+        title = QLabel(f"Cell {html.escape(str(cell.get('cell_id', '')))}")
+        title.setStyleSheet(f"color: {color}; font-size: 22pt; font-weight: bold;")
+        title.setTextFormat(Qt.RichText)
+        summary = QLabel(_cell_summary_html(cell))
+        summary.setTextFormat(Qt.RichText)
+        summary.setWordWrap(True)
+        summary.setStyleSheet("color: #e6ebf2; font-size: 12pt;")
+        summary.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        left.addWidget(title)
+        left.addWidget(summary)
+        left.addStretch(1)  # keep title + summary pinned to the top
+        left_widget = QWidget()
+        left_widget.setLayout(left)
+        left_widget.setFixedWidth(250)
+        outer.addWidget(left_widget)
+
+        # -- Middle: pie chart (slices darkened a shade), pinned to the top -
+        pie = CellInfoPieChart()
+        pie.setFixedSize(170, 170)
+        pie.set_slices(
+            [
+                {
+                    "count": row.get("count", 0),
+                    "glyph": row.get("glyph", ""),
+                    "rgba": darken_rgba(row.get("rgba", (0.6, 0.6, 0.6, 1.0)), CELL_PIE_SLICE_DARKEN),
+                }
+                for row in cell.get("gene_rows", [])
+            ]
+        )
+        outer.addWidget(pie, 0, Qt.AlignTop)
+
+        # -- Right: ranked gene list, fills panel height + scrolls ----------
+        gene_list = QLabel(_cell_gene_list_html(cell))
+        gene_list.setTextFormat(Qt.RichText)
+        gene_list.setWordWrap(False)
+        gene_list.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        gene_scroll = QScrollArea()
+        gene_scroll.setWidgetResizable(True)
+        gene_scroll.setFrameShape(QScrollArea.NoFrame)
+        gene_scroll.setStyleSheet("background: transparent;")
+        gene_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        gene_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        gene_scroll.setWidget(gene_list)
+        gene_scroll.setFixedWidth(230)
+        # Expanding height + a small minimum so the panel never demands more
+        # vertical space than the visible window; the list scrolls instead.
+        gene_scroll.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        gene_scroll.setMinimumHeight(60)
+        outer.addWidget(gene_scroll)
+
+        self.setLayout(outer)
+
+
+class CellInfoOverlay(QWidget):
+    """Docked bottom bar summarising every currently highlighted cell.
+
+    A persistent instruction header sits above a horizontally-scrolling row of
+    :class:`_CellPanel` columns — one per selected cell, packed left-to-right,
+    with a horizontal scrollbar once they overflow the viewport width.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("CellInfoOverlay")
+        self.setStyleSheet(
+            "#CellInfoOverlay { background: #14161c; }"
+            " QLabel { color: #f0f0f0; background: transparent; }"
+        )
+        self.setMaximumHeight(260)
+
+        outer = QVBoxLayout()
+        outer.setContentsMargins(8, 6, 8, 4)
+        outer.setSpacing(4)
+
+        self._instruction = QLabel(
+            "To deselect all currently highlighted cells, close this window "
+            "with the X in the top left of the window"
+        )
+        self._instruction.setStyleSheet("color: #9aa4b2; font-size: 9pt;")
+        self._instruction.setWordWrap(True)
+        outer.addWidget(self._instruction)
+
+        self._scroll = QScrollArea()
+        self._scroll.setWidgetResizable(True)
+        self._scroll.setFrameShape(QScrollArea.NoFrame)
+        self._scroll.setStyleSheet("background: transparent;")
+        self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        self._row = QWidget()
+        self._row_layout = QHBoxLayout()
+        self._row_layout.setContentsMargins(0, 0, 0, 0)
+        self._row_layout.setSpacing(0)
+        self._row_layout.addStretch(1)  # trailing stretch packs panels to the left
+        self._row.setLayout(self._row_layout)
+        self._scroll.setWidget(self._row)
+        outer.addWidget(self._scroll, 1)
+
+        self.setLayout(outer)
+
+    @staticmethod
+    def _divider() -> QFrame:
+        """A thick vertical rule drawn between adjacent cell panels."""
+        line = QFrame()
+        line.setObjectName("CellDivider")
+        line.setFixedWidth(3)
+        line.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        line.setStyleSheet("#CellDivider { background: rgba(255, 255, 255, 90); }")
+        return line
+
+    def set_cells(self, cells: list[dict]):
+        """Rebuild the panel row, one :class:`_CellPanel` per cell (in order)."""
+        while self._row_layout.count():
+            item = self._row_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        for index, cell in enumerate(cells):
+            if index > 0:
+                self._row_layout.addWidget(self._divider())  # separate the sets
+            self._row_layout.addWidget(_CellPanel(cell))
+        self._row_layout.addStretch(1)
+
+    def cell_panels(self) -> list[_CellPanel]:
+        panels = []
+        for i in range(self._row_layout.count()):
+            widget = self._row_layout.itemAt(i).widget()
+            if isinstance(widget, _CellPanel):
+                panels.append(widget)
+        return panels
 
 
 class ComparisonViewerController:
@@ -1791,6 +2254,15 @@ class ComparisonViewerController:
         self._gene_build_generation = 0
         self._gene_build_worker: object | None = None
         self._gene_inspector_widget = None
+        # Click-to-inspect cell state: a lazily-built per-dataset transcript
+        # index, the currently selected cell, and the floating summary box.
+        self._cell_transcript_index: dict[str, CellTranscriptIndex] = {}
+        # Per dataset, an ordered list of highlighted cells (each a dict with the
+        # cell id, highlight colour, geometry-derived draw data and panel stats).
+        self._selected_cells: dict[str, list[dict]] = {}
+        self._cell_info_overlay: CellInfoOverlay | None = None
+        self._cell_info_dock = None
+        self._suppress_dock_visibility = False
         self._install_gene_pick_callback()
 
     def set_status_callback(self, fn):
@@ -2892,6 +3364,43 @@ class ComparisonViewerController:
             dtype=float,
         )
 
+    def _label_display_affine(self, label_elem) -> np.ndarray:
+        """Napari affine for a label raster, kept consistent with the images.
+
+        Labels are rasterized on the morphology image's pixel grid, so their
+        pixel->micron scale must match the image layers (and the transcripts),
+        which the viewer derives from the resolved dataset ``pixel_size``
+        (:meth:`resolve_dataset_mask_affine`). We deliberately do NOT trust the
+        transformation stored on the label element: some upstream writers stamp
+        Xenium masks with a MERSCOPE-default 0.108 um/px scale even though the
+        raster is on the 0.2125 um/px Xenium grid, which shrinks the masks to
+        the top-left quadrant of the image. Rebuilding the affine from the
+        resolved pixel_size and the label's own (pixel-index) coordinates fixes
+        that and is a no-op for MERSCOPE, where the two already agree.
+        """
+        if self._x_transform is None or self._y_transform is None:
+            return self._napari_affine_from_element(label_elem)
+        try:
+            da_2d = get_scale0_dataarray(label_elem)
+            coords = getattr(da_2d, "coords", {})
+            x_coords = np.asarray(coords["x"].values) if "x" in coords else None
+            y_coords = np.asarray(coords["y"].values) if "y" in coords else None
+        except Exception as exc:
+            log.warning(
+                "[%s] Could not read label grid coords for %s (%s); "
+                "falling back to stored transform.",
+                self.active_dataset,
+                getattr(label_elem, "name", "<label>"),
+                exc,
+            )
+            return self._napari_affine_from_element(label_elem)
+        return build_napari_affine_from_px_to_um(
+            x_transform=self._x_transform,
+            y_transform=self._y_transform,
+            x_coords=x_coords,
+            y_coords=y_coords,
+        )
+
     def _image_grid_for_labels(self) -> tuple[tuple[int, int], tuple[int, int], np.ndarray, Affine]:
         if self.active_dataset is None:
             raise RuntimeError("No active dataset.")
@@ -3276,7 +3785,7 @@ class ComparisonViewerController:
         if len(getattr(data, "shape", ())) != 2:
             raise ValueError(f"Expected 2D cached outlines for {display_label_key}, got shape {getattr(data, 'shape', None)}")
 
-        napari_affine = self._napari_affine_from_element(label_elem)
+        napari_affine = self._label_display_affine(label_elem)
         outline_levels = [level_data for _scale_name, level_data in label_scale_levels]
         outline_data = outline_levels if len(outline_levels) > 1 else outline_levels[0]
         return {
@@ -3532,7 +4041,7 @@ class ComparisonViewerController:
                 coarse = lazy_label_pyramid(stored[0])[1:]
             if coarse:
                 levels = [stored[0]] + list(coarse)
-        return levels, self._napari_affine_from_element(label_elem)
+        return levels, self._label_display_affine(label_elem)
 
     def _ensure_cellpose_label_key(self) -> str:
         if self._active_sdata is None or self.active_dataset is None:
@@ -3766,10 +4275,15 @@ class ComparisonViewerController:
         generation = self._gene_build_generation
         max_points = int(getattr(self.args, "gene_max_render_points", DEFAULT_GENE_MAX_RENDER_POINTS))
         random_state = int(getattr(self.args, "random_state", 42))
+        cfg = self.datasets.get(ds)
+        zarr_path = getattr(cfg, "zarr_path", None)
         self._begin_progress("transcripts", f"{ds}: building per-gene transcripts for {points_key}...")
 
         def compute():
             t0 = time.time()
+            # Group genes by the cell type they mark when the store carries a
+            # marker reference; otherwise fall back to the deterministic rainbow.
+            reference = load_cell_type_marker_reference(zarr_path) if zarr_path is not None else None
             store = build_gene_point_groups(
                 points_obj,
                 x_col=x_col,
@@ -3777,10 +4291,16 @@ class ComparisonViewerController:
                 gene_col=gene_col,
                 assignment_col=assignment_col,
                 background_col=background_col,
+                reference=reference,
                 max_points=max_points if max_points > 0 else None,
                 random_state=random_state,
             )
-            return {"points_key": points_key, "store": store, "build_seconds": time.time() - t0}
+            return {
+                "points_key": points_key,
+                "store": store,
+                "reference": reference,
+                "build_seconds": time.time() - t0,
+            }
 
         if thread_worker is None:
             try:
@@ -3812,7 +4332,16 @@ class ComparisonViewerController:
             self._set_status(f"{ds} inspect genes: no transcripts found.")
             return
 
-        gene_visuals = assign_gene_visuals(store.genes)
+        reference = payload.get("reference")
+        # Two precomputed schemes over the same symbols (so switching only
+        # recolours). Without a reference both fall back to the rainbow and only
+        # A–Z ordering is offered.
+        coarse_scheme = build_cell_type_gene_visuals(store.genes, reference, kind="coarse")
+        fine_scheme = build_cell_type_gene_visuals(store.genes, reference, kind="fine")
+        has_reference = bool(reference)
+        gene_visuals = store.gene_visuals or coarse_scheme.visuals
+        ordering = "coarse" if has_reference else "alphabetical"
+
         hide_assigned = bool(getattr(self.args, "gene_hide_assigned", False))
         hide_background = bool(getattr(self.args, "gene_hide_background", False))
         show_controls = bool(getattr(self.args, "gene_show_controls", False))
@@ -3836,9 +4365,17 @@ class ComparisonViewerController:
             pending_groups=set(),
             highlighted_genes=[],
             group_display_ranges=[[] for _ in store.group_symbols],
+            reference=reference,
+            coarse_scheme=coarse_scheme,
+            fine_scheme=fine_scheme,
+            ordering=ordering,
+            color_kind="coarse",
         )
         timer.timeout.connect(lambda d=ds: self._flush_gene_group_rebuild(d))
         self._gene_inspector_states[ds] = state
+        # Transcripts (re)loaded: drop any stale per-cell index and clear the
+        # cell selection so a fresh click rebuilds against the new points.
+        self._invalidate_cell_inspection(ds)
 
         # Create each layer already populated with its enabled genes' points +
         # per-point colours + symbol. Building populated (vs. empty then growing)
@@ -3853,18 +4390,7 @@ class ComparisonViewerController:
         layer_names = state.layer_names
 
         if self._gene_inspector_widget is not None:
-            self._gene_inspector_widget.populate(
-                ds,
-                list(store.genes),
-                gene_visuals,
-                dict(store.source_gene_counts or store.gene_counts),
-                set(store.control_genes),
-                set(enabled),
-                hide_assigned,
-                hide_background,
-                show_controls,
-                spot_size,
-            )
+            self._populate_gene_inspector(state)
             try:
                 self._gene_inspector_widget.show()
                 self._gene_inspector_widget.raise_()
@@ -4017,15 +4543,447 @@ class ComparisonViewerController:
             return
         if self.active_dataset is None:
             return
+        ds = self.active_dataset
+        state = self._gene_inspector_states.get(str(ds).upper())
+
+        # 1) A click landing on a transcript highlights that gene (existing).
+        if state is not None:
+            gene = self._pick_gene_from_event(state, event)
+            if gene is not None:
+                self._add_highlighted_gene(state, gene)
+                return
+
+        # 2) Otherwise a click inside a segmentation mask adds it to the set of
+        #    highlighted cells (existing highlights are kept).
+        picked = self._pick_cell_from_event(event)
+        if picked is not None:
+            self._add_cell_selection(ds, picked[0], picked[1])
+            return
+
+        # 3) A click in empty space only clears transcript-gene highlights; the
+        #    selected cells stay highlighted so the user can pan/zoom freely.
+        #    Cells are deselected only by closing the bottom window.
+        if state is not None and state.highlighted_genes:
+            self._clear_highlighted_genes(state)
+
+    # -- Cell inspector: click a mask to summarise its cell -----------------
+    def _event_world_xy(self, event) -> tuple[float, float] | None:
+        """Return the click's global ``(x_um, y_um)``, or None."""
+        position = getattr(event, "position", None)
+        if position is None:
+            return None
+        try:
+            coords = np.asarray(position, dtype=float).ravel()
+        except Exception:
+            return None
+        if coords.size < 2:
+            return None
+        y_um, x_um = float(coords[-2]), float(coords[-1])
+        return x_um, y_um
+
+    def _cell_inspector_shape_key(self) -> str | None:
+        """Resolve the segmentation GeoDataFrame to hit-test, preferring ProSeg."""
+        if self._active_sdata is None:
+            return None
+        try:
+            shape_keys = [str(k) for k in self._active_sdata.shapes.keys()]
+        except Exception:
+            return None
+        if not shape_keys:
+            return None
+        for preferred in CELL_INSPECTOR_SHAPE_PREFERENCE:
+            for key in shape_keys:
+                if preferred in key.lower():
+                    return key
+        return shape_keys[0]
+
+    def _pick_cell_from_event(self, event):
+        """Return ``(cell_id, geometry)`` for the mask under the click, or None."""
+        world = self._event_world_xy(event)
+        if world is None:
+            return None
+        shape_key = self._cell_inspector_shape_key()
+        if shape_key is None:
+            return None
+        try:
+            gdf = self._active_sdata.shapes[shape_key]
+            return pick_cell_at_point(gdf, world[0], world[1])
+        except Exception as exc:
+            log.debug("Cell pick failed: %s", exc)
+            return None
+
+    def _empty_cell_transcript_index(self) -> CellTranscriptIndex:
+        return CellTranscriptIndex(
+            coords_yx=np.empty((0, 2), dtype=np.float32),
+            genes=np.empty((0,), dtype=object),
+            slices={},
+        )
+
+    def _get_cell_transcript_index(self, ds: str) -> CellTranscriptIndex:
+        """Lazily build (and cache) the assigned-transcript-per-cell index."""
+        key = str(ds).upper()
+        cached = self._cell_transcript_index.get(key)
+        if cached is not None:
+            return cached
+        try:
+            _pk, points_obj, x_col, y_col, assignment_col = self._resolve_points_columns()
+            gene_col = resolve_gene_column(points_obj)
+        except Exception as exc:
+            log.debug("Cell transcript index unavailable: %s", exc)
+            index = self._empty_cell_transcript_index()
+            self._cell_transcript_index[key] = index
+            return index
+        if gene_col is None or assignment_col is None:
+            index = self._empty_cell_transcript_index()
+        else:
+            self._set_status(f"{ds}: indexing transcripts by cell...")
+            index = build_cell_transcript_index(points_obj, x_col, y_col, gene_col, assignment_col)
+        self._cell_transcript_index[key] = index
+        return index
+
+    def _invalidate_cell_inspection(self, ds: str | None = None):
+        """Drop cached cell index(es) and clear highlighted cells."""
+        if ds is None:
+            self._cell_transcript_index.clear()
+            self._clear_all_cell_selections()
+            return
+        self._cell_transcript_index.pop(str(ds).upper(), None)
+        if self._selected_cells.pop(str(ds).upper(), None) is not None:
+            self._rebuild_cell_highlights(ds)
+
+    def _cell_selection_display(self, ds: str, cell_id, geometry, color: str) -> dict:
+        """Compute cached draw + panel data for one highlighted cell."""
+        key = str(ds).upper()
+        state = self._gene_inspector_states.get(key)
+        index = self._get_cell_transcript_index(ds)
+        coords_yx, genes = index.transcripts_for(cell_id)
+
+        if state is not None:
+            gene_visuals = state.gene_visuals
+        else:
+            gene_visuals = assign_gene_visuals(sorted({str(g) for g in genes.tolist()}))
+
+        gene_rows = []
+        for gene, count in ranked_gene_counts(genes):
+            visual = gene_visuals.get(gene) if gene_visuals else None
+            if visual is not None:
+                rgba = tuple(visual.rgba)
+                symbol = str(visual.symbol)
+            else:
+                rgba, symbol = (0.6, 0.6, 0.6, 1.0), "disc"
+            gene_rows.append(
+                {
+                    "gene": gene,
+                    "count": int(count),
+                    "rgba": rgba,
+                    "glyph": GENE_STATUS_SYMBOL_GLYPHS.get(symbol, "●"),
+                }
+            )
+
+        try:
+            centroid = geometry.centroid
+            centroid_yx = (float(centroid.y), float(centroid.x))
+        except Exception:
+            centroid_yx = None
+        try:
+            area_um2 = float(geometry.area)
+        except Exception:
+            area_um2 = None
+
+        return {
+            "cell_id": cell_id,
+            "color": str(color),
+            "paths": self._polygon_to_napari_paths(geometry),
+            "coords_yx": np.asarray(coords_yx, dtype=float),
+            "centroid_yx": centroid_yx,
+            "gene_rows": gene_rows,
+            "total": int(len(genes)),
+            "area": area_um2,
+            "intensities": self._compute_cell_channel_intensities(geometry),
+        }
+
+    def _add_cell_selection(self, ds: str, cell_id, geometry):
+        """Add a cell to the highlighted set (existing highlights are kept)."""
+        if geometry is None:
+            return
+        key = str(ds).upper()
+        entries = self._selected_cells.setdefault(key, [])
+        norm = normalize_cell_key(cell_id)
+        if any(normalize_cell_key(entry["cell_id"]) == norm for entry in entries):
+            return  # already highlighted; ignore repeat clicks on the same cell
+        color = CELL_HIGHLIGHT_COLORS[len(entries) % len(CELL_HIGHLIGHT_COLORS)]
+        entries.append(self._cell_selection_display(ds, cell_id, geometry, color))
+        self._rebuild_cell_highlights(ds)
+        self._set_status(f"{ds}: {len(entries)} cell(s) highlighted (added {cell_id}).")
+
+    def _rebuild_cell_highlights(self, ds: str):
+        """Redraw boundary + link layers and the bottom bar for all highlights."""
+        entries = self._selected_cells.get(str(ds).upper(), [])
+        self._update_cell_boundary_layer(entries)
+        self._update_cell_links_layer(entries)
+        if not entries:
+            if self._cell_info_overlay is not None:
+                self._cell_info_overlay.set_cells([])
+            self._hide_cell_dock()
+            return
+        overlay = self._ensure_cell_info_overlay()
+        if overlay is not None:
+            overlay.set_cells(entries)
+            self._show_cell_dock()
+
+    def _clear_all_cell_selections(self):
+        """Remove every highlight (boundary, links, panels) and hide the bar."""
+        self._selected_cells.clear()
+        self._remove_layer_by_name(CELL_INSPECTOR_BOUNDARY_LAYER)
+        self._remove_layer_by_name(CELL_INSPECTOR_LINKS_LAYER)
+        if self._cell_info_overlay is not None:
+            self._cell_info_overlay.set_cells([])
+        self._hide_cell_dock()
+
+    def _polygon_to_napari_paths(self, geometry) -> list[np.ndarray]:
+        """Return ``(N, 2)`` napari ``(y, x)`` ring arrays for a (multi)polygon."""
+        parts = geometry.geoms if getattr(geometry, "geom_type", "") == "MultiPolygon" else (geometry,)
+        paths: list[np.ndarray] = []
+        for part in parts:
+            if part.is_empty:
+                continue
+            coords = np.asarray(part.exterior.coords, dtype=float)
+            if coords.shape[0] < 3:
+                continue
+            paths.append(np.column_stack([coords[:, 1], coords[:, 0]]))  # (y, x)
+        return paths
+
+    def _mask_highlight_edge_width(self) -> float:
+        """Outline width (in microns) marginally thicker than the loaded masks.
+
+        The rasterised mask outlines are ``label_contour_width`` label-pixels
+        wide, so their micron thickness is ``label_contour_width * um_per_pixel``.
+        Drawing the highlight in micron (data) units at a small multiple of that
+        makes it read as slightly thicker than neighbouring outlines at every
+        zoom level without needing to track the camera.
+        """
+        ds = str(self.active_dataset or "").upper()
+        prefix = f"{ds} | labels | "
+        outline_px = max(1, int(getattr(self.args, "label_contour_width", 1)))
+        for layer in list(self.viewer.layers):
+            if not str(getattr(layer, "name", "")).startswith(prefix):
+                continue
+            matrix = self._image_layer_affine_matrix(layer)
+            if matrix is None:
+                continue
+            linear = matrix[:2, :2]
+            sx = float(np.hypot(linear[0, 0], linear[1, 0]))
+            sy = float(np.hypot(linear[0, 1], linear[1, 1]))
+            um_per_px = (sx + sy) / 2.0
+            if um_per_px > 0:
+                return um_per_px * outline_px * CELL_BOUNDARY_WIDTH_FACTOR
+        return CELL_BOUNDARY_FALLBACK_WIDTH_UM
+
+    def _update_cell_boundary_layer(self, entries: list[dict]):
+        self._remove_layer_by_name(CELL_INSPECTOR_BOUNDARY_LAYER)
+        all_paths: list[np.ndarray] = []
+        edge_colors: list[np.ndarray] = []
+        for entry in entries:
+            rgba = rgba_array(entry.get("color", "#ffffff"), alpha=1.0)
+            for path in entry.get("paths", []):
+                all_paths.append(path)
+                edge_colors.append(rgba)
+        if not all_paths:
+            return
+        try:
+            self.viewer.add_shapes(
+                all_paths,
+                shape_type="polygon",
+                name=CELL_INSPECTOR_BOUNDARY_LAYER,
+                edge_color=np.asarray(edge_colors, dtype=float),
+                face_color="transparent",
+                edge_width=self._mask_highlight_edge_width(),
+                opacity=1.0,
+            )
+        except Exception as exc:
+            log.debug("Could not draw cell boundary highlight: %s", exc)
+
+    def _update_cell_links_layer(self, entries: list[dict]):
+        self._remove_layer_by_name(CELL_INSPECTOR_LINKS_LAYER)
+        lines: list[np.ndarray] = []
+        for entry in entries:
+            centroid_yx = entry.get("centroid_yx")
+            coords = entry.get("coords_yx")
+            if centroid_yx is None or coords is None or len(coords) == 0:
+                continue
+            cy, cx = float(centroid_yx[0]), float(centroid_yx[1])
+            for y, x in np.asarray(coords, dtype=float):
+                lines.append(np.array([[float(y), float(x)], [cy, cx]], dtype=float))
+        if not lines:
+            return
+        try:
+            layer = self.viewer.add_shapes(
+                lines,
+                shape_type="line",
+                name=CELL_INSPECTOR_LINKS_LAYER,
+                edge_color="#ffffff",
+                edge_width=CELL_LINK_WIDTH,
+                opacity=float(CELL_LINK_COLOR[3]),
+            )
+        except Exception as exc:
+            log.debug("Could not draw cell transcript links: %s", exc)
+            return
+        self._send_links_below_transcripts(layer)
+
+    def _send_links_below_transcripts(self, links_layer):
+        """Move the link layer beneath the transcript points so it never occludes them."""
+        if self.active_dataset is None:
+            return
         state = self._gene_inspector_states.get(str(self.active_dataset).upper())
-        if state is None:
+        if state is None or not state.layer_names:
             return
-        gene = self._pick_gene_from_event(state, event)
-        if gene is None:
-            if state.highlighted_genes:
-                self._clear_highlighted_genes(state)
+        try:
+            names = {str(n) for n in state.layer_names}
+            layers = list(self.viewer.layers)
+            gene_indices = [i for i, layer in enumerate(layers) if str(layer.name) in names]
+            if not gene_indices:
+                return
+            target = min(gene_indices)
+            src = self.viewer.layers.index(links_layer)
+            if src > target:
+                self.viewer.layers.move(src, target)
+        except Exception as exc:
+            log.debug("Could not reorder cell link layer: %s", exc)
+
+    def _image_layer_affine_matrix(self, layer) -> np.ndarray | None:
+        """Return the 3x3 pixel->micron matrix for a 2D image layer."""
+        affine = getattr(layer, "affine", None)
+        if affine is None:
+            return None
+        matrix = getattr(affine, "affine_matrix", None)
+        if matrix is None:
+            try:
+                matrix = np.asarray(affine, dtype=float)
+            except Exception:
+                return None
+        matrix = np.asarray(matrix, dtype=float)
+        if matrix.ndim != 2 or matrix.shape[0] < 3 or matrix.shape[1] < 3:
+            return None
+        return matrix[-3:, -3:]
+
+    def _compute_cell_channel_intensities(self, geometry) -> list[tuple[str, float | None]]:
+        """Mean intensity of every loaded image channel within the cell polygon."""
+        rows: list[tuple[str, float | None]] = []
+        for layer in list(self.viewer.layers):
+            name = str(getattr(layer, "name", ""))
+            if not name.startswith("Image | "):
+                continue
+            matrix = self._image_layer_affine_matrix(layer)
+            if matrix is None:
+                continue
+            data = getattr(layer, "data", None)
+            if isinstance(data, (list, tuple)):
+                data = data[0] if data else None  # finest multiscale level
+            if data is None:
+                continue
+            try:
+                value = mean_intensity_in_polygon(data, matrix, geometry)
+            except Exception as exc:
+                log.debug("Intensity computation failed for %s: %s", name, exc)
+                value = None
+            channel = name.split(" | ", 1)[1] if " | " in name else name
+            rows.append((channel, value))
+        return rows
+
+    def _ensure_cell_info_overlay(self) -> CellInfoOverlay | None:
+        if self._cell_info_overlay is not None:
+            return self._cell_info_overlay
+        try:
+            widget = CellInfoOverlay()
+        except Exception as exc:
+            log.debug("Could not create cell info overlay: %s", exc)
+            return None
+        self._cell_info_overlay = widget
+        # Dock as a wide bar along the bottom (best-effort: a fake viewer used in
+        # tests has no docking API, in which case the bare widget still works).
+        window = getattr(self.viewer, "window", None)
+        if window is not None and hasattr(window, "add_dock_widget"):
+            try:
+                dock = window.add_dock_widget(widget, area="bottom", name="Cell inspector")
+                self._cell_info_dock = dock
+                visibility_changed = getattr(dock, "visibilityChanged", None)
+                if visibility_changed is not None:
+                    try:
+                        visibility_changed.connect(self._on_cell_dock_visibility_changed)
+                    except Exception:
+                        pass
+                self._hide_cell_dock()
+            except Exception as exc:
+                log.debug("Could not dock cell info overlay: %s", exc)
+                self._cell_info_dock = None
+        return self._cell_info_overlay
+
+    def _show_cell_dock(self):
+        dock = self._cell_info_dock
+        if dock is not None:
+            self._suppress_dock_visibility = True
+            try:
+                dock.show()
+                if hasattr(dock, "raise_"):
+                    dock.raise_()
+            except Exception:
+                pass
+            finally:
+                self._suppress_dock_visibility = False
+        elif self._cell_info_overlay is not None:
+            self._cell_info_overlay.show()
+
+    def _hide_cell_dock(self):
+        dock = self._cell_info_dock
+        if dock is not None:
+            self._suppress_dock_visibility = True
+            try:
+                dock.hide()
+            except Exception:
+                pass
+            finally:
+                self._suppress_dock_visibility = False
+        elif self._cell_info_overlay is not None:
+            self._cell_info_overlay.hide()
+
+    def _on_cell_dock_visibility_changed(self, visible: bool):
+        """Closing the bottom window (its X) deselects every highlighted cell.
+
+        napari's close button tears the dock down such that re-showing the same
+        instance does not bring it back, so we also drop our references; the next
+        cell selection then rebuilds a fresh dock (the window "comes back").
+        """
+        if visible or self._suppress_dock_visibility:
             return
-        self._add_highlighted_gene(state, gene)
+        if not self._selected_cells and self._cell_info_dock is None:
+            return
+        self._clear_all_cell_selections()
+        self._teardown_cell_info_dock()
+
+    def _teardown_cell_info_dock(self):
+        """Drop the current dock/overlay so a later selection recreates them."""
+        dock = self._cell_info_dock
+        self._cell_info_dock = None
+        self._cell_info_overlay = None
+        if dock is None:
+            return
+        window = getattr(self.viewer, "window", None)
+        remove = getattr(window, "remove_dock_widget", None) if window is not None else None
+        if remove is None:
+            return
+
+        def _remove(target=dock, remover=remove):
+            try:
+                remover(target)
+            except Exception:
+                pass
+
+        # Defer removal so we do not mutate the dock area from inside the dock's
+        # own close/visibility event.
+        try:
+            QTimer.singleShot(0, _remove)
+        except Exception:
+            _remove()
 
     def _pick_gene_from_event(self, state: GeneInspectorState, event) -> str | None:
         if state.group_display_ranges is None:
@@ -4173,6 +5131,85 @@ class ComparisonViewerController:
             f"{html.escape(str(gene))}: {count:,} counts<br>"
         )
 
+    def _gene_ordering_layout(self, state: GeneInspectorState):
+        """Return ``(layout, labels)`` for the widget given the current ordering.
+
+        ``layout`` is the ordered header/gene list; ``labels`` maps each gene to
+        its "Broad / Fine" text (only used, and only populated, in A–Z mode).
+        """
+        store = state.store
+        visuals = state.gene_visuals or {}
+        layout: list[tuple] = []
+        labels: dict[str, str] = {}
+
+        if state.ordering == "alphabetical":
+            layout = [("gene", gene) for gene in sorted(store.genes)]
+            if state.reference:
+                for gene in store.genes:
+                    info = state.reference.get(gene)
+                    if info:
+                        fine = info.get("fine")
+                        labels[gene] = f"{info['broad']} / {fine}" if fine else str(info["broad"])
+            return layout, labels
+
+        scheme = state.fine_scheme if state.ordering == "fine" else state.coarse_scheme
+        for title, genes in getattr(scheme, "groups", []):
+            rep = genes[len(genes) // 2] if genes else None
+            rgba = getattr(visuals.get(rep), "rgba", (0.6, 0.6, 0.6, 1.0)) if rep else (0.6, 0.6, 0.6, 1.0)
+            layout.append(("header", title, rgba))
+            layout.extend(("gene", gene) for gene in genes)
+        return layout, labels
+
+    def _populate_gene_inspector(self, state: GeneInspectorState):
+        """(Re)build the gene inspector list widget for ``state``'s ordering."""
+        widget = self._gene_inspector_widget
+        if widget is None:
+            return
+        store = state.store
+        layout, labels = self._gene_ordering_layout(state)
+        widget.set_ordering_available(bool(state.reference), state.ordering)
+        widget.populate(
+            state.dataset,
+            layout,
+            state.gene_visuals or {},
+            dict(store.source_gene_counts or store.gene_counts),
+            set(store.control_genes),
+            set(state.enabled_genes),
+            labels,
+            state.ordering,
+            state.hide_assigned,
+            state.hide_background,
+            state.show_controls,
+            state.spot_size,
+        )
+
+    def set_gene_ordering(self, dataset_name: str, kind: str):
+        """Switch the gene list ordering (broad / fine / A–Z).
+
+        Broad and fine each recolour the transcript points (symbols are shared, so
+        only colours and the list grouping change); A–Z keeps the current colours
+        and just relists the genes flat with their cell-type labels.
+        """
+        state = self._gene_inspector_states.get(str(dataset_name).upper())
+        if state is None:
+            return
+        kind = str(kind)
+        if kind in ("coarse", "fine"):
+            scheme = state.coarse_scheme if kind == "coarse" else state.fine_scheme
+            if scheme is None:
+                return
+            if state.color_kind != kind:
+                state.store.recolor(scheme.visuals)
+                state.gene_visuals = scheme.visuals
+                state.color_kind = kind
+                self._rebuild_gene_group_layers(state, group_indices=None)
+                if state.highlighted_genes:
+                    self._set_gene_highlight_status(state)
+            state.ordering = kind
+        else:
+            state.ordering = "alphabetical"
+        self._populate_gene_inspector(state)
+
     def set_gene_visible(self, dataset_name: str, gene: str, on: bool):
         state = self._gene_inspector_states.get(str(dataset_name).upper())
         if state is None:
@@ -4187,6 +5224,28 @@ class ComparisonViewerController:
             state.enabled_genes.discard(gene)
             self._discard_highlighted_genes(state, {gene})
         self._schedule_gene_group_rebuild(state, entry[0])
+
+    def set_genes_visible(self, dataset_name: str, genes: list[str], on: bool):
+        """Show/hide a batch of genes at once (used by group-heading clicks)."""
+        state = self._gene_inspector_states.get(str(dataset_name).upper())
+        if state is None:
+            return
+        on = bool(on)
+        groups: set[int] = set()
+        for gene in genes:
+            entry = state.store.gene_offsets.get(str(gene))
+            if entry is None:
+                continue
+            if on:
+                state.enabled_genes.add(str(gene))
+            else:
+                state.enabled_genes.discard(str(gene))
+            groups.add(int(entry[0]))
+        if not groups:
+            return
+        if not on:
+            self._discard_highlighted_genes(state, {str(g) for g in genes})
+        self._rebuild_gene_group_layers(state, group_indices=groups)
 
     def set_all_genes_visible(self, dataset_name: str, on: bool):
         state = self._gene_inspector_states.get(str(dataset_name).upper())
@@ -4263,6 +5322,7 @@ class ComparisonViewerController:
             except Exception:
                 pass
         self._remove_layers_by_prefix(layer_name_prefix(ds, "genes"))
+        self._invalidate_cell_inspection(ds)
         if self._gene_inspector_widget is not None and self._gene_inspector_widget.dataset == ds:
             self._gene_inspector_widget.clear()
 
@@ -4276,6 +5336,7 @@ class ComparisonViewerController:
                 except Exception:
                     pass
         self._gene_inspector_states.clear()
+        self._invalidate_cell_inspection(None)
         if self._gene_inspector_widget is not None:
             self._gene_inspector_widget.clear()
 
@@ -4663,6 +5724,8 @@ def main():
         set_hide_background_callback=controller.set_gene_hide_background,
         set_show_controls_callback=controller.set_gene_show_controls,
         set_hide_assigned_callback=controller.set_gene_hide_assigned,
+        set_ordering_callback=controller.set_gene_ordering,
+        set_genes_visible_callback=controller.set_genes_visible,
         spot_size=args.gene_spot_size,
         hide_assigned=args.gene_hide_assigned,
         hide_background=args.gene_hide_background,

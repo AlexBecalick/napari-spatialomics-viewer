@@ -195,9 +195,10 @@ def test_gene_inspector_widget_populate_and_callbacks(qapp):
     )
     from napari_compare_xenium_merscope.utils import assign_gene_visuals
 
-    w.populate("TEST", list(store.genes), assign_gene_visuals(store.genes),
+    layout = [("gene", g) for g in store.genes]
+    w.populate("TEST", layout, assign_gene_visuals(store.genes),
                dict(store.gene_counts), set(store.control_genes),
-               {"AAA", "BBB"}, False, False, False, 2.0)
+               {"AAA", "BBB"}, {}, "alphabetical", False, False, False, 2.0)
     assert len(w._checkboxes) == 3
     assert w._hide_assigned_check.text() == "Hide assigned spots"
     assert w._hide_bg_check.text() == "Hide unassigned spots"
@@ -215,6 +216,171 @@ def test_gene_inspector_widget_populate_and_callbacks(qapp):
 
     w._hide_assigned_check.setChecked(True)
     assert ("assigned", ("TEST", True)) in calls
+
+
+_REF = {
+    "SLC17A7": {"broad": "Neuron", "fine": "L2/3 IT"},
+    "SST": {"broad": "Neuron", "fine": "Sst"},
+    "AQP4": {"broad": "Astrocyte", "fine": "Protoplasmic astrocyte"},
+    "MOG": {"broad": "Oligodendrocyte", "fine": "Myelinating oligodendrocyte"},
+}
+
+
+def _ref_controller(qapp):
+    rows = []
+    for gene in _REF:
+        for i in range(4):
+            rows.append((gene, float(i), float(i), i >= 3))  # 3 fg + 1 bg each
+    df = pd.DataFrame(rows, columns=["gene", "x", "y", "background"])
+    store = build_gene_point_groups(
+        df, x_col="x", y_col="y", gene_col="gene", background_col="background", reference=_REF,
+    )
+    args = types.SimpleNamespace(
+        gene_spot_size=2.0, gene_max_render_points=40_000_000,
+        gene_hide_background=False, gene_show_controls=False, random_state=42,
+    )
+    ctrl = V.ComparisonViewerController(_FakeViewer(), {}, args)
+    ctrl.active_dataset = "TEST"
+    ctrl._gene_inspector_widget = None
+    ctrl._apply_gene_inspector_build(
+        ctrl._gene_build_generation, "TEST",
+        {"points_key": "transcripts", "store": store, "reference": _REF, "build_seconds": 0.0},
+    )
+    return ctrl
+
+
+def test_set_gene_ordering_recolors_and_keeps_symbols(qapp):
+    ctrl = _ref_controller(qapp)
+    state = ctrl._gene_inspector_states["TEST"]
+    # A reference was found: default ordering is coarse and points are coarse-coloured.
+    assert state.ordering == "coarse" and state.color_kind == "coarse"
+    assert state.reference is not None
+    symbols_before = list(state.store.group_symbols)
+    coarse_rgba = tuple(state.gene_visuals["SLC17A7"].rgba)
+
+    # Switch to fine: colours change, but the symbol grouping (and thus layers) is
+    # unchanged so only a recolour happens.
+    ctrl.set_gene_ordering("TEST", "fine")
+    assert state.ordering == "fine" and state.color_kind == "fine"
+    assert state.store.group_symbols == symbols_before
+    fine_rgba = tuple(state.gene_visuals["SLC17A7"].rgba)
+    assert coarse_rgba != fine_rgba
+
+    # A–Z keeps whatever colours are currently applied (here: fine).
+    ctrl.set_gene_ordering("TEST", "alphabetical")
+    assert state.ordering == "alphabetical" and state.color_kind == "fine"
+    assert tuple(state.gene_visuals["SLC17A7"].rgba) == fine_rgba
+
+    # Back to broad recolours again.
+    ctrl.set_gene_ordering("TEST", "coarse")
+    assert state.color_kind == "coarse"
+    assert tuple(state.gene_visuals["SLC17A7"].rgba) == coarse_rgba
+
+
+def _order_widget(qapp):
+    return V.GeneInspectorWidget(
+        close_callback=lambda ds: None,
+        set_gene_visible_callback=lambda *a: None,
+        set_all_genes_callback=lambda *a: None,
+        set_spot_size_callback=lambda *a: None,
+        set_hide_background_callback=lambda *a: None,
+        set_show_controls_callback=lambda *a: None,
+        set_hide_assigned_callback=lambda *a: None,
+        set_ordering_callback=lambda *a: None,
+    )
+
+
+def test_widget_grouped_populate_creates_headers_and_filters(qapp):
+    from napari_compare_xenium_merscope.utils import assign_gene_visuals
+
+    w = _order_widget(qapp)
+    visuals = assign_gene_visuals(["SLC17A7", "SST", "AQP4"])
+    layout = [
+        ("header", "Neuron", (0.2, 0.3, 0.9, 1.0)),
+        ("gene", "SLC17A7"), ("gene", "SST"),
+        ("header", "Astrocyte", (0.2, 0.8, 0.3, 1.0)),
+        ("gene", "AQP4"),
+    ]
+    counts = {"SLC17A7": 5, "SST": 3, "AQP4": 4}
+    w.populate("TEST", layout, visuals, counts, set(), {"SLC17A7", "SST", "AQP4"},
+               {}, "coarse", False, False, False, 2.0)
+    assert len(w._checkboxes) == 3
+    assert [t for _item, t, _g in w._headers] == ["Neuron", "Astrocyte"]
+
+    # Filtering to SST leaves the Neuron header visible but hides the Astrocyte one.
+    w._filter_edit.setText("SST")
+    headers = {t: item for item, t, _g in w._headers}
+    assert not headers["Neuron"].isHidden()
+    assert headers["Astrocyte"].isHidden()
+
+
+def test_clicking_group_header_toggles_group_genes(qapp):
+    from napari_compare_xenium_merscope.utils import assign_gene_visuals
+
+    calls = []
+    w = V.GeneInspectorWidget(
+        close_callback=lambda ds: None,
+        set_gene_visible_callback=lambda *a: None,
+        set_all_genes_callback=lambda *a: None,
+        set_spot_size_callback=lambda *a: None,
+        set_hide_background_callback=lambda *a: None,
+        set_show_controls_callback=lambda *a: None,
+        set_hide_assigned_callback=lambda *a: None,
+        set_ordering_callback=lambda *a: None,
+        set_genes_visible_callback=lambda ds, genes, on: calls.append((ds, tuple(genes), on)),
+    )
+    visuals = assign_gene_visuals(["SLC17A7", "SST", "AQP4"])
+    layout = [
+        ("header", "Neuron", (0.2, 0.3, 0.9, 1.0)),
+        ("gene", "SLC17A7"), ("gene", "SST"),
+        ("header", "Astrocyte", (0.2, 0.8, 0.3, 1.0)),
+        ("gene", "AQP4"),
+    ]
+    w.populate("TEST", layout, visuals, {"SLC17A7": 1, "SST": 1, "AQP4": 1}, set(),
+               {"SLC17A7", "SST", "AQP4"}, {}, "coarse", False, False, False, 2.0)
+    neuron_item = next(item for item, t, _g in w._headers if t == "Neuron")
+    header = w._gene_list.itemWidget(neuron_item)
+
+    # All on -> a header click turns the group off (and leaves other groups alone).
+    header.clicked.emit()
+    assert calls[-1] == ("TEST", ("SLC17A7", "SST"), False)
+    assert not w._checkboxes["SLC17A7"].isChecked()
+    assert not w._checkboxes["SST"].isChecked()
+    assert w._checkboxes["AQP4"].isChecked()
+
+    # Clicking again turns the whole group back on.
+    header.clicked.emit()
+    assert calls[-1] == ("TEST", ("SLC17A7", "SST"), True)
+    assert w._checkboxes["SLC17A7"].isChecked()
+
+
+def test_controller_set_genes_visible_batch(qapp):
+    ctrl = _ref_controller(qapp)
+    state = ctrl._gene_inspector_states["TEST"]
+
+    def total():
+        return sum(len(ctrl._get_layer_by_name(n).data) for n in state.layer_names)
+
+    ctrl.set_all_genes_visible("TEST", True)
+    full = total()
+    ctrl.set_genes_visible("TEST", ["SLC17A7", "SST"], False)
+    assert "SLC17A7" not in state.enabled_genes and "SST" not in state.enabled_genes
+    assert total() < full
+    ctrl.set_genes_visible("TEST", ["SLC17A7", "SST"], True)
+    assert "SLC17A7" in state.enabled_genes and total() == full
+
+
+def test_widget_alphabetical_appends_celltype_labels(qapp):
+    from napari_compare_xenium_merscope.utils import assign_gene_visuals
+
+    w = _order_widget(qapp)
+    visuals = assign_gene_visuals(["SLC17A7", "AQP4"])
+    layout = [("gene", "AQP4"), ("gene", "SLC17A7")]
+    labels = {"SLC17A7": "Neuron / L2/3 IT", "AQP4": "Astrocyte / Protoplasmic astrocyte"}
+    w.populate("TEST", layout, visuals, {"SLC17A7": 1, "AQP4": 1}, set(),
+               {"SLC17A7", "AQP4"}, labels, "alphabetical", False, False, False, 2.0)
+    assert w._headers == []
+    assert "Neuron / L2/3 IT" in w._checkboxes["SLC17A7"].text()
 
 
 def test_gene_layer_names_use_marker_symbol_labels(qapp):

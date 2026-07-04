@@ -1659,6 +1659,337 @@ def assign_gene_visuals(
     return visuals
 
 
+# -- Cell-type marker reference ------------------------------------------------
+# A curated map from marker gene -> (broad, fine) cell type, optionally stored in
+# a SpatialData object so the gene inspector can group genes by the cell type
+# they mark. The broad set is fixed; each broad hue is deliberately far from the
+# others so a group reads as one colour family, and (in the fine scheme) the fine
+# subtypes of one broad type stay close in hue while different broad types don't.
+CELL_TYPE_BROAD_COL = "broad_cell_type"
+CELL_TYPE_FINE_COL = "fine_cell_type"
+CELL_TYPE_MARKER_UNS_KEY = "cell_type_marker_reference"
+CONTROL_GROUP_TITLE = "Control / blank probes"
+
+COARSE_CELL_TYPE_ORDER = (
+    "Astrocyte",
+    "Fibroblast",
+    "Microglia",
+    "Neuron",
+    "Oligodendrocyte",
+    "Oligodendrocyte precursor",
+    "Vascular",
+)
+#: One clearly-distinct base hue (0..1) per broad cell type. Oligodendrocyte and
+#: its precursor sit next to each other (violet/magenta) so the lineage reads as
+#: related; every other pair is well separated around the wheel.
+COARSE_CELL_TYPE_HUES = {
+    "Astrocyte": 0.33,
+    "Fibroblast": 0.13,
+    "Microglia": 0.00,
+    "Neuron": 0.62,
+    "Oligodendrocyte": 0.78,
+    "Oligodendrocyte precursor": 0.88,
+    "Vascular": 0.50,
+}
+#: Functional (non-cell-type) broad groups for panel genes that don't mark a cell
+#: type -- Alzheimer's, autophagy, cell-cycle, stress. Hues sit in the gaps
+#: between the cell-type hues so they stay distinguishable.
+FUNCTIONAL_GROUP_HUES = {
+    "Alzheimer's disease": 0.95,
+    "Autophagy & lysosomal": 0.22,
+    "Cell cycle": 0.43,
+    "Stress & chaperones": 0.70,
+}
+#: Broad groups rendered as neutral greys rather than a colour family (controls
+#: and the catch-all functional bucket).
+GREY_GROUP_TITLES = {CONTROL_GROUP_TITLE, "Other / signalling"}
+
+
+@dataclass
+class GeneVisualScheme:
+    """A full (colour, shape) assignment plus the grouped display order.
+
+    ``visuals`` maps every gene (including controls) to its :class:`GeneVisual`.
+    ``groups`` is the ordered list of ``(title, genes)`` sections the gene
+    inspector renders under headings. ``kind`` is ``"coarse"`` or ``"fine"``.
+    Symbols are identical across the coarse and fine schemes (they depend only on
+    the broad grouping), so switching schemes only recolours -- it never changes
+    which napari Points layer a transcript belongs to.
+    """
+
+    kind: str
+    visuals: dict[str, GeneVisual]
+    groups: list[tuple[str, list[str]]]
+
+
+def _broad_hue(broad: str) -> float:
+    """Return the base hue for a broad group (hashed fallback if unknown)."""
+    if broad in COARSE_CELL_TYPE_HUES:
+        return float(COARSE_CELL_TYPE_HUES[broad])
+    if broad in FUNCTIONAL_GROUP_HUES:
+        return float(FUNCTIONAL_GROUP_HUES[broad])
+    digest = blake2s(str(broad).encode("utf-8"), digest_size=4).hexdigest()
+    return (int(digest, 16) / 0xFFFFFFFF) % 1.0
+
+
+def _shade_rgba(
+    hue: float,
+    i: int,
+    n: int,
+    alpha: float = 1.0,
+    sat_range: tuple[float, float] = (0.55, 0.95),
+    val_range: tuple[float, float] = (0.62, 0.98),
+) -> tuple[float, float, float, float]:
+    """Return the ``i``-th of ``n`` distinguishable shades of one hue.
+
+    Saturation and value are walked in opposite directions along a golden-ratio
+    sequence, so consecutive genes -- and genes 14 apart that share a marker
+    symbol -- land on visibly different shades while staying the same colour.
+    """
+    if n <= 1:
+        s, v = 0.85, 0.92
+    else:
+        t = (int(i) * 0.61803398875) % 1.0
+        v = val_range[0] + (val_range[1] - val_range[0]) * t
+        s = sat_range[1] - (sat_range[1] - sat_range[0]) * t
+    r, g, b = colorsys.hsv_to_rgb(float(hue) % 1.0, s, v)
+    return (float(r), float(g), float(b), float(alpha))
+
+
+def _control_shade_rgba(i: int, n: int, alpha: float = 1.0) -> tuple[float, float, float, float]:
+    """Neutral grey shades for control / blank probes (no colour family)."""
+    t = (int(i) * 0.61803398875) % 1.0 if n > 1 else 0.4
+    v = 0.45 + 0.35 * t
+    return (float(v), float(v), float(v), float(alpha))
+
+
+def _normalize_reference(reference: Any) -> dict[str, dict[str, str]]:
+    """Coerce a marker reference into ``{gene: {"broad": .., "fine": ..}}``.
+
+    Accepts a mapping, a JSON string (as stored in a table's ``uns``), or ``None``.
+    """
+    out: dict[str, dict[str, str]] = {}
+    if reference is None:
+        return out
+    if isinstance(reference, (str, bytes)):
+        try:
+            reference = json.loads(reference)
+        except Exception:
+            return out
+    if not reference:
+        return out
+    items = reference.get("genes", reference) if isinstance(reference, Mapping) else {}
+    if not isinstance(items, Mapping):
+        return out
+    for gene, info in items.items():
+        if isinstance(info, Mapping):
+            broad = info.get("broad") or info.get(CELL_TYPE_BROAD_COL)
+            fine = info.get("fine") or info.get(CELL_TYPE_FINE_COL)
+        elif isinstance(info, (list, tuple)) and len(info) >= 2:
+            broad, fine = info[0], info[1]
+        else:
+            continue
+        if broad is None:
+            continue
+        out[str(gene)] = {"broad": str(broad), "fine": str(fine) if fine is not None else ""}
+    return out
+
+
+def _symbols_by_broad(genes: Iterable[str], reference: Mapping[str, dict]) -> dict[str, str]:
+    """Assign each gene a marker symbol from its within-broad-group index.
+
+    Grouping by broad type (controls form their own group) and cycling the symbol
+    list per group keeps symbols stable whether the inspector is grouped by broad
+    or fine, and maximises symbol diversity inside each broad group.
+    """
+    grouped: dict[str, list[str]] = {}
+    for gene in genes:
+        info = reference.get(str(gene))
+        broad = info["broad"] if info else CONTROL_GROUP_TITLE
+        grouped.setdefault(broad, []).append(str(gene))
+    symbols: dict[str, str] = {}
+    for names in grouped.values():
+        for i, name in enumerate(sorted(names)):
+            symbols[name] = GENE_MARKER_SYMBOLS[i % len(GENE_MARKER_SYMBOLS)]
+    return symbols
+
+
+def _coarse_groups(genes: Iterable[str], reference: Mapping[str, dict]) -> list[tuple[str, list[str]]]:
+    """Ordered ``(broad, genes)`` sections, broad types alphabetical, controls last."""
+    by_broad: dict[str, list[str]] = {}
+    controls: list[str] = []
+    for gene in genes:
+        info = reference.get(str(gene))
+        if info:
+            by_broad.setdefault(info["broad"], []).append(str(gene))
+        else:
+            controls.append(str(gene))
+    groups = [(broad, sorted(by_broad[broad])) for broad in sorted(by_broad)]
+    if controls:
+        groups.append((CONTROL_GROUP_TITLE, sorted(controls)))
+    return groups
+
+
+def _fine_groups(
+    genes: Iterable[str], reference: Mapping[str, dict]
+) -> list[tuple[str, str, str, list[str]]]:
+    """Ordered ``(title, broad, fine, genes)`` sections by (broad, fine) alphabetical."""
+    keyed: dict[tuple[str, str], list[str]] = {}
+    controls: list[str] = []
+    for gene in genes:
+        info = reference.get(str(gene))
+        if info:
+            keyed.setdefault((info["broad"], info["fine"]), []).append(str(gene))
+        else:
+            controls.append(str(gene))
+    groups: list[tuple[str, str, str, list[str]]] = []
+    for broad, fine in sorted(keyed):
+        title = f"{broad} — {fine}" if fine else broad
+        groups.append((title, broad, fine, sorted(keyed[(broad, fine)])))
+    if controls:
+        groups.append((CONTROL_GROUP_TITLE, CONTROL_GROUP_TITLE, "", sorted(controls)))
+    return groups
+
+
+def _fine_hue_map(fine_groups: list[tuple[str, str, str, list[str]]]) -> dict[tuple[str, str], float]:
+    """Hue per ``(broad, fine)`` -- fine subtypes cluster around their broad hue."""
+    fines_by_broad: dict[str, list[str]] = {}
+    for _title, broad, fine, _names in fine_groups:
+        if broad in GREY_GROUP_TITLES:
+            continue
+        fines_by_broad.setdefault(broad, []).append(fine)
+    hue_map: dict[tuple[str, str], float] = {}
+    for broad, fines in fines_by_broad.items():
+        base = _broad_hue(broad)
+        ordered = sorted(set(fines))
+        k = len(ordered)
+        # Wider arc when a broad type has many subtypes, capped so it never bleeds
+        # into a neighbouring broad hue.
+        band = min(0.13, 0.028 * k)
+        for j, fine in enumerate(ordered):
+            offset = 0.0 if k <= 1 else band * (j / (k - 1) - 0.5)
+            hue_map[(broad, fine)] = base + offset
+    return hue_map
+
+
+def build_cell_type_gene_visuals(
+    genes: Iterable[str],
+    reference: Mapping[str, Any] | None,
+    kind: str = "coarse",
+    alpha: float = 1.0,
+) -> GeneVisualScheme:
+    """Build a :class:`GeneVisualScheme` grouping genes by broad or fine cell type.
+
+    ``kind="coarse"`` gives each broad type one hue (shaded per gene); ``"fine"``
+    gives each fine subtype its own hue near its broad type's hue. Symbols are the
+    same in both. Genes absent from ``reference`` (e.g. controls) form a trailing
+    grey group. Falls back to :func:`assign_gene_visuals` when no reference genes
+    match, so callers get a usable scheme regardless.
+    """
+    names = sorted({str(g) for g in genes})
+    ref = _normalize_reference(reference)
+    if not any(name in ref for name in names):
+        base = assign_gene_visuals(names, alpha=alpha)
+        return GeneVisualScheme(kind=kind, visuals=base, groups=[("Genes", names)])
+
+    symbols = _symbols_by_broad(names, ref)
+    visuals: dict[str, GeneVisual] = {}
+    display_groups: list[tuple[str, list[str]]] = []
+
+    if str(kind) == "fine":
+        fine_groups = _fine_groups(names, ref)
+        hue_map = _fine_hue_map(fine_groups)
+        for title, broad, fine, group_names in fine_groups:
+            for i, name in enumerate(group_names):
+                if broad in GREY_GROUP_TITLES:
+                    rgba = _control_shade_rgba(i, len(group_names), alpha)
+                else:
+                    rgba = _shade_rgba(
+                        hue_map[(broad, fine)], i, len(group_names), alpha,
+                        sat_range=(0.6, 0.98), val_range=(0.66, 0.99),
+                    )
+                visuals[name] = GeneVisual(rgba=rgba, symbol=symbols.get(name, "disc"))
+            display_groups.append((title, group_names))
+    else:
+        for broad, group_names in _coarse_groups(names, ref):
+            hue = _broad_hue(broad)
+            for i, name in enumerate(group_names):
+                if broad in GREY_GROUP_TITLES:
+                    rgba = _control_shade_rgba(i, len(group_names), alpha)
+                else:
+                    rgba = _shade_rgba(hue, i, len(group_names), alpha)
+                visuals[name] = GeneVisual(rgba=rgba, symbol=symbols.get(name, "disc"))
+            display_groups.append((broad, group_names))
+
+    # Any gene the reference/grouping missed still needs a visual.
+    for i, name in enumerate(names):
+        visuals.setdefault(name, GeneVisual(rgba=_control_shade_rgba(i, len(names), alpha), symbol="disc"))
+    return GeneVisualScheme(kind=str(kind), visuals=visuals, groups=display_groups)
+
+
+def load_cell_type_marker_reference(source: Any) -> dict[str, dict[str, str]] | None:
+    """Load a marker reference from a SpatialData object, AnnData table, or path.
+
+    Looks (in order) for a ``cell_type_marker_reference`` entry in the table's
+    ``uns``, then for ``broad_cell_type`` / ``fine_cell_type`` columns in the
+    table's ``var``. Returns ``{gene: {"broad", "fine"}}`` or ``None`` if absent.
+    Never raises -- a missing or older store simply yields ``None``.
+    """
+    try:
+        table = _resolve_marker_table(source)
+    except Exception:
+        return None
+    if table is None:
+        return None
+
+    uns = getattr(table, "uns", None)
+    if isinstance(uns, Mapping) and CELL_TYPE_MARKER_UNS_KEY in uns:
+        ref = _normalize_reference(uns[CELL_TYPE_MARKER_UNS_KEY])
+        if ref:
+            return ref
+
+    var = getattr(table, "var", None)
+    if var is not None and CELL_TYPE_BROAD_COL in getattr(var, "columns", []):
+        out: dict[str, dict[str, str]] = {}
+        fine_present = CELL_TYPE_FINE_COL in var.columns
+        for gene, broad in var[CELL_TYPE_BROAD_COL].items():
+            if broad is None or (isinstance(broad, float) and np.isnan(broad)):
+                continue
+            text = str(broad).strip()
+            if not text or text.lower() in ("nan", "none", ""):
+                continue
+            fine = str(var[CELL_TYPE_FINE_COL].get(gene, "")) if fine_present else ""
+            out[str(gene)] = {"broad": text, "fine": "" if fine.lower() in ("nan", "none") else fine}
+        if out:
+            return out
+    return None
+
+
+def _resolve_marker_table(source: Any):
+    """Return the AnnData table carrying the marker reference, or ``None``."""
+    if source is None:
+        return None
+    # A path/str to a zarr store: read only the (small) tables selection.
+    if isinstance(source, (str, Path)):
+        import spatialdata as _sd
+
+        source = _sd.read_zarr(str(source), selection=("tables",))
+    tables = getattr(source, "tables", None)
+    if tables is not None:  # a SpatialData object
+        for key in ("table", *tables.keys()):
+            table = tables.get(key)
+            if table is None:
+                continue
+            uns = getattr(table, "uns", {})
+            var = getattr(table, "var", None)
+            has_uns = isinstance(uns, Mapping) and CELL_TYPE_MARKER_UNS_KEY in uns
+            has_var = var is not None and CELL_TYPE_BROAD_COL in getattr(var, "columns", [])
+            if has_uns or has_var:
+                return table
+        return tables.get("table")
+    return source  # assume already an AnnData-like table
+
+
 @dataclass
 class GenePointStore:
     """Backing store for the per-gene transcript renderer.
@@ -1681,10 +2012,30 @@ class GenePointStore:
     sampled: bool = False
     source_gene_counts: dict[str, int] | None = None
     source_total_points: int | None = None
+    #: The (colour, symbol) scheme the points were coloured with. Symbols are
+    #: fixed at build time (they decide the layer grouping); only colours change
+    #: when the inspector switches between the broad and fine cell-type schemes.
+    gene_visuals: dict[str, GeneVisual] | None = None
 
     def gene_symbol(self, gene: str) -> str | None:
         entry = self.gene_offsets.get(str(gene))
         return None if entry is None else self.group_symbols[entry[0]]
+
+    def recolor(self, gene_visuals: Mapping[str, GeneVisual]) -> None:
+        """Rewrite per-point colours in place from a new visual scheme.
+
+        Each gene's points are one contiguous run within its group array, so this
+        is a cheap per-gene fill -- no re-read and no regrouping. The new scheme
+        must assign the SAME symbol per gene as the current one (else the layer
+        grouping would be stale); callers guarantee this by deriving symbols only
+        from the broad grouping.
+        """
+        for gene, (gi, fg_start, _fg_end, bg_end) in self.gene_offsets.items():
+            visual = gene_visuals.get(gene)
+            if visual is None or gi >= len(self.group_colors):
+                continue
+            self.group_colors[gi][fg_start:bg_end] = np.asarray(visual.rgba, dtype=np.float32)
+        self.gene_visuals = dict(gene_visuals)
 
     def full_gene_count(self, gene: str) -> int:
         """Return the source-dataset count for ``gene`` when available."""
@@ -1716,6 +2067,7 @@ def build_gene_point_groups(
     assignment_col: str | None = None,
     background_col: str | None = None,
     gene_visuals: Mapping[str, GeneVisual] | None = None,
+    reference: Mapping[str, Any] | None = None,
     max_points: int | None = None,
     random_state: int = 42,
     alpha: float = 1.0,
@@ -1778,16 +2130,34 @@ def build_gene_point_groups(
         x, y, gene, bg = x[keep], y[keep], gene[keep], bg[keep]
         sampled = True
 
-    # Stable gene visuals + integer codes over the alphabetical gene panel.
+    # Stable gene visuals + integer codes over the alphabetical gene panel. When
+    # a marker reference is supplied, colours + symbols come from the broad
+    # cell-type scheme; otherwise each gene falls back to the deterministic
+    # rainbow (symbol == alphabetical index % 14), preserving legacy behaviour.
     unique_names = sorted(set(gene.tolist()))
     if gene_visuals is None:
-        gene_visuals = assign_gene_visuals(unique_names, alpha=alpha)
+        if reference is not None:
+            gene_visuals = build_cell_type_gene_visuals(
+                unique_names, reference, kind="coarse", alpha=alpha
+            ).visuals
+        else:
+            gene_visuals = assign_gene_visuals(unique_names, alpha=alpha)
     codes = pd.Categorical(gene, categories=unique_names).codes.astype(np.int64)
     del gene
 
     # Which of the 14 marker symbols each gene falls under, mapped to compact
-    # group indices for only the symbols actually used.
-    symbol_idx_per_point = codes % len(GENE_MARKER_SYMBOLS)
+    # group indices for only the symbols actually used. The symbol is taken from
+    # the assigned visual so cell-type grouping (not alphabetical position) drives
+    # the layer split; genes with no visual fall back to alphabetical index % 14.
+    symbol_to_idx = {sym: i for i, sym in enumerate(GENE_MARKER_SYMBOLS)}
+    symbol_idx_by_code = np.array(
+        [
+            symbol_to_idx.get(getattr(gene_visuals.get(name), "symbol", None), i % len(GENE_MARKER_SYMBOLS))
+            for i, name in enumerate(unique_names)
+        ],
+        dtype=np.int64,
+    )
+    symbol_idx_per_point = symbol_idx_by_code[codes]
     used_symbol_idx = np.unique(symbol_idx_per_point)
     sidx_to_group = np.full(len(GENE_MARKER_SYMBOLS), -1, dtype=np.int64)
     for group_index, sidx in enumerate(used_symbol_idx):
@@ -1858,6 +2228,7 @@ def build_gene_point_groups(
         sampled=sampled,
         source_gene_counts=source_gene_counts,
         source_total_points=total_source,
+        gene_visuals=dict(gene_visuals),
     )
 
 
@@ -1956,6 +2327,245 @@ def rasterize_geometries_chunk(
                 draw_ring(interior.coords, 0)
 
     return out
+
+
+# ---------------------------------------------------------------------------
+# Cell inspection: click-to-select a segmentation mask and summarise its cell
+# ---------------------------------------------------------------------------
+
+
+def normalize_cell_key(value) -> str:
+    """Return a canonical string key for a cell id.
+
+    The transcript ``assignment`` column and the segmentation GeoDataFrame index
+    both identify a cell, but one may store the id as an integer and the other as
+    a string (``5`` vs ``"5"``). Normalising both through this function so an
+    integer-valued float/str collapses to its plain integer text lets the two
+    line up regardless of dtype.
+    """
+    if value is None:
+        return ""
+    try:
+        as_float = float(value)
+    except (TypeError, ValueError):
+        return str(value).strip()
+    if not np.isfinite(as_float):
+        return ""
+    if float(int(round(as_float))) == as_float:
+        return str(int(round(as_float)))
+    return repr(as_float)
+
+
+def pick_cell_at_point(gdf, x_um: float, y_um: float):
+    """Return ``(cell_id, geometry)`` for the polygon containing a point.
+
+    ``gdf`` is a segmentation GeoDataFrame in global micron coordinates; the
+    returned ``cell_id`` is the GeoDataFrame index label (the same value stored
+    in the transcript ``assignment`` column). When several polygons contain the
+    point (overlapping masks) the smallest-area one wins, so nested cells resolve
+    to the most specific mask. Returns ``None`` when no polygon contains it.
+    """
+    if gdf is None or len(gdf) == 0:
+        return None
+    point = Point(float(x_um), float(y_um))
+    try:
+        positions = np.asarray(gdf.sindex.query(point, predicate="intersects"), dtype=np.int64)
+        subset = gdf.iloc[positions]
+    except Exception:
+        subset = gdf
+    if len(subset) == 0:
+        return None
+    try:
+        contains = subset.geometry.contains(point)
+    except Exception:
+        return None
+    containing = subset[contains.to_numpy(dtype=bool, copy=False)]
+    if len(containing) == 0:
+        return None
+    areas = containing.geometry.area
+    best_label = areas.idxmin()
+    geometry = containing.geometry.loc[best_label]
+    return best_label, geometry
+
+
+@dataclass
+class CellTranscriptIndex:
+    """Assigned transcripts grouped by the cell they were assigned to.
+
+    ``coords_yx`` holds napari-order ``(y, x)`` micron coordinates and ``genes``
+    the per-transcript gene names, both sorted so every cell occupies one
+    contiguous run recorded in ``slices`` (``cell_key -> (start, end)``). Keys are
+    normalised via :func:`normalize_cell_key`.
+    """
+
+    coords_yx: np.ndarray
+    genes: np.ndarray
+    slices: dict
+
+    def transcripts_for(self, cell_id):
+        """Return ``(coords_yx, genes)`` for one cell (empty arrays if none)."""
+        span = self.slices.get(normalize_cell_key(cell_id))
+        if span is None:
+            return (
+                np.empty((0, 2), dtype=np.float32),
+                np.empty((0,), dtype=object),
+            )
+        start, end = span
+        return self.coords_yx[start:end], self.genes[start:end]
+
+
+def build_cell_transcript_index(
+    points_obj,
+    x_col: str,
+    y_col: str,
+    gene_col: str,
+    assignment_col: str | None,
+) -> CellTranscriptIndex:
+    """Index assigned transcripts by cell for fast per-cell lookup.
+
+    Reads every point partition once, keeps only assigned transcripts (per
+    :func:`assignment_mask`), and groups them by normalised cell id. Background /
+    unassigned transcripts are dropped.
+    """
+    empty = CellTranscriptIndex(
+        coords_yx=np.empty((0, 2), dtype=np.float32),
+        genes=np.empty((0,), dtype=object),
+        slices={},
+    )
+    if assignment_col is None:
+        return empty
+
+    cols = [x_col, y_col, gene_col, assignment_col]
+    key_parts: list[np.ndarray] = []
+    y_parts: list[np.ndarray] = []
+    x_parts: list[np.ndarray] = []
+    gene_parts: list[np.ndarray] = []
+
+    for pdf in _iter_point_partitions(points_obj, cols):
+        assigned = assignment_mask(pdf[assignment_col]).to_numpy(dtype=bool, copy=False)
+        if not assigned.any():
+            continue
+        sub = pdf.loc[assigned]
+        x_vals = sub[x_col].to_numpy(dtype=np.float32, copy=False)
+        y_vals = sub[y_col].to_numpy(dtype=np.float32, copy=False)
+        gene_vals = sub[gene_col].astype("string").to_numpy(dtype=object)
+        assign_vals = sub[assignment_col].to_numpy(dtype=object)
+        good = np.isfinite(x_vals) & np.isfinite(y_vals) & pd.notna(gene_vals)
+        if not np.any(good):
+            continue
+        keys = np.array(
+            [normalize_cell_key(v) for v in assign_vals[good]], dtype=object
+        )
+        key_parts.append(keys)
+        x_parts.append(np.ascontiguousarray(x_vals[good]))
+        y_parts.append(np.ascontiguousarray(y_vals[good]))
+        gene_parts.append(gene_vals[good].astype(str))
+
+    if not key_parts:
+        return empty
+
+    cell_keys = np.concatenate(key_parts)
+    x = np.concatenate(x_parts)
+    y = np.concatenate(y_parts)
+    genes = np.concatenate(gene_parts).astype(object)
+
+    order = np.argsort(cell_keys, kind="stable")
+    cell_keys = cell_keys[order]
+    coords_yx = np.column_stack([y[order], x[order]]).astype(np.float32, copy=False)
+    genes = genes[order]
+
+    slices: dict[str, tuple[int, int]] = {}
+    unique_keys, starts = np.unique(cell_keys, return_index=True)
+    starts = starts.tolist()
+    for i, key in enumerate(unique_keys.tolist()):
+        start = int(starts[i])
+        end = int(starts[i + 1]) if i + 1 < len(starts) else int(len(cell_keys))
+        slices[str(key)] = (start, end)
+
+    return CellTranscriptIndex(coords_yx=coords_yx, genes=genes, slices=slices)
+
+
+def ranked_gene_counts(genes) -> list[tuple[str, int]]:
+    """Return ``(gene, count)`` pairs sorted by count desc, then name asc."""
+    genes = np.asarray(genes, dtype=object)
+    if genes.size == 0:
+        return []
+    names, counts = np.unique(genes.astype(str), return_counts=True)
+    pairs = list(zip(names.tolist(), counts.tolist(), strict=True))
+    pairs.sort(key=lambda item: (-int(item[1]), str(item[0])))
+    return [(str(name), int(count)) for name, count in pairs]
+
+
+def darken_rgba(rgba, factor: float = 0.6) -> tuple[float, float, float, float]:
+    """Return ``rgba`` with its RGB channels scaled toward black by ``factor``."""
+    factor = float(factor)
+    r, g, b = (max(0.0, min(1.0, float(c) * factor)) for c in tuple(rgba)[:3])
+    alpha = float(rgba[3]) if len(tuple(rgba)) >= 4 else 1.0
+    return (r, g, b, alpha)
+
+
+def mean_intensity_in_polygon(image_2d, napari_affine, polygon) -> float | None:
+    """Mean pixel intensity inside ``polygon`` for one 2D image channel.
+
+    ``image_2d`` is a ``(y, x)`` pixel array (numpy or lazy/dask, sliced then
+    materialised over just the polygon's bounding box). ``napari_affine`` is the
+    3x3 matrix mapping pixel ``(row, col, 1)`` to global ``(y_um, x_um, 1)`` used
+    by the layer; ``polygon`` is a shapely geometry in global microns. Returns
+    ``None`` when the polygon falls outside the image or covers no pixels.
+    """
+    if polygon is None or getattr(polygon, "is_empty", True):
+        return None
+    affine = np.asarray(napari_affine, dtype=float)
+    if affine.shape != (3, 3):
+        return None
+    try:
+        inv_affine = np.linalg.inv(affine)
+    except np.linalg.LinAlgError:
+        return None
+
+    shape = tuple(int(s) for s in getattr(image_2d, "shape", ()))
+    if len(shape) < 2:
+        return None
+    height, width = shape[-2], shape[-1]
+
+    parts = polygon.geoms if getattr(polygon, "geom_type", "") == "MultiPolygon" else (polygon,)
+    all_coords = []
+    for part in parts:
+        if part.is_empty:
+            continue
+        all_coords.append(np.asarray(part.exterior.coords, dtype=float))
+    if not all_coords:
+        return None
+    coords = np.concatenate(all_coords, axis=0)  # (N, 2) as (x_um, y_um)
+    yx1 = np.column_stack([coords[:, 1], coords[:, 0], np.ones(len(coords))])
+    rc = yx1 @ inv_affine.T
+    rows, cols = rc[:, 0], rc[:, 1]
+    r0 = max(0, int(np.floor(rows.min())))
+    r1 = min(height, int(np.ceil(rows.max())) + 1)
+    c0 = max(0, int(np.floor(cols.min())))
+    c1 = min(width, int(np.ceil(cols.max())) + 1)
+    if r1 <= r0 or c1 <= c0:
+        return None
+
+    mask = rasterize_geometries_chunk(
+        parts,
+        [1] * len(parts),
+        shape=(r1 - r0, c1 - c0),
+        inv_affine=inv_affine,
+        y0=r0,
+        x0=c0,
+        dtype=np.uint8,
+    ).astype(bool)
+    if not mask.any():
+        return None
+
+    window = np.asarray(image_2d[..., r0:r1, c0:c1])
+    while window.ndim > 2:
+        window = window[0]
+    values = window[mask]
+    if values.size == 0:
+        return None
+    return float(np.nanmean(values))
 
 
 def label_outline_mask_chunk(labels, width: int = 1) -> np.ndarray:
