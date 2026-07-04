@@ -121,6 +121,33 @@ toggles stay fast even with hundreds of genes. The panel offers:
 - **Show control / blank probes** to include negative-control codewords (hidden by
   default), and a filter box to search the list.
 
+### Grouping genes by cell type
+
+If the SpatialData store carries a **cell-type marker reference** — a
+`cell_type_marker_reference` table element (or `broad_cell_type` / `fine_cell_type`
+columns / a `cell_type_marker_reference` entry in a table's `uns`) mapping each
+non-control gene to a broad and fine cell type — the Gene inspector uses it to
+group the list. **Order genes by** offers three modes:
+
+- **Broad cell type** (default when a reference is present): genes are grouped
+  under broad-type headings in alphabetical order. Each broad type gets its own
+  distinct colour; genes within a group share that colour as slightly different
+  shades (with different marker shapes) so they stay individually distinguishable.
+- **Fine cell type**: genes are grouped by fine subtype, ordered by broad then
+  fine. Fine subtypes of the same broad type get nearby hues (and so read as
+  related), while unrelated broad types stay far apart in colour.
+- **A–Z**: one flat, alphabetical list that keeps whichever colours (broad or
+  fine) were last applied and annotates each gene with its broad / fine type.
+
+Marker shapes are stable across all three modes, so only the colours change when
+switching — the same transcript keeps its shape. Without a reference the panel
+falls back to the flat alphabetical rainbow (only **A–Z** is available).
+
+The reference is a standalone data artefact produced outside this package (the
+viewer only *reads* it). For the P7513 panel it was written both as
+`cell_type_marker_reference.{csv,json}` beside the `.zarr` and as the
+`cell_type_marker_reference` table element inside the store.
+
 ```bash
 napari-compare-xenium-merscope ... \
   --gene-spot-size 2.0 \            # initial world-micron spot size
