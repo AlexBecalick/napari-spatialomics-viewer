@@ -91,6 +91,17 @@ saves it back to `labels/<shape-key>_labels` in the zarr, and then displays the
 label outlines as a lazy multiscale image. Future runs reuse the saved label
 layer and only rebuild the lightweight outline view.
 
+Clicking inside a cell mask highlights that cell (repeated clicks accumulate
+highlights). This is gated on the **ProSeg** (cell-inspector) layer's visibility:
+hiding that layer in the napari layer list disables click-to-highlight and clears
+any current highlights, and showing it again re-enables clicking.
+
+At startup layers are requested in the order transcripts → images → masks, and
+the (long) block of per-gene layers is pinned to the **bottom** of the napari
+layer list so it doesn't crowd the top. Because napari renders lower list
+entries beneath higher ones, the transcript points therefore sit *below* the
+image and mask layers; toggle image visibility if you need the spots in front.
+
 ```bash
 # Rebuild cached labels instead of reusing existing labels.
 napari-compare-xenium-merscope ... --overwrite-labels
