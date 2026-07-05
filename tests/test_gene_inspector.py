@@ -192,6 +192,7 @@ def test_gene_inspector_widget_populate_and_callbacks(qapp):
         set_hide_background_callback=lambda *a: calls.append(("bg", a)),
         set_show_controls_callback=lambda *a: calls.append(("ctrl", a)),
         set_hide_assigned_callback=lambda *a: calls.append(("assigned", a)),
+        set_colour_by_assignment_callback=lambda *a: calls.append(("assign_color", a)),
     )
     from napari_compare_xenium_merscope.utils import assign_gene_visuals
 
@@ -202,6 +203,7 @@ def test_gene_inspector_widget_populate_and_callbacks(qapp):
     assert len(w._checkboxes) == 3
     assert w._hide_assigned_check.text() == "Hide assigned spots"
     assert w._hide_bg_check.text() == "Hide unassigned spots"
+    assert w._colour_by_assignment_check.text() == "Colour transcripts by assigned/unassigned"
     assert w._items["Blank-1"].isHidden()      # control hidden by default
     assert not w._items["AAA"].isHidden()
     assert w._checkboxes["AAA"].isChecked()
@@ -216,6 +218,9 @@ def test_gene_inspector_widget_populate_and_callbacks(qapp):
 
     w._hide_assigned_check.setChecked(True)
     assert ("assigned", ("TEST", True)) in calls
+
+    w._colour_by_assignment_check.setChecked(True)
+    assert ("assign_color", ("TEST", True)) in calls
 
 
 _REF = {
@@ -275,6 +280,54 @@ def test_set_gene_ordering_recolors_and_keeps_symbols(qapp):
     ctrl.set_gene_ordering("TEST", "coarse")
     assert state.color_kind == "coarse"
     assert tuple(state.gene_visuals["SLC17A7"].rgba) == coarse_rgba
+
+
+def _display_range_for_gene(state, gene):
+    gi = state.store.gene_offsets[gene][0]
+    for start, end, name in state.group_display_ranges[gi]:
+        if name == gene:
+            return gi, start, end
+    raise AssertionError(f"No display range for {gene}")
+
+
+def test_colour_by_assignment_recolors_points_and_restores_current_scheme(qapp):
+    ctrl = _ref_controller(qapp)
+    state = ctrl._gene_inspector_states["TEST"]
+    ctrl.set_gene_ordering("TEST", "fine")
+    fine_rgba = np.asarray(state.gene_visuals["SLC17A7"].rgba, dtype=np.float32)
+
+    gi, start, end = _display_range_for_gene(state, "SLC17A7")
+    layer = ctrl._get_layer_by_name(state.layer_names[gi])
+    np.testing.assert_allclose(
+        layer.face_color[start:end], np.tile(fine_rgba, (end - start, 1)), atol=1e-6
+    )
+    assert layer.symbol == state.store.group_symbols[gi]
+
+    ctrl.set_gene_colour_by_assignment("TEST", True)
+    gi, start, end = _display_range_for_gene(state, "SLC17A7")
+    layer = ctrl._get_layer_by_name(state.layer_names[gi])
+    _g, _fg_start, fg_end, bg_end = state.store.gene_offsets["SLC17A7"]
+    fg_count = fg_end - _fg_start
+    bg_count = bg_end - fg_end
+    np.testing.assert_allclose(
+        layer.face_color[start:start + fg_count],
+        np.tile(V.GENE_ASSIGNED_RGBA, (fg_count, 1)),
+        atol=1e-6,
+    )
+    np.testing.assert_allclose(
+        layer.face_color[start + fg_count:start + fg_count + bg_count],
+        np.tile(V.GENE_UNASSIGNED_RGBA, (bg_count, 1)),
+        atol=1e-6,
+    )
+    assert layer.symbol == state.store.group_symbols[gi]
+
+    ctrl.set_gene_colour_by_assignment("TEST", False)
+    gi, start, end = _display_range_for_gene(state, "SLC17A7")
+    layer = ctrl._get_layer_by_name(state.layer_names[gi])
+    np.testing.assert_allclose(
+        layer.face_color[start:end], np.tile(fine_rgba, (end - start, 1)), atol=1e-6
+    )
+    assert layer.symbol == state.store.group_symbols[gi]
 
 
 def _order_widget(qapp):
