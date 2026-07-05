@@ -237,6 +237,7 @@ class GeneInspectorState:
     fine_scheme: object | None = None          # utils.GeneVisualScheme
     ordering: str = "coarse"
     color_kind: str = "coarse"
+    colour_by_assignment: bool = False
 
 
 DEFAULT_GENE_SPOT_SIZE = 0.5
@@ -250,6 +251,8 @@ GENE_SPOT_SIZE_MAX = 5.0
 GENE_SPOT_SIZE_STEP = 0.1
 DEFAULT_GENE_MAX_RENDER_POINTS = 40_000_000
 GENE_REBUILD_DEBOUNCE_MS = 60
+GENE_ASSIGNED_RGBA = np.array((1.0, 1.0, 0.0, 1.0), dtype=np.float32)
+GENE_UNASSIGNED_RGBA = np.array((1.0, 0.0, 0.0, 1.0), dtype=np.float32)
 GENE_STATUS_SYMBOL_GLYPHS = {
     "disc": "●",
     "ring": "○",
@@ -1557,12 +1560,14 @@ class GeneInspectorWidget(QWidget):
         set_hide_background_callback,
         set_show_controls_callback,
         set_hide_assigned_callback=None,
+        set_colour_by_assignment_callback=None,
         set_ordering_callback=None,
         set_genes_visible_callback=None,
         spot_size: float = DEFAULT_GENE_SPOT_SIZE,
         hide_assigned: bool = False,
         hide_background: bool = False,
         show_controls: bool = False,
+        colour_by_assignment: bool = False,
     ):
         super().__init__()
         self._close_callback = close_callback
@@ -1571,6 +1576,7 @@ class GeneInspectorWidget(QWidget):
         self._set_spot_size_callback = set_spot_size_callback
         self._set_hide_background_callback = set_hide_background_callback
         self._set_hide_assigned_callback = set_hide_assigned_callback
+        self._set_colour_by_assignment_callback = set_colour_by_assignment_callback
         self._set_show_controls_callback = set_show_controls_callback
         self._set_ordering_callback = set_ordering_callback
         self._set_genes_visible_callback = set_genes_visible_callback
@@ -1623,6 +1629,9 @@ class GeneInspectorWidget(QWidget):
         self._hide_bg_check = QCheckBox("Hide unassigned spots")
         self._hide_bg_check.setChecked(bool(hide_background))
         self._hide_bg_check.toggled.connect(self._on_hide_background_toggled)
+        self._colour_by_assignment_check = QCheckBox("Colour transcripts by assigned/unassigned")
+        self._colour_by_assignment_check.setChecked(bool(colour_by_assignment))
+        self._colour_by_assignment_check.toggled.connect(self._on_colour_by_assignment_toggled)
         self._show_controls_check = QCheckBox("Show control / blank probes")
         self._show_controls_check.setChecked(bool(show_controls))
         self._show_controls_check.toggled.connect(self._on_show_controls_toggled)
@@ -1670,6 +1679,7 @@ class GeneInspectorWidget(QWidget):
         root.addWidget(self._show_all_check)
         root.addWidget(self._hide_assigned_check)
         root.addWidget(self._hide_bg_check)
+        root.addWidget(self._colour_by_assignment_check)
         root.addWidget(self._show_controls_check)
         root.addWidget(self._order_label)
         order_row = QHBoxLayout()
@@ -1732,6 +1742,7 @@ class GeneInspectorWidget(QWidget):
         hide_background: bool,
         show_controls: bool,
         spot_size: float,
+        colour_by_assignment: bool = False,
     ):
         """Build the gene rows for ``dataset`` (called on the GUI thread).
 
@@ -1750,6 +1761,7 @@ class GeneInspectorWidget(QWidget):
             self._control_genes = set(control_genes)
             self._hide_assigned_check.setChecked(bool(hide_assigned))
             self._hide_bg_check.setChecked(bool(hide_background))
+            self._colour_by_assignment_check.setChecked(bool(colour_by_assignment))
             self._show_controls_check.setChecked(bool(show_controls))
             self._set_spot_widgets(float(spot_size))
 
@@ -1910,6 +1922,12 @@ class GeneInspectorWidget(QWidget):
             return
         if self._set_hide_assigned_callback is not None:
             self._set_hide_assigned_callback(self._dataset, bool(on))
+
+    def _on_colour_by_assignment_toggled(self, on: bool):
+        if self._suppress or self._dataset is None:
+            return
+        if self._set_colour_by_assignment_callback is not None:
+            self._set_colour_by_assignment_callback(self._dataset, bool(on))
 
     def _on_show_controls_toggled(self, on: bool):
         self._refresh_row_visibility()
@@ -4597,6 +4615,7 @@ class ComparisonViewerController:
             fine_scheme=fine_scheme,
             ordering=ordering,
             color_kind="coarse",
+            colour_by_assignment=False,
         )
         timer.timeout.connect(lambda d=ds: self._flush_gene_group_rebuild(d))
         self._gene_inspector_states[ds] = state
@@ -4665,11 +4684,21 @@ class ComparisonViewerController:
             start = cursor
             if not state.hide_assigned and fg_end > fg_start:
                 coord_slices.append(gcoords[fg_start:fg_end])
-                color_slices.append(gcolors[fg_start:fg_end])
+                if state.colour_by_assignment:
+                    color_slices.append(
+                        np.tile(GENE_ASSIGNED_RGBA, (int(fg_end - fg_start), 1))
+                    )
+                else:
+                    color_slices.append(gcolors[fg_start:fg_end])
                 cursor += int(fg_end - fg_start)
             if not state.hide_background and bg_end > fg_end:
                 coord_slices.append(gcoords[fg_end:bg_end])
-                color_slices.append(gcolors[fg_end:bg_end])
+                if state.colour_by_assignment:
+                    color_slices.append(
+                        np.tile(GENE_UNASSIGNED_RGBA, (int(bg_end - fg_end), 1))
+                    )
+                else:
+                    color_slices.append(gcolors[fg_end:bg_end])
                 cursor += int(bg_end - fg_end)
             if cursor > start:
                 display_ranges.append((start, cursor, str(gene)))
@@ -5493,6 +5522,7 @@ class ComparisonViewerController:
             state.hide_background,
             state.show_controls,
             state.spot_size,
+            state.colour_by_assignment,
         )
 
     def set_gene_ordering(self, dataset_name: str, kind: str):
@@ -5602,6 +5632,14 @@ class ComparisonViewerController:
             return
         state.hide_assigned = bool(on)
         self._rebuild_gene_group_layers(state, group_indices=None)
+
+    def set_gene_colour_by_assignment(self, dataset_name: str, on: bool):
+        state = self._gene_inspector_states.get(str(dataset_name).upper())
+        if state is None:
+            return
+        state.colour_by_assignment = bool(on)
+        self._rebuild_gene_group_layers(state, group_indices=None)
+        self._populate_gene_inspector(state)
 
     def set_gene_show_controls(self, dataset_name: str, on: bool):
         state = self._gene_inspector_states.get(str(dataset_name).upper())
@@ -6069,6 +6107,7 @@ def main():
         set_hide_background_callback=controller.set_gene_hide_background,
         set_show_controls_callback=controller.set_gene_show_controls,
         set_hide_assigned_callback=controller.set_gene_hide_assigned,
+        set_colour_by_assignment_callback=controller.set_gene_colour_by_assignment,
         set_ordering_callback=controller.set_gene_ordering,
         set_genes_visible_callback=controller.set_genes_visible,
         spot_size=args.gene_spot_size,
