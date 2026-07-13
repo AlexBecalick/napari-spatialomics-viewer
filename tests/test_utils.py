@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import xarray as xr
 import zarr
 from shapely.geometry import MultiPolygon, Polygon
@@ -466,6 +467,15 @@ def test_rasterize_geometries_chunk():
     assert tile.dtype == np.uint32
     assert tile.max() == 7
     assert np.count_nonzero(tile) == 25
+
+
+def test_rasterize_geometries_chunk_rejects_nonfinite_affine():
+    poly = Polygon([(0, 0), (1, 0), (1, 1), (0, 1)])
+    inv_affine = np.eye(3)
+    inv_affine[0, 0] = np.inf
+
+    with pytest.raises(ValueError, match="finite 3x3"):
+        rasterize_geometries_chunk([poly], [1], (2, 2), inv_affine)
 
 
 def test_label_outline_mask_chunk_marks_label_boundaries():
