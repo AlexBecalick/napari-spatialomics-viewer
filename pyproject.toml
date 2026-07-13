@@ -22,6 +22,8 @@ dependencies = [
   "packaging",
   "pandas",
   "psutil",
+  "py2app; sys_platform == 'darwin'",
+  "pyobjc-framework-Cocoa; sys_platform == 'darwin'",
   "qtpy",
   "shapely",
   "spatialdata>=0.7.3a1",
@@ -35,10 +37,14 @@ dev = [
 ]
 
 [project.scripts]
-napari-compare-xenium-merscope = "napari_compare_xenium_merscope.viewer:main"
+napari-compare-xenium-merscope = "napari_compare_xenium_merscope.launcher:main"
+napari-compare-xenium-merscope-install-macos-app = "napari_compare_xenium_merscope.launcher:install_macos_app_bundle"
 
 [tool.setuptools]
 package-dir = { "" = "src" }
+
+[tool.setuptools.package-data]
+napari_compare_xenium_merscope = ["assets/*.icns", "assets/*.png"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

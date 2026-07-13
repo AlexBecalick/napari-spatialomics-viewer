@@ -5,8 +5,8 @@ Napari-based viewer for visualising MERSCOPE and Xenium SpatialData `.zarr` outp
 The viewer opens a single Napari window with a tabbed control panel (tabs across
 the top of the right-hand dock): **Gene inspector**, **Cell segmentation**, **Per
 cell statistics**, **Draw tissue annotations**, **Images**, and **Dataset**. On
-startup it automatically loads all image channels, the Cellpose and ProSeg cell
-segmentations, and all transcripts (rendered as per-gene coloured points). A busy
+startup with a supplied dataset it automatically loads all image channels, the
+Cellpose and ProSeg cell segmentations, and all transcripts (rendered as per-gene coloured points). A busy
 progress bar with a stage label below the tabs shows what is loading (image
 pyramids, cell masks, transcripts, …).
 
@@ -25,7 +25,37 @@ For updating an existing Python environment after pulling any new changes to the
 pip install -e .
 ```
 
+### macOS application bundle
+
+On macOS, installation also provides the tooling used to create a lightweight
+application bundle at `~/Applications/Napari Compare Xenium MERSCOPE.app`. The
+first `napari-compare-xenium-merscope` launch creates or refreshes this bundle
+for the active Python environment, then runs the viewer through its native
+Mach-O launcher. The bundle contains an `Info.plist` and `.icns` icon, allowing
+the macOS Dock and third-party Dock replacements such as Sidebar to identify the
+viewer as an application rather than as a generic Python console script.
+
+The bundle uses the installed environment in place; it does not duplicate the
+napari or SpatialData dependencies. Rebuild it explicitly at any time with:
+
+```bash
+napari-compare-xenium-merscope-install-macos-app
+```
+
+Launching the `.app` from Finder, the Dock, or Sidebar opens with no dataset
+loaded and selects the **Dataset loader** tab. Choose a paired MERSCOPE/Xenium
+dataset or a standalone store there. Dataset paths passed explicitly on the
+command line still load immediately.
+
 ## Then Run
+
+Launch without a dataset to choose one in the viewer:
+
+```bash
+napari-compare-xenium-merscope
+```
+
+Or supply dataset paths to load them immediately:
 
 ```bash
 napari-compare-xenium-merscope \
