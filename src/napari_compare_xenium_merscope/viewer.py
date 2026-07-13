@@ -80,6 +80,7 @@ try:
     )
     from qtpy.QtWidgets import (
         QAbstractItemView,
+        QApplication,
         QButtonGroup,
         QCheckBox,
         QComboBox,
@@ -273,6 +274,12 @@ GENE_STATUS_SYMBOL_GLYPHS = {
 SYNTHETIC_IMAGE_PYRAMID_MIN_SIZE = 4096
 SYNTHETIC_IMAGE_PYRAMID_MAX_LEVELS = 10
 LABEL_CACHE_ATTR = "napari_compare_label_cache"
+# napari's opportunistic Dask Cache instance is shared by every layer. Its
+# callback bookkeeping is not safe when our image and segmentation layers
+# compute concurrently in different Qt worker/render threads. These layers
+# already use persisted Zarr pyramids, so retaining a second in-memory task
+# cache is unnecessary and can trigger dask.cache.Cache._posttask KeyErrors.
+NAPARI_DASK_CACHE_ENABLED = False
 LABEL_OUTLINE_PYRAMID_MIN_SIZE = 4096
 LABEL_OUTLINE_PYRAMID_MAX_LEVELS = 10
 DERIVED_CACHE_VERSION = 1
@@ -806,7 +813,7 @@ class ViewerControlPanel(QWidget):
         export_separate_annotations_callback,
         load_paired_callback,
         load_standalone_callback,
-        initial_dataset: str = "MERSCOPE",
+        initial_dataset: str | None = None,
     ):
         super().__init__()
         self._gene_inspector_widget = gene_inspector_widget
@@ -842,6 +849,7 @@ class ViewerControlPanel(QWidget):
             self._dataset_combo.setCurrentText(initial_dataset)
         self._dataset_combo.currentTextChanged.connect(self._on_dataset_changed)
         self._reload_button = QPushButton("Reload Dataset")
+        self._reload_button.setEnabled(bool(datasets))
         self._reload_button.clicked.connect(self._on_reload_clicked)
         self._load_paired_button = QPushButton("Load new paired dataset")
         self._load_paired_button.clicked.connect(self._on_load_paired)
@@ -941,9 +949,11 @@ class ViewerControlPanel(QWidget):
             ("Dataset loader", self._build_dataset_tab),
         ):
             self._add_tab(title, builder())
-        if self._tab_group.buttons():
-            self._tab_group.buttons()[0].setChecked(True)
-            self._tab_stack.setCurrentIndex(0)
+        initial_tab_index = 0 if datasets else 5
+        initial_tab_button = self._tab_group.button(initial_tab_index)
+        if initial_tab_button is not None:
+            initial_tab_button.setChecked(True)
+            self._tab_stack.setCurrentIndex(initial_tab_index)
 
         outer = QVBoxLayout()
         outer.setContentsMargins(4, 4, 4, 4)
@@ -1214,6 +1224,7 @@ class ViewerControlPanel(QWidget):
                 self._dataset_combo.setCurrentText(str(initial))
         finally:
             self._dataset_combo.blockSignals(False)
+        self._reload_button.setEnabled(bool(names))
 
     # -- event handlers -----------------------------------------------------
     def _on_dataset_changed(self, text: str):
@@ -1222,7 +1233,8 @@ class ViewerControlPanel(QWidget):
         self._load_callback(str(text), False)
 
     def _on_reload_clicked(self):
-        self._load_callback(self.current_dataset, True)
+        if self.current_dataset:
+            self._load_callback(self.current_dataset, True)
 
     def _browse_zarr(self, title: str) -> str | None:
         path = QFileDialog.getExistingDirectory(self, title, "")
@@ -3396,6 +3408,7 @@ class ComparisonViewerController:
                         affine=affine,
                         colormap=cmap,
                         blending="additive",
+                        cache=NAPARI_DASK_CACHE_ENABLED,
                         opacity=self.args.image_opacity,
                         visible=chan_visible,
                     )
@@ -4050,6 +4063,7 @@ class ComparisonViewerController:
             affine=prepared["napari_affine"],
             colormap=color_map,
             contrast_limits=(0.0, 1.0),
+            cache=NAPARI_DASK_CACHE_ENABLED,
             interpolation2d=str(getattr(self.args, "label_interpolation", "linear")),
             multiscale=n_levels > 1,
             opacity=self.args.shape_opacity,
@@ -4356,6 +4370,7 @@ class ComparisonViewerController:
             label_data,
             name=layer_name,
             affine=napari_affine,
+            cache=NAPARI_DASK_CACHE_ENABLED,
             colormap=payload["colormap"],
             multiscale=len(label_levels) > 1,
             opacity=min(1.0, max(0.0, float(self.args.shape_opacity))),
@@ -5807,7 +5822,6 @@ def log_environment_diagnostics(viewer) -> None:
         )
     except Exception:
         pass
-
     try:
         import qtpy
 
@@ -5844,6 +5858,61 @@ def log_environment_diagnostics(viewer) -> None:
         pass
 
 
+def application_icon_path() -> Path:
+    """Return the packaged application-icon path."""
+    return Path(__file__).resolve().parent / "assets" / "app_icon.png"
+
+
+def install_macos_dock_icon(path: Path) -> bool:
+    """Set the native Cocoa application icon for an unbundled macOS process."""
+    if sys.platform != "darwin":
+        return True
+    try:
+        from AppKit import NSApplication, NSImage
+
+        image = NSImage.alloc().initWithContentsOfFile_(str(path))
+        if image is None:
+            raise ValueError(f"Cocoa could not read {path}")
+        NSApplication.sharedApplication().setApplicationIconImage_(image)
+        return True
+    except Exception as exc:  # pragma: no cover - depends on the macOS runtime
+        log.warning("Could not install the native macOS Dock icon (%s).", exc)
+        return False
+
+
+def install_application_icon(viewer) -> bool:
+    """Install the packaged icon on the Qt application and napari window.
+
+    Setting the native window icon is important on macOS because Qt uses it for
+    the running application's Dock icon.  The QApplication-level icon covers
+    other top-level/dialog windows and the task switcher on other platforms.
+    """
+    path = application_icon_path()
+    icon = QIcon(str(path))
+    if not path.is_file() or icon.isNull():
+        log.warning("Application icon is missing or unreadable: %s", path)
+        return False
+
+    app = QApplication.instance()
+    if app is None:  # napari.Viewer normally creates it before this is called.
+        log.warning("Cannot install application icon before QApplication exists.")
+        return False
+    app.setWindowIcon(icon)
+
+    qt_window = getattr(getattr(viewer, "window", None), "_qt_window", None)
+    if qt_window is None:
+        log.warning("Could not find napari's native Qt window to install its icon.")
+        return False
+    qt_window.setWindowIcon(icon)
+    window_handle = qt_window.windowHandle()
+    if window_handle is not None:
+        window_handle.setIcon(icon)
+    if not install_macos_dock_icon(path):
+        return False
+    log.info("Installed application icon from %s", path)
+    return True
+
+
 def request_gl_core_profile() -> None:
     """Request an OpenGL 4.1 core-profile context before the Qt app is created.
 
@@ -5867,6 +5936,7 @@ def request_gl_core_profile() -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
+        prog="napari-compare-xenium-merscope",
         description="Napari comparison viewer for MERSCOPE and Xenium SpatialData outputs."
     )
     parser.add_argument("--merscope-zarr", default=None, type=Path, help="Path to MERSCOPE .zarr output")
@@ -6042,8 +6112,6 @@ def parse_args() -> argparse.Namespace:
     )
 
     args = parser.parse_args()
-    if args.merscope_zarr is None and args.xenium_zarr is None:
-        parser.error("Pass at least one dataset path: --merscope-zarr and/or --xenium-zarr.")
     if args.label_chunk_size <= 0:
         parser.error("--label-chunk-size must be positive.")
     if args.label_contour_width < 0:
@@ -6078,8 +6146,8 @@ def main():
         )
 
     available_datasets = list(datasets.keys())
-    initial_dataset = args.initial_dataset
-    if initial_dataset not in datasets:
+    initial_dataset: str | None = args.initial_dataset if datasets else None
+    if datasets and initial_dataset not in datasets:
         initial_dataset = available_datasets[0]
         log.info(
             "Initial dataset %s was not supplied; starting with %s.",
@@ -6094,6 +6162,7 @@ def main():
         request_gl_core_profile()
 
     viewer = napari.Viewer(title="Xenium vs MERSCOPE Comparison")
+    install_application_icon(viewer)
     log_environment_diagnostics(viewer)
     controller = ComparisonViewerController(viewer=viewer, datasets=datasets, args=args)
 
@@ -6151,7 +6220,10 @@ def main():
     viewer.window.add_dock_widget(panel, area="right", name="Viewer Controls")
 
     controller.install_canvas_overlays()
-    controller.load_dataset(initial_dataset, force=True)
+    if initial_dataset is not None:
+        controller.load_dataset(initial_dataset, force=True)
+    else:
+        panel.set_status("No dataset loaded. Choose a dataset from the Dataset loader tab.")
     napari.run()
 
 

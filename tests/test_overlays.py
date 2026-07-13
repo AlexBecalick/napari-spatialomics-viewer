@@ -6,6 +6,7 @@ import types
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import numpy as np
 import pytest
 
 from napari_compare_xenium_merscope import viewer as V
@@ -45,6 +46,18 @@ def test_scale_bar_format_um():
     assert fmt(12.5) == "12.5 µm"
     assert fmt(3.14159) == "3.14 µm"
     assert fmt(1500.0) == "1500 µm"  # stays in microns as requested
+
+
+def test_packaged_application_icon_is_installed_on_qt_window(qapp):
+    from qtpy.QtWidgets import QWidget
+
+    qt_window = QWidget()
+    viewer = types.SimpleNamespace(window=types.SimpleNamespace(_qt_window=qt_window))
+
+    assert V.application_icon_path().is_file()
+    assert V.install_application_icon(viewer)
+    assert not qapp.windowIcon().isNull()
+    assert not qt_window.windowIcon().isNull()
 
 
 def test_scale_bar_overlay_sizing_and_position(qapp):
@@ -96,3 +109,44 @@ def test_install_canvas_overlays_without_canvas_is_safe(qapp):
     # must still run without raising.
     ctrl.install_canvas_overlays()
     assert ctrl._scale_bar is None
+
+
+def test_label_outline_disables_thread_unsafe_global_dask_cache(qapp):
+    captured = {}
+
+    class FakeViewer:
+        layers = []
+        mouse_drag_callbacks = []
+
+        def add_image(self, data, **kwargs):
+            captured.update(kwargs)
+            return types.SimpleNamespace(
+                events=types.SimpleNamespace(
+                    visible=types.SimpleNamespace(connect=lambda *args, **kwargs: None)
+                )
+            )
+
+    args = types.SimpleNamespace(
+        shape_opacity=0.95,
+        hide_shapes=False,
+        label_interpolation="linear",
+    )
+    ctrl = V.ComparisonViewerController(FakeViewer(), {}, args)
+    ctrl._apply_label_zoom_interpolation = lambda *args, **kwargs: None
+
+    added = ctrl._finish_label_layer(
+        "MERSCOPE",
+        "MOSAIK_cellpose_labels",
+        {
+            "outline_data": [np.zeros((4, 4), dtype=np.uint8)],
+            "napari_affine": np.eye(3),
+            "n_levels": 1,
+            "display_label_key": "cached_outline",
+            "base_shape": (4, 4),
+            "base_dtype": np.dtype("uint8"),
+            "outline_width": 1,
+        },
+    )
+
+    assert added == 1
+    assert captured["cache"] is False
