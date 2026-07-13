@@ -8,6 +8,8 @@ import types
 
 import numpy as np
 import pandas as pd
+import anndata as ad
+import zarr
 
 from napari_compare_xenium_merscope.utils import (
     COARSE_CELL_TYPE_HUES,
@@ -127,6 +129,20 @@ def test_load_reference_returns_none_without_metadata():
     fake_sdata = types.SimpleNamespace(tables={"table": fake_table})
     assert load_cell_type_marker_reference(fake_sdata) is None
     assert load_cell_type_marker_reference(None) is None
+
+
+def test_load_reference_from_zarr_path_reads_anndata_table_directly(tmp_path):
+    path = tmp_path / "spatialdata.zarr"
+    marker_path = path / "tables" / "cell_type_marker_reference"
+    zarr.open_group(path, mode="w", zarr_format=2).create_group("tables")
+    table = ad.AnnData(X=np.zeros((1, 1)), var=pd.DataFrame(index=["SLC17A7"]))
+    table.uns["cell_type_marker_reference"] = {"genes": REF}
+    table.write_zarr(marker_path)
+
+    ref = load_cell_type_marker_reference(path)
+
+    assert ref is not None
+    assert ref["SLC17A7"] == {"broad": "Neuron", "fine": "L2/3 IT"}
 
 
 def test_build_store_groups_points_by_cell_type_symbol():

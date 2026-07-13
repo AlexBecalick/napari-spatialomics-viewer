@@ -1969,11 +1969,33 @@ def _resolve_marker_table(source: Any):
     """Return the AnnData table carrying the marker reference, or ``None``."""
     if source is None:
         return None
-    # A path/str to a zarr store: read only the (small) tables selection.
+    # Read AnnData tables directly instead of constructing a partial SpatialData
+    # object.  ``SpatialData.read_zarr(..., selection=("tables",))`` validates
+    # every table against its annotated region; because shapes/labels were
+    # intentionally omitted by that selection it emits misleading "region is
+    # not present" warnings for otherwise valid stores.  Direct reads also let
+    # us stop as soon as the small dedicated marker-reference table is found.
     if isinstance(source, (str, Path)):
-        import spatialdata as _sd
+        import anndata as ad
 
-        source = _sd.read_zarr(str(source), selection=("tables",))
+        path = Path(source)
+        root = open_zarr_group_unconsolidated(path)
+        if "tables" not in root:
+            return None
+        table_keys = list(root["tables"].group_keys())
+        preferred = [CELL_TYPE_MARKER_UNS_KEY, "table"]
+        ordered_keys = list(dict.fromkeys([*preferred, *table_keys]))
+        for key in ordered_keys:
+            if key not in table_keys:
+                continue
+            table = ad.read_zarr(str(path / "tables" / key))
+            uns = getattr(table, "uns", {})
+            var = getattr(table, "var", None)
+            has_uns = isinstance(uns, Mapping) and CELL_TYPE_MARKER_UNS_KEY in uns
+            has_var = var is not None and CELL_TYPE_BROAD_COL in getattr(var, "columns", [])
+            if has_uns or has_var:
+                return table
+        return None
     tables = getattr(source, "tables", None)
     if tables is not None:  # a SpatialData object
         for key in ("table", *tables.keys()):
@@ -2301,15 +2323,26 @@ def rasterize_geometries_chunk(
 
     out = np.zeros(tuple(int(v) for v in shape), dtype=dtype)
     inv = np.asarray(inv_affine, dtype=float)
+    if inv.shape != (3, 3) or not np.isfinite(inv).all():
+        raise ValueError("inv_affine must be a finite 3x3 matrix.")
 
     def draw_ring(coords, value):
         coords = np.asarray(coords, dtype=float)
-        if coords.shape[0] < 3:
+        if coords.ndim != 2 or coords.shape[0] < 3 or coords.shape[1] < 2:
             return
-        xy1 = np.column_stack([coords[:, 1], coords[:, 0], np.ones(coords.shape[0])])
-        rc = xy1 @ inv.T
-        rows = rc[:, 0] - float(y0)
-        cols = rc[:, 1] - float(x0)
+        if not np.isfinite(coords[:, :2]).all():
+            return
+        # Spell out the affine transform instead of dispatching thousands of
+        # tiny (N, 3) @ (3, 3) operations to BLAS.  Accelerate-backed NumPy on
+        # Apple Silicon can leak spurious divide/overflow floating-point status
+        # from these tiny matmuls even when every operand and result is finite.
+        # Label rasterisation only needs the first two affine output rows.
+        xs = coords[:, 0]
+        ys = coords[:, 1]
+        rows = ys * inv[0, 0] + xs * inv[0, 1] + inv[0, 2] - float(y0)
+        cols = ys * inv[1, 0] + xs * inv[1, 1] + inv[1, 2] - float(x0)
+        if not np.isfinite(rows).all() or not np.isfinite(cols).all():
+            return
         rr, cc = draw_polygon(rows, cols, shape=out.shape)
         if rr.size:
             out[rr, cc] = value

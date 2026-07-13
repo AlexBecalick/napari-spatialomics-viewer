@@ -13,6 +13,7 @@ authors = [
   { name = "Napari Compare contributors" }
 ]
 dependencies = [
+  "anndata",
   "dask[dataframe]",
   "geopandas",
   "napari[pyqt5]>=0.7.0",
