@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from importlib.metadata import version
 from pathlib import Path
 
 from PyInstaller.utils.hooks import collect_all, collect_data_files, copy_metadata
@@ -12,6 +13,9 @@ SPEC_DIR = Path(SPEC).resolve().parent
 PROJECT_ROOT = SPEC_DIR.parent.parent
 PACKAGE_ROOT = PROJECT_ROOT / "src"
 APP_NAME = "NapariCompareXeniumMERSCOPE"
+APP_DISPLAY_NAME = "Napari Compare Xenium MERSCOPE"
+APP_VERSION = version("napari-compare-xenium-merscope")
+ASSET_ROOT = PACKAGE_ROOT / "napari_compare_xenium_merscope" / "assets"
 
 datas = []
 binaries = []
@@ -90,9 +94,9 @@ exe = EXE(
     disable_windowed_traceback=False,
     argv_emulation=False,
     icon=(
-        str(PACKAGE_ROOT / "napari_compare_xenium_merscope" / "assets" / "app_icon.ico")
+        str(ASSET_ROOT / "app_icon.ico")
         if sys.platform == "win32"
-        else None
+        else str(ASSET_ROOT / "app_icon.icns") if sys.platform == "darwin" else None
     ),
 )
 
@@ -104,3 +108,20 @@ bundle = COLLECT(
     upx=False,
     name=APP_NAME,
 )
+
+if sys.platform == "darwin":
+    app = BUNDLE(
+        bundle,
+        name=f"{APP_DISPLAY_NAME}.app",
+        icon=str(ASSET_ROOT / "app_icon.icns"),
+        bundle_identifier="org.napari.compare-xenium-merscope",
+        version=APP_VERSION,
+        info_plist={
+            "CFBundleDisplayName": APP_DISPLAY_NAME,
+            "CFBundleName": APP_DISPLAY_NAME,
+            "CFBundleShortVersionString": APP_VERSION,
+            "CFBundleVersion": APP_VERSION,
+            "LSMinimumSystemVersion": "13.0",
+            "NSHighResolutionCapable": True,
+        },
+    )
