@@ -1,0 +1,11 @@
+Package: napari-compare-xenium-merscope
+Version: @VERSION@
+Section: science
+Priority: optional
+Architecture: @ARCHITECTURE@
+Installed-Size: @INSTALLED_SIZE@
+Maintainer: Napari Compare contributors
+Depends: libc6, libgl1, libxkbcommon-x11-0, libxcb-cursor0, libxcb-xinerama0
+Description: Interactive Xenium and MERSCOPE SpatialData viewer
+ A self-contained napari application for inspecting spatial transcriptomics
+ images, segmentations, transcripts, statistics, and annotations.

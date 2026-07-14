@@ -6,3 +6,6 @@ __pycache__/
 .ruff_cache/
 .venv/
 .DS_Store
+artifacts/
+build/
+dist/
