@@ -131,6 +131,8 @@ from .utils import (
     CORTICAL_DEPTH_PIECE_ID_PROPERTY,
     CORTICAL_DEPTH_ROLE_ORDER,
     CORTICAL_DEPTH_ROLE_SPECS,
+    OBJECT_ID_PROPERTY,
+    ObjectAnnotationShapeInput,
     GeneVisual,
     CellTranscriptIndex,
     CorticalDepthShapeInput,
@@ -147,6 +149,7 @@ from .utils import (
     affine_matrix_from_px_to_um,
     build_binned_label_color_dict,
     build_cortical_depth_annotation_geojson,
+    build_object_annotation_geojson,
     build_gene_point_groups,
     build_napari_affine_from_px_to_um,
     cellpose_quantification_features,
@@ -168,12 +171,14 @@ from .utils import (
     matching_layer_names,
     pixel_window_global_bounds,
     query_geometries_for_bounds,
+    read_object_annotation_geojson,
     rasterize_geometries_chunk,
     resolve_dataset_mask_affine,
     resolve_gene_column,
     snap_cortical_depth_boundaries_to_edge,
     write_cortical_depth_annotation_geojson,
     write_cortical_depth_separate_geojsons,
+    write_object_annotation_geojson,
 )
 
 logging.basicConfig(
@@ -298,6 +303,9 @@ CORTICAL_DEPTH_FILL_COLORS = {
     "ribbon": [0.0, 0.8, 0.5, 0.12],
 }
 CORTICAL_DEPTH_PIECE_ROLES = ("pia", "wm", "exclusion", "ribbon")
+DISTANCE_OBJECT_LAYER_TYPE = "distance_object"
+DISTANCE_OBJECT_EDGE_COLOR = "#ff4fd8"
+DISTANCE_OBJECT_FILL_COLOR = "#ff4fd833"
 
 # -- Cell inspector (click a segmentation mask to summarise its cell) --------
 CELL_INSPECTOR_BOUNDARY_LAYER = "Cell inspector | selected boundary"
@@ -810,6 +818,10 @@ class ViewerControlPanel(QWidget):
         validate_annotation_callback,
         export_annotation_callback,
         export_separate_annotations_callback,
+        create_object_annotation_callback,
+        validate_object_annotations_callback,
+        export_object_annotations_callback,
+        load_object_annotations_callback,
         load_paired_callback,
         load_standalone_callback,
         initial_dataset: str | None = None,
@@ -835,6 +847,10 @@ class ViewerControlPanel(QWidget):
         self._validate_annotation_callback = validate_annotation_callback
         self._export_annotation_callback = export_annotation_callback
         self._export_separate_annotations_callback = export_separate_annotations_callback
+        self._create_object_annotation_callback = create_object_annotation_callback
+        self._validate_object_annotations_callback = validate_object_annotations_callback
+        self._export_object_annotations_callback = export_object_annotations_callback
+        self._load_object_annotations_callback = load_object_annotations_callback
 
         self._active_stages: dict[str, str] = {}
         self._loaded_shape_keys: set[str] = set()
@@ -913,6 +929,26 @@ class ViewerControlPanel(QWidget):
         self._export_annotations_button.clicked.connect(self._on_export_annotations)
         self._export_separate_annotations_button = QPushButton("Export Separate GeoJSONs")
         self._export_separate_annotations_button.clicked.connect(self._on_export_separate_annotations)
+        self._object_name_input = QLineEdit()
+        self._object_name_input.setPlaceholderText("e.g. Amyloid plaques")
+        self._create_object_annotations_button = QPushButton("Create Named Object Layer")
+        self._create_object_annotations_button.clicked.connect(
+            self._on_create_object_annotations
+        )
+        self._validate_object_annotations_button = QPushButton(
+            "Validate Object Annotations"
+        )
+        self._validate_object_annotations_button.clicked.connect(
+            self._on_validate_object_annotations
+        )
+        self._export_object_annotations_button = QPushButton("Export Object GeoJSON")
+        self._export_object_annotations_button.clicked.connect(
+            self._on_export_object_annotations
+        )
+        self._load_object_annotations_button = QPushButton("Load Object GeoJSON")
+        self._load_object_annotations_button.clicked.connect(
+            self._on_load_object_annotations
+        )
 
         # -- Progress + status (shared, below the tabs) ---------------------
         self._progress_bar = QProgressBar()
@@ -1059,6 +1095,14 @@ class ViewerControlPanel(QWidget):
         layout.addWidget(self._validate_annotations_button)
         layout.addWidget(self._export_annotations_button)
         layout.addWidget(self._export_separate_annotations_button)
+        layout.addSpacing(12)
+        layout.addWidget(QLabel("Distance-from-object Annotations"))
+        layout.addWidget(QLabel("Object Set Name"))
+        layout.addWidget(self._object_name_input)
+        layout.addWidget(self._create_object_annotations_button)
+        layout.addWidget(self._validate_object_annotations_button)
+        layout.addWidget(self._export_object_annotations_button)
+        layout.addWidget(self._load_object_annotations_button)
         layout.addStretch(1)
         return self._scrollable(layout)
 
@@ -1440,6 +1484,101 @@ class ViewerControlPanel(QWidget):
             text += "\n\nWarnings:\n" + "\n".join(f"- {message}" for message in warnings_)
             QMessageBox.information(self, title, text)
             return
+        QMessageBox.information(self, title, text)
+
+    def _on_create_object_annotations(self):
+        object_name = self._object_name_input.text().strip()
+        if not object_name:
+            QMessageBox.warning(
+                self,
+                "Create Named Object Layer",
+                "Enter an object set name, such as 'Amyloid plaques'.",
+            )
+            return
+        try:
+            self._create_object_annotation_callback(
+                self.current_dataset,
+                object_name,
+            )
+        except Exception as exc:
+            self.set_status(f"Object-layer creation failed: {exc}")
+            QMessageBox.warning(self, "Create Named Object Layer", str(exc))
+
+    def _on_validate_object_annotations(self):
+        try:
+            result = self._validate_object_annotations_callback(self.current_dataset)
+        except Exception as exc:
+            self.set_status(f"Object annotation validation failed: {exc}")
+            QMessageBox.warning(self, "Validate Object Annotations", str(exc))
+            return
+        self._show_object_annotation_result("Validate Object Annotations", result)
+
+    def _on_export_object_annotations(self):
+        default_name = (
+            f"{self.current_dataset.lower()}_distance_object_annotations.geojson"
+        )
+        path, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "Export Object Annotations",
+            default_name,
+            "GeoJSON (*.geojson *.json);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            result = self._export_object_annotations_callback(
+                self.current_dataset,
+                Path(path),
+            )
+        except Exception as exc:
+            self.set_status(f"Object annotation export failed: {exc}")
+            QMessageBox.warning(self, "Export Object GeoJSON", str(exc))
+            return
+        self._show_object_annotation_result(
+            "Export Object GeoJSON",
+            result,
+            export_path=Path(path),
+        )
+
+    def _on_load_object_annotations(self):
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Load Object Annotations",
+            "",
+            "GeoJSON (*.geojson *.json);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            self._load_object_annotations_callback(
+                self.current_dataset,
+                Path(path),
+            )
+        except Exception as exc:
+            self.set_status(f"Object annotation load failed: {exc}")
+            QMessageBox.warning(self, "Load Object GeoJSON", str(exc))
+
+    def _show_object_annotation_result(
+        self,
+        title: str,
+        result,
+        export_path: Path | None = None,
+    ):
+        errors = list(getattr(result, "errors", ()))
+        warnings_ = list(getattr(result, "warnings", ()))
+        if errors:
+            text = "Object annotations are invalid:\n\n" + "\n".join(
+                f"- {message}" for message in errors
+            )
+            QMessageBox.warning(self, title, text)
+            return
+        text = "Object annotations are valid."
+        if export_path is not None:
+            text = f"Exported:\n{export_path}"
+        if warnings_:
+            text += "\n\nWarnings:\n" + "\n".join(
+                f"- {message}" for message in warnings_
+            )
         QMessageBox.information(self, title, text)
 
 
@@ -2980,6 +3119,196 @@ class ComparisonViewerController:
             f"{ds} snapped {len(snapped['pia']) + len(snapped['wm'])} pial/WM boundary line(s) to the tissue edge."
         )
         return True
+
+    def _distance_object_layer_name(self, ds: str, object_type: str) -> str:
+        return make_layer_name(ds, DISTANCE_OBJECT_LAYER_TYPE, object_type)
+
+    def _find_distance_object_annotation_layers(self, ds: str) -> list:
+        ds = str(ds).upper()
+        layers = []
+        for layer in self.viewer.layers:
+            metadata = getattr(layer, "metadata", {}) or {}
+            if metadata.get("distance_object_dataset") == ds and metadata.get(
+                "distance_object_type"
+            ):
+                layers.append(layer)
+        return layers
+
+    def _find_distance_object_annotation_layer(self, ds: str, object_type: str):
+        ds = str(ds).upper()
+        object_type = str(object_type).strip()
+        for layer in self._find_distance_object_annotation_layers(ds):
+            metadata = getattr(layer, "metadata", {}) or {}
+            if str(metadata.get("distance_object_type")) == object_type:
+                return layer
+        return self._get_layer_by_name(
+            self._distance_object_layer_name(ds, object_type)
+        )
+
+    def _ensure_distance_object_annotation_layer(
+        self,
+        ds: str,
+        object_type: str,
+    ):
+        ds = str(ds).upper()
+        object_type = str(object_type).strip()
+        if not object_type:
+            raise ValueError("Object set name must not be blank.")
+        layer = self._find_distance_object_annotation_layer(ds, object_type)
+        if layer is None:
+            layer = self.viewer.add_shapes(
+                data=[],
+                ndim=2,
+                shape_type="polygon",
+                name=self._distance_object_layer_name(ds, object_type),
+                edge_color=DISTANCE_OBJECT_EDGE_COLOR,
+                face_color=DISTANCE_OBJECT_FILL_COLOR,
+                edge_width=max(1.5, float(self.args.shape_edge_width) * 2.0),
+                visible=True,
+                features={OBJECT_ID_PROPERTY: []},
+                feature_defaults={OBJECT_ID_PROPERTY: [""]},
+            )
+        metadata = getattr(layer, "metadata", None)
+        if metadata is None:
+            metadata = {}
+            layer.metadata = metadata
+        metadata["distance_object_dataset"] = ds
+        metadata["distance_object_type"] = object_type
+        metadata["distance_object_role"] = "analysis_object"
+        return layer
+
+    def create_distance_object_annotation_layer(
+        self,
+        dataset_name: str,
+        object_type: str,
+    ):
+        """Create or activate a named polygon layer for distance analysis."""
+        if not self._ensure_dataset_is_active(dataset_name):
+            raise RuntimeError(f"Could not activate dataset {dataset_name}.")
+        layer = self._ensure_distance_object_annotation_layer(
+            self.active_dataset,
+            object_type,
+        )
+        try:
+            self.viewer.layers.selection.active = layer
+            layer.mode = "add_polygon"
+        except Exception:
+            pass
+        self._set_status(
+            f"{self.active_dataset} object layer {str(object_type).strip()!r} ready."
+        )
+        return layer
+
+    def _distance_object_layer_shape_inputs(
+        self,
+        layer,
+    ) -> list[ObjectAnnotationShapeInput]:
+        shapes = self._annotation_layer_shapes(layer)
+        object_ids: list[str | None] = [None] * len(shapes)
+        try:
+            features = getattr(layer, "features", None)
+            if features is not None and OBJECT_ID_PROPERTY in features:
+                values = list(features[OBJECT_ID_PROPERTY])
+                for index, value in enumerate(values[: len(shapes)]):
+                    object_ids[index] = str(value).strip() or None
+        except Exception:
+            pass
+        return [
+            ObjectAnnotationShapeInput(data=shape, object_id=object_ids[index])
+            for index, shape in enumerate(shapes)
+        ]
+
+    def _collect_distance_object_annotations(
+        self,
+        ds: str,
+    ) -> dict[str, list[ObjectAnnotationShapeInput]]:
+        objects: dict[str, list[ObjectAnnotationShapeInput]] = {}
+        for layer in self._find_distance_object_annotation_layers(ds):
+            metadata = getattr(layer, "metadata", {}) or {}
+            object_type = str(metadata.get("distance_object_type") or "").strip()
+            if object_type:
+                objects.setdefault(object_type, []).extend(
+                    self._distance_object_layer_shape_inputs(layer)
+                )
+        return objects
+
+    def validate_distance_object_annotations(self, dataset_name: str):
+        """Validate every named object polygon layer for one dataset."""
+        if not self._ensure_dataset_is_active(dataset_name):
+            result = build_object_annotation_geojson(
+                {}, dataset=str(dataset_name).upper()
+            )
+            self._set_status(f"Could not activate dataset {dataset_name}.")
+            return result
+        ds = self.active_dataset
+        result = build_object_annotation_geojson(
+            self._collect_distance_object_annotations(ds),
+            dataset=ds,
+        )
+        feature_count = len(result.geojson.get("features", []))
+        if result.ok:
+            self._set_status(
+                f"{ds} object annotations valid: features={feature_count}, "
+                f"warnings={len(result.warnings)}."
+            )
+        else:
+            self._set_status(
+                f"{ds} object annotations invalid: errors={len(result.errors)}."
+            )
+        return result
+
+    def export_distance_object_annotations(
+        self,
+        dataset_name: str,
+        path: Path,
+    ):
+        """Validate and write all named object layers to one GeoJSON file."""
+        result = self.validate_distance_object_annotations(dataset_name)
+        if not result.ok:
+            return result
+        write_object_annotation_geojson(path, result)
+        self._set_status(
+            f"{str(dataset_name).upper()} exported "
+            f"{len(result.geojson.get('features', []))} object polygons to {path}."
+        )
+        return result
+
+    def load_distance_object_annotations(
+        self,
+        dataset_name: str,
+        path: Path,
+    ) -> int:
+        """Load or replace named object layers from an existing GeoJSON file."""
+        if not self._ensure_dataset_is_active(dataset_name):
+            raise RuntimeError(f"Could not activate dataset {dataset_name}.")
+        objects = read_object_annotation_geojson(path)
+        loaded = 0
+        active_layer = None
+        for object_type, shape_inputs in objects.items():
+            layer = self._ensure_distance_object_annotation_layer(
+                self.active_dataset,
+                object_type,
+            )
+            layer.data = [shape_input.data for shape_input in shape_inputs]
+            layer.features = pd.DataFrame(
+                {
+                    OBJECT_ID_PROPERTY: [
+                        shape_input.object_id or "" for shape_input in shape_inputs
+                    ]
+                }
+            )
+            loaded += len(shape_inputs)
+            active_layer = layer
+        try:
+            if active_layer is not None:
+                self.viewer.layers.selection.active = active_layer
+                active_layer.mode = "select"
+        except Exception:
+            pass
+        self._set_status(
+            f"{self.active_dataset} loaded {loaded} object polygons from {path}."
+        )
+        return loaded
 
     def _ensure_dataset_is_active(self, dataset_name: str) -> bool:
         ds = str(dataset_name).upper()
@@ -6146,6 +6475,10 @@ def run_package_smoke_test_without_opengl() -> None:
         validate_annotation_callback=callback,
         export_annotation_callback=callback,
         export_separate_annotations_callback=callback,
+        create_object_annotation_callback=callback,
+        validate_object_annotations_callback=callback,
+        export_object_annotations_callback=callback,
+        load_object_annotations_callback=callback,
         load_paired_callback=callback,
         load_standalone_callback=callback,
         initial_dataset=None,
@@ -6248,6 +6581,10 @@ def main():
         validate_annotation_callback=controller.validate_cortical_depth_annotations,
         export_annotation_callback=controller.export_cortical_depth_annotations,
         export_separate_annotations_callback=controller.export_separate_cortical_depth_annotations,
+        create_object_annotation_callback=controller.create_distance_object_annotation_layer,
+        validate_object_annotations_callback=controller.validate_distance_object_annotations,
+        export_object_annotations_callback=controller.export_distance_object_annotations,
+        load_object_annotations_callback=controller.load_distance_object_annotations,
         load_paired_callback=controller.load_paired_dataset,
         load_standalone_callback=controller.load_standalone_dataset,
         initial_dataset=initial_dataset,

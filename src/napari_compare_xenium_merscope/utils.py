@@ -15,7 +15,7 @@ from typing import Any, Iterable, Mapping
 import numpy as np
 import pandas as pd
 import zarr
-from shapely.geometry import GeometryCollection, LineString, MultiLineString, MultiPolygon, Point, Polygon, box, mapping
+from shapely.geometry import GeometryCollection, LineString, MultiLineString, MultiPolygon, Point, Polygon, box, mapping, shape
 from shapely.ops import linemerge, polygonize, unary_union
 
 try:
@@ -111,6 +111,34 @@ class CorticalDepthShapeInput:
 
     data: np.ndarray
     tissue_piece_id: str | None = None
+
+
+OBJECT_ANNOTATION_SCHEMA = "merxen.distance_from_object/v1"
+OBJECT_ANNOTATION_ROLE = "analysis_object"
+OBJECT_ID_PROPERTY = "object_id"
+OBJECT_TYPE_PROPERTY = "object_type"
+
+
+@dataclass(frozen=True)
+class ObjectAnnotationExport:
+    """Generic polygon-object GeoJSON payload plus validation messages."""
+
+    geojson: dict[str, Any]
+    errors: tuple[str, ...]
+    warnings: tuple[str, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        """Return whether the object annotations passed validation."""
+        return len(self.errors) == 0
+
+
+@dataclass(frozen=True)
+class ObjectAnnotationShapeInput:
+    """One napari polygon and its optional persistent object identifier."""
+
+    data: np.ndarray
+    object_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -702,6 +730,218 @@ def write_cortical_depth_separate_geojsons(
         path.write_text(json.dumps(_jsonable(payload), indent=2) + "\n")
         written[role] = path
     return written
+
+
+def build_object_annotation_geojson(
+    objects_by_type: Mapping[str, Iterable[Any]],
+    *,
+    dataset: str | None = None,
+) -> ObjectAnnotationExport:
+    """Build a validated GeoJSON file for named polygon object sets.
+
+    Args:
+        objects_by_type: Mapping from a user-provided object type/name to napari
+            polygon arrays. Arrays use napari ``(y, x)`` coordinate order.
+        dataset: Optional dataset label stored on every feature.
+
+    Returns:
+        Validated object annotation payload. Each polygon is emitted as an
+        independent feature with a persistent or generated ``object_id``.
+    """
+    errors: list[str] = []
+    warnings_out: list[str] = []
+    features: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
+    for raw_object_type, raw_shapes in objects_by_type.items():
+        object_type = str(raw_object_type).strip()
+        if not object_type:
+            errors.append("Object annotation names must not be blank.")
+            continue
+        shapes = _coerce_object_annotation_shape_inputs(
+            [] if raw_shapes is None else list(raw_shapes)
+        )
+        if not shapes:
+            warnings_out.append(f"Object set {object_type!r} contains no polygons.")
+            continue
+        safe_type = _safe_object_identifier(object_type)
+        for index, shape_input in enumerate(shapes, start=1):
+            polygon = _napari_shape_to_polygon(
+                shape_input.data,
+                label=f"{object_type} polygon {index}",
+                errors=errors,
+            )
+            if polygon is None:
+                continue
+            object_id = str(shape_input.object_id or "").strip()
+            if not object_id:
+                generated_index = index
+                object_id = f"{safe_type}_{generated_index:04d}"
+                while object_id in seen_ids:
+                    generated_index += 1
+                    object_id = f"{safe_type}_{generated_index:04d}"
+            if object_id in seen_ids:
+                errors.append(f"Duplicate object_id {object_id!r}.")
+                continue
+            seen_ids.add(object_id)
+            properties: dict[str, Any] = {
+                "role": OBJECT_ANNOTATION_ROLE,
+                "annotation_role": "object",
+                OBJECT_ID_PROPERTY: object_id,
+                OBJECT_TYPE_PROPERTY: object_type,
+                "name": object_type,
+            }
+            if dataset:
+                properties["dataset"] = str(dataset)
+            features.append(
+                {
+                    "type": "Feature",
+                    "properties": properties,
+                    "geometry": mapping(polygon),
+                }
+            )
+
+    if not features:
+        errors.append("Draw at least one object polygon before exporting.")
+    payload = {
+        "type": "FeatureCollection",
+        "object_annotation_schema": OBJECT_ANNOTATION_SCHEMA,
+        "features": features,
+    }
+    return ObjectAnnotationExport(
+        geojson=_jsonable(payload),
+        errors=tuple(dict.fromkeys(errors)),
+        warnings=tuple(dict.fromkeys(warnings_out)),
+    )
+
+
+def write_object_annotation_geojson(
+    path: str | Path,
+    export: ObjectAnnotationExport,
+) -> None:
+    """Write validated polygon object annotations to GeoJSON."""
+    if not export.ok:
+        joined = "\n".join(export.errors)
+        raise ValueError(f"Object annotations are invalid:\n{joined}")
+    Path(path).write_text(json.dumps(_jsonable(export.geojson), indent=2) + "\n")
+
+
+def read_object_annotation_geojson(
+    path: str | Path,
+) -> dict[str, list[ObjectAnnotationShapeInput]]:
+    """Read object GeoJSON into named napari ``(y, x)`` polygon inputs.
+
+    Args:
+        path: Object annotation GeoJSON written by this viewer or another tool
+            using the MerXen object properties.
+
+    Returns:
+        Mapping of object type/name to polygon shapes and persistent IDs.
+
+    Raises:
+        ValueError: If features are not polygonal, IDs are duplicated, or a
+            polygon contains holes that napari Shapes cannot faithfully reload.
+    """
+    data = json.loads(Path(path).read_text())
+    if data.get("type") == "FeatureCollection":
+        features = data.get("features", [])
+    elif data.get("type") == "Feature":
+        features = [data]
+    else:
+        features = [{"type": "Feature", "properties": {}, "geometry": data}]
+
+    objects: dict[str, list[ObjectAnnotationShapeInput]] = {}
+    seen_ids: set[str] = set()
+    counters: dict[str, int] = {}
+    for feature_index, feature in enumerate(features, start=1):
+        properties = feature.get("properties") or {}
+        geometry = feature.get("geometry")
+        if geometry is None:
+            continue
+        geom = shape(geometry)
+        if isinstance(geom, Polygon):
+            polygons = [geom]
+        elif isinstance(geom, MultiPolygon):
+            polygons = list(geom.geoms)
+        else:
+            raise ValueError(
+                f"Object feature {feature_index} must be a Polygon or MultiPolygon."
+            )
+        object_type = str(
+            properties.get(OBJECT_TYPE_PROPERTY)
+            or properties.get("name")
+            or "objects"
+        ).strip()
+        if not object_type:
+            raise ValueError(f"Object feature {feature_index} has a blank object type.")
+        base_id = str(properties.get(OBJECT_ID_PROPERTY) or "").strip()
+        for polygon_index, polygon in enumerate(polygons, start=1):
+            if polygon.is_empty or polygon.area <= 0 or not polygon.is_valid:
+                raise ValueError(f"Object feature {feature_index} has invalid geometry.")
+            if polygon.interiors:
+                raise ValueError(
+                    f"Object feature {feature_index} contains polygon holes, which "
+                    "cannot be reloaded faithfully into a napari Shapes layer."
+                )
+            counters[object_type] = counters.get(object_type, 0) + 1
+            object_id = base_id
+            if len(polygons) > 1 and object_id:
+                object_id = f"{object_id}_{polygon_index}"
+            if not object_id:
+                object_id = (
+                    f"{_safe_object_identifier(object_type)}_"
+                    f"{counters[object_type]:04d}"
+                )
+            if object_id in seen_ids:
+                raise ValueError(f"Duplicate object_id {object_id!r} in {path}.")
+            seen_ids.add(object_id)
+            xy = np.asarray(polygon.exterior.coords[:-1], dtype=float)
+            objects.setdefault(object_type, []).append(
+                ObjectAnnotationShapeInput(
+                    data=xy[:, [1, 0]].astype(np.float32, copy=False),
+                    object_id=object_id,
+                )
+            )
+    if not objects:
+        raise ValueError(f"No polygon object annotations found in {path}.")
+    return objects
+
+
+def _coerce_object_annotation_shape_inputs(
+    shapes: Iterable[Any],
+) -> list[ObjectAnnotationShapeInput]:
+    out: list[ObjectAnnotationShapeInput] = []
+    for shape_input in shapes:
+        if isinstance(shape_input, ObjectAnnotationShapeInput):
+            out.append(shape_input)
+            continue
+        if isinstance(shape_input, Mapping):
+            data = shape_input.get("data")
+            if data is None:
+                data = shape_input.get("shape")
+            out.append(
+                ObjectAnnotationShapeInput(
+                    data=np.asarray(data, dtype=float),
+                    object_id=str(shape_input.get(OBJECT_ID_PROPERTY) or "").strip()
+                    or None,
+                )
+            )
+            continue
+        if isinstance(shape_input, tuple) and len(shape_input) == 2:
+            out.append(
+                ObjectAnnotationShapeInput(
+                    data=np.asarray(shape_input[0], dtype=float),
+                    object_id=str(shape_input[1] or "").strip() or None,
+                )
+            )
+            continue
+        out.append(ObjectAnnotationShapeInput(data=np.asarray(shape_input, dtype=float)))
+    return out
+
+
+def _safe_object_identifier(value: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("_").lower()
+    return safe or "object"
 
 
 def snap_cortical_depth_boundaries_to_edge(
