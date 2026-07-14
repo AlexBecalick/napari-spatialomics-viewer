@@ -1,0 +1,75 @@
+name: Package desktop applications
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-installer:
+    name: Windows installer
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: packaging/requirements-build.txt
+      - name: Install build environment
+        run: python -m pip install -r packaging/requirements-build.txt
+      - name: Run tests
+        run: python -m pytest -q
+      - name: Ensure Inno Setup is available
+        shell: pwsh
+        run: |
+          $compiler = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $compiler)) { choco install innosetup --no-progress -y }
+      - name: Build application and installer
+        shell: pwsh
+        run: ./packaging/windows/build_windows.ps1
+      - name: Smoke-test frozen application
+        shell: pwsh
+        run: |
+          $process = Start-Process ".\dist\NapariCompareXeniumMERSCOPE\NapariCompareXeniumMERSCOPE.exe" -ArgumentList "--package-smoke-test" -PassThru
+          if (-not $process.WaitForExit(120000)) {
+            $process.Kill()
+            throw "Frozen application smoke test timed out"
+          }
+          if ($process.ExitCode -ne 0) { throw "Frozen application exited with $($process.ExitCode)" }
+      - uses: actions/upload-artifact@v6
+        with:
+          name: windows-installer
+          path: artifacts/*-Setup.exe
+          if-no-files-found: error
+
+  linux-package:
+    name: Linux package
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: packaging/requirements-build.txt
+      - name: Install system libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libgl1 libxkbcommon-x11-0 libxcb-cursor0 libxcb-xinerama0
+      - name: Install build environment
+        run: python -m pip install -r packaging/requirements-build.txt
+      - name: Run tests
+        run: python -m pytest -q
+      - name: Build application and package
+        run: bash packaging/linux/build_linux.sh
+      - name: Smoke-test frozen application
+        run: timeout 120s xvfb-run -a ./dist/NapariCompareXeniumMERSCOPE/NapariCompareXeniumMERSCOPE --package-smoke-test
+      - uses: actions/upload-artifact@v6
+        with:
+          name: linux-deb
+          path: artifacts/*.deb
+          if-no-files-found: error
