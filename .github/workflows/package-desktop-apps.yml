@@ -70,11 +70,17 @@ jobs:
       - name: Smoke-test frozen application
         shell: pwsh
         run: |
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $env:QT_OPENGL = "software"
+          $env:NAPARI_COMPARE_SMOKE_TEST_LOG = Join-Path $PWD "package-smoke-test.log"
           $process = Start-Process ".\dist\NapariCompareXeniumMERSCOPE\NapariCompareXeniumMERSCOPE.exe" -ArgumentList "--package-smoke-test" -PassThru
           if (-not $process.WaitForExit(120000)) {
             $process.Kill()
+            $process.WaitForExit()
+            if (Test-Path $env:NAPARI_COMPARE_SMOKE_TEST_LOG) { Get-Content $env:NAPARI_COMPARE_SMOKE_TEST_LOG }
             throw "Frozen application smoke test timed out"
           }
+          if (Test-Path $env:NAPARI_COMPARE_SMOKE_TEST_LOG) { Get-Content $env:NAPARI_COMPARE_SMOKE_TEST_LOG }
           if ($process.ExitCode -ne 0) { throw "Frozen application exited with $($process.ExitCode)" }
       - uses: actions/upload-artifact@v6
         with:
@@ -96,7 +102,29 @@ jobs:
       - name: Install system libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y xvfb libgl1 libxkbcommon-x11-0 libxcb-cursor0 libxcb-xinerama0
+          sudo apt-get install -y \
+            xvfb \
+            libfontconfig1 \
+            libfreetype6 \
+            libgl1 \
+            libglib2.0-0 \
+            libice6 \
+            libsm6 \
+            libx11-6 \
+            libx11-xcb1 \
+            libxcb1 \
+            libxcb-cursor0 \
+            libxcb-icccm4 \
+            libxcb-image0 \
+            libxcb-keysyms1 \
+            libxcb-render-util0 \
+            libxcb-xinerama0 \
+            libxcb-xkb1 \
+            libxext6 \
+            libxi6 \
+            libxkbcommon0 \
+            libxkbcommon-x11-0 \
+            libxrender1
       - name: Install build environment
         run: python -m pip install -r packaging/requirements-build.txt
       - name: Run tests
