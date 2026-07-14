@@ -275,6 +275,13 @@ The SpatialData stores should contain points for transcripts, images for channel
 For a complete step-by-step workflow, see
 [docs/cortical_depth_annotation_guide.md](docs/cortical_depth_annotation_guide.md).
 
+The same tab also supports named polygon objects for MerXen's
+`distance_from_object` stage. Enter an object name (for example, `Amyloid
+plaques`), create its polygon layer, draw one polygon per object, then validate
+and export a combined object GeoJSON. Existing object GeoJSON can be loaded to
+continue editing while preserving IDs. See
+[docs/distance_object_annotation_guide.md](docs/distance_object_annotation_guide.md).
+
 The **Draw tissue annotations** tab holds the cortical-depth tools. Click
 **Create Drawing Layers** to add one editable napari Shapes layer for each
 MerXen cortical-depth input role. Draw in the same visible coordinate frame as

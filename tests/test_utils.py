@@ -17,6 +17,7 @@ from napari_compare_xenium_merscope.utils import (
     CELLPOSE_LABEL_KEY,
     CELLPOSE_QUANTIFICATION_TABLE_KEY,
     build_cortical_depth_annotation_geojson,
+    build_object_annotation_geojson,
     build_binned_label_color_dict,
     cellpose_quantification_features,
     cellpose_quantification_table_available,
@@ -33,11 +34,13 @@ from napari_compare_xenium_merscope.utils import (
     pixel_window_global_bounds,
     pick_default_shape_key,
     query_geometries_for_bounds,
+    read_object_annotation_geojson,
     rasterize_geometries_chunk,
     resolve_cellpose_quantification_feature,
     snap_cortical_depth_boundaries_to_edge,
     write_cortical_depth_annotation_geojson,
     write_cortical_depth_separate_geojsons,
+    write_object_annotation_geojson,
     _unique_valid_polygons,
 )
 
@@ -424,6 +427,76 @@ def test_cortical_depth_snap_moves_boundary_endpoints_to_edge():
     assert set(snapped) == {"pia", "wm"}
     assert np.allclose(snapped["pia"][0], np.asarray([[5.0, 0.0], [5.0, 100.0]]))
     assert np.allclose(snapped["wm"][0], np.asarray([[40.0, 0.0], [40.0, 100.0]]))
+
+
+def test_object_annotation_geojson_round_trip_preserves_names_ids_and_xy(tmp_path):
+    result = build_object_annotation_geojson(
+        {
+            "Amyloid plaques": [
+                (
+                    np.asarray(
+                        [[200.0, 100.0], [200.0, 120.0], [220.0, 120.0]]
+                    ),
+                    "plaque_a",
+                ),
+                np.asarray(
+                    [[300.0, 400.0], [300.0, 420.0], [320.0, 420.0]]
+                ),
+            ],
+            "Tau tangles": [
+                np.asarray([[10.0, 50.0], [20.0, 60.0], [20.0, 50.0]])
+            ],
+        },
+        dataset="XENIUM",
+    )
+
+    assert result.ok
+    assert len(result.geojson["features"]) == 3
+    first = result.geojson["features"][0]
+    assert first["properties"]["object_type"] == "Amyloid plaques"
+    assert first["properties"]["object_id"] == "plaque_a"
+    assert first["geometry"]["coordinates"][0][0] == [100.0, 200.0]
+
+    path = tmp_path / "objects.geojson"
+    write_object_annotation_geojson(path, result)
+    loaded = read_object_annotation_geojson(path)
+
+    assert set(loaded) == {"Amyloid plaques", "Tau tangles"}
+    assert loaded["Amyloid plaques"][0].object_id == "plaque_a"
+    np.testing.assert_allclose(
+        loaded["Amyloid plaques"][0].data,
+        np.asarray([[200.0, 100.0], [200.0, 120.0], [220.0, 120.0]]),
+    )
+
+
+def test_object_annotation_export_rejects_duplicate_ids():
+    polygon = np.asarray([[0.0, 0.0], [0.0, 10.0], [10.0, 10.0]])
+    result = build_object_annotation_geojson(
+        {"Plaques": [(polygon, "same"), (polygon + 20.0, "same")]}
+    )
+
+    assert not result.ok
+    assert any("Duplicate object_id" in error for error in result.errors)
+
+
+def test_object_annotation_generated_id_avoids_reloaded_id_collision():
+    result = build_object_annotation_geojson(
+        {
+            "Amyloid plaques": [
+                (
+                    np.asarray([[0.0, 0.0], [0.0, 5.0], [5.0, 5.0]]),
+                    "amyloid_plaques_0002",
+                ),
+                np.asarray([[10.0, 10.0], [10.0, 15.0], [15.0, 15.0]]),
+            ]
+        }
+    )
+
+    assert result.ok
+    assert [
+        feature["properties"]["object_id"]
+        for feature in result.geojson["features"]
+    ] == ["amyloid_plaques_0002", "amyloid_plaques_0003"]
 
 
 def test_pixel_window_global_bounds_and_query():
