@@ -6111,6 +6111,7 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--package-smoke-test", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--package-smoke-test-no-opengl", action="store_true", help=argparse.SUPPRESS)
 
     args = parser.parse_args()
     if args.label_chunk_size <= 0:
@@ -6122,8 +6123,46 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def run_package_smoke_test_without_opengl() -> None:
+    """Exercise the frozen Qt control panel on CI hosts without OpenGL."""
+    app = QApplication.instance() or QApplication([])
+    callback = lambda *args, **kwargs: None
+    panel = ViewerControlPanel(
+        datasets=[],
+        gene_inspector_widget=None,
+        load_callback=callback,
+        load_selected_labels_callback=callback,
+        unload_selected_shapes_callback=callback,
+        load_transcripts_callback=callback,
+        unload_transcripts_callback=callback,
+        load_selected_image_callback=callback,
+        load_all_images_callback=callback,
+        unload_selected_image_callback=callback,
+        load_cellpose_values_callback=callback,
+        remove_cellpose_values_callback=callback,
+        create_annotation_layers_callback=callback,
+        set_annotation_piece_callback=callback,
+        apply_annotation_piece_callback=callback,
+        snap_annotation_side_edges_callback=callback,
+        validate_annotation_callback=callback,
+        export_annotation_callback=callback,
+        export_separate_annotations_callback=callback,
+        load_paired_callback=callback,
+        load_standalone_callback=callback,
+        initial_dataset=None,
+    )
+    if panel._tab_stack.currentIndex() != 5:
+        raise RuntimeError("The empty viewer did not select the Dataset loader tab.")
+    panel.close()
+    app.processEvents()
+
+
 def main():
     args = parse_args()
+
+    if args.package_smoke_test_no_opengl:
+        run_package_smoke_test_without_opengl()
+        return
 
     if args.merscope_zarr is not None and not args.merscope_zarr.exists():
         raise FileNotFoundError(f"MERSCOPE zarr path not found: {args.merscope_zarr}")

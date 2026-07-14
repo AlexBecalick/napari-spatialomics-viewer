@@ -68,6 +68,10 @@ def test_empty_startup_selects_dataset_loader(qapp):
     assert not panel._reload_button.isEnabled()
 
 
+def test_no_opengl_package_smoke_test_builds_empty_control_panel(qapp):
+    V.run_package_smoke_test_without_opengl()
+
+
 def test_dataset_startup_keeps_gene_inspector_selected(qapp):
     panel = _panel(["MERSCOPE"], initial_dataset="MERSCOPE")
 

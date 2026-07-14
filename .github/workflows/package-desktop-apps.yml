@@ -67,11 +67,14 @@ jobs:
       - name: Build application and installer
         shell: pwsh
         run: ./packaging/windows/build_windows.ps1
-      - name: Smoke-test frozen application
+      # GitHub's Windows runners do not expose the OpenGL 2.1+ context that
+      # napari/VisPy requires. Exercise the frozen imports and real Qt control
+      # panel here; macOS and Linux retain the full OpenGL viewer smoke test.
+      - name: Smoke-test frozen Qt application
         shell: pwsh
         run: |
           $env:NAPARI_COMPARE_SMOKE_TEST_LOG = Join-Path $PWD "package-smoke-test.log"
-          $process = Start-Process ".\dist\NapariCompareXeniumMERSCOPE\NapariCompareXeniumMERSCOPE.exe" -ArgumentList "--package-smoke-test" -PassThru
+          $process = Start-Process ".\dist\NapariCompareXeniumMERSCOPE\NapariCompareXeniumMERSCOPE.exe" -ArgumentList "--package-smoke-test", "--package-smoke-test-no-opengl" -PassThru
           if (-not $process.WaitForExit(120000)) {
             $process.Kill()
             $process.WaitForExit()
