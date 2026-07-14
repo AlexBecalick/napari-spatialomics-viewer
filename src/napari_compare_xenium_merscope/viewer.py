@@ -6110,6 +6110,7 @@ def parse_args() -> argparse.Namespace:
             "May affect rendering on some setups; leave off if visuals look wrong."
         ),
     )
+    parser.add_argument("--package-smoke-test", action="store_true", help=argparse.SUPPRESS)
 
     args = parser.parse_args()
     if args.label_chunk_size <= 0:
@@ -6224,6 +6225,11 @@ def main():
         controller.load_dataset(initial_dataset, force=True)
     else:
         panel.set_status("No dataset loaded. Choose a dataset from the Dataset loader tab.")
+    if args.package_smoke_test:
+        # Installer CI exercises the fully frozen Qt/napari application, then
+        # exits without requiring human interaction or loading a dataset.
+        viewer.close()
+        return
     napari.run()
 
 

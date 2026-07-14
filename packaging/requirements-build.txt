@@ -1,0 +1,20 @@
+# Reproducible application-build environment. Keep these aligned with the
+# versions exercised by the repository's development environment.
+-e .
+anndata==0.12.17
+dask[dataframe]==2026.1.1
+geopandas==1.0.1
+napari[pyqt5]==0.7.0
+numpy==2.2.5
+ome-zarr==0.15.0
+packaging==25.0
+pandas==2.2.3
+psutil==7.0.0
+PyQt5==5.15.11
+PyInstaller==6.21.0
+pytest==9.1.0
+qtpy==2.4.3
+shapely==2.1.0
+spatialdata==0.7.3
+xarray==2025.3.0
+zarr==3.1.6

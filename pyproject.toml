@@ -44,7 +44,7 @@ napari-compare-xenium-merscope-install-macos-app = "napari_compare_xenium_mersco
 package-dir = { "" = "src" }
 
 [tool.setuptools.package-data]
-napari_compare_xenium_merscope = ["assets/*.icns", "assets/*.png"]
+napari_compare_xenium_merscope = ["assets/*.icns", "assets/*.ico", "assets/*.png"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
