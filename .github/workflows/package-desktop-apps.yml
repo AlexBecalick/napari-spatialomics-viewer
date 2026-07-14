@@ -7,6 +7,43 @@ permissions:
   contents: read
 
 jobs:
+  macos-package:
+    name: macOS ${{ matrix.architecture }} disk image
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            architecture: arm64
+          - runner: macos-15-intel
+            architecture: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: packaging/requirements-build.txt
+      - name: Verify runner architecture
+        run: test "$(uname -m)" = "${{ matrix.architecture }}"
+      - name: Install build environment
+        run: python -m pip install -r packaging/requirements-build.txt
+      - name: Run tests
+        run: python -m pytest -q
+      - name: Build application and disk image
+        run: bash packaging/macos/build_macos.sh
+      - name: Smoke-test frozen application
+        run: >-
+          ./dist/Napari\ Compare\ Xenium\ MERSCOPE.app/Contents/MacOS/NapariCompareXeniumMERSCOPE
+          --package-smoke-test
+      - uses: actions/upload-artifact@v6
+        with:
+          name: macos-${{ matrix.architecture }}-dmg
+          path: artifacts/*-macOS-${{ matrix.architecture }}.dmg
+          if-no-files-found: error
+
   windows-installer:
     name: Windows installer
     runs-on: windows-2025

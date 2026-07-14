@@ -1,4 +1,4 @@
-"""Entry point for self-contained Windows and Linux application bundles."""
+"""Entry point for self-contained macOS, Windows, and Linux applications."""
 
 from __future__ import annotations
 
