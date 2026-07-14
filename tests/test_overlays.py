@@ -111,7 +111,7 @@ def test_install_canvas_overlays_without_canvas_is_safe(qapp):
     assert ctrl._scale_bar is None
 
 
-def test_label_outline_disables_thread_unsafe_global_dask_cache(qapp):
+def test_label_outline_uses_thread_safe_global_dask_cache(qapp):
     captured = {}
 
     class FakeViewer:
@@ -149,4 +149,4 @@ def test_label_outline_disables_thread_unsafe_global_dask_cache(qapp):
     )
 
     assert added == 1
-    assert captured["cache"] is False
+    assert captured["cache"] is True

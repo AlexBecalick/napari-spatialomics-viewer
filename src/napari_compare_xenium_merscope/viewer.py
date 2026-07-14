@@ -121,6 +121,7 @@ try:
 except Exception:  # pragma: no cover - depends on the installed napari runtime
     thread_worker = None
 
+from .dask_cache import install_thread_safe_napari_dask_cache
 from .utils import (
     CELLPOSE_LABEL_KEY,
     CELLPOSE_QUANTIFICATION_TABLE_KEY,
@@ -274,12 +275,10 @@ GENE_STATUS_SYMBOL_GLYPHS = {
 SYNTHETIC_IMAGE_PYRAMID_MIN_SIZE = 4096
 SYNTHETIC_IMAGE_PYRAMID_MAX_LEVELS = 10
 LABEL_CACHE_ATTR = "napari_compare_label_cache"
-# napari's opportunistic Dask Cache instance is shared by every layer. Its
-# callback bookkeeping is not safe when our image and segmentation layers
-# compute concurrently in different Qt worker/render threads. These layers
-# already use persisted Zarr pyramids, so retaining a second in-memory task
-# cache is unnecessary and can trigger dask.cache.Cache._posttask KeyErrors.
-NAPARI_DASK_CACHE_ENABLED = False
+# Raster layers use napari's bounded opportunistic RAM cache. At startup we
+# replace its thread-unsafe callback bookkeeping with ThreadSafeDaskCache so
+# concurrent layers retain hot chunks without Cache._posttask races.
+NAPARI_DASK_CACHE_ENABLED = True
 LABEL_OUTLINE_PYRAMID_MIN_SIZE = 4096
 LABEL_OUTLINE_PYRAMID_MAX_LEVELS = 10
 DERIVED_CACHE_VERSION = 1
@@ -6201,6 +6200,11 @@ def main():
     if getattr(args, "gl_core_profile", False):
         request_gl_core_profile()
 
+    dask_cache = install_thread_safe_napari_dask_cache()
+    log.info(
+        "Installed thread-safe napari Dask cache (budget %.1f GB)",
+        float(dask_cache.cache.available_bytes) / (1024**3),
+    )
     viewer = napari.Viewer(title="Xenium vs MERSCOPE Comparison")
     install_application_icon(viewer)
     log_environment_diagnostics(viewer)
