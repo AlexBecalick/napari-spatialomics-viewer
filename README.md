@@ -47,6 +47,34 @@ loaded and selects the **Dataset loader** tab. Choose a paired MERSCOPE/Xenium
 dataset or a standalone store there. Dataset paths passed explicitly on the
 command line still load immediately.
 
+### Windows and Linux installers
+
+Self-contained application installers are built by the
+`Package desktop applications` GitHub Actions workflow. They include Python,
+napari, Qt, SpatialData, and this viewer, so end users do not need to create a
+conda environment or run `pip install`.
+
+- Windows produces an x86-64 Setup `.exe`. It installs for the current user,
+  adds a Start Menu entry, and optionally creates a desktop shortcut.
+- Linux produces an amd64 `.deb`. It installs the application under `/opt`, a
+  command under `/usr/bin`, and a desktop-menu entry with the project icon.
+
+Run the workflow manually from the repository's **Actions** page to obtain its
+downloadable artifacts. It does not create a GitHub Release or publish the
+installers automatically. Native packages are built and smoke-tested on their
+target operating systems; PyInstaller is not a cross-compiler.
+
+For local package builds, first install the pinned build environment:
+
+```bash
+python -m pip install -r packaging/requirements-build.txt
+```
+
+Then run `packaging/windows/build_windows.ps1` from PowerShell on Windows, or
+`bash packaging/linux/build_linux.sh` on Debian/Ubuntu Linux. Unsigned local or
+CI builds may show the operating system's unknown-publisher warning; public
+releases should be code-signed with project-owned certificates.
+
 ## Then Run
 
 Launch without a dataset to choose one in the viewer:
