@@ -70,8 +70,6 @@ jobs:
       - name: Smoke-test frozen application
         shell: pwsh
         run: |
-          $env:QT_QPA_PLATFORM = "offscreen"
-          $env:QT_OPENGL = "software"
           $env:NAPARI_COMPARE_SMOKE_TEST_LOG = Join-Path $PWD "package-smoke-test.log"
           $process = Start-Process ".\dist\NapariCompareXeniumMERSCOPE\NapariCompareXeniumMERSCOPE.exe" -ArgumentList "--package-smoke-test" -PassThru
           if (-not $process.WaitForExit(120000)) {
@@ -108,6 +106,7 @@ jobs:
             libfreetype6 \
             libgl1 \
             libglib2.0-0 \
+            libdbus-1-3 \
             libice6 \
             libsm6 \
             libx11-6 \
@@ -117,7 +116,13 @@ jobs:
             libxcb-icccm4 \
             libxcb-image0 \
             libxcb-keysyms1 \
+            libxcb-randr0 \
             libxcb-render-util0 \
+            libxcb-render0 \
+            libxcb-shape0 \
+            libxcb-shm0 \
+            libxcb-sync1 \
+            libxcb-xfixes0 \
             libxcb-xinerama0 \
             libxcb-xkb1 \
             libxext6 \
@@ -131,6 +136,18 @@ jobs:
         run: python -m pytest -q
       - name: Build application and package
         run: bash packaging/linux/build_linux.sh
+      - name: Verify frozen Qt libraries
+        run: |
+          plugin="$(find ./dist/NapariCompareXeniumMERSCOPE -name libqxcb.so -print -quit)"
+          if [[ -z "$plugin" ]]; then
+            echo "The frozen application does not contain the Qt xcb platform plugin." >&2
+            exit 1
+          fi
+          ldd "$plugin"
+          if ldd "$plugin" | grep -q "not found"; then
+            echo "The Qt xcb platform plugin has unresolved runtime libraries." >&2
+            exit 1
+          fi
       - name: Smoke-test frozen application
         run: timeout 120s xvfb-run -a ./dist/NapariCompareXeniumMERSCOPE/NapariCompareXeniumMERSCOPE --package-smoke-test
       - uses: actions/upload-artifact@v6
