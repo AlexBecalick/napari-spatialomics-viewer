@@ -286,8 +286,7 @@ The **Draw tissue annotations** tab holds the cortical-depth tools. Click
 **Create Drawing Layers** to add one editable napari Shapes layer for each
 MerXen cortical-depth input role. Draw in the same visible coordinate frame as
 the SpatialData cells/transcripts, then click **Validate Annotations** or
-**Export Combined GeoJSON**. **Export Separate GeoJSONs** writes the same
-validated annotations as one file per role.
+**Export Combined GeoJSON**.
 
 The exporter writes a single GeoJSON `FeatureCollection` with MerXen role
 labels. Napari stores shape vertices as `(y, x)`; export converts them back to

@@ -43,7 +43,6 @@ def _panel(datasets: list[str], initial_dataset: str | None = None):
         snap_annotation_side_edges_callback=callback,
         validate_annotation_callback=callback,
         export_annotation_callback=callback,
-        export_separate_annotations_callback=callback,
         create_object_annotation_callback=callback,
         validate_object_annotations_callback=callback,
         export_object_annotations_callback=callback,
@@ -83,3 +82,13 @@ def test_dataset_startup_keeps_gene_inspector_selected(qapp):
     assert panel.current_dataset == "MERSCOPE"
     assert panel._tab_stack.currentIndex() == 0
     assert panel._reload_button.isEnabled()
+
+
+def test_annotations_tab_only_offers_combined_cortical_depth_export(qapp):
+    from qtpy.QtWidgets import QPushButton
+
+    panel = _panel(["MERSCOPE"], initial_dataset="MERSCOPE")
+    button_labels = {button.text() for button in panel.findChildren(QPushButton)}
+
+    assert "Export Combined GeoJSON" in button_labels
+    assert "Export Separate GeoJSONs" not in button_labels

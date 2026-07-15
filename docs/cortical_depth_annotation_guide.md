@@ -226,7 +226,7 @@ top-level `napari_compare_validation` report with the errors and warnings.
 
 ## Export
 
-Prefer combined export:
+Export the combined MerXen annotation file:
 
 1. Click **Export Combined GeoJSON**.
 2. Choose a filename such as `xenium_cortical_depth_annotations.geojson` or
@@ -235,24 +235,6 @@ Prefer combined export:
    - `xenium_cortical_depth_annotation_geojson`,
    - `merscope_cortical_depth_annotation_geojson`,
    - or generic `cortical_depth_annotation_geojson` for single-platform rows.
-
-Separate-file export is also available:
-
-1. Click **Export Separate GeoJSONs**.
-2. Choose an output directory.
-3. The viewer writes per-role files for pia, WM, side/edge, exclusions, and
-   ribbons when those roles exist.
-4. Add the generated paths to the matching MerXen samplesheet columns, such as:
-   - `xenium_pial_boundary_geojson`,
-   - `xenium_wm_boundary_geojson`,
-   - `xenium_side_boundaries_geojson`,
-   - `xenium_exclusion_masks_geojson`,
-   - `xenium_cortical_ribbon_geojson`.
-
-Use the `merscope_` prefix for MERSCOPE rows. Generic aliases such as
-`pial_boundary_geojson`, `wm_boundary_geojson`, `side_boundaries_geojson`,
-`exclusion_masks_geojson`, and `cortical_ribbon_geojson` are supported for
-single-platform rows.
 
 ## Troubleshooting
 
