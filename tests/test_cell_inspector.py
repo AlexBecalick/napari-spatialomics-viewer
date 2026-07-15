@@ -342,7 +342,7 @@ def test_pick_cell_from_event_uses_proseg_shapes(qapp):
 def test_cell_picking_gated_on_proseg_layer_visibility(qapp):
     ctrl = _controller(qapp)
     seg = _FakeImageLayer(
-        "TEST | labels | MOSAIK_proseg_labels", np.zeros((4, 4)),
+        "Segmentation | Proseg", np.zeros((4, 4)),
         [[0.2, 0, 0], [0, 0.2, 0], [0, 0, 1]],
     )
     ctrl.viewer.layers.append(seg)
@@ -448,7 +448,7 @@ def test_boundary_width_scales_from_loaded_mask_outline(qapp):
     ctrl = _controller(qapp)
     # A loaded label-outline layer at 0.2 µm/pixel; contour width defaults to 1px.
     ctrl.viewer.layers.append(
-        _FakeImageLayer("TEST | labels | proseg", np.zeros((4, 4)), [[0.2, 0, 0], [0, 0.2, 0], [0, 0, 1]])
+        _FakeImageLayer("Segmentation | Proseg", np.zeros((4, 4)), [[0.2, 0, 0], [0, 0.2, 0], [0, 0, 1]])
     )
     width = ctrl._mask_highlight_edge_width()
     assert width == pytest.approx(0.2 * 1 * V.CELL_BOUNDARY_WIDTH_FACTOR)

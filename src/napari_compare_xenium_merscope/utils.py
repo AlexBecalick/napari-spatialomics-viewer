@@ -457,10 +457,35 @@ def pick_default_shape_key(shape_keys: Iterable[str]) -> str | None:
     return keys[0]
 
 
+#: User-facing display names for segmentation + cell-type overlay layers. These
+#: read as "Segmentation | Proseg" / "Cell types | Cellpose" in the napari layer
+#: list and, like "Image"/"Genes", omit the dataset (only one dataset is active
+#: at a time). All name building goes through the helpers below, so the friendly
+#: form stays consistent for find/remove logic.
+_FRIENDLY_LAYER_TYPE_LABELS = {"labels": "Segmentation", "cell_types": "Cell types"}
+
+
+def _pretty_segmentation_key(key: str) -> str:
+    """Shorten a segmentation element key for display (MOSAIK_proseg -> Proseg)."""
+    text = str(key)
+    if text.endswith("_labels"):
+        text = text[: -len("_labels")]
+    if text.startswith("MOSAIK_"):
+        text = text[len("MOSAIK_"):]
+    text = text.replace("_", " ").strip()
+    return text[:1].upper() + text[1:] if text else text
+
+
 def make_layer_name(dataset: str, layer_type: str, key: str, channel: str | None = None) -> str:
     """Build a standardized layer name for this viewer."""
     if str(layer_type) == "image":
         return " | ".join(["Image", str(channel if channel is not None else key)])
+    friendly = _FRIENDLY_LAYER_TYPE_LABELS.get(str(layer_type))
+    if friendly is not None:
+        parts = [friendly, _pretty_segmentation_key(key)]
+        if channel is not None:
+            parts.append(str(channel))
+        return " | ".join(parts)
     parts = [str(dataset).upper(), str(layer_type), str(key)]
     if channel is not None:
         parts.append(str(channel))
@@ -476,6 +501,12 @@ def layer_name_prefix(dataset: str, layer_type: str, key: str | None = None) -> 
         return " | ".join(parts)
     if str(layer_type) == "genes":
         return "Genes"
+    friendly = _FRIENDLY_LAYER_TYPE_LABELS.get(str(layer_type))
+    if friendly is not None:
+        parts = [friendly]
+        if key is not None:
+            parts.append(_pretty_segmentation_key(key))
+        return " | ".join(parts)
     parts = [str(dataset).upper(), str(layer_type)]
     if key is not None:
         parts.append(str(key))
@@ -2250,6 +2281,258 @@ def _resolve_marker_table(source: Any):
                 return table
         return tables.get("table")
     return source  # assume already an AnnData-like table
+
+
+# -- Per-cell cell-type assignments (from MerXen clustering) -------------------
+# MerXen's clustering-squidpy stage writes a per-cell annotation table back into
+# the store as ``<source_table>_clustering_squidpy``. Each cell row carries a
+# broad class (``broad_class``, human-readable, e.g. "Neurons") and a fine label
+# (``hierarchical_cluster``, formatted ``"{broad}:{sub}"`` or
+# ``"{broad}/{split}:{sub}"`` for neurons). The row joins to a segmentation label
+# mask through the SpatialData instance key: the mask's integer pixel ids equal
+# that key's per-row values. No colours are stored -- they are generated here to
+# mirror the transcript scheme (a max-distinct hue per broad type, shaded per
+# fine subtype). See [[celltype-marker-reference]] for the gene-level analogue.
+CELL_TYPE_BROAD_CLASS_COL = "broad_class"
+CELL_TYPE_FINE_CLUSTER_COL = "hierarchical_cluster"
+CELL_TYPE_NEURON_SPLIT_COL = "neuron_split_label"
+CLUSTERING_TABLE_SUFFIX = "_clustering_squidpy"
+#: MerXen collapses all neurons into a single ``broad_class``; split it back into
+#: excitatory/inhibitory broad categories using ``neuron_split_label``.
+NEURON_BROAD_CLASS = "Neurons"
+_NEURON_SPLIT_LABELS = {"excitatory": "Excitatory neurons", "inhibitory": "Inhibitory neurons"}
+
+#: Segmentation name -> the base table key(s) MerXen clusters for it. The
+#: clustering output table is ``<base>_clustering_squidpy``; the first candidate
+#: present in the store wins. Only tables that annotate the *same* segmentation
+#: as the mask being filled are listed, so the label ids join correctly.
+SEGMENTATION_BASE_TABLES = {
+    "proseg": ("table_MOSAIK_proseg",),
+    "cellpose": ("table_MOSAIK_cellpose", "table_MOSAIK_cellpose_image_quantification"),
+}
+#: Instance-key candidates when a table omits ``uns['spatialdata_attrs']``.
+_INSTANCE_KEY_CANDIDATES = ("cell", "cell_id", "cells", "cell_ID", "EntityID", "label_id")
+_MISSING_LABEL_TEXTS = {"", "nan", "none", "na", "<na>"}
+
+
+@dataclass
+class CellTypeAssignments:
+    """Per-cell broad/fine cell-type labels joined to a segmentation mask.
+
+    ``cell_ids`` are the SpatialData instance-key values (matching the integer
+    pixel ids of the segmentation label mask); ``broad``/``fine`` are the
+    human-readable labels, same length and order as ``cell_ids``. Cells whose
+    label was missing are dropped, so unannotated mask ids stay transparent.
+    """
+
+    segmentation: str
+    table_key: str
+    instance_key: str
+    cell_ids: np.ndarray            # int64
+    broad: np.ndarray               # str (object)
+    fine: np.ndarray                # str (object)
+
+    def labels_for(self, kind: str) -> np.ndarray:
+        """Return the per-cell labels for ``"broad"`` (default) or ``"fine"``."""
+        return self.fine if str(kind) == "fine" else self.broad
+
+
+def clustering_table_key_for_segmentation(zarr_path: Any, segmentation: str) -> str | None:
+    """Return the ``*_clustering_squidpy`` table key for ``segmentation``, if any.
+
+    Only tables that annotate the same segmentation as its mask are considered,
+    so a cellpose request never falls back to a proseg/merscope table (which
+    would join wrong ids). Returns ``None`` when no matching table is stored.
+    """
+    try:
+        root = open_zarr_group_unconsolidated(zarr_path)
+    except Exception:
+        return None
+    if "tables" not in root:
+        return None
+    present = set(root["tables"].group_keys())
+    for base in SEGMENTATION_BASE_TABLES.get(str(segmentation), ()):  # ordered
+        key = f"{base}{CLUSTERING_TABLE_SUFFIX}"
+        if key in present:
+            return key
+    return None
+
+
+def _resolve_instance_key(table) -> str:
+    """Pick the obs column whose values are the segmentation-mask label ids."""
+    uns = getattr(table, "uns", None)
+    obs = getattr(table, "obs", None)
+    columns = list(getattr(obs, "columns", []))
+    if isinstance(uns, Mapping):
+        attrs = uns.get("spatialdata_attrs")
+        key = attrs.get("instance_key") if isinstance(attrs, Mapping) else None
+        if isinstance(key, str) and key in columns:
+            return key
+    for candidate in _INSTANCE_KEY_CANDIDATES:
+        if candidate in columns:
+            return candidate
+    return ""
+
+
+def load_cell_type_assignments(zarr_path: Any, segmentation: str = "proseg") -> CellTypeAssignments | None:
+    """Load per-cell broad/fine cell-type labels for a segmentation from a store.
+
+    Reads the ``broad_class`` and ``hierarchical_cluster`` obs columns of the
+    segmentation's ``*_clustering_squidpy`` table and joins them to the mask via
+    the SpatialData instance key. Never raises -- a store without clustering
+    output (or without the expected columns) simply yields ``None``.
+    """
+    table_key = clustering_table_key_for_segmentation(zarr_path, segmentation)
+    if table_key is None:
+        return None
+    try:
+        import anndata as ad
+
+        table = ad.read_zarr(str(Path(zarr_path) / "tables" / table_key))
+    except Exception:
+        return None
+
+    obs = getattr(table, "obs", None)
+    if obs is None or CELL_TYPE_BROAD_CLASS_COL not in getattr(obs, "columns", []):
+        return None
+    instance_key = _resolve_instance_key(table)
+
+    broad = obs[CELL_TYPE_BROAD_CLASS_COL].astype(str).str.strip()
+    # Split the single "Neurons" broad class into excitatory / inhibitory
+    # categories where the neuron sub-split is recorded.
+    if CELL_TYPE_NEURON_SPLIT_COL in obs.columns:
+        split = obs[CELL_TYPE_NEURON_SPLIT_COL].astype(str).str.strip()
+        split_named = split.str.lower().map(_NEURON_SPLIT_LABELS)
+        is_neuron = broad.str.lower() == NEURON_BROAD_CLASS.lower()
+        broad = broad.mask(is_neuron & split_named.notna(), split_named)
+    if CELL_TYPE_FINE_CLUSTER_COL in obs.columns:
+        fine = obs[CELL_TYPE_FINE_CLUSTER_COL].astype(str).str.strip()
+    else:
+        fine = broad.copy()
+
+    if instance_key and instance_key in obs.columns:
+        ids = pd.to_numeric(obs[instance_key], errors="coerce")
+    else:
+        ids = pd.to_numeric(pd.Series(obs.index, index=obs.index), errors="coerce")
+
+    # Keep only rows with a real broad label and a valid integer mask id.
+    valid = ids.notna().to_numpy() & ~broad.str.lower().isin(_MISSING_LABEL_TEXTS).to_numpy()
+    if not valid.any():
+        return None
+    cell_ids = ids.to_numpy()[valid].astype(np.int64, copy=False)
+    broad_arr = broad.to_numpy()[valid]
+    fine_arr = fine.to_numpy()[valid]
+    # Fine labels can be missing even when broad is present; fall back to broad.
+    fine_missing = pd.Series(fine_arr).str.lower().isin(_MISSING_LABEL_TEXTS).to_numpy()
+    if fine_missing.any():
+        fine_arr = fine_arr.copy()
+        fine_arr[fine_missing] = broad_arr[fine_missing]
+
+    return CellTypeAssignments(
+        segmentation=str(segmentation),
+        table_key=str(table_key),
+        instance_key=str(instance_key),
+        cell_ids=cell_ids,
+        broad=broad_arr,
+        fine=fine_arr,
+    )
+
+
+@dataclass
+class CellTypeColorScheme:
+    """Colours + tick grouping for one cell-type level (broad or fine).
+
+    ``colors`` maps every label to its RGBA. ``order`` is the flat, ordered list
+    of tickable labels. ``groups`` is the ordered ``(header, [members])`` the
+    panel renders: for the fine level each broad class is a header over its fine
+    subtypes; for the broad level a single header holds all broad classes.
+    """
+
+    kind: str
+    colors: dict[str, tuple[float, float, float, float]]
+    order: list[str]
+    groups: list[tuple[str, list[str]]]
+
+
+def build_cell_type_color_schemes(
+    broad_per_cell: Iterable[str],
+    fine_per_cell: Iterable[str],
+    alpha: float = 1.0,
+) -> dict[str, CellTypeColorScheme]:
+    """Build the ``"broad"`` and ``"fine"`` colour schemes from per-cell labels.
+
+    Both levels draw from the same maximally-distinct glasbey palette the
+    transcripts use: each broad class gets its own colour, and each fine subtype
+    gets its own distinct colour too (not a shade of its broad class). Fine
+    subtypes are still *grouped* under their broad class in the panel; the
+    fine->broad grouping is taken from the aligned per-cell pairing (no string
+    parsing).
+    """
+    broad_arr = [str(b).strip() for b in broad_per_cell]
+    fine_arr = [str(f).strip() for f in fine_per_cell]
+
+    fines_by_broad: dict[str, list[str]] = {}
+    for broad, fine in zip(broad_arr, fine_arr):
+        if broad.lower() in _MISSING_LABEL_TEXTS:
+            continue
+        members = fines_by_broad.setdefault(broad, [])
+        if fine not in members:
+            members.append(fine)
+
+    broads = sorted(fines_by_broad)
+    broad_palette = gene_palette_rgba(len(broads), alpha=alpha)
+    broad_colors = {broad: broad_palette[i] for i, broad in enumerate(broads)}
+
+    # Every fine subtype gets its own maximally-distinct colour. Order them by
+    # their broad group (so the palette walk matches the panel order) but colour
+    # each independently.
+    fine_order: list[str] = [fine for broad in broads for fine in sorted(fines_by_broad[broad])]
+    fine_palette = gene_palette_rgba(len(fine_order), alpha=alpha)
+    fine_colors = {fine: fine_palette[i] for i, fine in enumerate(fine_order)}
+    fine_groups = [(broad, sorted(fines_by_broad[broad])) for broad in broads]
+
+    broad_scheme = CellTypeColorScheme(
+        kind="broad",
+        colors=broad_colors,
+        order=broads,
+        groups=[("Broad cell types", broads)] if broads else [],
+    )
+    fine_scheme = CellTypeColorScheme(
+        kind="fine",
+        colors=fine_colors,
+        order=fine_order,
+        groups=fine_groups,
+    )
+    return {"broad": broad_scheme, "fine": fine_scheme}
+
+
+def build_cell_type_color_dict(
+    cell_ids: np.ndarray,
+    labels: Iterable[str],
+    scheme: CellTypeColorScheme,
+    enabled: Iterable[str] | None = None,
+) -> dict[int | None, tuple[float, float, float, float]]:
+    """Map mask label ids to RGBA for a :class:`DirectLabelColormap`.
+
+    ``cell_ids`` and ``labels`` are aligned per-cell arrays. Background (``0``)
+    and unmapped ids stay transparent; a cell whose type is not in ``enabled``
+    (when given) is omitted, so unticking a type hides those masks.
+    """
+    enabled_set = None if enabled is None else {str(e) for e in enabled}
+    color_dict: dict[int | None, tuple[float, float, float, float]] = {
+        0: TRANSPARENT_RGBA,
+        None: TRANSPARENT_RGBA,
+    }
+    colors = scheme.colors
+    for cid, label in zip(np.asarray(cell_ids).tolist(), labels):
+        text = str(label)
+        if enabled_set is not None and text not in enabled_set:
+            continue
+        rgba = colors.get(text)
+        if rgba is None:
+            continue
+        color_dict[int(cid)] = rgba
+    return color_dict
 
 
 @dataclass

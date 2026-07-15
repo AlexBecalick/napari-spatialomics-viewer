@@ -22,10 +22,11 @@ import shutil
 import sys
 import time
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import xarray as xr
 
 try:
@@ -139,6 +140,10 @@ from .utils import (
     DERIVED_CACHE_ATTR,
     assign_gene_visuals,
     build_cell_type_gene_visuals,
+    build_cell_type_color_dict,
+    build_cell_type_color_schemes,
+    clustering_table_key_for_segmentation,
+    load_cell_type_assignments,
     load_cell_type_marker_reference,
     build_cell_transcript_index,
     darken_rgba,
@@ -245,6 +250,31 @@ class GeneInspectorState:
     ordering: str = "coarse"
     color_kind: str = "coarse"
     colour_by_assignment: bool = False
+
+
+@dataclass
+class CellTypeOverlayState:
+    """Live state for the cell-type mask-fill overlay of one dataset.
+
+    One dataset can colour one segmentation at a time. ``assignments`` and the
+    two colour ``schemes`` are cached per segmentation so switching broad/fine or
+    toggling a type recolours without re-reading the store. ``enabled`` holds the
+    labels currently shown for the active ``kind`` (broad/fine tracked
+    separately, so switching levels preserves each level's tick state).
+    """
+
+    dataset: str
+    segmentation: str = "proseg"
+    kind: str = "broad"
+    opacity: float = 0.95
+    layer_name: str | None = None
+    label_key: str | None = None
+    #: segmentation -> utils.CellTypeAssignments (None means "looked up, absent").
+    assignments: dict = field(default_factory=dict)
+    #: segmentation -> {"broad": CellTypeColorScheme, "fine": CellTypeColorScheme}.
+    schemes: dict = field(default_factory=dict)
+    #: segmentation -> {"broad": set(enabled labels), "fine": set(enabled labels)}.
+    enabled: dict = field(default_factory=dict)
 
 
 DEFAULT_GENE_SPOT_SIZE = 0.5
@@ -785,8 +815,8 @@ class FlowLayout(QLayout):
 class ViewerControlPanel(QWidget):
     """Right-dock control panel: tabbed controls with a shared progress bar.
 
-    Tabs (a wrapping button bar across the top): Gene inspector, Cell segmentation, Per cell statistics,
-    Draw tissue annotations, Images, Dataset. A busy progress bar plus a stage
+    Tabs (a wrapping button bar across the top): Gene inspector, Cell segmentation, Cell type labels,
+    Per cell statistics, Draw tissue annotations, Images, Dataset. A busy progress bar plus a stage
     label sit below the tabs and stay visible whatever tab is selected.
     """
 
@@ -801,6 +831,7 @@ class ViewerControlPanel(QWidget):
         self,
         datasets: list[str],
         gene_inspector_widget,
+        cell_type_widget,
         load_callback,
         load_selected_labels_callback,
         unload_selected_shapes_callback,
@@ -828,6 +859,7 @@ class ViewerControlPanel(QWidget):
     ):
         super().__init__()
         self._gene_inspector_widget = gene_inspector_widget
+        self._cell_type_widget = cell_type_widget
         self._load_callback = load_callback
         self._load_selected_labels_callback = load_selected_labels_callback
         self._unload_selected_shapes_callback = unload_selected_shapes_callback
@@ -978,13 +1010,14 @@ class ViewerControlPanel(QWidget):
         for title, builder in (
             ("Gene inspector", self._build_genes_tab),
             ("Cell segmentation", self._build_segmentation_tab),
+            ("Cell type labels", self._build_cell_type_tab),
             ("Per cell statistics", self._build_statistics_tab),
             ("Draw tissue annotations", self._build_annotations_tab),
             ("Images", self._build_images_tab),
             ("Dataset loader", self._build_dataset_tab),
         ):
             self._add_tab(title, builder())
-        initial_tab_index = 0 if datasets else 5
+        initial_tab_index = 0 if datasets else 6
         initial_tab_button = self._tab_group.button(initial_tab_index)
         if initial_tab_button is not None:
             initial_tab_button.setChecked(True)
@@ -1045,6 +1078,20 @@ class ViewerControlPanel(QWidget):
         # The gene inspector widget provides the per-gene list + spot controls.
         if self._gene_inspector_widget is not None:
             layout.addWidget(self._gene_inspector_widget, stretch=1)
+        else:
+            layout.addStretch(1)
+        tab = QWidget()
+        tab.setLayout(layout)
+        return tab
+
+    def _build_cell_type_tab(self) -> QWidget:
+        layout = QVBoxLayout()
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+        # The cell-type widget provides the segmentation/level controls, the
+        # opacity slider, and the per-type tick list.
+        if self._cell_type_widget is not None:
+            layout.addWidget(self._cell_type_widget, stretch=1)
         else:
             layout.addStretch(1)
         tab = QWidget()
@@ -2138,6 +2185,392 @@ class GeneInspectorWidget(QWidget):
         self._refresh_row_visibility()
 
 
+class CellTypeWidget(QWidget):
+    """Right-dock panel that fills segmentation masks by broad/fine cell type.
+
+    Mirrors :class:`GeneInspectorWidget`: a grouped, ticked list (each cell type
+    with a colour swatch, fine subtypes grouped under their broad class) plus a
+    Broad/Fine level toggle, a ProSeg/Cellpose segmentation selector, and a mask
+    opacity slider. Toggling a type shows/hides those cells; the controller
+    recolours the labels layer.
+    """
+
+    status_message = Signal(str)
+
+    def __init__(
+        self,
+        close_callback,
+        set_segmentation_callback,
+        set_kind_callback,
+        set_type_visible_callback,
+        set_types_visible_callback,
+        set_all_types_callback,
+        set_opacity_callback,
+        opacity: float = 0.95,
+    ):
+        super().__init__()
+        self._close_callback = close_callback
+        self._set_segmentation_callback = set_segmentation_callback
+        self._set_kind_callback = set_kind_callback
+        self._set_type_visible_callback = set_type_visible_callback
+        self._set_types_visible_callback = set_types_visible_callback
+        self._set_all_types_callback = set_all_types_callback
+        self._set_opacity_callback = set_opacity_callback
+
+        self._dataset: str | None = None
+        self._checkboxes: dict[str, QCheckBox] = {}
+        self._items: dict[str, QListWidgetItem] = {}
+        self._headers: list[tuple[QListWidgetItem, str, list[str]]] = []
+        # No level is active until the user clicks Broad or Fine (those buttons
+        # are the "colour the masks" trigger), so start with none checked.
+        self._kind = ""
+        self._segmentation = "proseg"
+        self._suppress = False
+
+        self._title = QLabel("Cell type labels")
+        self._status_label = QLabel(
+            "Fills cell masks by their stored cell-type annotation. "
+            "Choose a segmentation and level below."
+        )
+        self._status_label.setWordWrap(True)
+        self.status_message.connect(self._status_label.setText)
+
+        self._close_button = QPushButton("Remove cell-type colouring")
+        self._close_button.clicked.connect(self._on_close)
+
+        # -- Segmentation whose masks are filled ------------------------------
+        self._seg_label = QLabel("Fill segmentation")
+        self._seg_group = QButtonGroup(self)
+        self._seg_group.setExclusive(True)
+        self._seg_proseg_btn = QPushButton("ProSeg")
+        self._seg_cellpose_btn = QPushButton("Cellpose")
+        self._seg_buttons = {"proseg": self._seg_proseg_btn, "cellpose": self._seg_cellpose_btn}
+        for seg, button in self._seg_buttons.items():
+            button.setCheckable(True)
+            button.setCursor(Qt.PointingHandCursor)
+            button.clicked.connect(lambda _checked=False, s=seg: self._on_segmentation_clicked(s))
+            self._seg_group.addButton(button)
+        self._seg_proseg_btn.setChecked(True)
+
+        # -- Broad vs fine cell-type level ------------------------------------
+        self._level_label = QLabel("Colour by")
+        self._level_group = QButtonGroup(self)
+        self._level_group.setExclusive(True)
+        self._level_broad_btn = QPushButton("Broad cell type")
+        self._level_fine_btn = QPushButton("Fine cell type")
+        self._level_buttons = {"broad": self._level_broad_btn, "fine": self._level_fine_btn}
+        # Exclusive, but allow starting with none checked until the user picks.
+        self._level_group.setExclusive(False)
+        for kind, button in self._level_buttons.items():
+            button.setCheckable(True)
+            button.setCursor(Qt.PointingHandCursor)
+            button.clicked.connect(lambda _checked=False, k=kind: self._on_kind_clicked(k))
+            self._level_group.addButton(button)
+
+        # -- Mask opacity (0-100 % -> 0..1) -----------------------------------
+        self._opacity_slider = QSlider(Qt.Horizontal)
+        self._opacity_slider.setRange(0, 100)
+        self._opacity_slider.setValue(int(round(float(opacity) * 100)))
+        self._opacity_slider.valueChanged.connect(self._on_opacity_changed)
+        self._opacity_value = QLabel(f"{int(round(float(opacity) * 100))}%")
+
+        self._show_all_check = QCheckBox("Show all cell types")
+        self._show_all_check.setTristate(True)
+        self._show_all_check.clicked.connect(self._on_show_all_clicked)
+
+        self._filter_edit = QLineEdit()
+        self._filter_edit.setPlaceholderText("Filter cell types…")
+        self._filter_edit.textChanged.connect(self._apply_filter)
+
+        self._type_list = QListWidget()
+        self._type_list.setSelectionMode(QAbstractItemView.NoSelection)
+        self._type_list.setUniformItemSizes(False)
+        self._type_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        root = QVBoxLayout()
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
+        root.addWidget(self._title)
+        root.addWidget(self._close_button)
+        root.addWidget(self._seg_label)
+        seg_row = QHBoxLayout()
+        seg_row.addWidget(self._seg_proseg_btn)
+        seg_row.addWidget(self._seg_cellpose_btn)
+        root.addLayout(seg_row)
+        root.addWidget(self._level_label)
+        level_row = QHBoxLayout()
+        level_row.addWidget(self._level_broad_btn)
+        level_row.addWidget(self._level_fine_btn)
+        root.addLayout(level_row)
+        opacity_row = QHBoxLayout()
+        opacity_row.addWidget(QLabel("Mask opacity"))
+        opacity_row.addWidget(self._opacity_slider)
+        opacity_row.addWidget(self._opacity_value)
+        root.addLayout(opacity_row)
+        root.addWidget(self._show_all_check)
+        root.addWidget(self._filter_edit)
+        root.addWidget(self._type_list, stretch=1)
+        root.addWidget(self._status_label)
+        self.setLayout(root)
+        self.setMinimumWidth(240)
+
+    # -- public API ---------------------------------------------------------
+    def set_status(self, text: str):
+        self.status_message.emit(str(text))
+
+    @property
+    def dataset(self) -> str | None:
+        return self._dataset
+
+    def opacity(self) -> float:
+        return round(self._opacity_slider.value() / 100.0, 2)
+
+    def set_dataset(self, dataset: str | None):
+        """Point the panel at ``dataset`` and clear its rows (no level active)."""
+        self._suppress = True
+        try:
+            self._type_list.clear()
+            self._checkboxes.clear()
+            self._items.clear()
+            self._headers = []
+            self._dataset = None if dataset is None else str(dataset)
+            self._kind = ""
+            self._show_all_check.setCheckState(Qt.Unchecked)
+            for button in self._level_buttons.values():
+                button.blockSignals(True)
+                button.setChecked(False)
+                button.blockSignals(False)
+        finally:
+            self._suppress = False
+
+    def set_segmentation_available(self, available: dict[str, bool]):
+        """Enable a segmentation button only when it has stored annotations.
+
+        Keeps the current selection if it is still available, else falls back to
+        the first available segmentation.
+        """
+        if not available.get(self._segmentation, False):
+            self._segmentation = next((s for s, ok in available.items() if ok), self._segmentation)
+        for seg, button in self._seg_buttons.items():
+            button.blockSignals(True)
+            button.setEnabled(bool(available.get(seg, False)))
+            button.setChecked(seg == self._segmentation)
+            button.blockSignals(False)
+
+    def clear(self):
+        self._suppress = True
+        try:
+            self._type_list.clear()
+            self._checkboxes.clear()
+            self._items.clear()
+            self._headers = []
+            self._dataset = None
+            self._show_all_check.setCheckState(Qt.Unchecked)
+        finally:
+            self._suppress = False
+
+    def populate(
+        self,
+        dataset: str,
+        layout: list[tuple],
+        colors: dict,
+        counts: dict,
+        enabled: set,
+        segmentation: str,
+        kind: str,
+        opacity: float,
+    ):
+        """Build the cell-type rows for ``dataset`` (called on the GUI thread).
+
+        ``layout`` is an ordered list of ``("header", title, rgba)`` and
+        ``("type", label)`` entries -- the same convention the gene inspector
+        uses, so fine subtypes render grouped under their broad class heading.
+        """
+        self._suppress = True
+        try:
+            self._type_list.clear()
+            self._checkboxes.clear()
+            self._items.clear()
+            self._headers = []
+            self._dataset = str(dataset)
+            self._kind = str(kind)
+            self._segmentation = str(segmentation)
+            self._set_opacity_widgets(float(opacity))
+            for seg, button in self._seg_buttons.items():
+                button.blockSignals(True)
+                button.setChecked(seg == self._segmentation)
+                button.blockSignals(False)
+            for k, button in self._level_buttons.items():
+                button.blockSignals(True)
+                button.setChecked(bool(self._kind) and k == self._kind)
+                button.blockSignals(False)
+
+            pending_header: tuple | None = None
+            header_types: list[str] = []
+
+            def _finalize_header():
+                if pending_header is None:
+                    return
+                item, widget, title = pending_header
+                types = list(header_types)
+                self._headers.append((item, title, types))
+                widget.clicked.connect(lambda ts=types: self._on_header_clicked(ts))
+
+            for entry in layout:
+                if entry[0] == "header":
+                    _finalize_header()
+                    _, title, rgba = entry
+                    item = QListWidgetItem()
+                    item.setFlags(Qt.NoItemFlags)
+                    widget = self._make_header_widget(str(title), rgba)
+                    hint = widget.sizeHint()
+                    item.setSizeHint(QSize(hint.width(), hint.height() + 14))
+                    self._type_list.addItem(item)
+                    self._type_list.setItemWidget(item, widget)
+                    pending_header = (item, widget, str(title))
+                    header_types = []
+                    continue
+
+                label = str(entry[1])
+                rgba = colors.get(label, (1.0, 1.0, 1.0, 1.0))
+                count = int(counts.get(label, 0))
+                text = f"{label}    ({count:,})" if count else str(label)
+                check = QCheckBox(text)
+                check.setIcon(QIcon(make_gene_marker_pixmap(rgba, "disc", px=22)))
+                check.setChecked(label in enabled)
+                check.toggled.connect(lambda on, t=label: self._on_type_toggled(t, on))
+                item = QListWidgetItem()
+                item.setSizeHint(check.sizeHint())
+                self._type_list.addItem(item)
+                self._type_list.setItemWidget(item, check)
+                self._checkboxes[label] = check
+                self._items[label] = item
+                header_types.append(label)
+
+            _finalize_header()
+            self._refresh_row_visibility()
+            self._refresh_show_all_state()
+        finally:
+            self._suppress = False
+
+    def _make_header_widget(self, title: str, rgba) -> QLabel:
+        """A clickable, bold group heading tinted by the broad class colour."""
+        label = _GroupHeaderLabel(title)
+        label.setCursor(Qt.PointingHandCursor)
+        label.setToolTip("Click to show / hide all cell types in this group")
+        r, g, b = (int(round(255 * float(c))) for c in (rgba[:3] if rgba else (0.6, 0.6, 0.6)))
+        label.setStyleSheet(
+            "QLabel { font-weight: bold; font-size: 13pt; color: #f0f0f0; margin-top: 6px;"
+            f" padding: 4px 4px 4px 8px; border-left: 7px solid rgb({r}, {g}, {b}); }}"
+            "QLabel:hover { color: #ffffff; background: rgba(255, 255, 255, 20); }"
+        )
+        return label
+
+    # -- helpers ------------------------------------------------------------
+    def _set_opacity_widgets(self, opacity: float):
+        pct = int(round(min(1.0, max(0.0, float(opacity))) * 100))
+        self._opacity_slider.blockSignals(True)
+        self._opacity_slider.setValue(pct)
+        self._opacity_slider.blockSignals(False)
+        self._opacity_value.setText(f"{pct}%")
+
+    def _refresh_row_visibility(self):
+        needle = self._filter_edit.text().strip().lower()
+        for label, item in self._items.items():
+            item.setHidden(bool(needle) and needle not in label.lower())
+        for header_item, _title, types in self._headers:
+            any_visible = any(
+                t in self._items and not self._items[t].isHidden() for t in types
+            )
+            header_item.setHidden(not any_visible)
+
+    def _refresh_show_all_state(self):
+        labels = list(self._checkboxes)
+        checked = sum(1 for t in labels if self._checkboxes[t].isChecked())
+        self._show_all_check.blockSignals(True)
+        if not labels or checked == 0:
+            self._show_all_check.setCheckState(Qt.Unchecked)
+        elif checked == len(labels):
+            self._show_all_check.setCheckState(Qt.Checked)
+        else:
+            self._show_all_check.setCheckState(Qt.PartiallyChecked)
+        self._show_all_check.blockSignals(False)
+
+    # -- event handlers -----------------------------------------------------
+    def _on_close(self):
+        if self._dataset is not None:
+            self._close_callback(self._dataset)
+
+    def _on_segmentation_clicked(self, seg: str):
+        if seg == self._segmentation:
+            return
+        self._segmentation = str(seg)
+        if self._suppress or self._dataset is None:
+            return
+        self._set_segmentation_callback(self._dataset, str(seg))
+
+    def _on_kind_clicked(self, kind: str):
+        # Enforce single selection (the group is non-exclusive so it can start
+        # with neither Broad nor Fine chosen).
+        for k, button in self._level_buttons.items():
+            button.blockSignals(True)
+            button.setChecked(k == kind)
+            button.blockSignals(False)
+        if kind == self._kind:
+            return
+        self._kind = str(kind)
+        if self._suppress or self._dataset is None:
+            return
+        self._set_kind_callback(self._dataset, str(kind))
+
+    def _on_type_toggled(self, label: str, on: bool):
+        if self._suppress or self._dataset is None:
+            return
+        self._set_type_visible_callback(self._dataset, label, bool(on))
+        self._refresh_show_all_state()
+
+    def _on_show_all_clicked(self, _checked=None):
+        if self._suppress or self._dataset is None:
+            return
+        turn_on = self._show_all_check.checkState() != Qt.Unchecked
+        self._suppress = True
+        try:
+            for label in self._checkboxes:
+                self._checkboxes[label].setChecked(turn_on)
+        finally:
+            self._suppress = False
+        self._refresh_show_all_state()
+        self._set_all_types_callback(self._dataset, turn_on)
+
+    def _on_header_clicked(self, types: list[str]):
+        if self._suppress or self._dataset is None:
+            return
+        visible = [
+            t for t in types
+            if t in self._checkboxes and t in self._items and not self._items[t].isHidden()
+        ]
+        if not visible:
+            return
+        turn_on = not all(self._checkboxes[t].isChecked() for t in visible)
+        self._suppress = True
+        try:
+            for t in visible:
+                self._checkboxes[t].setChecked(turn_on)
+        finally:
+            self._suppress = False
+        self._refresh_show_all_state()
+        self._set_types_visible_callback(self._dataset, visible, turn_on)
+
+    def _on_opacity_changed(self, value: int):
+        self._opacity_value.setText(f"{int(value)}%")
+        if self._suppress or self._dataset is None:
+            return
+        self._set_opacity_callback(self._dataset, round(value / 100.0, 2))
+
+    def _apply_filter(self, _text: str):
+        self._refresh_row_visibility()
+
+
 class CellInfoPieChart(QWidget):
     """Pie chart of a cell's transcripts, one slice per gene.
 
@@ -2542,6 +2975,11 @@ class ComparisonViewerController:
         self._gene_build_generation = 0
         self._gene_build_worker: object | None = None
         self._gene_inspector_widget = None
+        # Cell-type mask-fill overlay (one coloured Labels layer per dataset).
+        self._cell_type_states: dict[str, CellTypeOverlayState] = {}
+        self._cell_type_widget = None
+        self._cell_type_generation = 0
+        self._cell_type_worker: object | None = None
         # Click-to-inspect cell state: a lazily-built per-dataset transcript
         # index, the currently selected cell, and the floating summary box.
         self._cell_transcript_index: dict[str, CellTranscriptIndex] = {}
@@ -2564,6 +3002,9 @@ class ComparisonViewerController:
 
     def set_gene_inspector_widget(self, widget):
         self._gene_inspector_widget = widget
+
+    def set_cell_type_widget(self, widget):
+        self._cell_type_widget = widget
 
     def _install_gene_pick_callback(self):
         callbacks = getattr(self.viewer, "mouse_drag_callbacks", None)
@@ -2655,7 +3096,7 @@ class ComparisonViewerController:
         mode = "nearest" if visible_um <= LABEL_CRISP_ZOOM_UM else "linear"
         for layer in list(self.viewer.layers):
             name = str(getattr(layer, "name", ""))
-            if " | labels | " in name and hasattr(layer, "interpolation2d"):
+            if name.startswith("Segmentation | ") and hasattr(layer, "interpolation2d"):
                 try:
                     if layer.interpolation2d != mode:
                         layer.interpolation2d = mode
@@ -3165,8 +3606,13 @@ class ComparisonViewerController:
                 face_color=DISTANCE_OBJECT_FILL_COLOR,
                 edge_width=max(1.5, float(self.args.shape_edge_width) * 2.0),
                 visible=True,
-                features={OBJECT_ID_PROPERTY: []},
-                feature_defaults={OBJECT_ID_PROPERTY: [""]},
+                # An empty dict/list makes napari infer float64, after which
+                # its blank string default fails with "could not convert
+                # string to float". Preserve string IDs explicitly.
+                features=pd.DataFrame(
+                    {OBJECT_ID_PROPERTY: pd.Series([], dtype="object")}
+                ),
+                feature_defaults={OBJECT_ID_PROPERTY: ""},
             )
         metadata = getattr(layer, "metadata", None)
         if metadata is None:
@@ -3448,6 +3894,7 @@ class ComparisonViewerController:
             self._publish_image_entries()
             self._publish_loaded_image_entries()
             self._publish_cellpose_value_options()
+            self._publish_cell_type_options()
 
             elapsed = time.time() - t0
             mem_after = memory_snapshot_gb()
@@ -5446,8 +5893,7 @@ class ComparisonViewerController:
         makes it read as slightly thicker than neighbouring outlines at every
         zoom level without needing to track the camera.
         """
-        ds = str(self.active_dataset or "").upper()
-        prefix = f"{ds} | labels | "
+        prefix = "Segmentation | "
         outline_px = max(1, int(getattr(self.args, "label_contour_width", 1)))
         for layer in list(self.viewer.layers):
             if not str(getattr(layer, "name", "")).startswith(prefix):
@@ -5533,6 +5979,26 @@ class ComparisonViewerController:
                 self.viewer.layers.move(src, target)
         except Exception as exc:
             log.debug("Could not reorder cell link layer: %s", exc)
+
+    def _send_cell_types_below_transcripts(self, cell_type_layer):
+        """Move the cell-type fill beneath the transcript points so they stay visible."""
+        if self.active_dataset is None:
+            return
+        state = self._gene_inspector_states.get(str(self.active_dataset).upper())
+        if state is None or not state.layer_names:
+            return  # no transcripts loaded -> leave the fill where it is
+        try:
+            names = {str(n) for n in state.layer_names}
+            layers = list(self.viewer.layers)
+            gene_indices = [i for i, layer in enumerate(layers) if str(layer.name) in names]
+            if not gene_indices:
+                return
+            target = min(gene_indices)
+            src = self.viewer.layers.index(cell_type_layer)
+            if src > target:
+                self.viewer.layers.move(src, target)
+        except Exception as exc:
+            log.debug("Could not reorder cell-type overlay layer: %s", exc)
 
     def _image_layer_affine_matrix(self, layer) -> np.ndarray | None:
         """Return the 3x3 pixel->micron matrix for a 2D image layer."""
@@ -5994,6 +6460,326 @@ class ComparisonViewerController:
             self._discard_highlighted_genes(state, set(state.store.control_genes))
             state.enabled_genes -= set(state.store.control_genes)
             self._rebuild_gene_group_layers(state, group_indices=None)
+
+    # -- Cell-type mask colouring ------------------------------------------
+    def _cell_type_state(self, dataset_name: str) -> CellTypeOverlayState:
+        ds = str(dataset_name).upper()
+        state = self._cell_type_states.get(ds)
+        if state is None:
+            state = CellTypeOverlayState(
+                dataset=ds, opacity=float(getattr(self.args, "shape_opacity", 0.95))
+            )
+            self._cell_type_states[ds] = state
+        return state
+
+    def _cell_type_layer_name(self, dataset: str, segmentation: str) -> str:
+        return make_layer_name(dataset, "cell_types", f"MOSAIK_{segmentation}")
+
+    def _load_cell_type_data(self, state: CellTypeOverlayState, segmentation: str) -> bool:
+        """Cache assignments + colour schemes for ``segmentation``; True if present.
+
+        Results are memoised per segmentation (``None`` recorded when a store has
+        no clustering table), so switching level or toggling a type never re-reads
+        the store.
+        """
+        seg = str(segmentation)
+        if seg in state.assignments:
+            return state.assignments[seg] is not None
+        cfg = self.datasets.get(state.dataset)
+        zarr_path = getattr(cfg, "zarr_path", None)
+        assignments = load_cell_type_assignments(zarr_path, seg) if zarr_path is not None else None
+        state.assignments[seg] = assignments
+        if assignments is None:
+            return False
+        schemes = build_cell_type_color_schemes(assignments.broad, assignments.fine, alpha=1.0)
+        state.schemes[seg] = schemes
+        # Default: every type shown, tracked independently for each level.
+        state.enabled[seg] = {
+            "broad": set(schemes["broad"].order),
+            "fine": set(schemes["fine"].order),
+        }
+        return True
+
+    @staticmethod
+    def _cell_type_counts(assignments, kind: str) -> dict[str, int]:
+        labels = np.asarray(assignments.labels_for(kind))
+        values, counts = np.unique(labels, return_counts=True)
+        return {str(v): int(c) for v, c in zip(values.tolist(), counts.tolist())}
+
+    def _populate_cell_type_panel(self, state: CellTypeOverlayState):
+        """(Re)build the cell-type tick list for the active segmentation + level."""
+        widget = self._cell_type_widget
+        if widget is None:
+            return
+        seg = state.segmentation
+        kind = state.kind or "broad"
+        schemes = state.schemes.get(seg)
+        assignments = state.assignments.get(seg)
+        if schemes is None or assignments is None:
+            widget.set_dataset(state.dataset)
+            widget.set_status(f"No cell-type annotations stored for {seg} segmentation.")
+            return
+        scheme = schemes[kind]
+        enabled = state.enabled[seg][kind]
+        counts = self._cell_type_counts(assignments, kind)
+        broad_colors = schemes["broad"].colors
+        layout: list[tuple] = []
+        for title, members in scheme.groups:
+            # Fine headers take their broad class's hue; the single broad header
+            # is a neutral grey (its rows already carry the distinct hues).
+            header_rgba = broad_colors.get(title, (0.6, 0.6, 0.6, 1.0)) if kind == "fine" else (0.6, 0.6, 0.6, 1.0)
+            layout.append(("header", title, header_rgba))
+            layout.extend(("type", member) for member in members)
+        widget.populate(
+            state.dataset,
+            layout,
+            scheme.colors,
+            counts,
+            set(enabled),
+            seg,
+            kind,
+            state.opacity,
+        )
+
+    def set_cell_type_segmentation(self, dataset_name: str, segmentation: str):
+        state = self._cell_type_state(dataset_name)
+        state.segmentation = str(segmentation)
+        if not self._load_cell_type_data(state, state.segmentation):
+            self._set_status(
+                f"{state.dataset}: no cell-type annotations for {state.segmentation} segmentation."
+            )
+            if self._cell_type_widget is not None:
+                self._cell_type_widget.set_dataset(state.dataset)
+            return
+        # Re-colour for the new segmentation only when a level is already active.
+        if state.kind:
+            self._populate_cell_type_panel(state)
+            self._start_cell_type_overlay_build(state)
+
+    def set_cell_type_kind(self, dataset_name: str, kind: str):
+        state = self._cell_type_state(dataset_name)
+        state.kind = str(kind)
+        if not self._load_cell_type_data(state, state.segmentation):
+            self._set_status(
+                f"{state.dataset}: no cell-type annotations for {state.segmentation} segmentation."
+            )
+            if self._cell_type_widget is not None:
+                self._cell_type_widget.set_dataset(state.dataset)
+            return
+        self._populate_cell_type_panel(state)
+        self._start_cell_type_overlay_build(state)
+
+    def set_cell_type_visible(self, dataset_name: str, label: str, on: bool):
+        state = self._cell_type_state(dataset_name)
+        enabled = state.enabled.get(state.segmentation, {}).get(state.kind or "broad")
+        if enabled is None:
+            return
+        if on:
+            enabled.add(str(label))
+        else:
+            enabled.discard(str(label))
+        self._recolor_cell_type_layer(state)
+
+    def set_cell_types_visible(self, dataset_name: str, labels: list[str], on: bool):
+        state = self._cell_type_state(dataset_name)
+        enabled = state.enabled.get(state.segmentation, {}).get(state.kind or "broad")
+        if enabled is None:
+            return
+        for label in labels:
+            if on:
+                enabled.add(str(label))
+            else:
+                enabled.discard(str(label))
+        self._recolor_cell_type_layer(state)
+
+    def set_all_cell_types_visible(self, dataset_name: str, on: bool):
+        state = self._cell_type_state(dataset_name)
+        seg = state.segmentation
+        kind = state.kind or "broad"
+        scheme = state.schemes.get(seg, {}).get(kind) if state.schemes.get(seg) else None
+        if scheme is None:
+            return
+        state.enabled[seg][kind] = set(scheme.order) if on else set()
+        self._recolor_cell_type_layer(state)
+
+    def set_cell_type_opacity(self, dataset_name: str, opacity: float):
+        state = self._cell_type_state(dataset_name)
+        state.opacity = float(opacity)
+        layer = self._get_layer_by_name(state.layer_name) if state.layer_name else None
+        if layer is not None:
+            try:
+                layer.opacity = min(1.0, max(0.0, float(opacity)))
+            except Exception as exc:
+                log.debug("Could not set cell-type overlay opacity: %s", exc)
+
+    def _cell_type_color_dict(self, state: CellTypeOverlayState):
+        seg = state.segmentation
+        kind = state.kind or "broad"
+        assignments = state.assignments.get(seg)
+        schemes = state.schemes.get(seg)
+        if assignments is None or schemes is None:
+            return None
+        return build_cell_type_color_dict(
+            assignments.cell_ids,
+            assignments.labels_for(kind),
+            schemes[kind],
+            enabled=state.enabled[seg][kind],
+        )
+
+    def _recolor_cell_type_layer(self, state: CellTypeOverlayState) -> bool:
+        """Recolour the existing overlay in place (tick/show-all changes)."""
+        layer = self._get_layer_by_name(state.layer_name) if state.layer_name else None
+        if layer is None:
+            return False
+        color_dict = self._cell_type_color_dict(state)
+        if color_dict is None:
+            return False
+        try:
+            layer.colormap = DirectLabelColormap(color_dict=color_dict)
+        except Exception as exc:
+            log.debug("Cell-type overlay recolour failed: %s", exc)
+            return False
+        return True
+
+    def _ensure_label_key_for_segmentation(self, segmentation: str) -> str:
+        """Resolve (loading/rasterizing if needed) the mask label key for a seg.
+
+        Prefers the stored ``MOSAIK_<seg>_labels`` element, whose pixel ids are
+        the SpatialData instance-key values the annotations join on.
+        """
+        if self._active_sdata is None:
+            raise RuntimeError("No active dataset.")
+        shape_key = f"MOSAIK_{segmentation}"
+        label_key = self._label_key_for_shape_key(shape_key)
+        if label_key in self._active_sdata.labels or self._refresh_label_key_from_store(label_key):
+            return label_key
+        if shape_key not in self._active_sdata.shapes:
+            shapes_sdata = self._read_shapes_from_store()
+            if shapes_sdata is not None:
+                for key, value in shapes_sdata.shapes.items():
+                    self._active_sdata.shapes[key] = value
+        return self.ensure_label_for_shape_key(shape_key)
+
+    def _start_cell_type_overlay_build(self, state: CellTypeOverlayState):
+        """Build (off the GUI thread) and draw the filled cell-type Labels layer."""
+        seg = state.segmentation
+        kind = state.kind or "broad"
+        self._cell_type_generation += 1
+        generation = self._cell_type_generation
+        self._set_status(f"{state.dataset}: colouring {seg} masks by {kind} cell type...")
+
+        def compute():
+            label_key = self._ensure_label_key_for_segmentation(seg)
+            label_levels, napari_affine = self._build_cellpose_label_display(label_key)
+            return {"label_key": label_key, "label_levels": label_levels, "napari_affine": napari_affine}
+
+        if thread_worker is None:
+            try:
+                payload = compute()
+            except Exception as exc:
+                self._handle_cell_type_error(generation, exc)
+                return
+            self._apply_cell_type_layer(generation, state, payload)
+            return
+
+        worker = thread_worker(compute)()
+        worker.returned.connect(
+            lambda payload, gen=generation, st=state: self._apply_cell_type_layer(gen, st, payload)
+        )
+        worker.errored.connect(lambda exc, gen=generation: self._handle_cell_type_error(gen, exc))
+        self._cell_type_worker = worker
+        worker.start()
+
+    def _apply_cell_type_layer(self, generation: int, state: CellTypeOverlayState, payload: dict):
+        if generation != self._cell_type_generation or self.active_dataset != state.dataset:
+            return
+        self._cell_type_worker = None
+        if self._active_sdata is None:
+            return
+        label_levels = payload["label_levels"]
+        label_key = str(payload["label_key"])
+        if not label_levels:
+            self._set_status(f"{state.dataset} cell-type overlay failed: labels[{label_key}] has no 2D levels.")
+            return
+        color_dict = self._cell_type_color_dict(state)
+        if color_dict is None:
+            return
+        label_data = label_levels if len(label_levels) > 1 else label_levels[0]
+        name = self._cell_type_layer_name(state.dataset, state.segmentation)
+        self._remove_layers_by_prefix(layer_name_prefix(state.dataset, "cell_types"))
+        layer = self.viewer.add_labels(
+            label_data,
+            name=name,
+            affine=payload["napari_affine"],
+            cache=NAPARI_DASK_CACHE_ENABLED,
+            colormap=DirectLabelColormap(color_dict=color_dict),
+            multiscale=len(label_levels) > 1,
+            opacity=min(1.0, max(0.0, float(state.opacity))),
+            blending="translucent",
+            visible=True,
+        )
+        # The cell-type fill must sit beneath the transcript points so it never
+        # occludes them (add_labels drops it on top of the stack by default).
+        self._send_cell_types_below_transcripts(layer)
+        state.layer_name = name
+        state.label_key = label_key
+        assignments = state.assignments.get(state.segmentation)
+        kind = state.kind or "broad"
+        n_shown = len(state.enabled[state.segmentation][kind])
+        n_cells = 0 if assignments is None else int(len(assignments.cell_ids))
+        self._set_status(
+            f"{state.dataset}: filled {state.segmentation} masks by {kind} cell type "
+            f"({n_shown} types shown, {n_cells:,} annotated cells)."
+        )
+        log.info(
+            "[%s] Cell-type overlay label=%s seg=%s kind=%s types_shown=%s cells=%s levels=%s",
+            state.dataset, label_key, state.segmentation, kind, n_shown, n_cells, len(label_levels),
+        )
+
+    def _handle_cell_type_error(self, generation: int, exc):
+        if generation != self._cell_type_generation:
+            return
+        self._cell_type_worker = None
+        message = exc[1] if isinstance(exc, tuple) and len(exc) > 1 else exc
+        self._set_status(f"Cell-type overlay failed: {message}")
+        log.error("Cell-type overlay failed: %s", message)
+
+    def close_cell_type_overlay(self, dataset_name: str):
+        state = self._cell_type_state(dataset_name)
+        self._cell_type_generation += 1  # cancel any in-flight build
+        self._cell_type_worker = None
+        self._remove_layers_by_prefix(layer_name_prefix(state.dataset, "cell_types"))
+        state.layer_name = None
+        if self._cell_type_widget is not None and self._cell_type_widget.dataset == state.dataset:
+            self._cell_type_widget.set_dataset(state.dataset)
+        self._set_status(f"{state.dataset}: removed cell-type colouring.")
+
+    def _publish_cell_type_options(self):
+        """Refresh the cell-type panel for the active dataset (on dataset load)."""
+        widget = self._cell_type_widget
+        if widget is None or self.active_dataset is None:
+            return
+        cfg = self.datasets.get(self.active_dataset)
+        zarr_path = getattr(cfg, "zarr_path", None)
+        available = {
+            seg: (
+                zarr_path is not None
+                and clustering_table_key_for_segmentation(zarr_path, seg) is not None
+            )
+            for seg in ("proseg", "cellpose")
+        }
+        state = self._cell_type_state(self.active_dataset)
+        # The previous overlay layer (if any) was dropped by _clear_layers().
+        state.layer_name = None
+        state.kind = ""
+        if available.get(state.segmentation) is False:
+            state.segmentation = next((s for s, ok in available.items() if ok), state.segmentation)
+        widget.set_dataset(self.active_dataset)
+        widget.set_segmentation_available(available)
+        if any(available.values()):
+            widget.set_status("Choose Broad or Fine cell type to colour the masks.")
+        else:
+            widget.set_status("No stored cell-type annotations in this dataset.")
 
     def close_gene_inspector(self, dataset_name: str):
         ds = str(dataset_name).upper()
@@ -6458,6 +7244,7 @@ def run_package_smoke_test_without_opengl() -> None:
     panel = ViewerControlPanel(
         datasets=[],
         gene_inspector_widget=None,
+        cell_type_widget=None,
         load_callback=callback,
         load_selected_labels_callback=callback,
         unload_selected_shapes_callback=callback,
@@ -6483,7 +7270,7 @@ def run_package_smoke_test_without_opengl() -> None:
         load_standalone_callback=callback,
         initial_dataset=None,
     )
-    if panel._tab_stack.currentIndex() != 5:
+    if panel._tab_stack.currentIndex() != 6:
         raise RuntimeError("The empty viewer did not select the Dataset loader tab.")
     panel.close()
     app.processEvents()
@@ -6538,7 +7325,7 @@ def main():
         "Installed thread-safe napari Dask cache (budget %.1f GB)",
         float(dask_cache.cache.available_bytes) / (1024**3),
     )
-    viewer = napari.Viewer(title="Xenium vs MERSCOPE Comparison")
+    viewer = napari.Viewer(title="Spatialomics Viewer")
     install_application_icon(viewer)
     log_environment_diagnostics(viewer)
     controller = ComparisonViewerController(viewer=viewer, datasets=datasets, args=args)
@@ -6561,9 +7348,21 @@ def main():
         hide_background=args.gene_hide_background,
         show_controls=args.gene_show_controls,
     )
+    # The cell-type mask-fill widget is the "Cell type labels" tab.
+    cell_type_widget = CellTypeWidget(
+        close_callback=controller.close_cell_type_overlay,
+        set_segmentation_callback=controller.set_cell_type_segmentation,
+        set_kind_callback=controller.set_cell_type_kind,
+        set_type_visible_callback=controller.set_cell_type_visible,
+        set_types_visible_callback=controller.set_cell_types_visible,
+        set_all_types_callback=controller.set_all_cell_types_visible,
+        set_opacity_callback=controller.set_cell_type_opacity,
+        opacity=float(getattr(args, "shape_opacity", 0.95)),
+    )
     panel = ViewerControlPanel(
         datasets=available_datasets,
         gene_inspector_widget=gene_inspector,
+        cell_type_widget=cell_type_widget,
         load_callback=controller.load_dataset,
         load_selected_labels_callback=controller.load_selected_labels,
         unload_selected_shapes_callback=controller.unload_selected_shapes,
@@ -6598,6 +7397,7 @@ def main():
     controller.set_datasets_changed_callback(panel.set_datasets)
     controller.set_cellpose_value_options_callback(panel.set_cellpose_value_options)
     controller.set_gene_inspector_widget(gene_inspector)
+    controller.set_cell_type_widget(cell_type_widget)
     viewer.window.add_dock_widget(panel, area="right", name="Viewer Controls")
 
     controller.install_canvas_overlays()
