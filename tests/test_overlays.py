@@ -311,3 +311,37 @@ def test_cell_type_overlay_absent_annotations_is_graceful(qapp, monkeypatch):
     from napari.layers import Labels
 
     assert not any(isinstance(layer, Labels) for layer in viewer.layers)
+
+
+def test_label_ids_for_shapes_use_true_instance_ids():
+    """Raster labels are the shapes' own index (instance id), not positional +1.
+
+    The v1 rasterizer labelled the Nth polygon ``N+1``, so the cell-type overlay
+    (keyed on the true instance id) coloured every cell with its neighbour's
+    colour. Labels must now equal the instance id so the join is exact.
+    """
+    geopandas = pytest.importorskip("geopandas")
+    from shapely.geometry import Polygon
+
+    ctrl = V.ComparisonViewerController.__new__(V.ComparisonViewerController)
+
+    def _square(cx, cy):
+        return Polygon([(cx, cy), (cx + 1, cy), (cx + 1, cy + 1), (cx, cy + 1)])
+
+    # Non-contiguous integer ids (as a QC-filtered proseg set would be).
+    gdf = geopandas.GeoDataFrame(
+        geometry=[_square(0, 0), _square(2, 0), _square(4, 0)],
+        index=[2, 94831, 94832],
+    )
+    series, dtype = ctrl._label_ids_for_shapes(gdf)
+    assert np.dtype(dtype) == np.uint32
+    assert series.loc[94831] == 94831  # not 94832 (the old positional +1)
+    assert series.loc[94832] == 94832
+    assert series.loc[2] == 2
+
+    # Large string ids (merscope EntityID) promote to uint64 and keep their value.
+    big = "3715213700018100006"
+    gdf_str = geopandas.GeoDataFrame(geometry=[_square(0, 0)], index=[big])
+    series_str, dtype_str = ctrl._label_ids_for_shapes(gdf_str)
+    assert np.dtype(dtype_str) == np.uint64
+    assert int(series_str.loc[big]) == int(big)

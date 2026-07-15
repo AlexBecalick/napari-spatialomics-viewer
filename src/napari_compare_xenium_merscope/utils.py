@@ -2302,17 +2302,69 @@ CLUSTERING_TABLE_SUFFIX = "_clustering_squidpy"
 NEURON_BROAD_CLASS = "Neurons"
 _NEURON_SPLIT_LABELS = {"excitatory": "Excitatory neurons", "inhibitory": "Inhibitory neurons"}
 
-#: Segmentation name -> the base table key(s) MerXen clusters for it. The
-#: clustering output table is ``<base>_clustering_squidpy``; the first candidate
-#: present in the store wins. Only tables that annotate the *same* segmentation
-#: as the mask being filled are listed, so the label ids join correctly.
-SEGMENTATION_BASE_TABLES = {
-    "proseg": ("table_MOSAIK_proseg",),
-    "cellpose": ("table_MOSAIK_cellpose", "table_MOSAIK_cellpose_image_quantification"),
-}
 #: Instance-key candidates when a table omits ``uns['spatialdata_attrs']``.
 _INSTANCE_KEY_CANDIDATES = ("cell", "cell_id", "cells", "cell_ID", "EntityID", "label_id")
 _MISSING_LABEL_TEXTS = {"", "nan", "none", "na", "<na>"}
+
+
+@dataclass(frozen=True)
+class CellTypeSource:
+    """One selectable cell-type layer: a clustering table joined to a mask.
+
+    A single set of segmentation masks can be coloured by more than one
+    clustering: ProSeg masks by the *reseg* (probabilistic-assignment) clustering
+    or by a *proseg-mask* (in-mask transcript) clustering; the original instrument
+    masks only by the *original* clustering. Each source pins the clustering
+    ``clustering_tables`` (first present in the store wins) to the ``mask_shape_keys``
+    it annotates (first present wins), so a request never joins a clustering's
+    instance ids against the wrong mask.
+    """
+
+    key: str
+    label: str
+    clustering_tables: tuple[str, ...]
+    mask_shape_keys: tuple[str, ...]
+
+
+#: Every cell-type source the viewer knows about, in display order. ``key`` is the
+#: stable identifier stored on the overlay state and passed through the widget;
+#: ``label`` is the button text. ``"proseg"`` is kept as the reseg key for
+#: backward compatibility (the historical name for this clustering).
+CELL_TYPE_SOURCES: tuple[CellTypeSource, ...] = (
+    CellTypeSource(
+        key="proseg",
+        label="ProSeg · reseg (probabilistic)",
+        clustering_tables=("table_MOSAIK_proseg_clustering_squidpy",),
+        mask_shape_keys=("MOSAIK_proseg",),
+    ),
+    CellTypeSource(
+        key="proseg_mask",
+        label="ProSeg · in-mask counts",
+        clustering_tables=(
+            "table_MOSAIK_proseg_mask_clustering_squidpy",
+            "table_MOSAIK_proseg_mask_counts_clustering_squidpy",
+        ),
+        mask_shape_keys=("MOSAIK_proseg",),
+    ),
+    CellTypeSource(
+        key="cellpose",
+        label="Cellpose",
+        clustering_tables=("table_MOSAIK_cellpose_clustering_squidpy",),
+        mask_shape_keys=("MOSAIK_cellpose",),
+    ),
+    CellTypeSource(
+        key="original",
+        label="Original segmentation",
+        clustering_tables=("table_original_clustering_squidpy",),
+        mask_shape_keys=("merscope_cell_boundaries", "cell_boundaries"),
+    ),
+)
+_CELL_TYPE_SOURCE_BY_KEY = {source.key: source for source in CELL_TYPE_SOURCES}
+
+
+def cell_type_source(key: Any) -> CellTypeSource | None:
+    """Return the :class:`CellTypeSource` for ``key`` (``None`` if unknown)."""
+    return _CELL_TYPE_SOURCE_BY_KEY.get(str(key))
 
 
 @dataclass
@@ -2338,12 +2390,17 @@ class CellTypeAssignments:
 
 
 def clustering_table_key_for_segmentation(zarr_path: Any, segmentation: str) -> str | None:
-    """Return the ``*_clustering_squidpy`` table key for ``segmentation``, if any.
+    """Return the ``*_clustering_squidpy`` table key for a cell-type source, if any.
 
-    Only tables that annotate the same segmentation as its mask are considered,
-    so a cellpose request never falls back to a proseg/merscope table (which
-    would join wrong ids). Returns ``None`` when no matching table is stored.
+    ``segmentation`` is a :data:`CELL_TYPE_SOURCES` key (``"proseg"`` = reseg,
+    ``"proseg_mask"``, ``"cellpose"``, ``"original"``). Only that source's own
+    clustering tables are considered, so a request never falls back to a
+    different segmentation's table (which would join wrong ids). Returns ``None``
+    for an unknown source or when no matching table is stored.
     """
+    source = cell_type_source(segmentation)
+    if source is None:
+        return None
     try:
         root = open_zarr_group_unconsolidated(zarr_path)
     except Exception:
@@ -2351,8 +2408,7 @@ def clustering_table_key_for_segmentation(zarr_path: Any, segmentation: str) -> 
     if "tables" not in root:
         return None
     present = set(root["tables"].group_keys())
-    for base in SEGMENTATION_BASE_TABLES.get(str(segmentation), ()):  # ordered
-        key = f"{base}{CLUSTERING_TABLE_SUFFIX}"
+    for key in source.clustering_tables:  # ordered; first present wins
         if key in present:
             return key
     return None
