@@ -142,6 +142,8 @@ from .utils import (
     build_cell_type_gene_visuals,
     build_cell_type_color_dict,
     build_cell_type_color_schemes,
+    CELL_TYPE_SOURCES,
+    cell_type_source,
     clustering_table_key_for_segmentation,
     load_cell_type_assignments,
     load_cell_type_marker_reference,
@@ -316,7 +318,12 @@ LABEL_CACHE_ATTR = "napari_compare_label_cache"
 NAPARI_DASK_CACHE_ENABLED = True
 LABEL_OUTLINE_PYRAMID_MIN_SIZE = 4096
 LABEL_OUTLINE_PYRAMID_MAX_LEVELS = 10
-DERIVED_CACHE_VERSION = 1
+# v2: the label-pyramid cache format changed from base+coarse to coarse-only
+# (the base is re-prepended at display time in _build_cellpose_label_display).
+# A v1 cache still stores the full-res base as its finest level, which would
+# duplicate the base and give napari a non-decreasing multiscale pyramid, so
+# bump the version to force stale v1 caches to rebuild.
+DERIVED_CACHE_VERSION = 2
 CORTICAL_DEPTH_LAYER_TYPE = "cortical_depth"
 CORTICAL_DEPTH_LAYER_COLORS = {
     "pia": "#00d5ff",
@@ -2169,9 +2176,10 @@ class CellTypeWidget(QWidget):
 
     Mirrors :class:`GeneInspectorWidget`: a grouped, ticked list (each cell type
     with a colour swatch, fine subtypes grouped under their broad class) plus a
-    Broad/Fine level toggle, a ProSeg/Cellpose segmentation selector, and a mask
-    opacity slider. Toggling a type shows/hides those cells; the controller
-    recolours the labels layer.
+    Broad/Fine level toggle, a cell-type *source* selector (which clustering fills
+    which masks -- ProSeg reseg/in-mask, Cellpose, or the original segmentation),
+    and a mask opacity slider. Toggling a type shows/hides those cells; the
+    controller recolours the labels layer.
     """
 
     status_message = Signal(str)
@@ -2217,19 +2225,25 @@ class CellTypeWidget(QWidget):
         self._close_button = QPushButton("Remove cell-type colouring")
         self._close_button.clicked.connect(self._on_close)
 
-        # -- Segmentation whose masks are filled ------------------------------
-        self._seg_label = QLabel("Fill segmentation")
+        # -- Cell-type source (which clustering fills which masks) ------------
+        # One button per CellTypeSource: ProSeg masks can be coloured by the reseg
+        # (probabilistic) or in-mask clustering; the original instrument masks by
+        # the original clustering; Cellpose by its own. Only sources whose
+        # clustering table is stored are shown (see set_segmentation_available).
+        self._seg_label = QLabel("Cell type source")
         self._seg_group = QButtonGroup(self)
         self._seg_group.setExclusive(True)
-        self._seg_proseg_btn = QPushButton("ProSeg")
-        self._seg_cellpose_btn = QPushButton("Cellpose")
-        self._seg_buttons = {"proseg": self._seg_proseg_btn, "cellpose": self._seg_cellpose_btn}
-        for seg, button in self._seg_buttons.items():
+        self._seg_buttons: dict[str, QPushButton] = {}
+        for source in CELL_TYPE_SOURCES:
+            button = QPushButton(source.label)
             button.setCheckable(True)
             button.setCursor(Qt.PointingHandCursor)
-            button.clicked.connect(lambda _checked=False, s=seg: self._on_segmentation_clicked(s))
+            button.setToolTip(source.label)
+            button.clicked.connect(lambda _checked=False, s=source.key: self._on_segmentation_clicked(s))
             self._seg_group.addButton(button)
-        self._seg_proseg_btn.setChecked(True)
+            self._seg_buttons[source.key] = button
+        if self._segmentation in self._seg_buttons:
+            self._seg_buttons[self._segmentation].setChecked(True)
 
         # -- Broad vs fine cell-type level ------------------------------------
         self._level_label = QLabel("Colour by")
@@ -2272,10 +2286,11 @@ class CellTypeWidget(QWidget):
         root.addWidget(self._title)
         root.addWidget(self._close_button)
         root.addWidget(self._seg_label)
-        seg_row = QHBoxLayout()
-        seg_row.addWidget(self._seg_proseg_btn)
-        seg_row.addWidget(self._seg_cellpose_btn)
-        root.addLayout(seg_row)
+        seg_col = QVBoxLayout()
+        seg_col.setSpacing(2)
+        for button in self._seg_buttons.values():
+            seg_col.addWidget(button)
+        root.addLayout(seg_col)
         root.addWidget(self._level_label)
         level_row = QHBoxLayout()
         level_row.addWidget(self._level_broad_btn)
@@ -2323,16 +2338,19 @@ class CellTypeWidget(QWidget):
             self._suppress = False
 
     def set_segmentation_available(self, available: dict[str, bool]):
-        """Enable a segmentation button only when it has stored annotations.
+        """Show a cell-type source button only when its clustering is stored.
 
         Keeps the current selection if it is still available, else falls back to
-        the first available segmentation.
+        the first available source. Unavailable sources are hidden, so the panel
+        only offers what the dataset actually contains.
         """
         if not available.get(self._segmentation, False):
             self._segmentation = next((s for s, ok in available.items() if ok), self._segmentation)
         for seg, button in self._seg_buttons.items():
+            ok = bool(available.get(seg, False))
             button.blockSignals(True)
-            button.setEnabled(bool(available.get(seg, False)))
+            button.setEnabled(ok)
+            button.setVisible(ok)
             button.setChecked(seg == self._segmentation)
             button.blockSignals(False)
 
@@ -4414,7 +4432,20 @@ class ComparisonViewerController:
         if self._x_transform is None or self._y_transform is None:
             raise RuntimeError("Image transform is not initialized.")
 
-        image_key = next(iter(self._active_images_sdata.images.keys()))
+        # Size the label grid to a REAL image, never a derived cache. Derived
+        # image caches (e.g. ``_napari_compare_imgpyr__..._ds4``, transcript
+        # density) sort first by their ``_`` prefix, so a plain
+        # ``next(iter(...))`` would pick a downsampled cache and rasterize every
+        # mask onto a too-small grid -- clipping all cells outside the top-left.
+        image_key = next(
+            (k for k in self._active_images_sdata.images.keys() if not is_derived_cache_key(k)),
+            None,
+        )
+        if image_key is None:
+            raise RuntimeError(
+                "Cannot build labels: no non-derived image found to size the grid "
+                f"(images: {sorted(self._active_images_sdata.images.keys())})."
+            )
         base_image_cyx = ensure_cyx(get_scale0_dataarray(self._active_images_sdata.images[image_key]))
         height = int(base_image_cyx.sizes["y"])
         width = int(base_image_cyx.sizes["x"])
@@ -4441,10 +4472,17 @@ class ComparisonViewerController:
         chunks = (min(chunk, height), min(chunk, width))
         return (height, width), chunks, napari_affine, spatialdata_affine
 
-    def _create_label_element(self, label_key: str, shape: tuple[int, int], chunks: tuple[int, int], transform: Affine):
+    def _create_label_element(
+        self,
+        label_key: str,
+        shape: tuple[int, int],
+        chunks: tuple[int, int],
+        transform: Affine,
+        dtype=np.uint32,
+    ):
         if da is None:
             raise RuntimeError("dask is required to create lazy label arrays.")
-        data = da.zeros(shape, chunks=chunks, dtype=np.uint32)
+        data = da.zeros(shape, chunks=chunks, dtype=dtype)
         label_da = xr.DataArray(data, dims=("y", "x"))
         return Labels2DModel.parse(label_da, transformations={"global": transform})
 
@@ -4455,12 +4493,52 @@ class ComparisonViewerController:
         chunks: tuple[int, int],
         transform: Affine,
         overwrite: bool,
+        dtype=np.uint32,
     ):
         if self._active_sdata is None:
             raise RuntimeError("No active SpatialData object.")
-        label_elem = self._create_label_element(label_key, shape, chunks, transform)
+        label_elem = self._create_label_element(label_key, shape, chunks, transform, dtype=dtype)
         self._active_sdata.labels[label_key] = label_elem
         self._active_sdata.write_element(label_key, overwrite=overwrite)
+
+    def _label_ids_for_shapes(self, gdf):
+        """Return ``(id_series, dtype)`` giving each polygon its raster label id.
+
+        The raster pixel value must equal the segmentation *instance id* -- the
+        value the transcript ``assignment`` column, the clustering table's
+        instance key, and the per-cell value tables all join on -- so the
+        cell-type and per-cell-value overlays colour the right cell. We therefore
+        label each polygon with its own GeoDataFrame index value (the instance
+        id) rather than a positional counter.
+
+        ``id_series`` is indexed by ``gdf.index`` so a chunk's candidates can be
+        looked up directly. ``dtype`` is the smallest unsigned integer that holds
+        every id. Note id ``0`` collides with the raster background and renders
+        transparent; no real segmentation annotates cell ``0`` (proseg/cellpose
+        reserve it, merscope ids are large), so this is harmless.
+        """
+        index = pd.Series(np.asarray(gdf.index), index=gdf.index)
+        numeric = pd.to_numeric(index, errors="coerce")
+        is_integer_ids = (
+            len(numeric) > 0
+            and numeric.notna().all()
+            and (numeric >= 0).all()
+            and np.array_equal(numeric.to_numpy(), np.floor(numeric.to_numpy()))
+        )
+        if is_integer_ids:
+            ids = numeric.astype("int64")
+        else:
+            # Non-numeric / negative index (e.g. exotic string ids): fall back to
+            # compact 1..N codes. Cell-type colouring can only join when the ids
+            # are numeric, so warn rather than silently mis-colour.
+            log.warning(
+                "Shapes index is not a non-negative integer id; rasterizing with "
+                "positional codes. Cell-type colouring may not join for this mask."
+            )
+            ids = pd.Series(pd.factorize(np.asarray(gdf.index))[0] + 1, index=gdf.index)
+        max_id = int(ids.max()) if len(ids) else 0
+        dtype = np.uint32 if max_id <= np.iinfo(np.uint32).max else np.uint64
+        return ids.astype(dtype), dtype
 
     def _label_cache_attrs(self, label_key: str) -> dict:
         if self.active_dataset is None:
@@ -4481,7 +4559,9 @@ class ComparisonViewerController:
         return bool(
             attrs.get("complete")
             and attrs.get("source_shape_key") == str(shape_key)
-            and attrs.get("version") == 1
+            # v2 rasterizes with true instance ids (v1 used positional id+1, which
+            # mis-joined the cell-type overlay); force a rebuild of v1 caches.
+            and attrs.get("version") == 2
         )
 
     def _mark_label_cache_complete(self, label_key: str, shape_key: str, shape: tuple[int, int], chunks: tuple[int, int]):
@@ -4491,7 +4571,7 @@ class ComparisonViewerController:
         label_path = cfg.zarr_path / "labels" / label_key
         group = zarr.open_group(str(label_path), mode="a")
         group.attrs[LABEL_CACHE_ATTR] = {
-            "version": 1,
+            "version": 2,
             "complete": True,
             "source_shape_key": str(shape_key),
             "shape": [int(shape[0]), int(shape[1])],
@@ -4544,8 +4624,10 @@ class ComparisonViewerController:
         label_path = cfg.zarr_path / "labels" / label_key / "s0"
         label_arr = zarr.open(str(label_path), mode="r+")
         inv_affine = np.linalg.inv(np.asarray(napari_affine, dtype=float))
-        gdf = self._active_sdata.shapes[shape_key].reset_index(drop=True)
-        label_ids = np.arange(1, len(gdf) + 1, dtype=np.uint32)
+        # Keep the true index: each polygon is rasterized with its own instance id
+        # so the raster pixel value == the join key used by the cell-type overlay.
+        gdf = self._active_sdata.shapes[shape_key]
+        label_series, id_dtype = self._label_ids_for_shapes(gdf)
 
         height, width = shape
         chunk_h, chunk_w = chunk_shape
@@ -4565,7 +4647,7 @@ class ComparisonViewerController:
                 if len(candidates) == 0:
                     continue
 
-                ids = label_ids[candidates.index.to_numpy(dtype=np.int64, copy=False)]
+                ids = label_series.loc[candidates.index].to_numpy()
                 tile = rasterize_geometries_chunk(
                     candidates.geometry,
                     ids,
@@ -4573,7 +4655,7 @@ class ComparisonViewerController:
                     inv_affine=inv_affine,
                     y0=y0,
                     x0=x0,
-                    dtype=np.uint32,
+                    dtype=id_dtype,
                 )
                 if np.any(tile):
                     label_arr[y0:y1, x0:x1] = tile
@@ -4628,6 +4710,11 @@ class ComparisonViewerController:
         t0 = time.time()
         self._set_status(f"{self.active_dataset} building labels for {shape_key}...")
         shape, chunks, napari_affine, spatialdata_affine = self._image_grid_for_labels()
+        # Size the raster dtype to the mask's instance ids (uint32, or uint64 for
+        # large ids such as merscope EntityIDs) so pixel values are never truncated.
+        id_dtype = np.uint32
+        if shape_key in self._active_sdata.shapes:
+            _label_series, id_dtype = self._label_ids_for_shapes(self._active_sdata.shapes[shape_key])
         self._discard_label_cache_before_write(label_key, shape_key)
         self._write_empty_label_element(
             label_key=label_key,
@@ -4635,6 +4722,7 @@ class ComparisonViewerController:
             chunks=chunks,
             transform=spatialdata_affine,
             overwrite=False,
+            dtype=id_dtype,
         )
         n_labels = self._rasterize_label_payload(
             shape_key=shape_key,
@@ -5052,6 +5140,16 @@ class ComparisonViewerController:
                     exc,
                 )
                 coarse = lazy_label_pyramid(stored[0])[1:]
+            # `coarse` must be strictly smaller than the base: a stale/foreign
+            # cache may still include the full-res base as its finest level, and
+            # prepending stored[0] on top of that yields a non-decreasing pyramid
+            # napari rejects. Drop any level not smaller than the base.
+            base_shape = tuple(int(s) for s in getattr(stored[0], "shape", ()))
+            coarse = [
+                level
+                for level in coarse
+                if tuple(int(s) for s in getattr(level, "shape", ())) < base_shape
+            ]
             if coarse:
                 levels = [stored[0]] + list(coarse)
         return levels, self._label_display_affine(label_elem)
@@ -5060,14 +5158,24 @@ class ComparisonViewerController:
         if self._active_sdata is None or self.active_dataset is None:
             raise RuntimeError("No active dataset.")
 
-        if CELLPOSE_LABEL_KEY in self._active_sdata.labels or self._refresh_label_key_from_store(CELLPOSE_LABEL_KEY):
-            return CELLPOSE_LABEL_KEY
-
         if CELLPOSE_SHAPE_KEY not in self._active_sdata.shapes:
             shapes_sdata = self._read_shapes_from_store()
             if shapes_sdata is not None:
                 for key, value in shapes_sdata.shapes.items():
                     self._active_sdata.shapes[key] = value
+
+        # Trust an external mask, but rebuild a stale viewer cache (v1 used
+        # positional id+1, which mis-joined the per-cell value overlay).
+        if (
+            not self.args.overwrite_labels
+            and (
+                CELLPOSE_LABEL_KEY in self._active_sdata.labels
+                or self._refresh_label_key_from_store(CELLPOSE_LABEL_KEY)
+            )
+        ):
+            cache_attrs = self._label_cache_attrs(CELLPOSE_LABEL_KEY)
+            if not cache_attrs or self._label_cache_is_complete(CELLPOSE_LABEL_KEY, CELLPOSE_SHAPE_KEY):
+                return CELLPOSE_LABEL_KEY
 
         return self.ensure_label_for_shape_key(CELLPOSE_SHAPE_KEY)
 
@@ -6452,7 +6560,22 @@ class ComparisonViewerController:
         return state
 
     def _cell_type_layer_name(self, dataset: str, segmentation: str) -> str:
-        return make_layer_name(dataset, "cell_types", f"MOSAIK_{segmentation}")
+        return make_layer_name(dataset, "cell_types", str(segmentation))
+
+    def _mask_shape_key_for_source(self, source_key: str) -> str:
+        """Resolve the segmentation mask shape key a cell-type source colours.
+
+        A source (e.g. ``"proseg"``/``"proseg_mask"``) names candidate mask shape
+        keys; the first present in the store wins. Falls back to the historical
+        ``MOSAIK_<source>`` name for unknown sources.
+        """
+        source = cell_type_source(source_key)
+        candidates = source.mask_shape_keys if source is not None else (f"MOSAIK_{source_key}",)
+        shapes = self._active_sdata.shapes if self._active_sdata is not None else {}
+        for candidate in candidates:
+            if candidate in shapes:
+                return candidate
+        return candidates[0]
 
     def _load_cell_type_data(self, state: CellTypeOverlayState, segmentation: str) -> bool:
         """Cache assignments + colour schemes for ``segmentation``; True if present.
@@ -6621,22 +6744,31 @@ class ComparisonViewerController:
         return True
 
     def _ensure_label_key_for_segmentation(self, segmentation: str) -> str:
-        """Resolve (loading/rasterizing if needed) the mask label key for a seg.
+        """Resolve (loading/rasterizing if needed) the mask label key for a source.
 
-        Prefers the stored ``MOSAIK_<seg>_labels`` element, whose pixel ids are
-        the SpatialData instance-key values the annotations join on.
+        ``segmentation`` is a cell-type source key; the mask it colours is resolved
+        via :meth:`_mask_shape_key_for_source`. An externally-authored label mask
+        (no viewer cache marker) is trusted -- its pixel ids are already the
+        instance keys. A viewer-built cache is reused only when it is the current
+        version; a stale one (v1 used positional ``id+1``) is rebuilt so the raster
+        pixel ids match the instance keys the cell-type overlay joins on.
         """
         if self._active_sdata is None:
             raise RuntimeError("No active dataset.")
-        shape_key = f"MOSAIK_{segmentation}"
+        shape_key = self._mask_shape_key_for_source(segmentation)
         label_key = self._label_key_for_shape_key(shape_key)
-        if label_key in self._active_sdata.labels or self._refresh_label_key_from_store(label_key):
-            return label_key
         if shape_key not in self._active_sdata.shapes:
             shapes_sdata = self._read_shapes_from_store()
             if shapes_sdata is not None:
                 for key, value in shapes_sdata.shapes.items():
                     self._active_sdata.shapes[key] = value
+        if (
+            not self.args.overwrite_labels
+            and (label_key in self._active_sdata.labels or self._refresh_label_key_from_store(label_key))
+        ):
+            cache_attrs = self._label_cache_attrs(label_key)
+            if not cache_attrs or self._label_cache_is_complete(label_key, shape_key):
+                return label_key
         return self.ensure_label_for_shape_key(shape_key)
 
     def _start_cell_type_overlay_build(self, state: CellTypeOverlayState):
@@ -6741,11 +6873,11 @@ class ComparisonViewerController:
         cfg = self.datasets.get(self.active_dataset)
         zarr_path = getattr(cfg, "zarr_path", None)
         available = {
-            seg: (
+            source.key: (
                 zarr_path is not None
-                and clustering_table_key_for_segmentation(zarr_path, seg) is not None
+                and clustering_table_key_for_segmentation(zarr_path, source.key) is not None
             )
-            for seg in ("proseg", "cellpose")
+            for source in CELL_TYPE_SOURCES
         }
         state = self._cell_type_state(self.active_dataset)
         # The previous overlay layer (if any) was dropped by _clear_layers().

@@ -891,3 +891,47 @@ def test_load_cell_type_assignments_reads_broad_fine_and_instance_key(tmp_path):
         "Neurons:1",
         "Vascular cells:0",
     ]
+
+
+def test_cell_type_sources_resolve_to_their_own_tables(tmp_path):
+    """Each source resolves only to its own clustering table; unknowns give None."""
+    import anndata as ad
+    import pandas as pd
+
+    from napari_compare_xenium_merscope.utils import (
+        CELL_TYPE_SOURCES,
+        cell_type_source,
+        clustering_table_key_for_segmentation,
+    )
+
+    def _table(instance_key):
+        obs = pd.DataFrame(
+            {
+                instance_key: np.array([1, 2], dtype=np.int64),
+                "broad_class": pd.Categorical(["Neurons", "Neurons"]),
+            }
+        )
+        adata = ad.AnnData(X=np.zeros((2, 1), dtype=np.float32), obs=obs)
+        adata.uns["spatialdata_attrs"] = {"instance_key": instance_key, "region_key": "region"}
+        return adata
+
+    store = str(tmp_path / "store.zarr")
+    root = zarr.open_group(store, mode="w", zarr_format=2)
+    root.create_group("tables")
+    # Only the reseg (proseg) and original clusterings are present in this store.
+    _table("cell").write_zarr(str(tmp_path / "store.zarr" / "tables" / "table_MOSAIK_proseg_clustering_squidpy"))
+    _table("EntityID").write_zarr(str(tmp_path / "store.zarr" / "tables" / "table_original_clustering_squidpy"))
+
+    assert clustering_table_key_for_segmentation(store, "proseg") == "table_MOSAIK_proseg_clustering_squidpy"
+    assert clustering_table_key_for_segmentation(store, "original") == "table_original_clustering_squidpy"
+    # A source whose table is absent, and an unknown source, both resolve to None
+    # rather than falling back to a different segmentation's clustering.
+    assert clustering_table_key_for_segmentation(store, "proseg_mask") is None
+    assert clustering_table_key_for_segmentation(store, "cellpose") is None
+    assert clustering_table_key_for_segmentation(store, "not_a_source") is None
+
+    # The registry pins each source to the masks it may colour.
+    assert {s.key for s in CELL_TYPE_SOURCES} == {"proseg", "proseg_mask", "cellpose", "original"}
+    assert "MOSAIK_proseg" in cell_type_source("proseg_mask").mask_shape_keys
+    assert "merscope_cell_boundaries" in cell_type_source("original").mask_shape_keys
+    assert cell_type_source("not_a_source") is None
