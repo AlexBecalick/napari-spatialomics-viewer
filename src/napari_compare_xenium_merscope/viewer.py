@@ -848,7 +848,6 @@ class ViewerControlPanel(QWidget):
         snap_annotation_side_edges_callback,
         validate_annotation_callback,
         export_annotation_callback,
-        export_separate_annotations_callback,
         create_object_annotation_callback,
         validate_object_annotations_callback,
         export_object_annotations_callback,
@@ -878,7 +877,6 @@ class ViewerControlPanel(QWidget):
         self._snap_annotation_side_edges_callback = snap_annotation_side_edges_callback
         self._validate_annotation_callback = validate_annotation_callback
         self._export_annotation_callback = export_annotation_callback
-        self._export_separate_annotations_callback = export_separate_annotations_callback
         self._create_object_annotation_callback = create_object_annotation_callback
         self._validate_object_annotations_callback = validate_object_annotations_callback
         self._export_object_annotations_callback = export_object_annotations_callback
@@ -959,8 +957,6 @@ class ViewerControlPanel(QWidget):
         self._validate_annotations_button.clicked.connect(self._on_validate_annotations)
         self._export_annotations_button = QPushButton("Export Combined GeoJSON")
         self._export_annotations_button.clicked.connect(self._on_export_annotations)
-        self._export_separate_annotations_button = QPushButton("Export Separate GeoJSONs")
-        self._export_separate_annotations_button.clicked.connect(self._on_export_separate_annotations)
         self._object_name_input = QLineEdit()
         self._object_name_input.setPlaceholderText("e.g. Amyloid plaques")
         self._create_object_annotations_button = QPushButton("Create Named Object Layer")
@@ -1141,7 +1137,6 @@ class ViewerControlPanel(QWidget):
         layout.addWidget(self._snap_side_edges_button)
         layout.addWidget(self._validate_annotations_button)
         layout.addWidget(self._export_annotations_button)
-        layout.addWidget(self._export_separate_annotations_button)
         layout.addSpacing(12)
         layout.addWidget(QLabel("Distance-from-object Annotations"))
         layout.addWidget(QLabel("Object Set Name"))
@@ -1497,22 +1492,6 @@ class ViewerControlPanel(QWidget):
                 )
                 return
         self._show_annotation_validation_result("Export Combined GeoJSON", result, export_path=Path(path))
-
-    def _on_export_separate_annotations(self):
-        directory = QFileDialog.getExistingDirectory(
-            self,
-            "Export Separate Cortical Depth GeoJSONs",
-            "",
-        )
-        if not directory:
-            return
-        try:
-            result = self._export_separate_annotations_callback(self.current_dataset, Path(directory))
-        except Exception as exc:
-            self.set_status(f"Separate annotation export failed: {exc}")
-            QMessageBox.warning(self, "Export Separate GeoJSONs", str(exc))
-            return
-        self._show_annotation_validation_result("Export Separate GeoJSONs", result, export_path=Path(directory))
 
     def _show_annotation_validation_result(self, title: str, result, export_path: Path | None = None):
         errors = list(getattr(result, "errors", ()))
@@ -7261,7 +7240,6 @@ def run_package_smoke_test_without_opengl() -> None:
         snap_annotation_side_edges_callback=callback,
         validate_annotation_callback=callback,
         export_annotation_callback=callback,
-        export_separate_annotations_callback=callback,
         create_object_annotation_callback=callback,
         validate_object_annotations_callback=callback,
         export_object_annotations_callback=callback,
@@ -7379,7 +7357,6 @@ def main():
         snap_annotation_side_edges_callback=controller.snap_cortical_depth_side_edges,
         validate_annotation_callback=controller.validate_cortical_depth_annotations,
         export_annotation_callback=controller.export_cortical_depth_annotations,
-        export_separate_annotations_callback=controller.export_separate_cortical_depth_annotations,
         create_object_annotation_callback=controller.create_distance_object_annotation_layer,
         validate_object_annotations_callback=controller.validate_distance_object_annotations,
         export_object_annotations_callback=controller.export_distance_object_annotations,
