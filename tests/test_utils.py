@@ -761,3 +761,133 @@ def test_build_gene_point_groups_many_genes_share_symbol_groups():
     # G005 has its one background point ordered last (fg then bg).
     gi, fg_start, fg_end, bg_end = store.gene_offsets["G005"]
     assert bg_end - fg_end == 1
+
+
+# -- Cell-type mask colouring --------------------------------------------------
+
+
+def test_build_cell_type_color_schemes_group_fine_but_colour_independently():
+    from napari_compare_xenium_merscope.utils import build_cell_type_color_schemes
+
+    broad = ["Neurons", "Neurons", "Neurons", "Astrocytes", "Astrocytes"]
+    fine = ["Neurons:0", "Neurons:1", "Neurons:0", "Astrocytes:0", "Astrocytes:1"]
+    schemes = build_cell_type_color_schemes(broad, fine)
+
+    b, f = schemes["broad"], schemes["fine"]
+    assert b.order == ["Astrocytes", "Neurons"]
+    assert b.groups == [("Broad cell types", ["Astrocytes", "Neurons"])]
+    # Fine still grouped under its broad header (order preserved) ...
+    assert f.groups == [
+        ("Astrocytes", ["Astrocytes:0", "Astrocytes:1"]),
+        ("Neurons", ["Neurons:0", "Neurons:1"]),
+    ]
+    # ... but every fine subtype gets its own maximally-distinct colour, not a
+    # shade of its broad class. Colours are distinct within each level (the two
+    # levels are never shown together, so they may reuse the same palette head).
+    fine_colors = [tuple(c) for c in f.colors.values()]
+    assert len(set(fine_colors)) == len(fine_colors)
+    broad_colors = [tuple(c) for c in b.colors.values()]
+    assert len(set(broad_colors)) == len(broad_colors)
+    # Neuron fine subtypes are NOT shades of the broad Neuron colour.
+    assert f.colors["Neurons:0"] != b.colors["Neurons"] or f.colors["Neurons:1"] != b.colors["Neurons"]
+
+
+def test_load_cell_type_assignments_splits_neurons_by_excitatory_inhibitory(tmp_path):
+    import anndata as ad
+    import pandas as pd
+
+    from napari_compare_xenium_merscope.utils import load_cell_type_assignments
+
+    obs = pd.DataFrame(
+        {
+            "cell": np.array([1, 2, 3], dtype=np.uint32),
+            "broad_class": pd.Categorical(["Neurons", "Neurons", "Astrocytes"]),
+            "hierarchical_cluster": pd.Categorical(
+                ["Neurons/Excitatory:0", "Neurons/Inhibitory:1", "Astrocytes:0"]
+            ),
+            "neuron_split_label": pd.Categorical(["Excitatory", "Inhibitory", "not_neuron"]),
+        }
+    )
+    adata = ad.AnnData(X=np.zeros((3, 1), dtype=np.float32), obs=obs)
+    adata.uns["spatialdata_attrs"] = {"instance_key": "cell", "region_key": "region"}
+    store = str(tmp_path / "store.zarr")
+    root = zarr.open_group(store, mode="w", zarr_format=2)
+    root.create_group("tables")
+    adata.write_zarr(str(tmp_path / "store.zarr" / "tables" / "table_MOSAIK_proseg_clustering_squidpy"))
+
+    assignments = load_cell_type_assignments(store, "proseg")
+    assert assignments is not None
+    # Neurons split into excitatory / inhibitory broad categories; non-neurons kept.
+    assert assignments.broad.tolist() == [
+        "Excitatory neurons",
+        "Inhibitory neurons",
+        "Astrocytes",
+    ]
+
+
+def test_build_cell_type_color_dict_respects_enabled_and_background():
+    from napari_compare_xenium_merscope.utils import (
+        TRANSPARENT_RGBA,
+        build_cell_type_color_dict,
+        build_cell_type_color_schemes,
+    )
+
+    cell_ids = np.array([2, 5, 9], dtype=np.int64)
+    labels = np.array(["Neurons", "Astrocytes", "Neurons"])
+    schemes = build_cell_type_color_schemes(labels, labels)
+    scheme = schemes["broad"]
+
+    full = build_cell_type_color_dict(cell_ids, labels, scheme)
+    assert full[0] == TRANSPARENT_RGBA and full[None] == TRANSPARENT_RGBA
+    assert set(full) == {0, None, 2, 5, 9}
+    assert full[2] == scheme.colors["Neurons"]
+
+    only_neurons = build_cell_type_color_dict(cell_ids, labels, scheme, enabled={"Neurons"})
+    # Astrocyte cell 5 is omitted (renders transparent); neurons kept.
+    assert set(only_neurons) == {0, None, 2, 9}
+
+
+def test_load_cell_type_assignments_reads_broad_fine_and_instance_key(tmp_path):
+    import anndata as ad
+    import pandas as pd
+
+    from napari_compare_xenium_merscope.utils import (
+        clustering_table_key_for_segmentation,
+        load_cell_type_assignments,
+    )
+
+    obs = pd.DataFrame(
+        {
+            "cell": np.array([2, 5, 12, 20], dtype=np.uint32),
+            "broad_class": pd.Categorical(["Neurons", "Neurons", "Vascular cells", "nan"]),
+            "hierarchical_cluster": pd.Categorical(
+                ["Neurons:0", "Neurons:1", "Vascular cells:0", "unassigned"]
+            ),
+        }
+    )
+    adata = ad.AnnData(X=np.zeros((4, 1), dtype=np.float32), obs=obs)
+    adata.uns["spatialdata_attrs"] = {"instance_key": "cell", "region_key": "region"}
+
+    store = str(tmp_path / "store.zarr")
+    # Lay out proper zarr groups for the store root and its ``tables`` group, as
+    # a real SpatialData store has, then write the table into it.
+    root = zarr.open_group(store, mode="w", zarr_format=2)
+    root.create_group("tables")
+    adata.write_zarr(str(tmp_path / "store.zarr" / "tables" / "table_MOSAIK_proseg_clustering_squidpy"))
+    assert clustering_table_key_for_segmentation(store, "proseg") == (
+        "table_MOSAIK_proseg_clustering_squidpy"
+    )
+    assert clustering_table_key_for_segmentation(store, "cellpose") is None
+
+    assignments = load_cell_type_assignments(store, "proseg")
+    assert assignments is not None
+    assert assignments.instance_key == "cell"
+    # The row with a missing broad label (cell 20) is dropped.
+    assert assignments.cell_ids.tolist() == [2, 5, 12]
+    assert assignments.cell_ids.dtype == np.int64
+    assert assignments.broad.tolist() == ["Neurons", "Neurons", "Vascular cells"]
+    assert assignments.labels_for("fine").tolist() == [
+        "Neurons:0",
+        "Neurons:1",
+        "Vascular cells:0",
+    ]

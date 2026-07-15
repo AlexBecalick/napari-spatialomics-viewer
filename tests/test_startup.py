@@ -26,6 +26,7 @@ def _panel(datasets: list[str], initial_dataset: str | None = None):
     return V.ViewerControlPanel(
         datasets=datasets,
         gene_inspector_widget=None,
+        cell_type_widget=None,
         load_callback=callback,
         load_selected_labels_callback=callback,
         unload_selected_shapes_callback=callback,
@@ -66,9 +67,9 @@ def test_empty_startup_selects_dataset_loader(qapp):
     panel = _panel([])
 
     assert panel.current_dataset == ""
-    assert panel._tab_stack.currentIndex() == 5
-    assert panel._tab_group.button(5).text() == "Dataset loader"
-    assert panel._tab_group.button(5).isChecked()
+    assert panel._tab_stack.currentIndex() == 6
+    assert panel._tab_group.button(6).text() == "Dataset loader"
+    assert panel._tab_group.button(6).isChecked()
     assert not panel._reload_button.isEnabled()
 
 
