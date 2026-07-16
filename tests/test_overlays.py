@@ -111,6 +111,80 @@ def test_install_canvas_overlays_without_canvas_is_safe(qapp):
     assert ctrl._scale_bar is None
 
 
+def test_scale_bar_stays_hidden_until_dataset_is_loaded(qapp):
+    from qtpy.QtWidgets import QWidget
+
+    viewer = _fake_zoom_viewer(zoom=4.0)
+    canvas = QWidget()
+    canvas.resize(1000, 800)
+    viewer.window._qt_viewer.canvas.native = canvas
+    ctrl = _controller(viewer, "linear")
+
+    ctrl.install_canvas_overlays()
+
+    assert ctrl._scale_bar is not None
+    assert ctrl._scale_bar.isHidden()
+
+    ctrl.active_dataset = "MERSCOPE"
+    ctrl._active_sdata = object()
+    ctrl._update_scale_bar_visibility()
+    assert not ctrl._scale_bar.isHidden()
+
+    ctrl.active_dataset = None
+    ctrl._update_scale_bar_visibility()
+    assert ctrl._scale_bar.isHidden()
+
+
+def test_dismissed_welcome_overlay_redraws_canvas_when_layer_arrives(qapp):
+    from napari.components import ViewerModel
+    from qtpy.QtWidgets import QWidget
+
+    class SceneBackend:
+        def __init__(self):
+            self.resize_calls = []
+
+        def resizeGL(self, width, height):
+            self.resize_calls.append((width, height))
+
+    class SceneCanvas:
+        def __init__(self):
+            self.updates = 0
+            self._backend = SceneBackend()
+
+        def update(self):
+            self.updates += 1
+
+    native = QWidget()
+    native.resize(1000, 800)
+    target = QWidget()
+    scene_canvas = SceneCanvas()
+    canvas = types.SimpleNamespace(native=native, _scene_canvas=scene_canvas)
+    model = ViewerModel()
+    viewer = types.SimpleNamespace(
+        layers=model.layers,
+        theme="dark",
+        welcome_screen=types.SimpleNamespace(visible=False),
+        window=types.SimpleNamespace(_qt_viewer=types.SimpleNamespace(canvas=canvas)),
+    )
+    overlay = V.DatasetWelcomeOverlay(viewer, target, start_visible=True)
+
+    # Recent-dataset activation dismisses the overlay before workers add layers.
+    overlay.dismiss()
+    qapp.processEvents()
+    updates_after_dismiss = scene_canvas.updates
+    assert updates_after_dismiss == 1
+    resize_calls_after_dismiss = len(scene_canvas._backend.resize_calls)
+    assert scene_canvas._backend.resize_calls[-1] == (1000, 800)
+
+    # The later layer event must refresh both the GL viewport geometry and the
+    # paint even though dismiss() has already hidden the overlay.
+    model.add_image(np.zeros((8, 8)), name="Image | DAPI")
+    qapp.processEvents()
+    assert scene_canvas.updates == updates_after_dismiss + 1
+    assert len(scene_canvas._backend.resize_calls) == resize_calls_after_dismiss + 1
+    assert scene_canvas._backend.resize_calls[-1] == (1000, 800)
+
+
 def test_label_outline_uses_thread_safe_global_dask_cache(qapp):
     captured = {}
 
