@@ -44,8 +44,12 @@ napari-compare-xenium-merscope-install-macos-app
 
 Launching the `.app` from Finder, the Dock, or Sidebar opens with no dataset
 loaded and selects the **Dataset loader** tab. Choose a paired MERSCOPE/Xenium
-dataset or a standalone store there. Dataset paths passed explicitly on the
-command line still load immediately.
+dataset or a standalone store there by selecting the dataset's
+`spatialdata.zarr` folder. The empty canvas points toward these controls and
+keeps napari's rotating **Did you know?** tip. The loader also retains the ten
+most recently opened dataset folders; select an entry and click **Open selected
+recent dataset** (or double-click it) to reopen it. Dataset paths passed
+explicitly on the command line still load immediately.
 
 ### Self-contained desktop installers
 
@@ -139,6 +143,8 @@ dock so every full name stays readable.
 - **Per cell statistics** — Channel / Statistic / Colormap dropdowns plus
   **Load / Unload per-cell statistic overlay** (MERSCOPE Cellpose quantification).
 - **Draw tissue annotations** — the cortical-depth drawing tools (see below).
+  Selecting this tab automatically expands napari's layer controls so the active
+  drawing layer can be edited.
 - **Images** — a list of every individual image **channel** (across all image
   elements, for both MERSCOPE and Xenium); currently-loaded channels are shown in
   **green**. Use **Load selected image(s)**, **Load all images**, and **Unload
@@ -146,7 +152,15 @@ dock so every full name stays readable.
 - **Dataset loader** — the MERSCOPE/XENIUM switcher for the currently open
   stores, **Reload Dataset**, and buttons to open a different dataset: **Load new
   paired dataset** (browse for a MERSCOPE store then a Xenium store) or **Load new
-  standalone MERSCOPE / Xenium dataset** (browse for a single store).
+  standalone MERSCOPE / Xenium dataset** (browse for a single store). Each
+  browser expects the store's `spatialdata.zarr` folder. **Recently viewed**
+  lists up to ten stores and persists between launches.
+
+The left dock is simplified for the spatial-transcriptomics workflow. **Layer
+controls** starts collapsed and can be expanded or collapsed with the arrow in
+its title. The create-points, create-shapes, create-labels, console, 2D/3D,
+axis, and grid buttons are hidden; delete and **Reset view to original state**
+remain available.
 
 Segmentations display as memory-efficient label outlines. If a matching label
 element is already present in the SpatialData store, it is loaded lazily. If it
@@ -160,11 +174,13 @@ highlights). This is gated on the **ProSeg** (cell-inspector) layer's visibility
 hiding that layer in the napari layer list disables click-to-highlight and clears
 any current highlights, and showing it again re-enables clicking.
 
-At startup layers are requested in the order transcripts → images → masks, and
-the (long) block of per-gene layers is pinned to the **bottom** of the napari
-layer list so it doesn't crowd the top. Because napari renders lower list
-entries beneath higher ones, the transcript points therefore sit *below* the
-image and mask layers; toggle image visibility if you need the spots in front.
+The transcript renderer still uses one real napari Points layer for each marker
+symbol behind the scenes, but the layer list presents them as one **Genes** row.
+The row sits immediately beneath the final visible native layer, and its
+visibility control shows or hides every gene layer together. The real gene layer
+block remains pinned to the bottom of napari's model, so transcript points sit
+*below* image and mask layers; toggle image visibility if you need the spots in
+front.
 
 ```bash
 # Rebuild cached labels instead of reusing existing labels.
@@ -257,7 +273,8 @@ material performance cost (antialiasing aside).
 
 ### Scale bar
 
-A scale bar sits in the bottom-right corner of the canvas. Its length is fixed at
+Once a dataset has loaded, a scale bar appears in the bottom-right corner of the
+canvas. It remains hidden on the empty launch screen. Its length is fixed at
 about a quarter of the canvas width; as you zoom, the **bar stays the same size**
 and only its **label** changes to show how many microns it currently spans (large
 bold white text with a black outline).

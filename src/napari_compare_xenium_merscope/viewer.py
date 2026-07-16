@@ -24,6 +24,7 @@ import time
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
+from weakref import WeakSet
 
 import numpy as np
 import pandas as pd
@@ -66,7 +67,19 @@ except ImportError:
     sys.exit(1)
 
 try:
-    from qtpy.QtCore import QEvent, QObject, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTimer, Signal
+    from qtpy.QtCore import (
+        QEvent,
+        QObject,
+        QPoint,
+        QPointF,
+        QRect,
+        QRectF,
+        QSettings,
+        QSize,
+        Qt,
+        QTimer,
+        Signal,
+    )
     from qtpy.QtGui import (
         QBrush,
         QColor,
@@ -101,6 +114,7 @@ try:
         QSizePolicy,
         QSlider,
         QStackedWidget,
+        QToolButton,
         QVBoxLayout,
         QWidget,
     )
@@ -280,6 +294,8 @@ class CellTypeOverlayState:
 
 
 DEFAULT_GENE_SPOT_SIZE = 0.5
+MAX_RECENT_DATASETS = 10
+RECENT_DATASETS_SETTINGS_KEY = "dataset_loader/recent_datasets"
 GENE_HIGHLIGHT_SPOT_SIZE = 2.0
 #: When the (smaller) visible field of view is at or below this many microns, the
 #: label outlines switch to crisp nearest-neighbour interpolation; above it they
@@ -833,6 +849,7 @@ class ViewerControlPanel(QWidget):
     # the GUI thread.
     status_message = Signal(str)
     progress_message = Signal(str, str, bool)  # (stage key, text, active)
+    dataset_open_requested = Signal()
 
     def __init__(
         self,
@@ -862,6 +879,8 @@ class ViewerControlPanel(QWidget):
         load_paired_callback,
         load_standalone_callback,
         initial_dataset: str | None = None,
+        expand_layer_controls_callback=None,
+        settings: QSettings | None = None,
     ):
         super().__init__()
         self._gene_inspector_widget = gene_inspector_widget
@@ -876,6 +895,11 @@ class ViewerControlPanel(QWidget):
         self._unload_selected_image_callback = unload_selected_image_callback
         self._load_paired_callback = load_paired_callback
         self._load_standalone_callback = load_standalone_callback
+        self._expand_layer_controls_callback = expand_layer_controls_callback
+        self._settings = settings or QSettings(
+            "Napari Compare Xenium MERSCOPE",
+            "Spatialomics Viewer",
+        )
         self._load_cellpose_values_callback = load_cellpose_values_callback
         self._remove_cellpose_values_callback = remove_cellpose_values_callback
         self._create_annotation_layers_callback = create_annotation_layers_callback
@@ -909,6 +933,18 @@ class ViewerControlPanel(QWidget):
         self._load_standalone_merscope_button.clicked.connect(self._on_load_standalone_merscope)
         self._load_standalone_xenium_button = QPushButton("Load new standalone Xenium dataset")
         self._load_standalone_xenium_button.clicked.connect(self._on_load_standalone_xenium)
+        self._recent_dataset_list = QListWidget()
+        self._recent_dataset_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._recent_dataset_list.setMaximumHeight(220)
+        self._recent_dataset_list.itemActivated.connect(self._on_recent_dataset_activated)
+        self._recent_dataset_list.currentItemChanged.connect(
+            self._on_recent_dataset_selection_changed
+        )
+        self._open_recent_dataset_button = QPushButton("Open selected recent dataset")
+        self._open_recent_dataset_button.setEnabled(False)
+        self._open_recent_dataset_button.clicked.connect(self._on_open_recent_dataset)
+        self._recent_datasets = self._read_recent_datasets()
+        self._refresh_recent_dataset_list()
 
         # -- Cell segmentation ----------------------------------------------
         self._shape_list = QListWidget()
@@ -1057,6 +1093,10 @@ class ViewerControlPanel(QWidget):
         button.setCursor(Qt.PointingHandCursor)
         button.setStyleSheet(self._TAB_BUTTON_STYLE)
         button.clicked.connect(lambda _checked=False, idx=index: self._tab_stack.setCurrentIndex(idx))
+        if title == "Draw tissue annotations" and self._expand_layer_controls_callback is not None:
+            button.clicked.connect(
+                lambda _checked=False: self._expand_layer_controls_callback()
+            )
         self._tab_group.addButton(button, index)
         self._tab_bar_layout.addWidget(button)
 
@@ -1183,6 +1223,10 @@ class ViewerControlPanel(QWidget):
         layout.addWidget(self._load_paired_button)
         layout.addWidget(self._load_standalone_merscope_button)
         layout.addWidget(self._load_standalone_xenium_button)
+        layout.addSpacing(10)
+        layout.addWidget(QLabel("Recently viewed"))
+        layout.addWidget(self._recent_dataset_list)
+        layout.addWidget(self._open_recent_dataset_button)
         layout.addStretch(1)
         return self._scrollable(layout)
 
@@ -1318,6 +1362,91 @@ class ViewerControlPanel(QWidget):
             self._dataset_combo.blockSignals(False)
         self._reload_button.setEnabled(bool(names))
 
+    @property
+    def recent_datasets(self) -> list[dict[str, str]]:
+        """Return a copy of the persisted most-recently-opened dataset list."""
+        return [dict(entry) for entry in self._recent_datasets]
+
+    def _read_recent_datasets(self) -> list[dict[str, str]]:
+        raw = self._settings.value(RECENT_DATASETS_SETTINGS_KEY, "")
+        if not raw:
+            return []
+        try:
+            entries = json.loads(str(raw))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            log.warning("Ignoring unreadable recently viewed dataset settings.")
+            return []
+        if not isinstance(entries, list):
+            return []
+
+        cleaned: list[dict[str, str]] = []
+        seen_paths: set[str] = set()
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            platform = str(entry.get("platform", "")).upper()
+            path = str(entry.get("path", "")).strip()
+            if platform not in {"MERSCOPE", "XENIUM"} or not path or path in seen_paths:
+                continue
+            seen_paths.add(path)
+            cleaned.append({"platform": platform, "path": path})
+            if len(cleaned) >= MAX_RECENT_DATASETS:
+                break
+        return cleaned
+
+    def _write_recent_datasets(self):
+        self._settings.setValue(
+            RECENT_DATASETS_SETTINGS_KEY,
+            json.dumps(self._recent_datasets, separators=(",", ":")),
+        )
+        self._settings.sync()
+
+    @staticmethod
+    def _recent_dataset_label(entry: dict[str, str]) -> str:
+        path = Path(entry["path"])
+        if path.name.lower() == "spatialdata.zarr" and path.parent.name:
+            folder = f"{path.parent.name}/{path.name}"
+        else:
+            folder = path.name or str(path)
+        return f"{entry['platform']} — {folder}"
+
+    def _refresh_recent_dataset_list(self):
+        self._recent_dataset_list.clear()
+        if not self._recent_datasets:
+            item = QListWidgetItem("No recent datasets yet")
+            item.setFlags(Qt.NoItemFlags)
+            self._recent_dataset_list.addItem(item)
+            self._open_recent_dataset_button.setEnabled(False)
+            return
+        for entry in self._recent_datasets:
+            item = QListWidgetItem(self._recent_dataset_label(entry))
+            item.setData(Qt.UserRole, dict(entry))
+            item.setToolTip(entry["path"])
+            self._recent_dataset_list.addItem(item)
+        self._open_recent_dataset_button.setEnabled(False)
+
+    def record_recent_dataset(self, platform: str, path) -> None:
+        """Move a successfully opened SpatialData folder to the top of recents."""
+        platform = str(platform).upper()
+        normalized = str(Path(path).expanduser().absolute())
+        entry = {"platform": platform, "path": normalized}
+        self._recent_datasets = [
+            existing
+            for existing in self._recent_datasets
+            if existing.get("path") != normalized
+        ]
+        self._recent_datasets.insert(0, entry)
+        del self._recent_datasets[MAX_RECENT_DATASETS:]
+        self._write_recent_datasets()
+        self._refresh_recent_dataset_list()
+
+    def _recent_browse_directory(self) -> str:
+        if not self._recent_datasets:
+            return ""
+        path = Path(self._recent_datasets[0]["path"])
+        candidate = path.parent if path.name.lower() == "spatialdata.zarr" else path
+        return str(candidate) if candidate.exists() else ""
+
     # -- event handlers -----------------------------------------------------
     def _on_dataset_changed(self, text: str):
         if not text:
@@ -1329,29 +1458,77 @@ class ViewerControlPanel(QWidget):
             self._load_callback(self.current_dataset, True)
 
     def _browse_zarr(self, title: str) -> str | None:
-        path = QFileDialog.getExistingDirectory(self, title, "")
+        path = QFileDialog.getExistingDirectory(
+            self,
+            title,
+            self._recent_browse_directory(),
+        )
         return path or None
 
     def _on_load_paired(self):
-        merscope_path = self._browse_zarr("Select the MERSCOPE .zarr store")
+        merscope_path = self._browse_zarr(
+            "Select the spatialdata.zarr folder for the MERSCOPE dataset"
+        )
         if not merscope_path:
             return
-        xenium_path = self._browse_zarr("Select the Xenium .zarr store")
+        xenium_path = self._browse_zarr(
+            "Select the spatialdata.zarr folder for the Xenium dataset"
+        )
         if not xenium_path:
             return
-        self._load_paired_callback(merscope_path, xenium_path)
+        result = self._load_paired_callback(merscope_path, xenium_path)
+        if result is False:
+            return
+        self.record_recent_dataset("MERSCOPE", merscope_path)
+        self.record_recent_dataset("XENIUM", xenium_path)
+        self.dataset_open_requested.emit()
 
     def _on_load_standalone_merscope(self):
-        path = self._browse_zarr("Select the MERSCOPE .zarr store")
+        path = self._browse_zarr(
+            "Select the spatialdata.zarr folder for the MERSCOPE dataset"
+        )
         if not path:
             return
-        self._load_standalone_callback("MERSCOPE", path)
+        result = self._load_standalone_callback("MERSCOPE", path)
+        if result is False:
+            return
+        self.record_recent_dataset("MERSCOPE", path)
+        self.dataset_open_requested.emit()
 
     def _on_load_standalone_xenium(self):
-        path = self._browse_zarr("Select the Xenium .zarr store")
+        path = self._browse_zarr(
+            "Select the spatialdata.zarr folder for the Xenium dataset"
+        )
         if not path:
             return
-        self._load_standalone_callback("XENIUM", path)
+        result = self._load_standalone_callback("XENIUM", path)
+        if result is False:
+            return
+        self.record_recent_dataset("XENIUM", path)
+        self.dataset_open_requested.emit()
+
+    def _on_recent_dataset_selection_changed(self, current, _previous):
+        self._open_recent_dataset_button.setEnabled(
+            current is not None and bool(current.data(Qt.UserRole))
+        )
+
+    def _on_recent_dataset_activated(self, item):
+        self._open_recent_dataset_item(item)
+
+    def _on_open_recent_dataset(self):
+        self._open_recent_dataset_item(self._recent_dataset_list.currentItem())
+
+    def _open_recent_dataset_item(self, item):
+        entry = item.data(Qt.UserRole) if item is not None else None
+        if not entry:
+            return
+        platform = str(entry["platform"])
+        path = str(entry["path"])
+        result = self._load_standalone_callback(platform, path)
+        if result is False:
+            return
+        self.record_recent_dataset(platform, path)
+        self.dataset_open_requested.emit()
 
     def _on_load_selected_labels(self):
         keys = self.selected_shape_keys()
@@ -2935,6 +3112,494 @@ class ScaleBarOverlay(QWidget):
         painter.end()
 
 
+def _gene_aggregate_thumbnail(px: int = 30) -> QPixmap:
+    """Return a compact multicolour transcript thumbnail for the aggregate row."""
+    pixmap = QPixmap(px, px)
+    pixmap.fill(QColor(8, 10, 14))
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.Antialiasing, True)
+    colors = (
+        QColor("#22d3ee"),
+        QColor("#a3e635"),
+        QColor("#f472b6"),
+        QColor("#facc15"),
+        QColor("#8b5cf6"),
+    )
+    points = ((6, 7), (15, 5), (23, 9), (9, 15), (19, 16), (6, 24), (15, 25), (24, 23))
+    painter.setPen(Qt.NoPen)
+    for index, (x, y) in enumerate(points):
+        painter.setBrush(QBrush(colors[index % len(colors)]))
+        painter.drawEllipse(QPointF(float(x), float(y)), 2.0, 2.0)
+    painter.end()
+    return pixmap
+
+
+class GeneLayerAggregateRow(QFrame):
+    """One layer-list row controlling all hidden transcript marker layers."""
+
+    def __init__(self, viewer, parent=None):
+        super().__init__(parent)
+        self.viewer = viewer
+        self.setObjectName("GeneLayerAggregateRow")
+        self.setFixedHeight(38)
+        self.setToolTip("Controls the visibility of all transcript gene layers")
+        self.setStyleSheet(
+            "#GeneLayerAggregateRow {"
+            " background: rgba(104, 116, 132, 105);"
+            " border: 1px solid rgba(180, 190, 205, 65); border-radius: 3px; }"
+            "#GeneLayerAggregateRow QLabel { background: transparent; }"
+        )
+
+        thumbnail = QLabel()
+        thumbnail.setPixmap(_gene_aggregate_thumbnail())
+        thumbnail.setFixedSize(32, 32)
+
+        self.visibility_button = QToolButton()
+        self.visibility_button.setAutoRaise(True)
+        self.visibility_button.setFixedSize(32, 32)
+        self.visibility_button.setIconSize(QSize(20, 20))
+        self.visibility_button.clicked.connect(self.toggle_visibility)
+
+        label = QLabel("Genes")
+        font = label.font()
+        font.setBold(True)
+        label.setFont(font)
+        label.setAlignment(Qt.AlignVCenter | Qt.AlignHCenter)
+        label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+
+        layer_type = QLabel("•••")
+        layer_type.setAlignment(Qt.AlignCenter)
+        layer_type.setToolTip("Points layers")
+
+        layout = QHBoxLayout()
+        layout.setContentsMargins(3, 2, 8, 2)
+        layout.setSpacing(5)
+        layout.addWidget(thumbnail)
+        layout.addWidget(self.visibility_button)
+        layout.addWidget(label, 1)
+        layout.addWidget(layer_type)
+        self.setLayout(layout)
+        self.setVisible(False)
+
+    def gene_layers(self) -> list:
+        return [
+            layer
+            for layer in self.viewer.layers
+            if str(getattr(layer, "name", "")).startswith("Genes | ")
+        ]
+
+    def refresh(self):
+        layers = self.gene_layers()
+        self.setVisible(bool(layers))
+        if not layers:
+            return
+        all_visible = all(bool(getattr(layer, "visible", False)) for layer in layers)
+        icon_name = "visibility" if all_visible else "visibility_off"
+        try:
+            from napari.resources import get_icon_path
+
+            self.visibility_button.setIcon(QIcon(get_icon_path(icon_name)))
+        except Exception:
+            self.visibility_button.setText("●" if all_visible else "○")
+        action = "Hide" if all_visible else "Show"
+        self.visibility_button.setToolTip(f"{action} all gene layers")
+        self.setToolTip(
+            f"Genes — {len(layers)} underlying transcript marker layer(s); "
+            f"click the eye to {action.lower()} all"
+        )
+
+    def toggle_visibility(self):
+        layers = self.gene_layers()
+        if not layers:
+            return
+        visible = not all(bool(getattr(layer, "visible", False)) for layer in layers)
+        for layer in layers:
+            layer.visible = visible
+        self.refresh()
+
+
+class NapariLeftPanelAdapter(QObject):
+    """Apply the viewer-specific, non-destructive presentation of napari's left dock."""
+
+    def __init__(self, viewer):
+        qt_viewer = viewer.window._qt_viewer
+        super().__init__(qt_viewer)
+        self.viewer = viewer
+        self.qt_viewer = qt_viewer
+        self._refresh_pending = False
+        # Weak references are essential here: each Points layer can own millions
+        # of coordinates and must be collectable when a dataset is replaced.
+        self._observed_gene_layers = WeakSet()
+        self._layer_controls_expanded = True
+        self._expanded_layer_controls_height = 260
+        self._collapse_button = None
+
+        # Remove layer creation shortcuts while retaining the delete action.
+        layer_buttons = qt_viewer.layerButtons
+        for name in ("newPointsButton", "newShapesButton", "newLabelsButton"):
+            button = getattr(layer_buttons, name, None)
+            if button is not None:
+                button.hide()
+
+        # Keep only napari's reset-to-original-view action in the lower toolbar.
+        viewer_buttons = qt_viewer.viewerButtons
+        for name in (
+            "consoleButton",
+            "ndisplayButton",
+            "rollDimsButton",
+            "transposeDimsButton",
+            "gridViewButton",
+        ):
+            button = getattr(viewer_buttons, name, None)
+            if button is not None:
+                button.hide()
+
+        self._layer_view = qt_viewer.layers
+        layer_list_container = qt_viewer.dockLayerList.inner_widget()
+        self.gene_row = GeneLayerAggregateRow(viewer, layer_list_container)
+        layer_list_layout = layer_list_container.layout()
+        # Native order is layer buttons, layer list, viewer buttons. The custom
+        # row belongs immediately below the list, where the underlying gene block
+        # previously appeared.
+        layer_list_layout.insertWidget(2, self.gene_row)
+        # Once the layer view is sized to its visible rows, this spacer absorbs
+        # the rest of the dock height while the reset-view button stays at the
+        # bottom. The Genes row therefore remains attached to the final layer.
+        layer_list_layout.insertStretch(3, 1)
+        self._layer_view.setMinimumHeight(0)
+
+        for event_name in ("inserted", "removed", "moved", "reordered", "renamed"):
+            emitter = getattr(viewer.layers.events, event_name, None)
+            if emitter is not None:
+                emitter.connect(self._on_layers_changed)
+
+        self._controls_dock = qt_viewer.dockLayerControls
+        self._layer_controls = self._controls_dock.inner_widget()
+        self._controls_dock.visibilityChanged.connect(self._on_controls_dock_visibility)
+        self._install_collapse_button()
+
+        self._refresh_gene_presentation()
+        self.set_layer_controls_expanded(False)
+
+    def _on_layers_changed(self, _event=None):
+        self._schedule_gene_refresh()
+
+    def _observe_gene_layer(self, layer):
+        if layer in self._observed_gene_layers:
+            return
+        self._observed_gene_layers.add(layer)
+        for event_name in ("visible", "name"):
+            emitter = getattr(getattr(layer, "events", None), event_name, None)
+            if emitter is not None:
+                emitter.connect(self._on_layers_changed)
+
+    def _schedule_gene_refresh(self):
+        if self._refresh_pending:
+            return
+        self._refresh_pending = True
+        QTimer.singleShot(0, self._refresh_gene_presentation)
+
+    def _refresh_gene_presentation(self):
+        self._refresh_pending = False
+        for layer in self.viewer.layers:
+            if str(getattr(layer, "name", "")).startswith("Genes | "):
+                self._observe_gene_layer(layer)
+
+        # The visible Qt model is reverse-proxied, so filter by displayed name
+        # rather than assuming a relationship between list/model row numbers.
+        model = self._layer_view.model()
+        visible_row_heights: list[int] = []
+        for row in range(model.rowCount()):
+            index = model.index(row, 0)
+            name = str(index.data(Qt.DisplayRole) or "")
+            hidden = name.startswith("Genes | ")
+            self._layer_view.setRowHidden(row, hidden)
+            if hidden:
+                continue
+            hint = index.data(Qt.SizeHintRole)
+            height = int(hint.height()) if isinstance(hint, QSize) else -1
+            if height <= 0:
+                height = int(self._layer_view.sizeHintForRow(row))
+            visible_row_heights.append(max(1, height if height > 0 else 34))
+
+        # QListView normally expands to fill the dock, which left a large gap
+        # between the last native layer and the separate aggregate row. Cap its
+        # height at exactly its visible content; if there are more rows than fit,
+        # Qt still gives it the available space and its scrollbar remains usable.
+        spacing = max(0, int(self._layer_view.spacing()))
+        content_height = 2 * int(self._layer_view.frameWidth())
+        content_height += sum(visible_row_heights)
+        content_height += spacing * max(0, len(visible_row_heights) - 1)
+        self._layer_view.setMaximumHeight(max(2, content_height))
+        self.gene_row.refresh()
+
+    def _on_controls_dock_visibility(self, visible: bool):
+        if visible:
+            QTimer.singleShot(0, self._install_collapse_button)
+
+    def _install_collapse_button(self):
+        title = getattr(self._controls_dock, "title", None)
+        if title is None or title.layout() is None:
+            return
+        existing = getattr(title, "_napari_compare_collapse_button", None)
+        if existing is not None:
+            self._collapse_button = existing
+            self._update_collapse_button()
+            return
+        button = QPushButton(title)
+        button.setObjectName("LayerControlsCollapseButton")
+        button.setStyleSheet(
+            "QPushButton { min-width: 18px; max-width: 18px;"
+            " min-height: 16px; max-height: 16px; padding: 0; border: none; }"
+        )
+        button.setFlat(True)
+        button.setFixedSize(22, 18)
+        button.clicked.connect(self.toggle_layer_controls)
+        title.layout().insertWidget(max(0, title.layout().count() - 1), button)
+        title._napari_compare_collapse_button = button
+        self._collapse_button = button
+        self._update_collapse_button()
+
+    def _update_collapse_button(self):
+        if self._collapse_button is None:
+            return
+        if self._layer_controls_expanded:
+            self._collapse_button.setText("▾")
+            self._collapse_button.setToolTip("Collapse layer controls")
+        else:
+            self._collapse_button.setText("▸")
+            self._collapse_button.setToolTip("Expand layer controls")
+
+    def toggle_layer_controls(self):
+        self.set_layer_controls_expanded(not self._layer_controls_expanded)
+
+    def expand_layer_controls(self):
+        self.set_layer_controls_expanded(True)
+
+    def set_layer_controls_expanded(self, expanded: bool):
+        expanded = bool(expanded)
+        dock = self._controls_dock
+        if expanded == self._layer_controls_expanded and self._collapse_button is not None:
+            self._update_collapse_button()
+            return
+
+        if not expanded and dock.height() > 60:
+            self._expanded_layer_controls_height = max(180, int(dock.height()))
+        self._layer_controls_expanded = expanded
+        self._layer_controls.setVisible(expanded)
+        if expanded:
+            dock.setMinimumHeight(50)
+            dock.setMaximumHeight(16777215)
+            requested_height = self._expanded_layer_controls_height
+        else:
+            title = getattr(dock, "title", None)
+            title_height = title.sizeHint().height() if title is not None else 20
+            requested_height = max(24, int(title_height) + 4)
+            dock.setMinimumHeight(requested_height)
+            dock.setMaximumHeight(requested_height)
+        self._update_collapse_button()
+
+        main_window = getattr(self.viewer.window, "_qt_window", None)
+        resize_docks = getattr(main_window, "resizeDocks", None)
+        if resize_docks is not None:
+            try:
+                resize_docks([dock], [requested_height], Qt.Vertical)
+            except Exception:
+                pass
+
+
+def simplify_napari_welcome_screen(viewer) -> bool:
+    """Hide napari's logo/open-file copy while retaining its rotating tip."""
+    try:
+        canvas = viewer.window._qt_viewer.canvas
+        visuals = canvas._overlay_to_visual.get(viewer.welcome_screen, [])
+        changed = False
+        for visual in visuals:
+            node = visual.node
+            for child_name in ("logo", "header", "shortcut_keybindings", "shortcut_descriptions"):
+                child = getattr(node, child_name, None)
+                if child is not None:
+                    child.visible = False
+                    changed = True
+        return changed
+    except Exception as exc:
+        log.debug("Could not simplify napari's welcome visual: %s", exc)
+        return False
+
+
+class DatasetWelcomeOverlay(QWidget):
+    """Empty-canvas instruction with an arrow aimed at the dataset loader."""
+
+    def __init__(self, viewer, target_widget, *, start_visible: bool):
+        parent = viewer.window._qt_viewer.canvas.native
+        super().__init__(parent)
+        self.viewer = viewer
+        self.target_widget = target_widget
+        self._dismissed = not bool(start_visible)
+        self._canvas_redraw_pending = False
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WA_TranslucentBackground, True)
+        parent.installEventFilter(self)
+        target_widget.installEventFilter(self)
+        viewer.layers.events.inserted.connect(self.dismiss)
+        self._sync_geometry()
+        self.setVisible(not self._dismissed)
+        if not self._dismissed:
+            viewer.welcome_screen.visible = True
+            self.raise_()
+        else:
+            viewer.welcome_screen.visible = False
+        QTimer.singleShot(0, self.update)
+
+    def eventFilter(self, obj, event):  # noqa: N802 (Qt override)
+        if event.type() in (QEvent.Resize, QEvent.Move, QEvent.Show):
+            if obj is self.parentWidget():
+                self._sync_geometry()
+            else:
+                self.update()
+        return False
+
+    def _sync_geometry(self):
+        parent = self.parentWidget()
+        if parent is not None:
+            self.setGeometry(parent.rect())
+            self.update()
+
+    def dismiss(self, _event=None):
+        if not self._dismissed:
+            self._dismissed = True
+            self.viewer.welcome_screen.visible = False
+            self.hide()
+        # A recent-dataset selection dismisses this full-canvas Qt widget before
+        # the background workers add their VisPy layers. Each later insertion
+        # reaches this method again; even though dismissal is already complete,
+        # it must still refresh the canvas geometry. On macOS, a redraw alone can
+        # leave VisPy's OpenGL viewport stale until a dock resize occurs.
+        self._schedule_canvas_redraw()
+
+    def _schedule_canvas_redraw(self):
+        if self._canvas_redraw_pending:
+            return
+        self._canvas_redraw_pending = True
+        QTimer.singleShot(0, self._redraw_canvas)
+
+    def _redraw_canvas(self):
+        self._canvas_redraw_pending = False
+        try:
+            canvas = self.viewer.window._qt_viewer.canvas
+        except Exception:
+            return
+        native = getattr(canvas, "native", None)
+        scene_canvas = getattr(canvas, "_scene_canvas", None)
+        try:
+            # Re-run the same VisPy/Qt geometry hook that QOpenGLWidget invokes
+            # after a real dock resize. The layer, extent and camera can all be
+            # correct while the existing GL viewport still renders an empty
+            # frame; resizeGL refreshes that viewport without visibly changing
+            # either dock width.
+            backend = scene_canvas._backend
+            backend.resizeGL(native.width(), native.height())
+        except Exception:
+            pass
+        try:
+            scene_canvas.update()
+        except Exception:
+            pass
+        try:
+            # update() schedules the QOpenGLWidget paint; repaint() forces it in
+            # this event-loop turn, after layer insertion and camera fitting.
+            native.update()
+            native.repaint()
+        except Exception:
+            pass
+
+    def _arrow_target(self) -> QPointF:
+        target_center = self.target_widget.rect().center()
+        global_center = self.target_widget.mapToGlobal(target_center)
+        local_center = self.mapFromGlobal(global_center)
+        return QPointF(
+            float(max(12, self.width() - 14)),
+            float(max(55, min(self.height() - 55, local_center.y()))),
+        )
+
+    def paintEvent(self, _event):  # noqa: N802 (Qt override)
+        if self._dismissed or self.width() < 240 or self.height() < 180:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        dark_theme = str(getattr(self.viewer, "theme", "dark")).lower() != "light"
+        text_color = QColor("#d9dee7") if dark_theme else QColor("#27303d")
+        accent = QColor("#4aa3ff") if dark_theme else QColor("#1769aa")
+
+        width = min(760.0, max(210.0, self.width() * 0.62))
+        left = max(20.0, (self.width() - width) / 2.0)
+        top = max(42.0, self.height() * 0.16)
+        title_rect = QRectF(left, top, width, 68.0)
+        detail_rect = QRectF(left, top + 76.0, width, 156.0)
+
+        title_font = QFont()
+        title_font.setBold(True)
+        title_font.setPointSize(28)
+        painter.setFont(title_font)
+        painter.setPen(QPen(text_color))
+        painter.drawText(
+            title_rect,
+            Qt.AlignCenter | Qt.TextWordWrap,
+            "Load a spatial transcriptomics dataset",
+        )
+
+        detail_font = QFont()
+        detail_font.setPointSize(24)
+        painter.setFont(detail_font)
+        painter.drawText(
+            detail_rect,
+            Qt.AlignCenter | Qt.TextWordWrap,
+            "Navigate to your dataset's spatialdata.zarr folder, then select "
+            "that folder using the Dataset loader.",
+        )
+
+        tip = self._arrow_target()
+        start = QPointF(
+            min(tip.x() - 110.0, detail_rect.right() + 20.0),
+            detail_rect.center().y(),
+        )
+        dx, dy = tip.x() - start.x(), tip.y() - start.y()
+        length = float(np.hypot(dx, dy))
+        if length > 1.0:
+            ux, uy = dx / length, dy / length
+            px, py = -uy, ux
+            arrow_length, arrow_width = 36.0, 19.0
+            shaft_end = QPointF(
+                tip.x() - ux * arrow_length,
+                tip.y() - uy * arrow_length,
+            )
+            pen = QPen(accent)
+            pen.setWidthF(10.0)
+            pen.setCapStyle(Qt.FlatCap)
+            painter.setPen(pen)
+            # Stop the shaft at the arrowhead base. Drawing through to the tip
+            # makes the cap protrude beyond or distort the triangular head.
+            painter.drawLine(start, shaft_end)
+            arrow = QPolygonF(
+                [
+                    tip,
+                    QPointF(
+                        shaft_end.x() + px * arrow_width,
+                        shaft_end.y() + py * arrow_width,
+                    ),
+                    QPointF(
+                        shaft_end.x() - px * arrow_width,
+                        shaft_end.y() - py * arrow_width,
+                    ),
+                ]
+            )
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(accent))
+            painter.drawPolygon(arrow)
+        painter.end()
+
+
 class ComparisonViewerController:
     """Coordinate loading/clearing napari layers for each dataset."""
 
@@ -3023,8 +3688,7 @@ class ComparisonViewerController:
         if native is not None:
             try:
                 self._scale_bar = ScaleBarOverlay(native)
-                self._scale_bar.show()
-                self._scale_bar.raise_()
+                self._update_scale_bar_visibility()
                 self._canvas_resize_relay = _WidgetResizeRelay(self._on_canvas_geometry_changed)
                 native.installEventFilter(self._canvas_resize_relay)
             except Exception as exc:
@@ -3035,6 +3699,15 @@ class ComparisonViewerController:
         except Exception as exc:
             log.debug("Could not connect camera zoom for overlays: %s", exc)
         self._on_camera_zoom()
+
+    def _update_scale_bar_visibility(self):
+        """Show the scale bar only after a dataset has loaded successfully."""
+        if self._scale_bar is None:
+            return
+        visible = self.active_dataset is not None and self._active_sdata is not None
+        self._scale_bar.setVisible(visible)
+        if visible:
+            self._scale_bar.raise_()
 
     def _canvas_native_widget(self):
         try:
@@ -3819,10 +4492,10 @@ class ComparisonViewerController:
         ds = str(dataset_name).upper()
         if ds not in self.datasets:
             self._set_status(f"Unknown dataset: {dataset_name}")
-            return
+            return False
 
         if (self.active_dataset == ds) and (not force):
-            return
+            return True
 
         self._reset_progress()
         mem_before = memory_snapshot_gb()
@@ -3836,6 +4509,7 @@ class ComparisonViewerController:
             self._clear_layers()
             gc.collect()
             self.active_dataset = None
+            self._update_scale_bar_visibility()
             self._segmentation_keys = []
             self._image_keys = []
             self._image_channels = []
@@ -3892,6 +4566,7 @@ class ComparisonViewerController:
             self._publish_loaded_image_entries()
             self._publish_cellpose_value_options()
             self._publish_cell_type_options()
+            self._update_scale_bar_visibility()
 
             elapsed = time.time() - t0
             mem_after = memory_snapshot_gb()
@@ -3906,6 +4581,7 @@ class ComparisonViewerController:
 
             # Kick off the default background loads (images / masks / transcripts).
             self._start_startup_autoload(ds)
+            return True
 
         except Exception as exc:
             self._set_status(f"Failed to load {ds}: {exc}")
@@ -3913,6 +4589,7 @@ class ComparisonViewerController:
             self.active_dataset = None
             self._active_sdata = None
             self._active_images_sdata = None
+            self._update_scale_bar_visibility()
             self._segmentation_keys = []
             self._image_keys = []
             self._image_channels = []
@@ -3922,6 +4599,7 @@ class ComparisonViewerController:
             self._publish_loaded_image_entries()
             if self._cellpose_value_options_callback is not None:
                 self._cellpose_value_options_callback([], [], False)
+            return False
         finally:
             self._end_progress("dataset")
 
@@ -3939,10 +4617,11 @@ class ComparisonViewerController:
         self.active_dataset = None
         self._active_sdata = None
         self._active_images_sdata = None
+        self._update_scale_bar_visibility()
         self.datasets = datasets
         if self._datasets_changed_callback is not None:
             self._datasets_changed_callback(list(datasets.keys()), initial)
-        self.load_dataset(initial, force=True)
+        return self.load_dataset(initial, force=True)
 
     def load_paired_dataset(self, merscope_path, xenium_path):
         """Open a MERSCOPE + Xenium pair browsed from the Dataset loader tab."""
@@ -3960,8 +4639,8 @@ class ComparisonViewerController:
         except Exception as exc:
             self._set_status(f"Could not open paired dataset: {exc}")
             log.exception("Failed to open paired dataset")
-            return
-        self._replace_datasets(datasets, initial="MERSCOPE")
+            return False
+        return self._replace_datasets(datasets, initial="MERSCOPE")
 
     def load_standalone_dataset(self, platform: str, path):
         """Open a single MERSCOPE or Xenium store browsed from the loader tab."""
@@ -3975,8 +4654,8 @@ class ComparisonViewerController:
         except Exception as exc:
             self._set_status(f"Could not open {platform} dataset: {exc}")
             log.exception("Failed to open standalone %s dataset", platform)
-            return
-        self._replace_datasets(datasets, initial=platform)
+            return False
+        return self._replace_datasets(datasets, initial=platform)
 
     def _pyramid_levels_from_element(self, elem) -> list[object]:
         """Return the (c, y, x) DataArrays of a stored image element, coarsest last."""
@@ -7439,6 +8118,7 @@ def main():
     install_application_icon(viewer)
     log_environment_diagnostics(viewer)
     controller = ComparisonViewerController(viewer=viewer, datasets=datasets, args=args)
+    left_panel = NapariLeftPanelAdapter(viewer)
 
     # The gene inspector widget is embedded as the "Gene inspector" tab of the
     # control panel, so build it first and pass it in.
@@ -7496,6 +8176,7 @@ def main():
         load_paired_callback=controller.load_paired_dataset,
         load_standalone_callback=controller.load_standalone_dataset,
         initial_dataset=initial_dataset,
+        expand_layer_controls_callback=left_panel.expand_layer_controls,
     )
     controller.set_status_callback(panel.set_status)
     controller.set_progress_callback(panel.set_progress)
@@ -7509,9 +8190,23 @@ def main():
     controller.set_cell_type_widget(cell_type_widget)
     viewer.window.add_dock_widget(panel, area="right", name="Viewer Controls")
 
+    simplify_napari_welcome_screen(viewer)
+    welcome_overlay = DatasetWelcomeOverlay(
+        viewer,
+        panel._load_paired_button,
+        start_visible=initial_dataset is None,
+    )
+    panel.dataset_open_requested.connect(welcome_overlay.dismiss)
+    # Keep the Qt helpers alive with the controller for the lifetime of the app.
+    controller._left_panel_adapter = left_panel
+    controller._dataset_welcome_overlay = welcome_overlay
+
     controller.install_canvas_overlays()
     if initial_dataset is not None:
-        controller.load_dataset(initial_dataset, force=True)
+        loaded = controller.load_dataset(initial_dataset, force=True)
+        if loaded:
+            for dataset_name, config in datasets.items():
+                panel.record_recent_dataset(dataset_name, config.zarr_path)
     else:
         panel.set_status("No dataset loaded. Choose a dataset from the Dataset loader tab.")
     if args.package_smoke_test:
