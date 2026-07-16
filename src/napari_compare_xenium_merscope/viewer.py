@@ -427,6 +427,10 @@ CELL_BOUNDARY_FALLBACK_WIDTH_UM = 0.3
 CELL_LINK_COLOR = (1.0, 1.0, 1.0, 0.35)
 CELL_LINK_WIDTH = 0.25
 CELL_PIE_SLICE_DARKEN = 0.6
+#: Maximum canvas movement still treated as an inspection click. Hit-testing
+#: transcripts and cell polygons is deferred until release; moving farther than
+#: this makes the gesture a pure napari pan with no synchronous pick work.
+INSPECT_CLICK_DRAG_THRESHOLD_PX = 4.0
 #: Cell masks whose GeoDataFrames are preferred targets for a mask click, most
 #: specific first. ProSeg is the primary target named in the feature request.
 CELL_INSPECTOR_SHAPE_PREFERENCE = ("proseg", "cellpose", "cell")
@@ -7003,10 +7007,67 @@ class ComparisonViewerController:
         state.pending_groups = set()
         self._rebuild_gene_group_layers(state, group_indices=sorted(groups) if groups else None)
 
+    @staticmethod
+    def _event_canvas_position(event) -> np.ndarray | None:
+        """Return a copied 2D canvas-pixel position for drag discrimination."""
+        value = getattr(event, "pos", None)
+        if value is None:
+            return None
+        try:
+            position = np.asarray(value, dtype=float).ravel()
+        except Exception:
+            return None
+        if position.size < 2 or not np.isfinite(position[:2]).all():
+            return None
+        return position[:2].copy()
+
+    @staticmethod
+    def _snapshot_pick_event(event):
+        """Capture the world-space fields needed after napari mutates the event."""
+        values = {}
+        for name in ("position", "view_direction", "dims_displayed"):
+            value = getattr(event, name, None)
+            if value is None:
+                values[name] = None
+                continue
+            try:
+                values[name] = np.asarray(value).copy()
+            except Exception:
+                values[name] = value
+        return SimpleNamespace(**values)
+
     def _on_viewer_mouse_press(self, _viewer, event):
+        """Defer inspection hit-testing until release of a genuine click.
+
+        napari keeps generator callbacks alive across press, move, and release.
+        Yielding immediately lets its native pan handler start without waiting
+        for Points ``get_value`` calls or a GeoPandas spatial-index query.
+        """
         event_type = str(getattr(event, "type", "mouse_press"))
         if "press" not in event_type:
             return
+        pick_event = self._snapshot_pick_event(event)
+        press_position = self._event_canvas_position(event)
+        dragged = False
+
+        # Return control to napari before doing any transcript/cell hit-testing.
+        yield
+        while str(getattr(event, "type", "")) == "mouse_move":
+            current_position = self._event_canvas_position(event)
+            if press_position is None or current_position is None:
+                # Without canvas coordinates, any move is safest to classify as
+                # a drag: panning responsiveness takes priority over inspection.
+                dragged = True
+            elif np.linalg.norm(current_position - press_position) > INSPECT_CLICK_DRAG_THRESHOLD_PX:
+                dragged = True
+            yield
+
+        if dragged or "release" not in str(getattr(event, "type", "")):
+            return
+        self._handle_viewer_click(pick_event)
+
+    def _handle_viewer_click(self, event):
+        """Run the existing transcript/cell inspection logic for a true click."""
         if self.active_dataset is None:
             return
         ds = self.active_dataset

@@ -511,7 +511,7 @@ def test_clicking_transcripts_accumulates_highlights_and_empty_click_clears(qapp
         dims_displayed=(0, 1),
     )
 
-    ctrl._on_viewer_mouse_press(ctrl.viewer, event)
+    _dispatch_click(ctrl, event)
 
     assert state.highlighted_genes == ["AAA"]
     assert "AAA: 6 counts" in messages[-1]
@@ -521,7 +521,7 @@ def test_clicking_transcripts_accumulates_highlights_and_empty_click_clears(qapp
 
     aaa_layer._pick_value = None
     bbb_layer._pick_value = 0
-    ctrl._on_viewer_mouse_press(ctrl.viewer, event)
+    _dispatch_click(ctrl, event)
 
     assert state.highlighted_genes == ["AAA", "BBB"]
     assert "AAA: 6 counts" in messages[-1]
@@ -533,9 +533,37 @@ def test_clicking_transcripts_accumulates_highlights_and_empty_click_clears(qapp
 
     aaa_layer._pick_value = None
     bbb_layer._pick_value = None
-    ctrl._on_viewer_mouse_press(ctrl.viewer, event)
+    _dispatch_click(ctrl, event)
 
     assert state.highlighted_genes == []
     assert messages[-1] == "Click on any transcript to highlight that gene"
     assert float(aaa_layer.size) == 0.5
     assert float(bbb_layer.size) == 0.5
+
+
+def test_drag_callback_never_runs_inspection_hit_tests(qapp, monkeypatch):
+    ctrl = _controller(_demo_store(), qapp)
+    event = types.SimpleNamespace(
+        type="mouse_press",
+        pos=(10.0, 10.0),
+        position=(10.0, 10.0),
+        view_direction=None,
+        dims_displayed=(0, 1),
+    )
+    calls = []
+    monkeypatch.setattr(
+        ctrl, "_handle_viewer_click", lambda _event: calls.append("picked")
+    )
+
+    callback = ctrl._on_viewer_mouse_press(ctrl.viewer, event)
+    next(callback)
+    assert calls == []  # mouse-down yields immediately
+
+    event.type = "mouse_move"
+    event.pos = (10.0 + V.INSPECT_CLICK_DRAG_THRESHOLD_PX + 1.0, 10.0)
+    next(callback)
+    event.type = "mouse_release"
+    with pytest.raises(StopIteration):
+        next(callback)
+
+    assert calls == []
