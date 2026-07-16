@@ -255,6 +255,9 @@ class GeneInspectorState:
     pending_groups: set | None = None
     highlighted_genes: list | None = None
     group_display_ranges: list[list[tuple[int, int, str]]] | None = None
+    # Fixed-size per-layer masks.  Gene/filter toggles update these booleans and
+    # assign ``Points.shown`` instead of reallocating coordinate/colour arrays.
+    group_shown_masks: list[np.ndarray] | None = None
     #: Cell-type marker metadata + the two precomputed visual schemes. When
     #: ``reference`` is None the panel has no metadata and only flat A–Z ordering
     #: (the legacy rainbow) is offered. ``ordering`` is the list layout the user
@@ -6184,10 +6187,12 @@ class ComparisonViewerController:
         # avoids napari's data-resize path that both drops the per-point symbol
         # back to the default disc and can reset colours to white.
         for gi, symbol in enumerate(store.group_symbols):
-            coords, colors, sizes, ranges = self._gene_group_arrays(state, gi)
+            coords, colors, sizes, ranges, shown = self._gene_group_arrays(state, gi)
             state.group_display_ranges[gi] = ranges
             layer_name = self._gene_layer_name(ds, symbol)
-            self._create_gene_points_layer(layer_name, symbol, spot_size, coords, colors, sizes)
+            self._create_gene_points_layer(
+                layer_name, symbol, spot_size, coords, colors, sizes, shown=shown
+            )
             state.layer_names.append(layer_name)
         layer_names = state.layer_names
         # Pin the (long) gene-layer block to the bottom of the layer list so it
@@ -6222,53 +6227,45 @@ class ComparisonViewerController:
         log.error("[%s] Gene inspector build failed: %s", ds, message)
 
     def _gene_group_arrays(self, state: GeneInspectorState, gi: int):
-        """Concatenate enabled genes for one marker group and track click ranges."""
+        """Return one group's fixed arrays, click ranges, and visibility mask."""
         store = state.store
         gcoords = store.group_coords[gi]
-        gcolors = store.group_colors[gi]
-        coord_slices: list[np.ndarray] = []
-        color_slices: list[np.ndarray] = []
+        if state.colour_by_assignment:
+            gcolors = np.empty((len(gcoords), 4), dtype=np.float32)
+        else:
+            gcolors = store.group_colors[gi]
         display_ranges: list[tuple[int, int, str]] = []
-        cursor = 0
         for gene in store.genes:
-            if gene not in state.enabled_genes:
-                continue
             entry = store.gene_offsets.get(gene)
             if entry is None or entry[0] != gi:
                 continue
             _g, fg_start, fg_end, bg_end = entry
-            start = cursor
-            if not state.hide_assigned and fg_end > fg_start:
-                coord_slices.append(gcoords[fg_start:fg_end])
-                if state.colour_by_assignment:
-                    color_slices.append(
-                        np.tile(GENE_ASSIGNED_RGBA, (int(fg_end - fg_start), 1))
-                    )
-                else:
-                    color_slices.append(gcolors[fg_start:fg_end])
-                cursor += int(fg_end - fg_start)
-            if not state.hide_background and bg_end > fg_end:
-                coord_slices.append(gcoords[fg_end:bg_end])
-                if state.colour_by_assignment:
-                    color_slices.append(
-                        np.tile(GENE_UNASSIGNED_RGBA, (int(bg_end - fg_end), 1))
-                    )
-                else:
-                    color_slices.append(gcolors[fg_end:bg_end])
-                cursor += int(bg_end - fg_end)
-            if cursor > start:
-                display_ranges.append((start, cursor, str(gene)))
-        if coord_slices:
-            coords = np.concatenate(coord_slices, axis=0)
-            colors = np.concatenate(color_slices, axis=0)
-            sizes = self._gene_group_size_array(state, len(coords), display_ranges)
-            return coords, colors, sizes, display_ranges
-        return (
-            np.empty((0, 2), dtype=np.float32),
-            np.empty((0, 4), dtype=np.float32),
-            None,
-            display_ranges,
-        )
+            display_ranges.append((int(fg_start), int(bg_end), str(gene)))
+            if state.colour_by_assignment:
+                gcolors[fg_start:fg_end] = GENE_ASSIGNED_RGBA
+                gcolors[fg_end:bg_end] = GENE_UNASSIGNED_RGBA
+        shown = self._gene_group_shown_mask(state, gi)
+        sizes = self._gene_group_size_array(state, len(gcoords), display_ranges)
+        return gcoords, gcolors, sizes, display_ranges, shown
+
+    def _gene_group_shown_mask(self, state: GeneInspectorState, gi: int) -> np.ndarray:
+        store = state.store
+        if state.group_shown_masks is None:
+            state.group_shown_masks = [
+                np.zeros(len(coords), dtype=bool) for coords in store.group_coords
+            ]
+        shown = state.group_shown_masks[gi]
+        shown.fill(False)
+        for gene in store.genes:
+            entry = store.gene_offsets.get(gene)
+            if entry is None or int(entry[0]) != int(gi) or gene not in state.enabled_genes:
+                continue
+            _group, fg_start, fg_end, bg_end = entry
+            if not state.hide_assigned:
+                shown[int(fg_start):int(fg_end)] = True
+            if not state.hide_background:
+                shown[int(fg_end):int(bg_end)] = True
+        return shown
 
     def _gene_group_size_array(self, state: GeneInspectorState, n_points: int, ranges: list[tuple[int, int, str]]):
         highlighted_genes = set(state.highlighted_genes or [])
@@ -6282,10 +6279,19 @@ class ComparisonViewerController:
                 sizes[int(start):int(end)] = float(GENE_HIGHLIGHT_SPOT_SIZE)
         return sizes
 
-    def _create_gene_points_layer(self, name, symbol, spot_size, coords, colors, sizes=None):
+    def _create_gene_points_layer(
+        self, name, symbol, spot_size, coords, colors, sizes=None, shown=None
+    ):
         """Add a Points layer pre-populated with data + per-point colour + symbol."""
         size = sizes if sizes is not None else float(spot_size)
-        kwargs = dict(name=name, size=size, opacity=1.0, visible=True, symbol=str(symbol))
+        kwargs = dict(
+            name=name,
+            size=size,
+            opacity=1.0,
+            visible=True,
+            symbol=str(symbol),
+            shown=np.ones(len(coords), dtype=bool) if shown is None else shown,
+        )
         try:
             layer = self.viewer.add_points(coords, face_color=colors, border_color=colors, **kwargs)
         except TypeError:
@@ -6330,32 +6336,27 @@ class ComparisonViewerController:
         except Exception as exc:  # pragma: no cover - defensive; ordering is cosmetic
             log.debug("Could not reorder gene layers to bottom: %s", exc)
 
-    def _set_gene_layer_data(self, layer, coords, colors, symbol, spot_size, sizes=None):
-        layer.data = coords
+    def _set_gene_layer_colors(self, layer, colors, symbol):
+        if not len(getattr(layer, "data", ())):
+            return
         try:
-            layer.size = sizes if sizes is not None else float(spot_size)
+            layer.face_color = colors
         except Exception:
             pass
-        if len(coords):
+        try:
+            layer.border_color = colors
+        except (AttributeError, TypeError):
             try:
-                layer.face_color = colors
+                layer.edge_color = colors
             except Exception:
                 pass
-            try:
-                layer.border_color = colors
-            except (AttributeError, TypeError):
-                try:
-                    layer.edge_color = colors
-                except Exception:
-                    pass
-            # Re-apply the symbol: changing ``data`` resets the per-point symbol
-            # array back to the default disc, so it must be re-broadcast here.
-            try:
-                layer.symbol = str(symbol)
-            except Exception:
-                pass
+        try:
+            layer.symbol = str(symbol)
+        except Exception:
+            pass
 
     def _rebuild_gene_group_layers(self, state: GeneInspectorState, group_indices=None):
+        """Refresh only per-point ``shown`` masks for gene/filter changes."""
         store = state.store
         if group_indices is None:
             group_indices = range(len(store.group_symbols))
@@ -6365,10 +6366,28 @@ class ComparisonViewerController:
             layer = self._get_layer_by_name(state.layer_names[gi])
             if layer is None:
                 continue
-            coords, colors, sizes, ranges = self._gene_group_arrays(state, gi)
+            shown = self._gene_group_shown_mask(state, gi)
+            try:
+                layer.shown = shown
+            except Exception:
+                # Older/fake layers may not expose ``shown``.  Keep a plain
+                # attribute so tests and downstream adapters still see the mask.
+                setattr(layer, "shown", np.asarray(shown, dtype=bool))
+
+    def _recolor_gene_group_layers(self, state: GeneInspectorState, group_indices=None):
+        store = state.store
+        if group_indices is None:
+            group_indices = range(len(store.group_symbols))
+        for gi in group_indices:
+            if gi < 0 or gi >= len(state.layer_names):
+                continue
+            layer = self._get_layer_by_name(state.layer_names[gi])
+            if layer is None:
+                continue
+            _coords, colors, _sizes, ranges, _shown = self._gene_group_arrays(state, gi)
             if state.group_display_ranges is not None and gi < len(state.group_display_ranges):
                 state.group_display_ranges[gi] = ranges
-            self._set_gene_layer_data(layer, coords, colors, store.group_symbols[gi], state.spot_size, sizes)
+            self._set_gene_layer_colors(layer, colors, store.group_symbols[gi])
 
     def _schedule_gene_group_rebuild(self, state: GeneInspectorState, group_index: int):
         if state.pending_groups is None:
@@ -7119,7 +7138,7 @@ class ComparisonViewerController:
                 state.store.recolor(scheme.visuals)
                 state.gene_visuals = scheme.visuals
                 state.color_kind = kind
-                self._rebuild_gene_group_layers(state, group_indices=None)
+                self._recolor_gene_group_layers(state, group_indices=None)
                 if state.highlighted_genes:
                     self._set_gene_highlight_status(state)
             state.ordering = kind
@@ -7213,7 +7232,7 @@ class ComparisonViewerController:
         if state is None:
             return
         state.colour_by_assignment = bool(on)
-        self._rebuild_gene_group_layers(state, group_indices=None)
+        self._recolor_gene_group_layers(state, group_indices=None)
         self._populate_gene_inspector(state)
 
     def set_gene_show_controls(self, dataset_name: str, on: bool):

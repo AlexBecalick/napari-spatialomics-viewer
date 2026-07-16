@@ -34,9 +34,7 @@ def qapp():
 
 
 class _FakeLayer:
-    """Mimics the napari Points quirk where assigning ``data`` resets the
-    per-point ``symbol`` back to the default disc, so tests catch a regression
-    if the controller forgets to re-apply the symbol after a data change."""
+    """Small Points-layer double including napari's per-point ``shown`` mask."""
 
     def __init__(self, name, data, **kw):
         self.name = name
@@ -50,6 +48,9 @@ class _FakeLayer:
         self.border_width = 0.05
         self._pick_value = None
         self._data = np.asarray(data)
+        self.shown = np.asarray(
+            kw.get("shown", np.ones(len(self._data), dtype=bool)), dtype=bool
+        )
         if kw.get("symbol"):
             self.symbol = kw["symbol"]
 
@@ -106,7 +107,22 @@ def _controller(store, qapp):
 
 
 def _total(ctrl, state):
-    return sum(len(ctrl._get_layer_by_name(n).data) for n in state.layer_names)
+    return sum(
+        int(np.count_nonzero(ctrl._get_layer_by_name(n).shown))
+        for n in state.layer_names
+    )
+
+
+def _dispatch_click(ctrl, event):
+    event.type = "mouse_press"
+    if not hasattr(event, "pos"):
+        y, x = np.asarray(event.position, dtype=float).ravel()[-2:]
+        event.pos = (x, y)
+    callback = ctrl._on_viewer_mouse_press(ctrl.viewer, event)
+    next(callback)
+    event.type = "mouse_release"
+    with pytest.raises(StopIteration):
+        next(callback)
 
 
 def test_controller_toggle_background_controls_and_teardown(qapp):
@@ -162,14 +178,17 @@ def test_controller_toggle_background_controls_and_teardown(qapp):
             assert layer.symbol == store.group_symbols[gi]
             assert layer.face_color.shape == (len(layer.data), 4)
 
-    # And the symbol survives a per-gene toggle (data change resets it in napari;
-    # the controller must re-apply it).
+    # A per-gene toggle updates only the visibility mask: fixed geometry and its
+    # marker symbol both remain untouched.
     gi = store.gene_offsets["AAA"][0]
+    layer = ctrl._get_layer_by_name(state.layer_names[gi])
+    data_id = id(layer.data)
     ctrl.set_gene_visible("TEST", "AAA", False)
     ctrl._flush_gene_group_rebuild("TEST")
     ctrl.set_gene_visible("TEST", "AAA", True)
     ctrl._flush_gene_group_rebuild("TEST")
-    assert ctrl._get_layer_by_name(state.layer_names[gi]).symbol == store.group_symbols[gi]
+    assert layer.symbol == store.group_symbols[gi]
+    assert id(layer.data) == data_id
 
     ctrl._teardown_gene_inspector("TEST")
     assert [l for l in ctrl.viewer.layers if "Genes" in str(l.name)] == []
@@ -412,7 +431,10 @@ def test_controller_set_genes_visible_batch(qapp):
     state = ctrl._gene_inspector_states["TEST"]
 
     def total():
-        return sum(len(ctrl._get_layer_by_name(n).data) for n in state.layer_names)
+        return sum(
+            int(np.count_nonzero(ctrl._get_layer_by_name(n).shown))
+            for n in state.layer_names
+        )
 
     ctrl.set_all_genes_visible("TEST", True)
     full = total()
