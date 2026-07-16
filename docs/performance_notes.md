@@ -13,7 +13,7 @@ slowness were addressed:
 2. **Laggy pan/zoom** — coarse zoom levels were computed lazily from
    full-resolution data, so every pan re-read gigabytes.
 
-### Threading (no more freezes)
+### Responsive, cancellable loading
 
 All heavy builds now run in `napari` `thread_worker`s and only touch napari
 layers back on the GUI thread:
@@ -22,6 +22,19 @@ layers back on the GUI thread:
 - label rasterization + label-outline pyramid build,
 - image pyramid build,
 - Cellpose value-overlay label prep + pyramid build + colour mapping.
+
+Dataset metadata is prepared off the GUI thread too. Image channels put a lazy
+preview on screen first and replace it with the materialized pyramid when ready;
+cell clicks draw their boundary and a loading panel immediately while transcript
+counts and image intensities are calculated in the background. Repeated identical
+requests are deduplicated, obsolete work is cooperatively cancelled on dataset
+switch/reload, and zarr-heavy work shares a small I/O pool rather than starting
+an unbounded number of competing reads.
+
+Inspection hit-testing is also deferred from mouse-down to mouse-release. A
+gesture moving more than four canvas pixels is classified as a pan and skips all
+Points-layer and cell-polygon picking, so those synchronous queries cannot delay
+the first movement of the view.
 
 Status/progress updates from worker threads are marshalled to the GUI thread via
 Qt signals (`ViewerControlPanel.status_message` / `ViewerControlPanel.progress_message`).
@@ -46,6 +59,26 @@ adds only a fraction of the base size (~8 GB at 4x downsample for the reference
 MERSCOPE element). Builds are one-time and cached; rebuild with
 `--overwrite-derived-caches`.
 
+### Bounded transcript memory and constant-time toggles
+
+Transcript ingestion is a two-pass streaming build. The first pass retains only
+gene/cell counts; the second fills a fixed render array and, when necessary, uses
+an exact uniform sample without first concatenating every coordinate. Gene names
+in the exact per-cell index are dictionary encoded with compact integer codes.
+The displayed Points layers keep fixed coordinate/color buffers and checkbox
+changes update napari's per-point `shown` mask, avoiding repeated concatenate,
+copy, and GPU-buffer replacement work.
+
+Cell inspection reuses the exact compact index built during transcript loading,
+so a render cap never changes a selected cell's gene counts.
+
+### Reusable dataset sessions
+
+Prepared dataset metadata, transcript arrays, and label display specs are held in
+an LRU session cache. Switching back to a recent dataset can restore them without
+re-reading/re-grouping. The default RAM budget is 20% of physical memory capped
+at 8 GiB; inactive sessions are evicted first.
+
 ## Relevant flags
 
 - `--skip-images` / `--skip-cellpose` / `--skip-proseg` / `--skip-transcripts`:
@@ -57,6 +90,10 @@ MERSCOPE element). Builds are one-time and cached; rebuild with
   (others load hidden/toggleable). Default: a DAPI-like channel, else the first.
 - `--overwrite-derived-caches`: rebuild density/outline/image/label pyramid
   caches even when matching cache metadata exists.
+- `--session-cache-gb FLOAT`: RAM budget for inactive prepared dataset sessions;
+  `0` disables cross-dataset reuse.
+- `--background-io-workers INT` (default 2): maximum concurrent zarr-heavy
+  builders. Increase only if profiling shows the storage device is underused.
 - `--gl-core-profile` (experimental): request an OpenGL 4.1 core context instead
   of the macOS default legacy 2.1 context; see below.
 
@@ -85,14 +122,20 @@ carry regression risk. Revisit if a specific interaction still feels heavy.
    current baseline before committing. `qtpy` already abstracts the binding, so
    the code should not need changes.
 
-3. **Points layer tuning.** The per-gene transcript points already render with
-   `antialiasing = 0` and no per-point border (`_create_gene_points_layer`) so
-   that tens of millions of points stay responsive. If they ever feel heavy at
-   extreme counts, lower `--gene-max-render-points` to uniformly subsample.
-
-4. **Persisted label pyramid for outlines.** The label *outline* cache is
+3. **Persisted label pyramid for outlines.** The label *outline* cache is
    already materialized, but building it from a single-scale 12-gigapixel label
    array streams the full labels once (~minutes, one-time, threaded). If that
    first build is painful, a shared materialized base-label pyramid could feed
    both the outline and value-overlay caches so the full labels are read once
    rather than once per derived cache.
+
+## Measuring transcript-store changes
+
+The synthetic benchmark reports build time, retained compact-array size, and RSS
+change. Its defaults exercise one million source points; use the second command
+for a larger stress run:
+
+```bash
+python scripts/benchmark_transcript_store.py --points 1000000
+python scripts/benchmark_transcript_store.py --points 10000000 --render-cap 2000000
+```

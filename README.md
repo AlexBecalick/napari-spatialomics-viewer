@@ -8,7 +8,9 @@ cell statistics**, **Draw tissue annotations**, **Images**, and **Dataset**. On
 startup with a supplied dataset it automatically loads all image channels, the
 Cellpose and ProSeg cell segmentations, and all transcripts (rendered as per-gene coloured points). A busy
 progress bar with a stage label below the tabs shows what is loading (image
-pyramids, cell masks, transcripts, …).
+pyramids, cell masks, transcripts, …). Image channels appear first as lazy
+previews while optimized pyramids build in the background; switching datasets
+keeps recent prepared sessions in an LRU cache for fast return visits.
 
 ## Install
 
@@ -204,7 +206,11 @@ are shown by default; control/blank probes are hidden. Use **Load / reload
 transcripts** to rebuild the panel and **Unload transcripts** to free the points.
 
 Genes are grouped by marker shape into at most 14 napari Points layers, so per-gene
-toggles stay fast even with hundreds of genes. The panel offers:
+toggles stay fast even with hundreds of genes. Each layer keeps fixed point
+buffers and toggles update a per-point visibility mask, avoiding large array and
+GPU-buffer rebuilds. Transcript ingestion is bounded and streaming; if the render
+cap samples the visible points, cell-click gene summaries remain exact through a
+separate compact dictionary-encoded index. The panel offers:
 
 - a per-gene checkbox (with the colour/shape marker) and a **Show all genes** toggle,
 - a **Spot size** slider (world microns; spots keep a real size and scale with zoom),
@@ -246,6 +252,18 @@ napari-compare-xenium-merscope ... \
   --gene-show-controls \            # start with control/blank probes shown
   --gene-max-render-points 40000000 # subsample cap for very large panels
 ```
+
+Loading jobs are cancellable and duplicate requests are coalesced. These optional
+limits tune reuse and storage concurrency:
+
+```bash
+napari-compare-xenium-merscope ... \
+  --session-cache-gb 4 \
+  --background-io-workers 2
+```
+
+See [docs/performance_notes.md](docs/performance_notes.md) for cache details and
+the synthetic transcript-store benchmark.
 
 ### Zoomed-out appearance (spots and outlines)
 
