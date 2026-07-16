@@ -10,7 +10,7 @@ import re
 from dataclasses import dataclass
 from hashlib import blake2s
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 import numpy as np
 import pandas as pd
@@ -2592,6 +2592,48 @@ def build_cell_type_color_dict(
 
 
 @dataclass
+class CellTranscriptIndex:
+    """Compact assigned-transcript index grouped by normalized cell id.
+
+    Gene names are dictionary encoded once in ``gene_names`` and represented by
+    the smallest practical unsigned integer dtype in ``gene_codes``.  This keeps
+    the always-resident index bounded to roughly ten bytes per assigned
+    transcript (two float32 coordinates plus a compact code), rather than an
+    object-string array per transcript.
+    """
+
+    coords_yx: np.ndarray
+    gene_codes: np.ndarray
+    gene_names: tuple[str, ...]
+    slices: dict[str, tuple[int, int]]
+
+    @classmethod
+    def empty(cls) -> "CellTranscriptIndex":
+        return cls(
+            coords_yx=np.empty((0, 2), dtype=np.float32),
+            gene_codes=np.empty((0,), dtype=np.uint8),
+            gene_names=(),
+            slices={},
+        )
+
+    def transcripts_for(self, cell_id):
+        """Return ``(coords_yx, genes)`` for one cell (empty arrays if absent)."""
+        span = self.slices.get(normalize_cell_key(cell_id))
+        if span is None:
+            return (
+                np.empty((0, 2), dtype=np.float32),
+                np.empty((0,), dtype=object),
+            )
+        start, end = span
+        names = np.asarray(self.gene_names, dtype=object)
+        return self.coords_yx[start:end], names[self.gene_codes[start:end]]
+
+
+class TranscriptBuildCancelled(RuntimeError):
+    """Raised when a cooperative transcript build cancellation is requested."""
+
+
+@dataclass
 class GenePointStore:
     """Backing store for the per-gene transcript renderer.
 
@@ -2617,6 +2659,10 @@ class GenePointStore:
     #: fixed at build time (they decide the layer grouping); only colours change
     #: when the inspector switches between the broad and fine cell-type schemes.
     gene_visuals: dict[str, GeneVisual] | None = None
+    #: Compact all-assigned-transcript index built during the same streaming
+    #: passes as the renderer.  It is intentionally independent of render
+    #: sampling so cell summaries remain exact when the point view is capped.
+    cell_transcript_index: CellTranscriptIndex | None = None
 
     def gene_symbol(self, gene: str) -> str | None:
         entry = self.gene_offsets.get(str(gene))
@@ -2657,6 +2703,64 @@ def _empty_gene_point_store() -> GenePointStore:
         sampled=False,
         source_gene_counts={},
         source_total_points=0,
+        cell_transcript_index=None,
+    )
+
+
+def _unsigned_code_dtype(category_count: int):
+    """Smallest unsigned dtype capable of representing ``category_count`` ids."""
+    maximum = max(0, int(category_count) - 1)
+    if maximum <= np.iinfo(np.uint8).max:
+        return np.uint8
+    if maximum <= np.iinfo(np.uint16).max:
+        return np.uint16
+    if maximum <= np.iinfo(np.uint32).max:
+        return np.uint32
+    return np.uint64
+
+
+def _check_transcript_cancelled(cancel_check: Callable[[], bool] | None) -> None:
+    if cancel_check is not None and bool(cancel_check()):
+        raise TranscriptBuildCancelled("Transcript build cancelled")
+
+
+def _point_partition_arrays(
+    pdf: pd.DataFrame,
+    *,
+    x_col: str,
+    y_col: str,
+    gene_col: str,
+    assignment_col: str | None,
+    background_col: str | None,
+):
+    """Return compact valid arrays for one transcript partition."""
+    x_all = pdf[x_col].to_numpy(dtype=np.float32, copy=False)
+    y_all = pdf[y_col].to_numpy(dtype=np.float32, copy=False)
+    gene_all = pdf[gene_col].astype("string").to_numpy(dtype=object)
+    good = np.isfinite(x_all) & np.isfinite(y_all) & pd.notna(gene_all)
+    if not np.any(good):
+        return None
+
+    if background_col is not None and background_col in pdf.columns:
+        background_all = pdf[background_col].to_numpy(dtype=bool, copy=False)
+    elif assignment_col is not None and assignment_col in pdf.columns:
+        background_all = ~assignment_mask(pdf[assignment_col]).to_numpy(dtype=bool, copy=False)
+    else:
+        background_all = np.zeros(len(pdf), dtype=bool)
+
+    assignment_all = None
+    assigned_all = None
+    if assignment_col is not None and assignment_col in pdf.columns:
+        assignment_all = pdf[assignment_col].to_numpy(dtype=object)
+        assigned_all = assignment_mask(pdf[assignment_col]).to_numpy(dtype=bool, copy=False)
+
+    return (
+        np.ascontiguousarray(x_all[good]),
+        np.ascontiguousarray(y_all[good]),
+        gene_all[good].astype(str),
+        np.ascontiguousarray(background_all[good]),
+        None if assignment_all is None else assignment_all[good],
+        None if assigned_all is None else np.ascontiguousarray(assigned_all[good]),
     )
 
 
@@ -2672,6 +2776,8 @@ def build_gene_point_groups(
     max_points: int | None = None,
     random_state: int = 42,
     alpha: float = 1.0,
+    build_cell_index: bool = False,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> GenePointStore:
     """Read all transcripts into a symbol-grouped, gene-sorted point store.
 
@@ -2686,56 +2792,189 @@ def build_gene_point_groups(
     if assignment_col is not None and assignment_col not in cols:
         cols.append(assignment_col)
 
-    xs: list[np.ndarray] = []
-    ys: list[np.ndarray] = []
-    gene_parts: list[np.ndarray] = []
-    bg_parts: list[np.ndarray] = []
-
+    # Pass 1 retains only small aggregate dictionaries.  In particular, it does
+    # not keep a Python string object for every transcript and it lets us size
+    # all output arrays exactly before the second streaming pass.
+    source_gene_counts: dict[str, int] = {}
+    cell_counts: dict[str, int] = {}
+    total_source = 0
     for pdf in _iter_point_partitions(points_obj, cols):
-        x_vals = pdf[x_col].to_numpy(dtype=np.float32, copy=False)
-        y_vals = pdf[y_col].to_numpy(dtype=np.float32, copy=False)
-        gene_vals = pdf[gene_col].astype("string").to_numpy(dtype=object)
-        good = np.isfinite(x_vals) & np.isfinite(y_vals) & pd.notna(gene_vals)
-        if not np.any(good):
+        _check_transcript_cancelled(cancel_check)
+        arrays = _point_partition_arrays(
+            pdf,
+            x_col=x_col,
+            y_col=y_col,
+            gene_col=gene_col,
+            assignment_col=assignment_col,
+            background_col=background_col,
+        )
+        if arrays is None:
             continue
-        if background_col is not None and background_col in pdf.columns:
-            bg = pdf[background_col].to_numpy(dtype=bool, copy=False)
-        elif assignment_col is not None and assignment_col in pdf.columns:
-            bg = ~assignment_mask(pdf[assignment_col]).to_numpy(dtype=bool, copy=False)
-        else:
-            bg = np.zeros(len(pdf), dtype=bool)
-        xs.append(np.ascontiguousarray(x_vals[good]))
-        ys.append(np.ascontiguousarray(y_vals[good]))
-        gene_parts.append(gene_vals[good].astype(str))
-        bg_parts.append(np.ascontiguousarray(bg[good]))
+        _x, _y, genes_part, _bg, assignment_part, assigned_part = arrays
+        total_source += int(len(genes_part))
+        names, counts = np.unique(genes_part, return_counts=True)
+        for name, count in zip(names.tolist(), counts.tolist(), strict=True):
+            text = str(name)
+            source_gene_counts[text] = source_gene_counts.get(text, 0) + int(count)
 
-    if not xs:
+        if build_cell_index and assignment_part is not None and assigned_part is not None:
+            assigned_values = assignment_part[assigned_part]
+            keys = np.fromiter(
+                (normalize_cell_key(value) for value in assigned_values),
+                dtype=object,
+                count=int(len(assigned_values)),
+            )
+            keys = keys[keys != ""]
+            if len(keys):
+                unique_keys, key_counts = np.unique(keys, return_counts=True)
+                for key, count in zip(unique_keys.tolist(), key_counts.tolist(), strict=True):
+                    text = str(key)
+                    cell_counts[text] = cell_counts.get(text, 0) + int(count)
+
+    if total_source == 0:
         return _empty_gene_point_store()
 
-    x = np.concatenate(xs)
-    y = np.concatenate(ys)
-    gene = np.concatenate(gene_parts)
-    bg = np.concatenate(bg_parts)
-    del xs, ys, gene_parts, bg_parts
-    total_source = int(x.shape[0])
-    source_names, source_counts = np.unique(gene, return_counts=True)
-    source_gene_counts = {
-        str(name): int(count)
-        for name, count in zip(source_names.tolist(), source_counts.tolist(), strict=True)
-    }
+    source_genes = sorted(source_gene_counts)
+    gene_to_code = {name: index for index, name in enumerate(source_genes)}
+    gene_code_dtype = _unsigned_code_dtype(len(source_genes))
 
-    sampled = False
+    render_count = total_source
     if max_points is not None and 0 < int(max_points) < total_source:
-        rng = np.random.default_rng(int(random_state))
-        keep = np.sort(rng.choice(total_source, size=int(max_points), replace=False))
-        x, y, gene, bg = x[keep], y[keep], gene[keep], bg[keep]
-        sampled = True
+        render_count = int(max_points)
+    sampled = render_count < total_source
+
+    render_x = np.empty(render_count, dtype=np.float32)
+    render_y = np.empty(render_count, dtype=np.float32)
+    render_gene_codes = np.empty(render_count, dtype=gene_code_dtype)
+    render_background = np.empty(render_count, dtype=bool)
+
+    cell_index = CellTranscriptIndex.empty() if build_cell_index else None
+    cell_keys = sorted(cell_counts)
+    cell_code_by_key = {key: index for index, key in enumerate(cell_keys)}
+    cell_offsets = np.zeros(len(cell_keys) + 1, dtype=np.int64)
+    if build_cell_index and cell_keys:
+        cell_offsets[1:] = np.cumsum(
+            np.asarray([cell_counts[key] for key in cell_keys], dtype=np.int64)
+        )
+        cell_coords = np.empty((int(cell_offsets[-1]), 2), dtype=np.float32)
+        cell_gene_codes = np.empty(int(cell_offsets[-1]), dtype=gene_code_dtype)
+        cell_write = cell_offsets[:-1].copy()
+    else:
+        cell_coords = np.empty((0, 2), dtype=np.float32)
+        cell_gene_codes = np.empty((0,), dtype=gene_code_dtype)
+        cell_write = np.empty((0,), dtype=np.int64)
+
+    # Pass 2 fills fixed-size outputs.  Sequential hypergeometric allocation
+    # selects an exact uniform sample without ever materialising the uncapped
+    # coordinate set in memory.
+    rng = np.random.default_rng(int(random_state))
+    remaining_source = int(total_source)
+    remaining_sample = int(render_count)
+    render_cursor = 0
+    for pdf in _iter_point_partitions(points_obj, cols):
+        _check_transcript_cancelled(cancel_check)
+        arrays = _point_partition_arrays(
+            pdf,
+            x_col=x_col,
+            y_col=y_col,
+            gene_col=gene_col,
+            assignment_col=assignment_col,
+            background_col=background_col,
+        )
+        if arrays is None:
+            continue
+        x_part, y_part, genes_part, bg_part, assignment_part, assigned_part = arrays
+        part_count = int(len(genes_part))
+        part_gene_codes = np.fromiter(
+            (gene_to_code[str(name)] for name in genes_part),
+            dtype=gene_code_dtype,
+            count=part_count,
+        )
+
+        if remaining_sample == remaining_source:
+            keep = np.arange(part_count, dtype=np.int64)
+        elif remaining_sample <= 0:
+            keep = np.empty((0,), dtype=np.int64)
+        else:
+            take = int(
+                rng.hypergeometric(
+                    ngood=part_count,
+                    nbad=max(0, remaining_source - part_count),
+                    nsample=remaining_sample,
+                )
+            )
+            keep = (
+                np.sort(rng.choice(part_count, size=take, replace=False))
+                if take > 0
+                else np.empty((0,), dtype=np.int64)
+            )
+        take = int(len(keep))
+        if take:
+            end = render_cursor + take
+            render_x[render_cursor:end] = x_part[keep]
+            render_y[render_cursor:end] = y_part[keep]
+            render_gene_codes[render_cursor:end] = part_gene_codes[keep]
+            render_background[render_cursor:end] = bg_part[keep]
+            render_cursor = end
+        remaining_source -= part_count
+        remaining_sample -= take
+
+        if build_cell_index and assignment_part is not None and assigned_part is not None and cell_keys:
+            assigned_positions = np.flatnonzero(assigned_part)
+            if len(assigned_positions):
+                normalized = np.fromiter(
+                    (normalize_cell_key(assignment_part[pos]) for pos in assigned_positions),
+                    dtype=object,
+                    count=int(len(assigned_positions)),
+                )
+                valid_keys = normalized != ""
+                assigned_positions = assigned_positions[valid_keys]
+                normalized = normalized[valid_keys]
+                if len(assigned_positions):
+                    codes = np.fromiter(
+                        (cell_code_by_key[str(key)] for key in normalized),
+                        dtype=np.int64,
+                        count=int(len(normalized)),
+                    )
+                    order = np.argsort(codes, kind="stable")
+                    codes_sorted = codes[order]
+                    positions_sorted = assigned_positions[order]
+                    starts = np.concatenate(
+                        ([0], np.flatnonzero(np.diff(codes_sorted) != 0) + 1)
+                    )
+                    ends = np.concatenate((starts[1:], [len(codes_sorted)]))
+                    for start, end in zip(starts.tolist(), ends.tolist(), strict=True):
+                        code = int(codes_sorted[start])
+                        count = int(end - start)
+                        dest = int(cell_write[code])
+                        src = positions_sorted[start:end]
+                        cell_coords[dest:dest + count, 0] = y_part[src]
+                        cell_coords[dest:dest + count, 1] = x_part[src]
+                        cell_gene_codes[dest:dest + count] = part_gene_codes[src]
+                        cell_write[code] += count
+
+    if render_cursor != render_count:
+        raise RuntimeError(
+            f"Transcript streaming sample filled {render_cursor} points; expected {render_count}"
+        )
+
+    if cell_keys:
+        slices = {
+            key: (int(cell_offsets[index]), int(cell_offsets[index + 1]))
+            for index, key in enumerate(cell_keys)
+        }
+        cell_index = CellTranscriptIndex(
+            coords_yx=cell_coords,
+            gene_codes=cell_gene_codes,
+            gene_names=tuple(source_genes),
+            slices=slices,
+        )
 
     # Stable gene visuals + integer codes over the alphabetical gene panel. When
     # a marker reference is supplied, colours + symbols come from the broad
     # cell-type scheme; otherwise each gene falls back to the deterministic
     # rainbow (symbol == alphabetical index % 14), preserving legacy behaviour.
-    unique_names = sorted(set(gene.tolist()))
+    unique_names = list(source_genes)
     if gene_visuals is None:
         if reference is not None:
             gene_visuals = build_cell_type_gene_visuals(
@@ -2743,9 +2982,6 @@ def build_gene_point_groups(
             ).visuals
         else:
             gene_visuals = assign_gene_visuals(unique_names, alpha=alpha)
-    codes = pd.Categorical(gene, categories=unique_names).codes.astype(np.int64)
-    del gene
-
     # Which of the 14 marker symbols each gene falls under, mapped to compact
     # group indices for only the symbols actually used. The symbol is taken from
     # the assigned visual so cell-type grouping (not alphabetical position) drives
@@ -2758,7 +2994,7 @@ def build_gene_point_groups(
         ],
         dtype=np.int64,
     )
-    symbol_idx_per_point = symbol_idx_by_code[codes]
+    symbol_idx_per_point = symbol_idx_by_code[render_gene_codes]
     used_symbol_idx = np.unique(symbol_idx_per_point)
     sidx_to_group = np.full(len(GENE_MARKER_SYMBOLS), -1, dtype=np.int64)
     for group_index, sidx in enumerate(used_symbol_idx):
@@ -2767,12 +3003,19 @@ def build_gene_point_groups(
     group_symbols = [GENE_MARKER_SYMBOLS[int(sidx)] for sidx in used_symbol_idx]
 
     # Sort primary by group, then gene code, then background (foreground first).
-    order = np.lexsort((bg, codes, group_per_point))
-    coords = np.column_stack([y[order], x[order]]).astype(np.float32, copy=False)
-    codes_sorted = codes[order]
-    bg_sorted = bg[order]
+    bucket = (
+        group_per_point.astype(np.uint64) * np.uint64(max(1, 2 * len(unique_names)))
+        + render_gene_codes.astype(np.uint64) * np.uint64(2)
+        + render_background.astype(np.uint64)
+    )
+    order = np.argsort(bucket, kind="stable")
+    coords = np.empty((render_count, 2), dtype=np.float32)
+    coords[:, 0] = render_y[order]
+    coords[:, 1] = render_x[order]
+    codes_sorted = render_gene_codes[order]
+    bg_sorted = render_background[order]
     group_sorted = group_per_point[order]
-    del order, x, y, bg, codes, group_per_point, symbol_idx_per_point
+    del order, bucket, render_x, render_y, render_background, group_per_point, symbol_idx_per_point
 
     code_to_rgba = np.array(
         [gene_visuals[name].rgba for name in unique_names], dtype=np.float32
@@ -2830,6 +3073,7 @@ def build_gene_point_groups(
         source_gene_counts=source_gene_counts,
         source_total_points=total_source,
         gene_visuals=dict(gene_visuals),
+        cell_transcript_index=cell_index,
     )
 
 
@@ -3000,32 +3244,6 @@ def pick_cell_at_point(gdf, x_um: float, y_um: float):
     return best_label, geometry
 
 
-@dataclass
-class CellTranscriptIndex:
-    """Assigned transcripts grouped by the cell they were assigned to.
-
-    ``coords_yx`` holds napari-order ``(y, x)`` micron coordinates and ``genes``
-    the per-transcript gene names, both sorted so every cell occupies one
-    contiguous run recorded in ``slices`` (``cell_key -> (start, end)``). Keys are
-    normalised via :func:`normalize_cell_key`.
-    """
-
-    coords_yx: np.ndarray
-    genes: np.ndarray
-    slices: dict
-
-    def transcripts_for(self, cell_id):
-        """Return ``(coords_yx, genes)`` for one cell (empty arrays if none)."""
-        span = self.slices.get(normalize_cell_key(cell_id))
-        if span is None:
-            return (
-                np.empty((0, 2), dtype=np.float32),
-                np.empty((0,), dtype=object),
-            )
-        start, end = span
-        return self.coords_yx[start:end], self.genes[start:end]
-
-
 def build_cell_transcript_index(
     points_obj,
     x_col: str,
@@ -3033,68 +3251,25 @@ def build_cell_transcript_index(
     gene_col: str,
     assignment_col: str | None,
 ) -> CellTranscriptIndex:
-    """Index assigned transcripts by cell for fast per-cell lookup.
+    """Build a compact assigned-transcript-per-cell index.
 
-    Reads every point partition once, keeps only assigned transcripts (per
-    :func:`assignment_mask`), and groups them by normalised cell id. Background /
-    unassigned transcripts are dropped.
+    This fallback uses the same bounded-memory two-pass streamer as the gene
+    renderer but retains only a one-point render sample.  The normal viewer path
+    builds the index together with the full transcript renderer and therefore
+    does not perform this extra read.
     """
-    empty = CellTranscriptIndex(
-        coords_yx=np.empty((0, 2), dtype=np.float32),
-        genes=np.empty((0,), dtype=object),
-        slices={},
-    )
     if assignment_col is None:
-        return empty
-
-    cols = [x_col, y_col, gene_col, assignment_col]
-    key_parts: list[np.ndarray] = []
-    y_parts: list[np.ndarray] = []
-    x_parts: list[np.ndarray] = []
-    gene_parts: list[np.ndarray] = []
-
-    for pdf in _iter_point_partitions(points_obj, cols):
-        assigned = assignment_mask(pdf[assignment_col]).to_numpy(dtype=bool, copy=False)
-        if not assigned.any():
-            continue
-        sub = pdf.loc[assigned]
-        x_vals = sub[x_col].to_numpy(dtype=np.float32, copy=False)
-        y_vals = sub[y_col].to_numpy(dtype=np.float32, copy=False)
-        gene_vals = sub[gene_col].astype("string").to_numpy(dtype=object)
-        assign_vals = sub[assignment_col].to_numpy(dtype=object)
-        good = np.isfinite(x_vals) & np.isfinite(y_vals) & pd.notna(gene_vals)
-        if not np.any(good):
-            continue
-        keys = np.array(
-            [normalize_cell_key(v) for v in assign_vals[good]], dtype=object
-        )
-        key_parts.append(keys)
-        x_parts.append(np.ascontiguousarray(x_vals[good]))
-        y_parts.append(np.ascontiguousarray(y_vals[good]))
-        gene_parts.append(gene_vals[good].astype(str))
-
-    if not key_parts:
-        return empty
-
-    cell_keys = np.concatenate(key_parts)
-    x = np.concatenate(x_parts)
-    y = np.concatenate(y_parts)
-    genes = np.concatenate(gene_parts).astype(object)
-
-    order = np.argsort(cell_keys, kind="stable")
-    cell_keys = cell_keys[order]
-    coords_yx = np.column_stack([y[order], x[order]]).astype(np.float32, copy=False)
-    genes = genes[order]
-
-    slices: dict[str, tuple[int, int]] = {}
-    unique_keys, starts = np.unique(cell_keys, return_index=True)
-    starts = starts.tolist()
-    for i, key in enumerate(unique_keys.tolist()):
-        start = int(starts[i])
-        end = int(starts[i + 1]) if i + 1 < len(starts) else int(len(cell_keys))
-        slices[str(key)] = (start, end)
-
-    return CellTranscriptIndex(coords_yx=coords_yx, genes=genes, slices=slices)
+        return CellTranscriptIndex.empty()
+    store = build_gene_point_groups(
+        points_obj,
+        x_col=x_col,
+        y_col=y_col,
+        gene_col=gene_col,
+        assignment_col=assignment_col,
+        max_points=1,
+        build_cell_index=True,
+    )
+    return store.cell_transcript_index or CellTranscriptIndex.empty()
 
 
 def ranked_gene_counts(genes) -> list[tuple[str, int]]:

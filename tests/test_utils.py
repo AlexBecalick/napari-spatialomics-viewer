@@ -8,6 +8,7 @@ from shapely.geometry import MultiPolygon, Polygon
 
 from napari_compare_xenium_merscope.utils import (
     GENE_MARKER_SYMBOLS,
+    TranscriptBuildCancelled,
     GeneVisual,
     assign_gene_visuals,
     build_gene_point_groups,
@@ -712,6 +713,48 @@ def test_build_gene_point_groups_subsamples_when_over_cap():
     assert sum(store.gene_counts.values()) == 5
     assert store.source_total_points == 10
     assert store.source_gene_counts == {"AAA": 3, "BBB": 2, "Blank-1": 1, "CCC": 4}
+
+
+def test_bounded_gene_store_keeps_exact_compact_cell_index():
+    df = _gene_points_frame()
+    store = build_gene_point_groups(
+        df,
+        x_col="x",
+        y_col="y",
+        gene_col="gene",
+        assignment_col="assignment",
+        max_points=3,
+        random_state=4,
+        build_cell_index=True,
+    )
+
+    assert store.total_points == 3
+    assert store.cell_transcript_index is not None
+    coords, genes = store.cell_transcript_index.transcripts_for(7)
+    # The renderer is capped, but every assigned transcript remains available
+    # for exact per-cell inspection in compact dictionary-encoded arrays.
+    assert len(genes) == int((~df["background"]).sum()) == 6
+    assert coords.dtype == np.float32
+    assert store.cell_transcript_index.gene_codes.dtype.kind == "u"
+    assert store.cell_transcript_index.gene_codes.dtype.itemsize == 1
+
+
+def test_gene_store_build_is_cooperatively_cancellable_between_passes():
+    checks = 0
+
+    def cancelled():
+        nonlocal checks
+        checks += 1
+        return checks > 1
+
+    with pytest.raises(TranscriptBuildCancelled):
+        build_gene_point_groups(
+            _gene_points_frame(),
+            x_col="x",
+            y_col="y",
+            gene_col="gene",
+            cancel_check=cancelled,
+        )
 
 
 def test_build_gene_point_groups_empty_input():
