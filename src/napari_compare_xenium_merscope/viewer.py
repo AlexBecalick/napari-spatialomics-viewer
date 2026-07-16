@@ -22,8 +22,11 @@ import shutil
 import sys
 import time
 import warnings
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Event, RLock, Semaphore
+from types import SimpleNamespace
 from weakref import WeakSet
 
 import numpy as np
@@ -3622,6 +3625,20 @@ class ComparisonViewerController:
         self._current_cortical_depth_piece_id = CORTICAL_DEPTH_DEFAULT_PIECE_ID
         self._active_sdata = None
         self._active_images_sdata = None
+        self._dataset_sessions: OrderedDict[str, DatasetSession] = OrderedDict()
+        self._dataset_load_generation = 0
+        self._dataset_load_worker: object | None = None
+        self._dataset_loading_key: tuple[str, bool] | None = None
+        self._dataset_load_cancel = Event()
+        self._task_cancel_events: dict[str, Event] = {}
+        self._task_keys: dict[str, tuple] = {}
+        # SpatialData/zarr metadata mutations are serialized per process.  The
+        # lock is acquired only on worker threads, never while handling GUI
+        # events, so it avoids duplicate cache writers without freezing Qt.
+        self._cache_write_lock = RLock()
+        self._store_io_slots = Semaphore(
+            max(1, int(getattr(args, "background_io_workers", 2)))
+        )
         self._segmentation_keys: list[str] = []
         self._image_keys: list[str] = []
         self._image_channels: list[tuple[str, str]] = []
@@ -3813,6 +3830,58 @@ class ComparisonViewerController:
         """Clear all loading stages (e.g. when switching datasets)."""
         for key in ("dataset", "images", "masks", "transcripts"):
             self._end_progress(key)
+
+    def _begin_task_token(self, kind: str, key: tuple) -> Event | None:
+        """Return a fresh cooperative-cancellation token, or None for a duplicate."""
+        kind = str(kind)
+        if self._task_keys.get(kind) == tuple(key):
+            token = self._task_cancel_events.get(kind)
+            if token is not None and not token.is_set():
+                return None
+        previous = self._task_cancel_events.get(kind)
+        if previous is not None:
+            previous.set()
+        token = Event()
+        self._task_cancel_events[kind] = token
+        self._task_keys[kind] = tuple(key)
+        return token
+
+    def _finish_task_token(self, kind: str, token: Event) -> None:
+        if self._task_cancel_events.get(str(kind)) is token:
+            self._task_cancel_events.pop(str(kind), None)
+            self._task_keys.pop(str(kind), None)
+
+    def _cancel_background_tasks(self) -> None:
+        """Cooperatively cancel every dataset-bound build before activation."""
+        for token in list(self._task_cancel_events.values()):
+            token.set()
+        self._task_cancel_events.clear()
+        self._task_keys.clear()
+        for worker in (
+            self._image_build_worker,
+            self._label_build_worker,
+            self._gene_build_worker,
+            self._cellpose_value_worker,
+            self._cell_type_worker,
+        ):
+            try:
+                if worker is not None:
+                    worker.quit()
+            except Exception:
+                pass
+        self._image_build_generation += 1
+        self._label_build_generation += 1
+        self._gene_build_generation += 1
+        self._cellpose_value_generation += 1
+        self._cell_type_generation += 1
+
+    def _raise_if_task_cancelled(
+        self, cancel_check=None, expected_dataset: str | None = None
+    ) -> None:
+        if cancel_check is not None and bool(cancel_check()):
+            raise RuntimeError("Background task cancelled")
+        if expected_dataset is not None and self.active_dataset != str(expected_dataset).upper():
+            raise RuntimeError("Background task belongs to an inactive dataset")
 
     def _publish_shape_keys(self):
         if self._shape_keys_callback is not None:
@@ -4616,10 +4685,14 @@ class ComparisonViewerController:
 
     def _replace_datasets(self, datasets: dict[str, DatasetConfig], initial: str):
         """Swap in a freshly browsed set of datasets and load the initial one."""
+        self._dataset_load_cancel.set()
+        self._dataset_loading_key = None
+        self._cancel_background_tasks()
         self._clear_layers()
         self.active_dataset = None
         self._active_sdata = None
         self._active_images_sdata = None
+        self._dataset_sessions.clear()
         self._update_scale_bar_visibility()
         self.datasets = datasets
         if self._datasets_changed_callback is not None:
@@ -4664,7 +4737,15 @@ class ComparisonViewerController:
         """Return the (c, y, x) DataArrays of a stored image element, coarsest last."""
         return [ensure_cyx(cyx) for _name, cyx in image_scale_dataarrays(elem)]
 
-    def _ensure_image_pyramid_cache(self, image_key: str, image_elem) -> list[object]:
+    def _ensure_image_pyramid_cache(
+        self,
+        image_key: str,
+        image_elem,
+        *,
+        dataset_name: str | None = None,
+        target_sdata=None,
+        cancel_check=None,
+    ) -> list[object]:
         """Ensure a materialized coarse-level pyramid exists for a single-scale image.
 
         Returns the coarse (c, y, x) levels (level 1..N, base excluded) read back
@@ -4673,7 +4754,11 @@ class ComparisonViewerController:
         levels, so subsequent zoomed-out/mid views read tiny tiles instead of
         re-reading full-resolution chunks.
         """
-        if self._active_sdata is None or self.active_dataset is None or da is None:
+        ds = str(dataset_name or self.active_dataset or "").upper()
+        sdata = target_sdata if target_sdata is not None else self._active_sdata
+        if sdata is None or not ds or da is None:
+            return []
+        if cancel_check is not None and cancel_check():
             return []
 
         step = max(2, int(self.args.image_pyramid_downsample))
@@ -4686,10 +4771,10 @@ class ComparisonViewerController:
         }
         if (
             not bool(getattr(self.args, "overwrite_derived_caches", False))
-            and self._derived_cache_complete("images", cache_key, expected)
-            and self._refresh_image_key_from_store(cache_key)
+            and self._derived_cache_complete("images", cache_key, expected, dataset_name=ds)
+            and self._refresh_image_key_from_store(cache_key, dataset_name=ds, target_sdata=sdata)
         ):
-            return self._pyramid_levels_from_element(self._active_sdata.images[cache_key])
+            return self._pyramid_levels_from_element(sdata.images[cache_key])
 
         base_cyx = ensure_cyx(get_scale0_dataarray(image_elem))
         levels = lazy_coarsened_pyramid(base_cyx.data, step=step, reducer=np.mean)
@@ -4707,25 +4792,41 @@ class ComparisonViewerController:
             dtype=base_dtype,
         )
         Image2DModel.validate(pyramid_tree)
-        self._discard_derived_cache_before_write("images", cache_key)
-        self._active_sdata.images[cache_key] = pyramid_tree
-        self._set_status(
-            f"{self.active_dataset} writing image pyramid cache for {image_key} (downsample {step}x)..."
-        )
-        self._active_sdata.write_element(cache_key, overwrite=False)
-        self._mark_derived_cache_complete("images", cache_key, {**expected, "levels": int(len(levels))})
-        self._refresh_image_key_from_store(cache_key)
+        if cancel_check is not None and cancel_check():
+            return []
+        with self._cache_write_lock:
+            if cancel_check is not None and cancel_check():
+                return []
+            self._discard_derived_cache_before_write(
+                "images", cache_key, dataset_name=ds, target_sdata=sdata
+            )
+            sdata.images[cache_key] = pyramid_tree
+            self._set_status(
+                f"{ds} writing image pyramid cache for {image_key} (downsample {step}x)..."
+            )
+            sdata.write_element(cache_key, overwrite=False)
+            self._mark_derived_cache_complete(
+                "images",
+                cache_key,
+                {**expected, "levels": int(len(levels))},
+                dataset_name=ds,
+            )
+            self._refresh_image_key_from_store(
+                cache_key, dataset_name=ds, target_sdata=sdata
+            )
         log.info(
             "[%s] Built image pyramid cache images[%s] from images[%s] downsample=%sx levels=%s",
-            self.active_dataset,
+            ds,
             cache_key,
             image_key,
             step,
             len(levels),
         )
-        return self._pyramid_levels_from_element(self._active_sdata.images[cache_key])
+        return self._pyramid_levels_from_element(sdata.images[cache_key])
 
-    def _display_scale_levels_for_image(self, image_key: str, sdata) -> tuple[list[tuple[str, object]], str]:
+    def _display_scale_levels_for_image(
+        self, image_key: str, sdata, *, build_cache: bool = True
+    ) -> tuple[list[tuple[str, object]], str]:
         """Return (scale_levels, source) for display: stored pyramid, or base plus
         a materialized coarse pyramid for single-scale images."""
         elem = sdata.images[image_key]
@@ -4735,7 +4836,7 @@ class ComparisonViewerController:
         if len(stored) > 1:
             return stored, "stored"
 
-        if da is not None:
+        if da is not None and build_cache:
             try:
                 coarse = self._ensure_image_pyramid_cache(image_key, elem)
             except Exception as exc:
@@ -4751,7 +4852,15 @@ class ComparisonViewerController:
                 return extended, "materialized"
         return stored, "single"
 
-    def _prime_image_pyramid_caches(self, ds: str, sdata, only_keys: set[str] | None = None) -> None:
+    def _prime_image_pyramid_caches(
+        self,
+        ds: str,
+        sdata,
+        only_keys: set[str] | None = None,
+        *,
+        target_sdata=None,
+        cancel_check=None,
+    ) -> None:
         """Pre-build materialized pyramids for single-scale images (worker-thread safe)."""
         if da is None or sdata is None:
             return
@@ -4762,10 +4871,18 @@ class ComparisonViewerController:
         if only_keys is not None:
             image_keys = [k for k in image_keys if k in only_keys]
         for image_key in image_keys:
+            if cancel_check is not None and cancel_check():
+                return
             try:
                 if len(image_scale_dataarrays(sdata.images[image_key])) > 1:
                     continue
-                self._ensure_image_pyramid_cache(image_key, sdata.images[image_key])
+                self._ensure_image_pyramid_cache(
+                    image_key,
+                    sdata.images[image_key],
+                    dataset_name=ds,
+                    target_sdata=target_sdata,
+                    cancel_check=cancel_check,
+                )
             except Exception as exc:
                 log.warning("[%s] Could not build image pyramid cache for %s (%s)", ds, image_key, exc)
 
@@ -4787,7 +4904,14 @@ class ComparisonViewerController:
         return {labels[0]} if labels else set()
 
     def _add_image_layers(
-        self, ds: str, sdata, x_transform, y_transform, only_channels: set[tuple[str, str]] | None = None
+        self,
+        ds: str,
+        sdata,
+        x_transform,
+        y_transform,
+        only_channels: set[tuple[str, str]] | None = None,
+        *,
+        build_cache: bool = True,
     ) -> dict[str, int]:
         visible = not self.args.hide_images
         total_layers = 0
@@ -4809,7 +4933,9 @@ class ComparisonViewerController:
 
         for image_key in image_keys:
             try:
-                scale_levels, image_source = self._display_scale_levels_for_image(image_key, sdata)
+                scale_levels, image_source = self._display_scale_levels_for_image(
+                    image_key, sdata, build_cache=build_cache
+                )
                 if len(scale_levels) == 0:
                     raise ValueError("image has no readable scale levels")
 
@@ -4912,16 +5038,18 @@ class ComparisonViewerController:
             return shape_key
         return f"{shape_key}_labels"
 
-    def _read_labels_from_store(self):
-        if self.active_dataset is None:
+    def _read_labels_from_store(self, dataset_name: str | None = None):
+        ds = str(dataset_name or self.active_dataset or "").upper()
+        if not ds:
             return None
-        cfg = self.datasets[self.active_dataset]
+        cfg = self.datasets[ds]
         return sd.read_zarr(str(cfg.zarr_path), selection=("labels",))
 
-    def _read_images_from_store(self):
-        if self.active_dataset is None:
+    def _read_images_from_store(self, dataset_name: str | None = None):
+        ds = str(dataset_name or self.active_dataset or "").upper()
+        if not ds:
             return None
-        cfg = self.datasets[self.active_dataset]
+        cfg = self.datasets[ds]
         return sd.read_zarr(str(cfg.zarr_path), selection=("images",))
 
     def _read_shapes_from_store(self):
@@ -4930,34 +5058,46 @@ class ComparisonViewerController:
         cfg = self.datasets[self.active_dataset]
         return sd.read_zarr(str(cfg.zarr_path), selection=("shapes",))
 
-    def _refresh_label_key_from_store(self, label_key: str) -> bool:
-        if self._active_sdata is None:
+    def _refresh_label_key_from_store(
+        self, label_key: str, *, dataset_name: str | None = None, target_sdata=None
+    ) -> bool:
+        sdata = target_sdata if target_sdata is not None else self._active_sdata
+        if sdata is None:
             return False
-        labels_sdata = self._read_labels_from_store()
+        labels_sdata = self._read_labels_from_store(dataset_name)
         if labels_sdata is None or label_key not in labels_sdata.labels:
             return False
-        self._active_sdata.labels[label_key] = labels_sdata.labels[label_key]
+        sdata.labels[label_key] = labels_sdata.labels[label_key]
         return True
 
-    def _refresh_image_key_from_store(self, image_key: str) -> bool:
-        if self._active_sdata is None:
+    def _refresh_image_key_from_store(
+        self, image_key: str, *, dataset_name: str | None = None, target_sdata=None
+    ) -> bool:
+        sdata = target_sdata if target_sdata is not None else self._active_sdata
+        if sdata is None:
             return False
-        images_sdata = self._read_images_from_store()
+        images_sdata = self._read_images_from_store(dataset_name)
         if images_sdata is None or image_key not in images_sdata.images:
             return False
-        self._active_sdata.images[image_key] = images_sdata.images[image_key]
+        sdata.images[image_key] = images_sdata.images[image_key]
         return True
 
-    def _derived_cache_path(self, element_type: str, key: str) -> Path | None:
-        if self.active_dataset is None:
+    def _derived_cache_path(
+        self, element_type: str, key: str, dataset_name: str | None = None
+    ) -> Path | None:
+        ds = str(dataset_name or self.active_dataset or "").upper()
+        if not ds:
             return None
-        cfg = self.datasets[self.active_dataset]
+        cfg = self.datasets[ds]
         return cfg.zarr_path / str(element_type) / str(key)
 
-    def _remove_label_from_parent_metadata(self, label_key: str):
-        if self.active_dataset is None:
+    def _remove_label_from_parent_metadata(
+        self, label_key: str, dataset_name: str | None = None
+    ):
+        ds = str(dataset_name or self.active_dataset or "").upper()
+        if not ds:
             return
-        labels_path = self.datasets[self.active_dataset].zarr_path / "labels"
+        labels_path = self.datasets[ds].zarr_path / "labels"
         if not labels_path.exists():
             return
         try:
@@ -4968,36 +5108,46 @@ class ComparisonViewerController:
         except Exception as exc:
             log.debug("[%s] Could not update labels metadata for %s (%s)", self.active_dataset, label_key, exc)
 
-    def _discard_derived_cache_before_write(self, element_type: str, key: str):
+    def _discard_derived_cache_before_write(
+        self,
+        element_type: str,
+        key: str,
+        *,
+        dataset_name: str | None = None,
+        target_sdata=None,
+    ):
         """Remove a stale private cache so SpatialData can write it fresh."""
         if not is_derived_cache_key(key):
             raise ValueError(f"Refusing to delete non-derived cache element: {key}")
-        if self._active_sdata is None:
+        sdata = target_sdata if target_sdata is not None else self._active_sdata
+        if sdata is None:
             return
 
         collection = None
         if element_type == "labels":
-            collection = self._active_sdata.labels
+            collection = sdata.labels
         elif element_type == "images":
-            collection = self._active_sdata.images
+            collection = sdata.images
         if collection is not None and key in collection:
             try:
                 del collection[key]
             except Exception:
                 pass
 
-        path = self._derived_cache_path(element_type, key)
+        path = self._derived_cache_path(element_type, key, dataset_name)
         if path is None or not path.exists():
             return
         if not path.is_dir():
             raise ValueError(f"Refusing to delete non-directory derived cache path: {path}")
         shutil.rmtree(path)
         if element_type == "labels":
-            self._remove_label_from_parent_metadata(key)
+            self._remove_label_from_parent_metadata(key, dataset_name)
         log.info("[%s] Removed stale derived cache %s/%s before rewrite", self.active_dataset, element_type, key)
 
-    def _derived_cache_attrs(self, element_type: str, key: str) -> dict:
-        path = self._derived_cache_path(element_type, key)
+    def _derived_cache_attrs(
+        self, element_type: str, key: str, dataset_name: str | None = None
+    ) -> dict:
+        path = self._derived_cache_path(element_type, key, dataset_name)
         if path is None or not path.exists():
             return {}
         try:
@@ -5007,10 +5157,16 @@ class ComparisonViewerController:
         except Exception:
             return {}
 
-    def _derived_cache_complete(self, element_type: str, key: str, expected: dict[str, object]) -> bool:
+    def _derived_cache_complete(
+        self,
+        element_type: str,
+        key: str,
+        expected: dict[str, object],
+        dataset_name: str | None = None,
+    ) -> bool:
         if bool(getattr(self.args, "overwrite_derived_caches", False)):
             return False
-        attrs = self._derived_cache_attrs(element_type, key)
+        attrs = self._derived_cache_attrs(element_type, key, dataset_name)
         if not attrs.get("complete"):
             return False
         if attrs.get("version") != DERIVED_CACHE_VERSION:
@@ -5020,8 +5176,14 @@ class ComparisonViewerController:
                 return False
         return True
 
-    def _mark_derived_cache_complete(self, element_type: str, key: str, attrs: dict[str, object]):
-        path = self._derived_cache_path(element_type, key)
+    def _mark_derived_cache_complete(
+        self,
+        element_type: str,
+        key: str,
+        attrs: dict[str, object],
+        dataset_name: str | None = None,
+    ):
+        path = self._derived_cache_path(element_type, key, dataset_name)
         if path is None:
             return
         group = zarr.open_group(str(path), mode="a")
@@ -5295,20 +5457,25 @@ class ComparisonViewerController:
         shape: tuple[int, int],
         chunk_shape: tuple[int, int],
         napari_affine: np.ndarray,
+        *,
+        cancel_check=None,
+        expected_dataset: str | None = None,
     ) -> int:
-        if self._active_sdata is None or self.active_dataset is None:
+        self._raise_if_task_cancelled(cancel_check, expected_dataset)
+        sdata = self._active_sdata
+        ds = self.active_dataset
+        if sdata is None or ds is None:
             return 0
-        if shape_key not in self._active_sdata.shapes:
+        if shape_key not in sdata.shapes:
             raise KeyError(f"Shape key '{shape_key}' not found in current dataset.")
 
-        ds = self.active_dataset
         cfg = self.datasets[ds]
         label_path = cfg.zarr_path / "labels" / label_key / "s0"
         label_arr = zarr.open(str(label_path), mode="r+")
         inv_affine = np.linalg.inv(np.asarray(napari_affine, dtype=float))
         # Keep the true index: each polygon is rasterized with its own instance id
         # so the raster pixel value == the join key used by the cell-type overlay.
-        gdf = self._active_sdata.shapes[shape_key]
+        gdf = sdata.shapes[shape_key]
         label_series, id_dtype = self._label_ids_for_shapes(gdf)
 
         height, width = shape
@@ -5320,8 +5487,10 @@ class ComparisonViewerController:
         t0 = time.time()
 
         for y0 in range(0, height, chunk_h):
+            self._raise_if_task_cancelled(cancel_check, expected_dataset)
             y1 = min(y0 + chunk_h, height)
             for x0 in range(0, width, chunk_w):
+                self._raise_if_task_cancelled(cancel_check, expected_dataset)
                 x1 = min(x0 + chunk_w, width)
                 processed += 1
                 bounds = pixel_window_global_bounds(napari_affine, y0, y1, x0, x1)
@@ -5363,7 +5532,14 @@ class ComparisonViewerController:
         )
         return int(len(gdf))
 
-    def ensure_label_for_shape_key(self, shape_key: str) -> str:
+    def ensure_label_for_shape_key(
+        self,
+        shape_key: str,
+        *,
+        cancel_check=None,
+        expected_dataset: str | None = None,
+    ) -> str:
+        self._raise_if_task_cancelled(cancel_check, expected_dataset)
         if self._active_sdata is None or self.active_dataset is None:
             raise RuntimeError("No active dataset.")
 
@@ -5412,7 +5588,10 @@ class ComparisonViewerController:
             shape=shape,
             chunk_shape=chunks,
             napari_affine=napari_affine,
+            cancel_check=cancel_check,
+            expected_dataset=expected_dataset,
         )
+        self._raise_if_task_cancelled(cancel_check, expected_dataset)
         self._mark_label_cache_complete(label_key, shape_key, shape, chunks)
         self._refresh_label_key_from_store(label_key)
         mem_after = memory_snapshot_gb()
@@ -5448,8 +5627,18 @@ class ComparisonViewerController:
         set_transformation(tree, {"global": transform}, set_all=True)
         return tree
 
-    def _ensure_label_outline_cache(self, label_key: str, width: int) -> str:
-        if self._active_sdata is None:
+    def _ensure_label_outline_cache(
+        self,
+        label_key: str,
+        width: int,
+        *,
+        cancel_check=None,
+        expected_dataset: str | None = None,
+    ) -> str:
+        self._raise_if_task_cancelled(cancel_check, expected_dataset)
+        sdata = self._active_sdata
+        ds = self.active_dataset
+        if sdata is None or ds is None:
             raise RuntimeError("No active dataset.")
         if is_derived_cache_key(label_key):
             return label_key
@@ -5463,16 +5652,22 @@ class ComparisonViewerController:
         }
         if (
             not bool(getattr(self.args, "overwrite_labels", False))
-            and self._derived_cache_complete("labels", cache_key, expected)
-            and self._refresh_label_key_from_store(cache_key)
+            and self._derived_cache_complete(
+                "labels", cache_key, expected, dataset_name=ds
+            )
+            and self._refresh_label_key_from_store(
+                cache_key, dataset_name=ds, target_sdata=sdata
+            )
         ):
             return cache_key
 
-        if label_key not in self._active_sdata.labels:
-            if not self._refresh_label_key_from_store(label_key):
+        if label_key not in sdata.labels:
+            if not self._refresh_label_key_from_store(
+                label_key, dataset_name=ds, target_sdata=sdata
+            ):
                 raise KeyError(f"Label key '{label_key}' not found in current dataset.")
 
-        label_elem = self._active_sdata.labels[label_key]
+        label_elem = sdata.labels[label_key]
         label_scale_levels = [
             (scale_name, level_data)
             for scale_name, level_data in self._raster_scale_levels(label_elem)
@@ -5499,24 +5694,32 @@ class ComparisonViewerController:
             dtype=np.uint8,
         )
         Labels2DModel.validate(outline_tree)
-        self._discard_derived_cache_before_write("labels", cache_key)
-        self._active_sdata.labels[cache_key] = outline_tree
-        self._set_status(f"{self.active_dataset} writing cached outline pyramid for {label_key}...")
-        self._active_sdata.write_element(cache_key, overwrite=False)
-        self._mark_derived_cache_complete(
-            "labels",
-            cache_key,
-            {
-                **expected,
-                "source": source,
-                "levels": int(len(outline_levels)),
-                "source_shapes": [
-                    [int(axis) for axis in getattr(level_data, "shape")]
-                    for _scale_name, level_data in label_scale_levels
-                ],
-            },
-        )
-        self._refresh_label_key_from_store(cache_key)
+        self._raise_if_task_cancelled(cancel_check, expected_dataset)
+        with self._cache_write_lock:
+            self._raise_if_task_cancelled(cancel_check, expected_dataset)
+            self._discard_derived_cache_before_write(
+                "labels", cache_key, dataset_name=ds, target_sdata=sdata
+            )
+            sdata.labels[cache_key] = outline_tree
+            self._set_status(f"{ds} writing cached outline pyramid for {label_key}...")
+            sdata.write_element(cache_key, overwrite=False)
+            self._mark_derived_cache_complete(
+                "labels",
+                cache_key,
+                {
+                    **expected,
+                    "source": source,
+                    "levels": int(len(outline_levels)),
+                    "source_shapes": [
+                        [int(axis) for axis in getattr(level_data, "shape")]
+                        for _scale_name, level_data in label_scale_levels
+                    ],
+                },
+                dataset_name=ds,
+            )
+            self._refresh_label_key_from_store(
+                cache_key, dataset_name=ds, target_sdata=sdata
+            )
         log.info(
             "[%s] Built cached outline pyramid labels[%s] from labels[%s] levels=%s source=%s width=%s",
             self.active_dataset,
@@ -5528,7 +5731,13 @@ class ComparisonViewerController:
         )
         return cache_key
 
-    def _prepare_label_outline_display(self, label_key: str) -> dict[str, object] | None:
+    def _prepare_label_outline_display(
+        self,
+        label_key: str,
+        *,
+        cancel_check=None,
+        expected_dataset: str | None = None,
+    ) -> dict[str, object] | None:
         """Build/refresh the outline pyramid and gather display data (thread-safe).
 
         This does the heavy work (outline pyramid build + zarr I/O + lazy scale
@@ -5536,15 +5745,26 @@ class ComparisonViewerController:
         from a worker thread. Pair it with :meth:`_finish_label_layer` on the GUI
         thread.
         """
-        if self._active_sdata is None or self.active_dataset is None:
+        self._raise_if_task_cancelled(cancel_check, expected_dataset)
+        sdata = self._active_sdata
+        ds = self.active_dataset
+        if sdata is None or ds is None:
             return None
-        if label_key not in self._active_sdata.labels:
-            if not self._refresh_label_key_from_store(label_key):
+        if label_key not in sdata.labels:
+            if not self._refresh_label_key_from_store(
+                label_key, dataset_name=ds, target_sdata=sdata
+            ):
                 raise KeyError(f"Label key '{label_key}' not found in current dataset.")
 
         outline_width = max(1, int(self.args.label_contour_width))
-        display_label_key = self._ensure_label_outline_cache(label_key, outline_width)
-        label_elem = self._active_sdata.labels[display_label_key]
+        display_label_key = self._ensure_label_outline_cache(
+            label_key,
+            outline_width,
+            cancel_check=cancel_check,
+            expected_dataset=expected_dataset,
+        )
+        self._raise_if_task_cancelled(cancel_check, expected_dataset)
+        label_elem = sdata.labels[display_label_key]
         label_scale_levels = [
             (scale_name, level_data)
             for scale_name, level_data in self._raster_scale_levels(label_elem)
@@ -5657,42 +5877,73 @@ class ComparisonViewerController:
             t0 = time.time()
             specs: list[dict[str, object]] = []
             total_labels = 0
-            for key in keys:
-                if self._segmentation_source() == "labels" and key in self._active_sdata.labels:
-                    label_key = key
-                else:
-                    label_key = self.ensure_label_for_shape_key(key)
-                prepared = self._prepare_label_outline_display(label_key)
-                try:
-                    n_labels = int(len(self._active_sdata.shapes[key]))
-                except Exception:
-                    n_labels = 1
-                specs.append({"label_key": label_key, "prepared": prepared, "n_labels": n_labels})
-                total_labels += n_labels
+            with self._store_io_slots:
+                for key in keys:
+                    self._raise_if_task_cancelled(cancel_token.is_set, ds)
+                    if self._segmentation_source() == "labels" and key in self._active_sdata.labels:
+                        label_key = key
+                    else:
+                        label_key = self.ensure_label_for_shape_key(
+                            key,
+                            cancel_check=cancel_token.is_set,
+                            expected_dataset=ds,
+                        )
+                    prepared = self._prepare_label_outline_display(
+                        label_key,
+                        cancel_check=cancel_token.is_set,
+                        expected_dataset=ds,
+                    )
+                    try:
+                        n_labels = int(len(self._active_sdata.shapes[key]))
+                    except Exception:
+                        n_labels = 1
+                    specs.append({"label_key": label_key, "prepared": prepared, "n_labels": n_labels})
+                    total_labels += n_labels
             return {"specs": specs, "total_labels": total_labels, "build_seconds": time.time() - t0}
 
         if thread_worker is None:
             try:
                 payload = compute()
             except Exception as exc:
-                self._handle_label_build_error(generation, ds, mem_before, exc)
+                self._handle_label_build_error(
+                    generation, ds, mem_before, exc, cancel_token
+                )
                 return
-            self._apply_label_build(generation, ds, mem_before, payload)
+            self._apply_label_build(
+                generation, ds, mem_before, payload, cancel_token
+            )
             return
 
         worker_factory = thread_worker(compute)
         worker = worker_factory()
         worker.returned.connect(
-            lambda payload, gen=generation, d=ds, mb=mem_before: self._apply_label_build(gen, d, mb, payload)
+            lambda payload, gen=generation, d=ds, mb=mem_before, token=cancel_token: self._apply_label_build(
+                gen, d, mb, payload, token
+            )
         )
         worker.errored.connect(
-            lambda exc, gen=generation, d=ds, mb=mem_before: self._handle_label_build_error(gen, d, mb, exc)
+            lambda exc, gen=generation, d=ds, mb=mem_before, token=cancel_token: self._handle_label_build_error(
+                gen, d, mb, exc, token
+            )
         )
         self._label_build_worker = worker
         worker.start()
 
-    def _apply_label_build(self, generation: int, ds: str, mem_before: dict[str, float], payload: dict[str, object]):
-        if generation != self._label_build_generation or self.active_dataset != ds:
+    def _apply_label_build(
+        self,
+        generation: int,
+        ds: str,
+        mem_before: dict[str, float],
+        payload: dict[str, object],
+        token: Event | None = None,
+    ):
+        if token is not None:
+            self._finish_task_token("masks", token)
+        if (
+            generation != self._label_build_generation
+            or self.active_dataset != ds
+            or (token is not None and token.is_set())
+        ):
             return
         self._label_build_worker = None
         self._end_progress("masks")
@@ -5710,7 +5961,16 @@ class ComparisonViewerController:
             f"(build={float(payload.get('build_seconds', 0.0)):.1f}s)"
         )
 
-    def _handle_label_build_error(self, generation: int, ds: str, mem_before: dict[str, float], exc):
+    def _handle_label_build_error(
+        self,
+        generation: int,
+        ds: str,
+        mem_before: dict[str, float],
+        exc,
+        token: Event | None = None,
+    ):
+        if token is not None:
+            self._finish_task_token("masks", token)
         if generation != self._label_build_generation:
             return
         self._label_build_worker = None
@@ -5727,7 +5987,14 @@ class ComparisonViewerController:
             if len(getattr(level_data, "shape", ())) == 2
         ]
 
-    def _ensure_label_pyramid_cache(self, label_key: str, step: int) -> list[object]:
+    def _ensure_label_pyramid_cache(
+        self,
+        label_key: str,
+        step: int,
+        *,
+        cancel_check=None,
+        expected_dataset: str | None = None,
+    ) -> list[object]:
         """Ensure a materialized max-pooled label pyramid exists for a single-scale
         label element, returning the coarse levels (base excluded).
 
@@ -5736,7 +6003,10 @@ class ComparisonViewerController:
         what the previous lazy ``lazy_label_pyramid`` produced, just persisted so
         zoomed-out views no longer re-read the full-resolution label array.
         """
-        if self._active_sdata is None or self.active_dataset is None or da is None:
+        self._raise_if_task_cancelled(cancel_check, expected_dataset)
+        sdata = self._active_sdata
+        ds = self.active_dataset
+        if sdata is None or ds is None or da is None:
             return []
         if is_derived_cache_key(label_key):
             return []
@@ -5751,15 +6021,19 @@ class ComparisonViewerController:
         }
         if (
             not bool(getattr(self.args, "overwrite_derived_caches", False))
-            and self._derived_cache_complete("labels", cache_key, expected)
-            and self._refresh_label_key_from_store(cache_key)
+            and self._derived_cache_complete("labels", cache_key, expected, ds)
+            and self._refresh_label_key_from_store(
+                cache_key, dataset_name=ds, target_sdata=sdata
+            )
         ):
-            return self._label_pyramid_levels_from_element(self._active_sdata.labels[cache_key])
+            return self._label_pyramid_levels_from_element(sdata.labels[cache_key])
 
-        if label_key not in self._active_sdata.labels and not self._refresh_label_key_from_store(label_key):
+        if label_key not in sdata.labels and not self._refresh_label_key_from_store(
+            label_key, dataset_name=ds, target_sdata=sdata
+        ):
             raise KeyError(f"Label key '{label_key}' not found in current dataset.")
 
-        label_elem = self._active_sdata.labels[label_key]
+        label_elem = sdata.labels[label_key]
         base_levels = self._label_pyramid_levels_from_element(label_elem)
         if len(base_levels) == 0:
             raise ValueError(f"Expected 2D labels for {label_key}, found no readable 2D levels")
@@ -5777,34 +6051,59 @@ class ComparisonViewerController:
             dtype=getattr(base, "dtype", None),
         )
         Labels2DModel.validate(pyramid_tree)
-        self._discard_derived_cache_before_write("labels", cache_key)
-        self._active_sdata.labels[cache_key] = pyramid_tree
-        self._set_status(
-            f"{self.active_dataset} writing label pyramid cache for {label_key} (downsample {step}x)..."
-        )
-        self._active_sdata.write_element(cache_key, overwrite=False)
-        self._mark_derived_cache_complete("labels", cache_key, {**expected, "levels": int(len(levels))})
-        self._refresh_label_key_from_store(cache_key)
+        self._raise_if_task_cancelled(cancel_check, expected_dataset)
+        with self._cache_write_lock:
+            self._raise_if_task_cancelled(cancel_check, expected_dataset)
+            self._discard_derived_cache_before_write(
+                "labels", cache_key, dataset_name=ds, target_sdata=sdata
+            )
+            sdata.labels[cache_key] = pyramid_tree
+            self._set_status(
+                f"{ds} writing label pyramid cache for {label_key} (downsample {step}x)..."
+            )
+            sdata.write_element(cache_key, overwrite=False)
+            self._mark_derived_cache_complete(
+                "labels",
+                cache_key,
+                {**expected, "levels": int(len(levels))},
+                dataset_name=ds,
+            )
+            self._refresh_label_key_from_store(
+                cache_key, dataset_name=ds, target_sdata=sdata
+            )
         log.info(
             "[%s] Built label pyramid cache labels[%s] from labels[%s] downsample=%sx levels=%s",
-            self.active_dataset,
+            ds,
             cache_key,
             label_key,
             step,
             len(levels),
         )
-        return self._label_pyramid_levels_from_element(self._active_sdata.labels[cache_key])
+        return self._label_pyramid_levels_from_element(sdata.labels[cache_key])
 
-    def _build_cellpose_label_display(self, label_key: str) -> tuple[list[object], np.ndarray]:
+    def _build_cellpose_label_display(
+        self,
+        label_key: str,
+        *,
+        cancel_check=None,
+        expected_dataset: str | None = None,
+    ) -> tuple[list[object], np.ndarray]:
         """Return (label_levels, napari_affine) for the cell-value overlay.
 
         Uses the stored pyramid when present, otherwise the lazy base plus a
         materialized max-pooled coarse pyramid, so pan/zoom over the value
         overlay reads small tiles instead of the full-resolution label array.
         """
-        if label_key not in self._active_sdata.labels and not self._refresh_label_key_from_store(label_key):
+        self._raise_if_task_cancelled(cancel_check, expected_dataset)
+        sdata = self._active_sdata
+        ds = self.active_dataset
+        if sdata is None or ds is None:
+            raise RuntimeError("No active dataset.")
+        if label_key not in sdata.labels and not self._refresh_label_key_from_store(
+            label_key, dataset_name=ds, target_sdata=sdata
+        ):
             raise KeyError(f"Label key '{label_key}' not found in current dataset.")
-        label_elem = self._active_sdata.labels[label_key]
+        label_elem = sdata.labels[label_key]
         stored = self._label_pyramid_levels_from_element(label_elem)
         if len(stored) == 0:
             raise ValueError(f"labels[{label_key}] has no readable 2D levels")
@@ -5813,11 +6112,17 @@ class ComparisonViewerController:
         if len(stored) == 1 and da is not None:
             step = max(2, int(self.args.image_pyramid_downsample))
             try:
-                coarse = self._ensure_label_pyramid_cache(label_key, step)
+                coarse = self._ensure_label_pyramid_cache(
+                    label_key,
+                    step,
+                    cancel_check=cancel_check,
+                    expected_dataset=expected_dataset,
+                )
             except Exception as exc:
+                self._raise_if_task_cancelled(cancel_check, expected_dataset)
                 log.warning(
                     "[%s] Label pyramid cache build failed for %s (%s); using lazy fallback.",
-                    self.active_dataset,
+                    ds,
                     label_key,
                     exc,
                 )
@@ -5836,7 +6141,10 @@ class ComparisonViewerController:
                 levels = [stored[0]] + list(coarse)
         return levels, self._label_display_affine(label_elem)
 
-    def _ensure_cellpose_label_key(self) -> str:
+    def _ensure_cellpose_label_key(
+        self, *, cancel_check=None, expected_dataset: str | None = None
+    ) -> str:
+        self._raise_if_task_cancelled(cancel_check, expected_dataset)
         if self._active_sdata is None or self.active_dataset is None:
             raise RuntimeError("No active dataset.")
 
@@ -5859,7 +6167,11 @@ class ComparisonViewerController:
             if not cache_attrs or self._label_cache_is_complete(CELLPOSE_LABEL_KEY, CELLPOSE_SHAPE_KEY):
                 return CELLPOSE_LABEL_KEY
 
-        return self.ensure_label_for_shape_key(CELLPOSE_SHAPE_KEY)
+        return self.ensure_label_for_shape_key(
+            CELLPOSE_SHAPE_KEY,
+            cancel_check=cancel_check,
+            expected_dataset=expected_dataset,
+        )
 
     def _compute_cellpose_value_payload(
         self,
@@ -5890,8 +6202,19 @@ class ComparisonViewerController:
             "colormap": DirectLabelColormap(color_dict=mapping.color_dict),
         }
 
-    def _apply_cellpose_value_payload(self, generation: int, payload: dict[str, object]):
-        if generation != self._cellpose_value_generation or self.active_dataset != "MERSCOPE":
+    def _apply_cellpose_value_payload(
+        self,
+        generation: int,
+        payload: dict[str, object],
+        token: Event | None = None,
+    ):
+        if token is not None:
+            self._finish_task_token("cell-values", token)
+        if (
+            generation != self._cellpose_value_generation
+            or self.active_dataset != "MERSCOPE"
+            or (token is not None and token.is_set())
+        ):
             return
         self._cellpose_value_worker = None
         if self._active_sdata is None:
@@ -5946,7 +6269,11 @@ class ComparisonViewerController:
             len(label_levels),
         )
 
-    def _handle_cellpose_value_error(self, generation: int, exc):
+    def _handle_cellpose_value_error(
+        self, generation: int, exc, token: Event | None = None
+    ):
+        if token is not None:
+            self._finish_task_token("cell-values", token)
         if generation != self._cellpose_value_generation:
             return
         self._cellpose_value_worker = None
@@ -5973,6 +6300,16 @@ class ComparisonViewerController:
             self._set_status(f"Missing {CELLPOSE_QUANTIFICATION_TABLE_KEY}; cannot load Cellpose value overlay.")
             return
 
+        task_key = (
+            "MERSCOPE",
+            str(channel),
+            str(statistic),
+            str(colormap_name),
+        )
+        cancel_token = self._begin_task_token("cell-values", task_key)
+        if cancel_token is None:
+            self._set_status("That Cellpose value overlay is already being prepared.")
+            return
         self._cellpose_value_generation += 1
         generation = self._cellpose_value_generation
         self._set_status(f"MERSCOPE building Cellpose value overlay: {channel} {statistic}...")
@@ -5982,9 +6319,21 @@ class ComparisonViewerController:
             # the color mapping, and materializes a max-pooled label pyramid so
             # the overlay pans/zooms without re-reading the full-resolution
             # labels. All off the GUI thread; layer creation happens on apply.
-            label_key = self._ensure_cellpose_label_key()
-            label_levels, napari_affine = self._build_cellpose_label_display(label_key)
-            payload = self._compute_cellpose_value_payload(cfg.zarr_path, channel, statistic, colormap_name)
+            with self._store_io_slots:
+                self._raise_if_task_cancelled(cancel_token.is_set, "MERSCOPE")
+                label_key = self._ensure_cellpose_label_key(
+                    cancel_check=cancel_token.is_set,
+                    expected_dataset="MERSCOPE",
+                )
+                label_levels, napari_affine = self._build_cellpose_label_display(
+                    label_key,
+                    cancel_check=cancel_token.is_set,
+                    expected_dataset="MERSCOPE",
+                )
+                self._raise_if_task_cancelled(cancel_token.is_set, "MERSCOPE")
+                payload = self._compute_cellpose_value_payload(
+                    cfg.zarr_path, channel, statistic, colormap_name
+                )
             return {
                 **payload,
                 "label_key": label_key,
@@ -5996,22 +6345,32 @@ class ComparisonViewerController:
             try:
                 payload = compute()
             except Exception as exc:
-                self._handle_cellpose_value_error(generation, exc)
+                self._handle_cellpose_value_error(generation, exc, cancel_token)
                 return
-            self._apply_cellpose_value_payload(generation, payload)
+            self._apply_cellpose_value_payload(generation, payload, cancel_token)
             return
 
         worker_factory = thread_worker(compute)
         worker = worker_factory()
         worker.returned.connect(
-            lambda payload, gen=generation: self._apply_cellpose_value_payload(gen, payload)
+            lambda payload, gen=generation, token=cancel_token: self._apply_cellpose_value_payload(
+                gen, payload, token
+            )
         )
-        worker.errored.connect(lambda exc, gen=generation: self._handle_cellpose_value_error(gen, exc))
+        worker.errored.connect(
+            lambda exc, gen=generation, token=cancel_token: self._handle_cellpose_value_error(
+                gen, exc, token
+            )
+        )
         self._cellpose_value_worker = worker
         worker.start()
 
     def remove_cellpose_value_overlay(self, dataset_name: str):
         ds = str(dataset_name).upper()
+        token = self._task_cancel_events.get("cell-values")
+        if token is not None:
+            token.set()
+            self._finish_task_token("cell-values", token)
         self._cellpose_value_generation += 1
         self._cellpose_value_worker = None
         removed = 0
@@ -6081,24 +6440,33 @@ class ComparisonViewerController:
         random_state = int(getattr(self.args, "random_state", 42))
         cfg = self.datasets.get(ds)
         zarr_path = getattr(cfg, "zarr_path", None)
+        task_key = (ds, str(points_key), max_points, random_state)
+        cancel_token = self._begin_task_token("transcripts", task_key)
+        if cancel_token is None:
+            self._set_status(f"{ds}: transcript build is already running.")
+            return
         self._begin_progress("transcripts", f"{ds}: building per-gene transcripts for {points_key}...")
 
         def compute():
             t0 = time.time()
             # Group genes by the cell type they mark when the store carries a
             # marker reference; otherwise fall back to the deterministic rainbow.
-            reference = load_cell_type_marker_reference(zarr_path) if zarr_path is not None else None
-            store = build_gene_point_groups(
-                points_obj,
-                x_col=x_col,
-                y_col=y_col,
-                gene_col=gene_col,
-                assignment_col=assignment_col,
-                background_col=background_col,
-                reference=reference,
-                max_points=max_points if max_points > 0 else None,
-                random_state=random_state,
-            )
+            with self._store_io_slots:
+                self._raise_if_task_cancelled(cancel_token.is_set, ds)
+                reference = load_cell_type_marker_reference(zarr_path) if zarr_path is not None else None
+                store = build_gene_point_groups(
+                    points_obj,
+                    x_col=x_col,
+                    y_col=y_col,
+                    gene_col=gene_col,
+                    assignment_col=assignment_col,
+                    background_col=background_col,
+                    reference=reference,
+                    max_points=max_points if max_points > 0 else None,
+                    random_state=random_state,
+                    build_cell_index=assignment_col is not None,
+                    cancel_check=cancel_token.is_set,
+                )
             return {
                 "points_key": points_key,
                 "store": store,
@@ -6110,23 +6478,35 @@ class ComparisonViewerController:
             try:
                 payload = compute()
             except Exception as exc:
-                self._handle_gene_inspector_build_error(generation, ds, exc)
+                self._handle_gene_inspector_build_error(generation, ds, exc, cancel_token)
                 return
-            self._apply_gene_inspector_build(generation, ds, payload)
+            self._apply_gene_inspector_build(generation, ds, payload, cancel_token)
             return
 
         worker = thread_worker(compute)()
         worker.returned.connect(
-            lambda payload, gen=generation, d=ds: self._apply_gene_inspector_build(gen, d, payload)
+            lambda payload, gen=generation, d=ds, token=cancel_token: self._apply_gene_inspector_build(
+                gen, d, payload, token
+            )
         )
         worker.errored.connect(
-            lambda exc, gen=generation, d=ds: self._handle_gene_inspector_build_error(gen, d, exc)
+            lambda exc, gen=generation, d=ds, token=cancel_token: self._handle_gene_inspector_build_error(
+                gen, d, exc, token
+            )
         )
         self._gene_build_worker = worker
         worker.start()
 
-    def _apply_gene_inspector_build(self, generation: int, ds: str, payload: dict):
-        if generation != self._gene_build_generation or self.active_dataset != ds:
+    def _apply_gene_inspector_build(
+        self, generation: int, ds: str, payload: dict, token: Event | None = None
+    ):
+        if token is not None:
+            self._finish_task_token("transcripts", token)
+        if (
+            generation != self._gene_build_generation
+            or self.active_dataset != ds
+            or (token is not None and token.is_set())
+        ):
             return
         self._gene_build_worker = None
         self._end_progress("transcripts")
@@ -6169,6 +6549,9 @@ class ComparisonViewerController:
             pending_groups=set(),
             highlighted_genes=[],
             group_display_ranges=[[] for _ in store.group_symbols],
+            group_shown_masks=[
+                np.zeros(len(coords), dtype=bool) for coords in store.group_coords
+            ],
             reference=reference,
             coarse_scheme=coarse_scheme,
             fine_scheme=fine_scheme,
@@ -6217,7 +6600,11 @@ class ComparisonViewerController:
             float(payload.get("build_seconds", 0.0)),
         )
 
-    def _handle_gene_inspector_build_error(self, generation: int, ds: str, exc):
+    def _handle_gene_inspector_build_error(
+        self, generation: int, ds: str, exc, token: Event | None = None
+    ):
+        if token is not None:
+            self._finish_task_token("transcripts", token)
         if generation != self._gene_build_generation:
             return
         self._gene_build_worker = None
@@ -7441,7 +7828,13 @@ class ComparisonViewerController:
             return False
         return True
 
-    def _ensure_label_key_for_segmentation(self, segmentation: str) -> str:
+    def _ensure_label_key_for_segmentation(
+        self,
+        segmentation: str,
+        *,
+        cancel_check=None,
+        expected_dataset: str | None = None,
+    ) -> str:
         """Resolve (loading/rasterizing if needed) the mask label key for a source.
 
         ``segmentation`` is a cell-type source key; the mask it colours is resolved
@@ -7451,6 +7844,7 @@ class ComparisonViewerController:
         version; a stale one (v1 used positional ``id+1``) is rebuilt so the raster
         pixel ids match the instance keys the cell-type overlay joins on.
         """
+        self._raise_if_task_cancelled(cancel_check, expected_dataset)
         if self._active_sdata is None:
             raise RuntimeError("No active dataset.")
         shape_key = self._mask_shape_key_for_source(segmentation)
@@ -7467,40 +7861,77 @@ class ComparisonViewerController:
             cache_attrs = self._label_cache_attrs(label_key)
             if not cache_attrs or self._label_cache_is_complete(label_key, shape_key):
                 return label_key
-        return self.ensure_label_for_shape_key(shape_key)
+        return self.ensure_label_for_shape_key(
+            shape_key,
+            cancel_check=cancel_check,
+            expected_dataset=expected_dataset,
+        )
 
     def _start_cell_type_overlay_build(self, state: CellTypeOverlayState):
         """Build (off the GUI thread) and draw the filled cell-type Labels layer."""
         seg = state.segmentation
         kind = state.kind or "broad"
+        task_key = (state.dataset, seg, kind)
+        cancel_token = self._begin_task_token("cell-types", task_key)
+        if cancel_token is None:
+            self._set_status(f"{state.dataset}: that cell-type overlay is already being prepared.")
+            return
         self._cell_type_generation += 1
         generation = self._cell_type_generation
         self._set_status(f"{state.dataset}: colouring {seg} masks by {kind} cell type...")
 
         def compute():
-            label_key = self._ensure_label_key_for_segmentation(seg)
-            label_levels, napari_affine = self._build_cellpose_label_display(label_key)
+            with self._store_io_slots:
+                self._raise_if_task_cancelled(cancel_token.is_set, state.dataset)
+                label_key = self._ensure_label_key_for_segmentation(
+                    seg,
+                    cancel_check=cancel_token.is_set,
+                    expected_dataset=state.dataset,
+                )
+                label_levels, napari_affine = self._build_cellpose_label_display(
+                    label_key,
+                    cancel_check=cancel_token.is_set,
+                    expected_dataset=state.dataset,
+                )
             return {"label_key": label_key, "label_levels": label_levels, "napari_affine": napari_affine}
 
         if thread_worker is None:
             try:
                 payload = compute()
             except Exception as exc:
-                self._handle_cell_type_error(generation, exc)
+                self._handle_cell_type_error(generation, exc, cancel_token)
                 return
-            self._apply_cell_type_layer(generation, state, payload)
+            self._apply_cell_type_layer(generation, state, payload, cancel_token)
             return
 
         worker = thread_worker(compute)()
         worker.returned.connect(
-            lambda payload, gen=generation, st=state: self._apply_cell_type_layer(gen, st, payload)
+            lambda payload, gen=generation, st=state, token=cancel_token: self._apply_cell_type_layer(
+                gen, st, payload, token
+            )
         )
-        worker.errored.connect(lambda exc, gen=generation: self._handle_cell_type_error(gen, exc))
+        worker.errored.connect(
+            lambda exc, gen=generation, token=cancel_token: self._handle_cell_type_error(
+                gen, exc, token
+            )
+        )
         self._cell_type_worker = worker
         worker.start()
 
-    def _apply_cell_type_layer(self, generation: int, state: CellTypeOverlayState, payload: dict):
-        if generation != self._cell_type_generation or self.active_dataset != state.dataset:
+    def _apply_cell_type_layer(
+        self,
+        generation: int,
+        state: CellTypeOverlayState,
+        payload: dict,
+        token: Event | None = None,
+    ):
+        if token is not None:
+            self._finish_task_token("cell-types", token)
+        if (
+            generation != self._cell_type_generation
+            or self.active_dataset != state.dataset
+            or (token is not None and token.is_set())
+        ):
             return
         self._cell_type_worker = None
         if self._active_sdata is None:
@@ -7545,7 +7976,11 @@ class ComparisonViewerController:
             state.dataset, label_key, state.segmentation, kind, n_shown, n_cells, len(label_levels),
         )
 
-    def _handle_cell_type_error(self, generation: int, exc):
+    def _handle_cell_type_error(
+        self, generation: int, exc, token: Event | None = None
+    ):
+        if token is not None:
+            self._finish_task_token("cell-types", token)
         if generation != self._cell_type_generation:
             return
         self._cell_type_worker = None
@@ -7555,6 +7990,10 @@ class ComparisonViewerController:
 
     def close_cell_type_overlay(self, dataset_name: str):
         state = self._cell_type_state(dataset_name)
+        token = self._task_cancel_events.get("cell-types")
+        if token is not None:
+            token.set()
+            self._finish_task_token("cell-types", token)
         self._cell_type_generation += 1  # cancel any in-flight build
         self._cell_type_worker = None
         self._remove_layers_by_prefix(layer_name_prefix(state.dataset, "cell_types"))
@@ -7601,6 +8040,10 @@ class ComparisonViewerController:
     def _teardown_gene_inspector(self, ds: str):
         ds = str(ds).upper()
         # Cancel any in-flight build so a stale result cannot install layers.
+        token = self._task_cancel_events.pop("transcripts", None)
+        if token is not None:
+            token.set()
+        self._task_keys.pop("transcripts", None)
         self._gene_build_generation += 1
         self._gene_build_worker = None
         state = self._gene_inspector_states.pop(ds, None)
@@ -7663,41 +8106,91 @@ class ComparisonViewerController:
         images_sdata = self._active_images_sdata
         only_channels = {(str(k), str(c)) for k, c in image_channels} if image_channels is not None else None
         only_keys = {k for k, _c in only_channels} if only_channels is not None else None
+        request_key = (
+            ds,
+            tuple(sorted(only_channels)) if only_channels is not None else ("__all__",),
+            int(getattr(self.args, "image_pyramid_downsample", 4)),
+        )
+        cancel_token = self._begin_task_token("images", request_key)
+        if cancel_token is None:
+            self._set_status(f"{ds}: that image load is already running.")
+            return
         self._image_build_generation += 1
         generation = self._image_build_generation
         scope = "selected channels" if only_channels is not None else "all images"
-        self._begin_progress("images", f"{ds}: computing image pyramids ({scope}; one-time cached build)...")
+        # Time-to-first-pixel: install a temporary lazy/synthetic view before the
+        # one-time materialized cache build starts.  The apply phase swaps it for
+        # the fast persisted pyramid without changing the user's layer choices.
+        if only_channels is None:
+            self._remove_layers_by_prefix(layer_name_prefix(ds, "image"))
+        else:
+            for image_key, channel in only_channels:
+                self._remove_layer_by_name(make_layer_name(ds, "image", image_key, channel))
+        preview_stats = self._add_image_layers(
+            ds,
+            images_sdata,
+            self._x_transform,
+            self._y_transform,
+            only_channels=only_channels,
+            build_cache=False,
+        )
+        self._publish_loaded_image_entries()
+        self._begin_progress(
+            "images",
+            f"{ds}: displayed {preview_stats['layers']} image layer(s); optimizing pyramids in background…",
+        )
+        target_sdata = self._active_sdata
 
         def compute():
             # Heavy: streams full-resolution channels once to materialize small
             # coarse-level pyramids into the zarr. Runs on a worker thread so the
             # UI stays responsive; the layer creation happens on the GUI thread.
             t0 = time.time()
-            self._prime_image_pyramid_caches(ds, images_sdata, only_keys=only_keys)
+            with self._store_io_slots:
+                self._raise_if_task_cancelled(cancel_token.is_set, ds)
+                self._prime_image_pyramid_caches(
+                    ds,
+                    images_sdata,
+                    only_keys=only_keys,
+                    target_sdata=target_sdata,
+                    cancel_check=cancel_token.is_set,
+                )
             return {"build_seconds": time.time() - t0, "only_channels": only_channels}
 
         if thread_worker is None:
             try:
                 payload = compute()
             except Exception as exc:
-                self._handle_image_build_error(generation, ds, exc)
+                self._handle_image_build_error(generation, ds, exc, cancel_token)
                 return
-            self._apply_image_build(generation, ds, payload)
+            self._apply_image_build(generation, ds, payload, cancel_token)
             return
 
         worker_factory = thread_worker(compute)
         worker = worker_factory()
         worker.returned.connect(
-            lambda payload, gen=generation, d=ds: self._apply_image_build(gen, d, payload)
+            lambda payload, gen=generation, d=ds, token=cancel_token: self._apply_image_build(
+                gen, d, payload, token
+            )
         )
         worker.errored.connect(
-            lambda exc, gen=generation, d=ds: self._handle_image_build_error(gen, d, exc)
+            lambda exc, gen=generation, d=ds, token=cancel_token: self._handle_image_build_error(
+                gen, d, exc, token
+            )
         )
         self._image_build_worker = worker
         worker.start()
 
-    def _apply_image_build(self, generation: int, ds: str, payload: dict[str, object]):
-        if generation != self._image_build_generation or self.active_dataset != ds:
+    def _apply_image_build(
+        self, generation: int, ds: str, payload: dict[str, object], token: Event | None = None
+    ):
+        if token is not None:
+            self._finish_task_token("images", token)
+        if (
+            generation != self._image_build_generation
+            or self.active_dataset != ds
+            or (token is not None and token.is_set())
+        ):
             return
         self._image_build_worker = None
         self._end_progress("images")
@@ -7716,7 +8209,11 @@ class ComparisonViewerController:
             f"pyramid build={float(payload.get('build_seconds', 0.0)):.1f}s."
         )
 
-    def _handle_image_build_error(self, generation: int, ds: str, exc):
+    def _handle_image_build_error(
+        self, generation: int, ds: str, exc, token: Event | None = None
+    ):
+        if token is not None:
+            self._finish_task_token("images", token)
         if generation != self._image_build_generation:
             return
         self._image_build_worker = None

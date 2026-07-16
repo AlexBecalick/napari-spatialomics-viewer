@@ -289,8 +289,16 @@ def _cell_type_controller_with_synthetic_store(qapp, monkeypatch):
     )
     # id 5 is present in the mask but absent from the annotation table.
     mask = np.array([[0, 1, 2, 5], [3, 4, 0, 0]], dtype=np.uint32)
-    monkeypatch.setattr(ctrl, "_ensure_label_key_for_segmentation", lambda seg: "MOSAIK_proseg_labels")
-    monkeypatch.setattr(ctrl, "_build_cellpose_label_display", lambda key: ([mask], np.eye(3)))
+    monkeypatch.setattr(
+        ctrl,
+        "_ensure_label_key_for_segmentation",
+        lambda seg, **_kwargs: "MOSAIK_proseg_labels",
+    )
+    monkeypatch.setattr(
+        ctrl,
+        "_build_cellpose_label_display",
+        lambda key, **_kwargs: ([mask], np.eye(3)),
+    )
     # Run the "heavy" build synchronously so assertions see the layer immediately.
     monkeypatch.setattr(V, "thread_worker", None)
     return viewer, ctrl
