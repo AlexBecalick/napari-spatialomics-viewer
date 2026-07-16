@@ -2829,6 +2829,9 @@ def _cell_summary_html(cell: dict) -> str:
         f"<b>Total transcripts:</b> {int(cell.get('total', 0)):,}",
         f"<b>Area:</b> {area_text}",
     ]
+    if cell.get("loading"):
+        lines.append("<i>Loading transcript and image statistics…</i>")
+        return "<br>".join(lines)
     intensity_rows = cell.get("intensities") or []
     if intensity_rows:
         lines.append("<b>Mean intensity:</b>")
@@ -2841,6 +2844,8 @@ def _cell_summary_html(cell: dict) -> str:
 
 
 def _cell_gene_list_html(cell: dict) -> str:
+    if cell.get("loading"):
+        return "<i>Loading…</i>"
     lines = []
     for row in cell.get("gene_rows", []):
         rgba = row.get("rgba", (1.0, 1.0, 1.0, 1.0))
@@ -3665,6 +3670,9 @@ class ComparisonViewerController:
         # Click-to-inspect cell state: a lazily-built per-dataset transcript
         # index, the currently selected cell, and the floating summary box.
         self._cell_transcript_index: dict[str, CellTranscriptIndex] = {}
+        self._cell_inspection_generation = 0
+        self._cell_inspection_workers: dict[tuple[str, str], object] = {}
+        self._cell_intensity_cache: dict[tuple, list[tuple[str, float | None]]] = {}
         # Per dataset, an ordered list of highlighted cells (each a dict with the
         # cell id, highlight colour, geometry-derived draw data and panel stats).
         self._selected_cells: dict[str, list[dict]] = {}
@@ -6561,9 +6569,11 @@ class ComparisonViewerController:
         )
         timer.timeout.connect(lambda d=ds: self._flush_gene_group_rebuild(d))
         self._gene_inspector_states[ds] = state
-        # Transcripts (re)loaded: drop any stale per-cell index and clear the
-        # cell selection so a fresh click rebuilds against the new points.
+        # Transcripts (re)loaded: clear stale selections, then install the compact
+        # exact per-cell index produced by the same background streaming pass.
         self._invalidate_cell_inspection(ds)
+        if store.cell_transcript_index is not None:
+            self._cell_transcript_index[ds] = store.cell_transcript_index
 
         # Create each layer already populated with its enabled genes' points +
         # per-point colours + symbol. Building populated (vs. empty then growing)
@@ -6916,54 +6926,79 @@ class ComparisonViewerController:
             return None
 
     def _empty_cell_transcript_index(self) -> CellTranscriptIndex:
-        return CellTranscriptIndex(
-            coords_yx=np.empty((0, 2), dtype=np.float32),
-            genes=np.empty((0,), dtype=object),
-            slices={},
-        )
+        return CellTranscriptIndex.empty()
 
     def _get_cell_transcript_index(self, ds: str) -> CellTranscriptIndex:
-        """Lazily build (and cache) the assigned-transcript-per-cell index."""
+        """Return the already-prepared index without doing GUI-thread I/O."""
         key = str(ds).upper()
         cached = self._cell_transcript_index.get(key)
-        if cached is not None:
-            return cached
-        try:
-            _pk, points_obj, x_col, y_col, assignment_col = self._resolve_points_columns()
-            gene_col = resolve_gene_column(points_obj)
-        except Exception as exc:
-            log.debug("Cell transcript index unavailable: %s", exc)
-            index = self._empty_cell_transcript_index()
-            self._cell_transcript_index[key] = index
-            return index
-        if gene_col is None or assignment_col is None:
-            index = self._empty_cell_transcript_index()
-        else:
-            self._set_status(f"{ds}: indexing transcripts by cell...")
-            index = build_cell_transcript_index(points_obj, x_col, y_col, gene_col, assignment_col)
-        self._cell_transcript_index[key] = index
-        return index
+        return cached if cached is not None else self._empty_cell_transcript_index()
 
     def _invalidate_cell_inspection(self, ds: str | None = None):
         """Drop cached cell index(es) and clear highlighted cells."""
+        self._cell_inspection_generation += 1
+        for worker in list(self._cell_inspection_workers.values()):
+            try:
+                worker.quit()
+            except Exception:
+                pass
+        self._cell_inspection_workers.clear()
         if ds is None:
             self._cell_transcript_index.clear()
+            self._cell_intensity_cache.clear()
             self._clear_all_cell_selections()
             return
-        self._cell_transcript_index.pop(str(ds).upper(), None)
-        if self._selected_cells.pop(str(ds).upper(), None) is not None:
+        ds_key = str(ds).upper()
+        self._cell_transcript_index.pop(ds_key, None)
+        self._cell_intensity_cache = {
+            key: value for key, value in self._cell_intensity_cache.items() if key[0] != ds_key
+        }
+        if self._selected_cells.pop(ds_key, None) is not None:
             self._rebuild_cell_highlights(ds)
 
-    def _cell_selection_display(self, ds: str, cell_id, geometry, color: str) -> dict:
-        """Compute cached draw + panel data for one highlighted cell."""
+    def _cell_image_specs(self) -> list[tuple[str, object, np.ndarray]]:
+        """Capture immutable-enough image inputs on the GUI thread."""
+        specs: list[tuple[str, object, np.ndarray]] = []
+        for layer in list(self.viewer.layers):
+            name = str(getattr(layer, "name", ""))
+            if not name.startswith("Image | "):
+                continue
+            matrix = self._image_layer_affine_matrix(layer)
+            if matrix is None:
+                continue
+            data = getattr(layer, "data", None)
+            if isinstance(data, (list, tuple)):
+                data = data[0] if data else None
+            if data is not None:
+                specs.append((name, data, np.asarray(matrix, dtype=float).copy()))
+        return specs
+
+    @staticmethod
+    def _cell_intensity_cache_key(ds: str, cell_id, image_specs) -> tuple:
+        return (
+            str(ds).upper(),
+            normalize_cell_key(cell_id),
+            tuple((name, id(data), matrix.tobytes()) for name, data, matrix in image_specs),
+        )
+
+    def _cell_selection_display(
+        self,
+        ds: str,
+        cell_id,
+        geometry,
+        color: str,
+        *,
+        index: CellTranscriptIndex | None = None,
+        gene_visuals: dict | None = None,
+        image_specs=None,
+    ) -> dict:
+        """Compute panel data; intended to run in a worker thread."""
         key = str(ds).upper()
-        state = self._gene_inspector_states.get(key)
-        index = self._get_cell_transcript_index(ds)
+        if index is None:
+            index = self._get_cell_transcript_index(ds)
         coords_yx, genes = index.transcripts_for(cell_id)
 
-        if state is not None:
-            gene_visuals = state.gene_visuals
-        else:
+        if gene_visuals is None:
             gene_visuals = assign_gene_visuals(sorted({str(g) for g in genes.tolist()}))
 
         gene_rows = []
@@ -6993,6 +7028,13 @@ class ComparisonViewerController:
         except Exception:
             area_um2 = None
 
+        specs = self._cell_image_specs() if image_specs is None else list(image_specs)
+        cache_key = self._cell_intensity_cache_key(key, cell_id, specs)
+        intensities = self._cell_intensity_cache.get(cache_key)
+        if intensities is None:
+            intensities = self._compute_cell_channel_intensities_from_specs(geometry, specs)
+            self._cell_intensity_cache[cache_key] = intensities
+
         return {
             "cell_id": cell_id,
             "color": str(color),
@@ -7002,8 +7044,131 @@ class ComparisonViewerController:
             "gene_rows": gene_rows,
             "total": int(len(genes)),
             "area": area_um2,
-            "intensities": self._compute_cell_channel_intensities(geometry),
+            "intensities": intensities,
+            "loading": False,
         }
+
+    def _cell_selection_placeholder(self, cell_id, geometry, color: str) -> dict:
+        try:
+            centroid = geometry.centroid
+            centroid_yx = (float(centroid.y), float(centroid.x))
+        except Exception:
+            centroid_yx = None
+        try:
+            area_um2 = float(geometry.area)
+        except Exception:
+            area_um2 = None
+        return {
+            "cell_id": cell_id,
+            "color": str(color),
+            "paths": self._polygon_to_napari_paths(geometry),
+            "coords_yx": np.empty((0, 2), dtype=float),
+            "centroid_yx": centroid_yx,
+            "gene_rows": [],
+            "total": 0,
+            "area": area_um2,
+            "intensities": [],
+            "loading": True,
+        }
+
+    def _cell_index_build_inputs(self):
+        try:
+            _pk, points_obj, x_col, y_col, assignment_col = self._resolve_points_columns()
+            gene_col = resolve_gene_column(points_obj)
+        except Exception:
+            return None
+        if gene_col is None or assignment_col is None:
+            return None
+        return points_obj, x_col, y_col, gene_col, assignment_col
+
+    def _start_cell_selection_build(self, ds: str, cell_id, geometry, color: str):
+        ds_key = str(ds).upper()
+        norm = normalize_cell_key(cell_id)
+        worker_key = (ds_key, norm)
+        if worker_key in self._cell_inspection_workers:
+            return
+        generation = self._cell_inspection_generation
+        index = self._cell_transcript_index.get(ds_key)
+        index_inputs = None if index is not None else self._cell_index_build_inputs()
+        state = self._gene_inspector_states.get(ds_key)
+        visuals = dict(state.gene_visuals) if state is not None else None
+        image_specs = self._cell_image_specs()
+
+        def compute():
+            # Intensity means can trigger dask/zarr reads. Share the bounded I/O
+            # pool with startup jobs so several clicks cannot create a read storm.
+            with self._store_io_slots:
+                local_index = index
+                if local_index is None:
+                    if index_inputs is None:
+                        local_index = self._empty_cell_transcript_index()
+                    else:
+                        local_index = build_cell_transcript_index(*index_inputs)
+                payload = self._cell_selection_display(
+                    ds_key,
+                    cell_id,
+                    geometry,
+                    color,
+                    index=local_index,
+                    gene_visuals=visuals,
+                    image_specs=image_specs,
+                )
+            return payload, local_index
+
+        if thread_worker is None:
+            try:
+                payload, built_index = compute()
+            except Exception as exc:
+                self._handle_cell_selection_error(generation, worker_key, exc)
+                return
+            self._apply_cell_selection_payload(
+                generation, worker_key, payload, built_index
+            )
+            return
+
+        worker = thread_worker(compute)()
+        worker.returned.connect(
+            lambda result, gen=generation, wk=worker_key: self._apply_cell_selection_payload(
+                gen, wk, result[0], result[1]
+            )
+        )
+        worker.errored.connect(
+            lambda exc, gen=generation, wk=worker_key: self._handle_cell_selection_error(
+                gen, wk, exc
+            )
+        )
+        self._cell_inspection_workers[worker_key] = worker
+        worker.start()
+
+    def _apply_cell_selection_payload(
+        self,
+        generation: int,
+        worker_key: tuple[str, str],
+        payload: dict,
+        index: CellTranscriptIndex,
+    ):
+        self._cell_inspection_workers.pop(worker_key, None)
+        ds, norm = worker_key
+        if generation != self._cell_inspection_generation or self.active_dataset != ds:
+            return
+        self._cell_transcript_index.setdefault(ds, index)
+        entries = self._selected_cells.get(ds, [])
+        for entry in entries:
+            if normalize_cell_key(entry.get("cell_id")) == norm:
+                entry.update(payload)
+                break
+        self._rebuild_cell_highlights(ds)
+        self._set_status(f"{ds}: cell {payload.get('cell_id')} statistics ready.")
+
+    def _handle_cell_selection_error(
+        self, generation: int, worker_key: tuple[str, str], exc
+    ):
+        self._cell_inspection_workers.pop(worker_key, None)
+        if generation != self._cell_inspection_generation:
+            return
+        message = exc[1] if isinstance(exc, tuple) and len(exc) > 1 else exc
+        self._set_status(f"{worker_key[0]} cell inspection failed: {message}")
+        log.error("[%s] Cell inspection failed: %s", worker_key[0], message)
 
     def _add_cell_selection(self, ds: str, cell_id, geometry):
         """Add a cell to the highlighted set (existing highlights are kept)."""
@@ -7015,9 +7180,10 @@ class ComparisonViewerController:
         if any(normalize_cell_key(entry["cell_id"]) == norm for entry in entries):
             return  # already highlighted; ignore repeat clicks on the same cell
         color = CELL_HIGHLIGHT_COLORS[len(entries) % len(CELL_HIGHLIGHT_COLORS)]
-        entries.append(self._cell_selection_display(ds, cell_id, geometry, color))
+        entries.append(self._cell_selection_placeholder(cell_id, geometry, color))
         self._rebuild_cell_highlights(ds)
-        self._set_status(f"{ds}: {len(entries)} cell(s) highlighted (added {cell_id}).")
+        self._set_status(f"{ds}: loading statistics for cell {cell_id}…")
+        self._start_cell_selection_build(ds, cell_id, geometry, color)
 
     def _rebuild_cell_highlights(self, ds: str):
         """Redraw boundary + link layers and the bottom bar for all highlights."""
@@ -7190,19 +7356,16 @@ class ComparisonViewerController:
 
     def _compute_cell_channel_intensities(self, geometry) -> list[tuple[str, float | None]]:
         """Mean intensity of every loaded image channel within the cell polygon."""
+        return self._compute_cell_channel_intensities_from_specs(
+            geometry, self._cell_image_specs()
+        )
+
+    def _compute_cell_channel_intensities_from_specs(
+        self, geometry, image_specs
+    ) -> list[tuple[str, float | None]]:
+        """Worker-safe intensity computation over captured image layer inputs."""
         rows: list[tuple[str, float | None]] = []
-        for layer in list(self.viewer.layers):
-            name = str(getattr(layer, "name", ""))
-            if not name.startswith("Image | "):
-                continue
-            matrix = self._image_layer_affine_matrix(layer)
-            if matrix is None:
-                continue
-            data = getattr(layer, "data", None)
-            if isinstance(data, (list, tuple)):
-                data = data[0] if data else None  # finest multiscale level
-            if data is None:
-                continue
+        for name, data, matrix in image_specs:
             try:
                 value = mean_intensity_in_polygon(data, matrix, geometry)
             except Exception as exc:

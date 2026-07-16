@@ -40,6 +40,12 @@ def qapp():
     return QApplication.instance() or QApplication([])
 
 
+@pytest.fixture(autouse=True)
+def synchronous_workers(monkeypatch):
+    """Make controller integration assertions deterministic in this module."""
+    monkeypatch.setattr(V, "thread_worker", None)
+
+
 # ---------------------------------------------------------------------------
 # Pure helpers
 # ---------------------------------------------------------------------------
@@ -219,6 +225,9 @@ class _FakeLayer:
         self.affine = kw.get("affine")
         self._pick_value = None
         self._data = data if isinstance(data, list) else np.asarray(data)
+        self.shown = np.asarray(
+            kw.get("shown", np.ones(len(self._data), dtype=bool)), dtype=bool
+        )
 
     @property
     def data(self):
@@ -390,6 +399,21 @@ def test_add_cell_selection_draws_layers_and_populates_overlay(qapp):
     overlay = ctrl._cell_info_overlay
     assert overlay is not None and len(overlay.cell_panels()) == 1
     assert entries[0]["intensities"] and entries[0]["intensities"][0][0] == "DAPI"
+
+
+def test_add_cell_selection_draws_loading_placeholder_before_worker_finishes(
+    qapp, monkeypatch
+):
+    ctrl = _controller(qapp)
+    monkeypatch.setattr(ctrl, "_start_cell_selection_build", lambda *args: None)
+    _cid, geom = ctrl._pick_cell_from_event(_event(5.0, 5.0))
+
+    ctrl._add_cell_selection("TEST", 202, geom)
+
+    entry = ctrl._selected_cells["TEST"][0]
+    assert entry["loading"] is True
+    assert ctrl._get_layer_by_name(V.CELL_INSPECTOR_BOUNDARY_LAYER) is not None
+    assert ctrl._get_layer_by_name(V.CELL_INSPECTOR_LINKS_LAYER) is None
 
 
 def test_multiple_cells_accumulate_with_distinct_colours(qapp):
