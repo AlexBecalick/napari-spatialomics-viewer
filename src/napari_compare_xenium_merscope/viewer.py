@@ -239,6 +239,42 @@ class DatasetConfig:
     xenium_spec_path: Path | None = None
 
 
+@dataclass
+class DatasetSession:
+    """Prepared, reusable non-visual state for one dataset."""
+
+    dataset: str
+    config: DatasetConfig
+    sdata: object
+    images_sdata: object | None
+    x_transform: tuple[float, float, float]
+    y_transform: tuple[float, float, float]
+    segmentation_keys: list[str]
+    image_keys: list[str]
+    image_channels: list[tuple[str, str]]
+    cellpose_channels: list[str] = field(default_factory=list)
+    cellpose_statistics: list[str] = field(default_factory=list)
+    cellpose_values_available: bool = False
+    cell_type_available: dict[str, bool] = field(default_factory=dict)
+    gene_payload: dict | None = None
+    label_specs: dict[str, dict] = field(default_factory=dict)
+    last_used: float = field(default_factory=time.monotonic)
+
+    def estimated_bytes(self) -> int:
+        """Best-effort size of prepared in-memory arrays retained for reuse."""
+        payload = self.gene_payload or {}
+        store = payload.get("store")
+        if store is None:
+            return 0
+        arrays = list(getattr(store, "group_coords", ())) + list(
+            getattr(store, "group_colors", ())
+        )
+        index = getattr(store, "cell_transcript_index", None)
+        if index is not None:
+            arrays.extend((index.coords_yx, index.gene_codes))
+        return int(sum(int(getattr(array, "nbytes", 0)) for array in arrays))
+
+
 
 @dataclass
 class GeneInspectorState:
@@ -3920,24 +3956,8 @@ class ComparisonViewerController:
         et al.) store images as SpatialData image elements with a ``c`` channel
         coordinate, so channel names come from the same ``channel_labels`` path.
         """
-        entries: list[tuple[str, str]] = []
         images_sdata = self._active_images_sdata
-        if images_sdata is None:
-            return entries
-        try:
-            image_keys = [str(k) for k in images_sdata.images.keys() if not is_derived_cache_key(str(k))]
-        except Exception:
-            return entries
-        for image_key in sorted(image_keys):
-            try:
-                base = ensure_cyx(get_scale0_dataarray(images_sdata.images[image_key]))
-                channels = channel_labels(base)
-            except Exception as exc:
-                log.warning("[%s] Could not read channels for image '%s' (%s)", self.active_dataset, image_key, exc)
-                continue
-            for channel in channels:
-                entries.append((image_key, str(channel)))
-        return entries
+        return self._enumerate_image_channels_for(images_sdata)
 
     def _publish_image_entries(self):
         if self._image_entries_callback is None:
@@ -3969,6 +3989,15 @@ class ComparisonViewerController:
             return
         if self.active_dataset is None or self.active_dataset != "MERSCOPE":
             self._cellpose_value_options_callback([], [], False)
+            return
+
+        session = self._dataset_sessions.get(self.active_dataset)
+        if session is not None:
+            self._cellpose_value_options_callback(
+                list(session.cellpose_channels),
+                list(session.cellpose_statistics),
+                bool(session.cellpose_values_available),
+            )
             return
 
         cfg = self.datasets[self.active_dataset]
@@ -4566,7 +4595,175 @@ class ComparisonViewerController:
             self.load_selected_labels(ds, mask_keys)
 
         if not bool(getattr(self.args, "skip_transcripts", False)):
-            self.open_gene_inspector(ds)
+            self.open_gene_inspector(ds, reuse_cached=True)
+
+    @staticmethod
+    def _enumerate_image_channels_for(images_sdata) -> list[tuple[str, str]]:
+        entries: list[tuple[str, str]] = []
+        if images_sdata is None:
+            return entries
+        try:
+            image_keys = [
+                str(key)
+                for key in images_sdata.images.keys()
+                if not is_derived_cache_key(str(key))
+            ]
+        except Exception:
+            return entries
+        for image_key in sorted(image_keys):
+            try:
+                base = ensure_cyx(get_scale0_dataarray(images_sdata.images[image_key]))
+                entries.extend((image_key, str(channel)) for channel in channel_labels(base))
+            except Exception as exc:
+                log.warning("Could not read channels for image '%s' (%s)", image_key, exc)
+        return entries
+
+    def _prepare_dataset_session(
+        self, ds: str, cfg: DatasetConfig, cancel_token: Event
+    ) -> DatasetSession:
+        """Read all startup metadata away from the Qt GUI thread."""
+        if cancel_token.is_set():
+            raise RuntimeError("Dataset load cancelled")
+        selection = startup_selection(self._segmentation_source())
+        sdata = sd.read_zarr(str(cfg.zarr_path), selection=selection)
+        if cancel_token.is_set():
+            raise RuntimeError("Dataset load cancelled")
+        try:
+            images_sdata = sd.read_zarr(str(cfg.zarr_path), selection=("images",))
+        except Exception as exc:
+            log.warning("[%s] Could not read images element (%s); continuing without images.", ds, exc)
+            images_sdata = None
+        ms_tf_path, xe_spec_path = self._resolve_optional_transform_paths(ds, cfg)
+        x_transform, y_transform = resolve_dataset_mask_affine(
+            ds,
+            merscope_transform_path=ms_tf_path,
+            xenium_spec_path=xe_spec_path,
+        )
+        if self._segmentation_source() == "labels":
+            segmentation_keys = sorted(
+                str(key) for key in sdata.labels.keys() if not is_derived_cache_key(str(key))
+            )
+            if not segmentation_keys:
+                raise RuntimeError(
+                    "No labels found in this store. Generate label layers first or use "
+                    "`--segmentation-source shapes`."
+                )
+        else:
+            segmentation_keys = sorted(str(key) for key in sdata.shapes.keys())
+        image_keys = sorted(
+            str(key)
+            for key in getattr(images_sdata, "images", {}).keys()
+            if not is_derived_cache_key(str(key))
+        )
+        image_channels = self._enumerate_image_channels_for(images_sdata)
+
+        cellpose_channels: list[str] = []
+        cellpose_statistics: list[str] = []
+        cellpose_available = False
+        if ds == "MERSCOPE" and cellpose_quantification_table_available(cfg.zarr_path):
+            features = cellpose_quantification_features(cfg.zarr_path)
+            cellpose_channels = sorted({feature.channel for feature in features})
+            order = ["min", "median", "mean", "max", "iqr"]
+            cellpose_statistics = sorted(
+                {feature.statistic for feature in features},
+                key=lambda value: (0, order.index(value)) if value in order else (1, value),
+            )
+            cellpose_available = True
+        cell_type_available = {
+            source.key: clustering_table_key_for_segmentation(cfg.zarr_path, source.key) is not None
+            for source in CELL_TYPE_SOURCES
+        }
+        return DatasetSession(
+            dataset=ds,
+            config=cfg,
+            sdata=sdata,
+            images_sdata=images_sdata,
+            x_transform=x_transform,
+            y_transform=y_transform,
+            segmentation_keys=segmentation_keys,
+            image_keys=image_keys,
+            image_channels=image_channels,
+            cellpose_channels=cellpose_channels,
+            cellpose_statistics=cellpose_statistics,
+            cellpose_values_available=cellpose_available,
+            cell_type_available=cell_type_available,
+        )
+
+    def _session_cache_budget_bytes(self) -> int:
+        configured = getattr(self.args, "session_cache_gb", None)
+        if configured is not None:
+            return max(0, int(float(configured) * (1024**3)))
+        if psutil is None:
+            return 4 * 1024**3
+        return int(min(8 * 1024**3, psutil.virtual_memory().total * 0.20))
+
+    def _evict_dataset_sessions(self) -> None:
+        budget = self._session_cache_budget_bytes()
+        total = sum(session.estimated_bytes() for session in self._dataset_sessions.values())
+        for key in list(self._dataset_sessions.keys()):
+            if total <= budget:
+                break
+            if key == self.active_dataset:
+                continue
+            session = self._dataset_sessions.pop(key)
+            total -= session.estimated_bytes()
+            log.info("Evicted prepared %s session from the in-memory LRU cache", key)
+
+    def _apply_dataset_session(
+        self,
+        generation: int,
+        session: DatasetSession,
+        mem_before: dict[str, float],
+        started_at: float,
+    ) -> None:
+        if generation != self._dataset_load_generation or self._dataset_load_cancel.is_set():
+            return
+        self._dataset_load_worker = None
+        self._dataset_loading_key = None
+        self._cancel_background_tasks()
+        self._clear_layers()
+        gc.collect()
+        ds = session.dataset
+        self.active_dataset = ds
+        self._active_sdata = session.sdata
+        self._active_images_sdata = session.images_sdata
+        self._x_transform = session.x_transform
+        self._y_transform = session.y_transform
+        self._segmentation_keys = list(session.segmentation_keys)
+        self._image_keys = list(session.image_keys)
+        self._image_channels = list(session.image_channels)
+        session.last_used = time.monotonic()
+        self._dataset_sessions[ds] = session
+        self._dataset_sessions.move_to_end(ds)
+        self._publish_shape_keys()
+        self._publish_loaded_segmentation_keys()
+        self._publish_image_entries()
+        self._publish_loaded_image_entries()
+        self._publish_cellpose_value_options()
+        self._publish_cell_type_options()
+        self._update_scale_bar_visibility()
+        self._end_progress("dataset")
+        elapsed = time.time() - started_at
+        mem_after = memory_snapshot_gb()
+        self._set_status(
+            f"{ds} metadata loaded in {elapsed:.1f}s | images={len(self._image_keys)} "
+            f"{self._segmentation_layer_type()}_keys={len(self._segmentation_keys)} | "
+            f"RSS {mem_before['rss_gb']:.1f}->{mem_after['rss_gb']:.1f} GB | "
+            "starting progressive background loads…"
+        )
+        self._evict_dataset_sessions()
+        self._start_startup_autoload(ds)
+
+    def _handle_dataset_load_error(self, generation: int, ds: str, exc) -> None:
+        if generation != self._dataset_load_generation:
+            return
+        self._dataset_load_worker = None
+        self._dataset_loading_key = None
+        self._end_progress("dataset")
+        message = exc[1] if isinstance(exc, tuple) and len(exc) > 1 else exc
+        if not self._dataset_load_cancel.is_set():
+            self._set_status(f"Failed to load {ds}: {message}")
+            log.error("[%s] Failed to load dataset: %s", ds, message)
 
     def load_dataset(self, dataset_name: str, force: bool = False):
         ds = str(dataset_name).upper()
@@ -4576,112 +4773,58 @@ class ComparisonViewerController:
 
         if (self.active_dataset == ds) and (not force):
             return True
+        request_key = (ds, bool(force))
+        if self._dataset_loading_key == request_key and self._dataset_load_worker is not None:
+            self._set_status(f"{ds} metadata load is already running.")
+            return True
 
+        # Stop dataset-bound builders as soon as a switch is requested. The old
+        # layers stay visible until the new session is ready, but no stale job
+        # keeps competing with its metadata reads or writing into its store.
+        self._cancel_background_tasks()
         self._reset_progress()
         mem_before = memory_snapshot_gb()
         t0 = time.time()
         cfg = self.datasets[ds]
-
-        try:
-            self._begin_progress("dataset", f"Loading {ds} metadata...")
-            log.info("[%s] Loading dataset from %s", ds, cfg.zarr_path)
-
-            self._clear_layers()
-            gc.collect()
-            self.active_dataset = None
-            self._update_scale_bar_visibility()
-            self._segmentation_keys = []
-            self._image_keys = []
-            self._image_channels = []
-            self._publish_shape_keys()
-            self._publish_loaded_segmentation_keys()
-            self._publish_image_entries()
-            self._publish_loaded_image_entries()
-            if self._cellpose_value_options_callback is not None:
-                self._cellpose_value_options_callback([], [], False)
-
-            selection = startup_selection(self._segmentation_source())
-            sdata = sd.read_zarr(str(cfg.zarr_path), selection=selection)
-            self._active_sdata = sdata
-            # Read images as a separate element so their keys populate the Images
-            # tab even when auto-load is skipped; tolerate image-less stores.
-            self._active_images_sdata = None
-            try:
-                self._ensure_images_loaded(ds)
-            except Exception as exc:
-                log.warning("[%s] Could not read images element (%s); continuing without images.", ds, exc)
-                self._active_images_sdata = None
-            ms_tf_path, xe_spec_path = self._resolve_optional_transform_paths(ds, cfg)
-            x_transform, y_transform = resolve_dataset_mask_affine(
-                ds,
-                merscope_transform_path=ms_tf_path,
-                xenium_spec_path=xe_spec_path,
-            )
-            self._x_transform = x_transform
-            self._y_transform = y_transform
-            log.info("[%s] Using image px->um transform x=%s y=%s", ds, x_transform, y_transform)
-
-            self.active_dataset = ds
-            if self._segmentation_source() == "labels":
-                self._segmentation_keys = sorted(
-                    str(k) for k in sdata.labels.keys() if not is_derived_cache_key(str(k))
-                )
-                if len(self._segmentation_keys) == 0:
-                    raise RuntimeError(
-                        "No labels found in this store. Generate label layers first "
-                        "or use `--segmentation-source shapes`."
-                    )
-            else:
-                self._segmentation_keys = sorted(str(k) for k in sdata.shapes.keys())
-            images_source = self._active_images_sdata
-            self._image_keys = sorted(
-                str(k)
-                for k in getattr(images_source, "images", {}).keys()
-                if not is_derived_cache_key(str(k))
-            )
-            self._image_channels = self._enumerate_image_channels()
-            self._publish_shape_keys()
-            self._publish_loaded_segmentation_keys()
-            self._publish_image_entries()
-            self._publish_loaded_image_entries()
-            self._publish_cellpose_value_options()
-            self._publish_cell_type_options()
-            self._update_scale_bar_visibility()
-
-            elapsed = time.time() - t0
-            mem_after = memory_snapshot_gb()
-            summary = (
-                f"{ds} metadata loaded in {elapsed:.1f}s | "
-                f"images={len(self._image_keys)} "
-                f"{self._segmentation_layer_type()}_keys={len(self._segmentation_keys)} | "
-                f"RSS {mem_before['rss_gb']:.1f}->{mem_after['rss_gb']:.1f} GB | starting background loads..."
-            )
-            log.info(summary)
-            self._set_status(summary)
-
-            # Kick off the default background loads (images / masks / transcripts).
-            self._start_startup_autoload(ds)
+        self._dataset_load_generation += 1
+        generation = self._dataset_load_generation
+        self._dataset_load_cancel.set()
+        self._dataset_load_cancel = Event()
+        cancel_token = self._dataset_load_cancel
+        self._dataset_loading_key = request_key
+        if force:
+            self._dataset_sessions.pop(ds, None)
+        cached = self._dataset_sessions.get(ds)
+        self._begin_progress("dataset", f"Loading {ds} metadata…")
+        if cached is not None:
+            self._apply_dataset_session(generation, cached, mem_before, t0)
             return True
 
-        except Exception as exc:
-            self._set_status(f"Failed to load {ds}: {exc}")
-            log.exception("[%s] Failed to load dataset", ds)
-            self.active_dataset = None
-            self._active_sdata = None
-            self._active_images_sdata = None
-            self._update_scale_bar_visibility()
-            self._segmentation_keys = []
-            self._image_keys = []
-            self._image_channels = []
-            self._publish_shape_keys()
-            self._publish_loaded_segmentation_keys()
-            self._publish_image_entries()
-            self._publish_loaded_image_entries()
-            if self._cellpose_value_options_callback is not None:
-                self._cellpose_value_options_callback([], [], False)
-            return False
-        finally:
-            self._end_progress("dataset")
+        def compute():
+            with self._store_io_slots:
+                return self._prepare_dataset_session(ds, cfg, cancel_token)
+
+        if thread_worker is None:
+            try:
+                session = compute()
+            except Exception as exc:
+                self._handle_dataset_load_error(generation, ds, exc)
+                return False
+            self._apply_dataset_session(generation, session, mem_before, t0)
+            return True
+
+        worker = thread_worker(compute)()
+        worker.returned.connect(
+            lambda session, gen=generation, mb=mem_before, start=t0: self._apply_dataset_session(
+                gen, session, mb, start
+            )
+        )
+        worker.errored.connect(
+            lambda exc, gen=generation, d=ds: self._handle_dataset_load_error(gen, d, exc)
+        )
+        self._dataset_load_worker = worker
+        worker.start()
+        return True
 
     def _build_dataset_config(self, platform: str, zarr_path: Path) -> DatasetConfig:
         return DatasetConfig(
@@ -5870,6 +6013,45 @@ class ComparisonViewerController:
             self._set_status("No segmentation selected.")
             return
 
+        # A dataset session retains display-ready outline specs. Switching away
+        # and back can therefore restore previously prepared masks immediately,
+        # without reopening zarr or rebuilding their pyramids.
+        session = self._dataset_sessions.get(str(ds))
+        cached_specs: list[dict[str, object]] = []
+        if session is not None:
+            for key in keys:
+                label_key = self._label_key_for_shape_key(key)
+                spec = session.label_specs.get(label_key)
+                if spec is None:
+                    cached_specs = []
+                    break
+                cached_specs.append(dict(spec))
+        if cached_specs:
+            self._label_build_generation += 1
+            generation = self._label_build_generation
+            mem_before = memory_snapshot_gb()
+            self._begin_progress("masks", f"{ds}: restoring prepared cell segmentation…")
+            self._apply_label_build(
+                generation,
+                str(ds),
+                mem_before,
+                {
+                    "specs": cached_specs,
+                    "total_labels": sum(int(spec.get("n_labels", 1)) for spec in cached_specs),
+                    "build_seconds": 0.0,
+                },
+            )
+            return
+
+        task_key = (
+            str(ds),
+            tuple(sorted(keys)),
+            int(getattr(self.args, "label_contour_width", 1)),
+        )
+        cancel_token = self._begin_task_token("masks", task_key)
+        if cancel_token is None:
+            self._set_status(f"{ds}: that segmentation load is already running.")
+            return
         self._label_build_generation += 1
         generation = self._label_build_generation
         mem_before = memory_snapshot_gb()
@@ -5960,6 +6142,9 @@ class ComparisonViewerController:
             added = self._finish_label_layer(ds, str(spec["label_key"]), spec["prepared"])
             if added > 0:
                 added_layers += 1
+            session = self._dataset_sessions.get(ds)
+            if session is not None:
+                session.label_specs[str(spec["label_key"])] = dict(spec)
         self._publish_loaded_segmentation_keys()
         mem_after = memory_snapshot_gb()
         self._set_status(
@@ -6423,11 +6608,21 @@ class ComparisonViewerController:
         background_col = first_existing_col(points_obj, ["background"])
         return points_key, points_obj, x_col, y_col, assignment_col, gene_col, background_col
 
-    def open_gene_inspector(self, dataset_name: str):
+    def open_gene_inspector(self, dataset_name: str, reuse_cached: bool = False):
         if not self._ensure_dataset_is_active(dataset_name):
             self._set_status(f"Could not activate dataset {dataset_name}.")
             return
         ds = str(dataset_name).upper()
+        session = self._dataset_sessions.get(ds)
+        if reuse_cached and session is not None and session.gene_payload is not None:
+            self._teardown_gene_inspector(ds)
+            self._gene_build_generation += 1
+            generation = self._gene_build_generation
+            self._begin_progress("transcripts", f"{ds}: restoring prepared transcripts…")
+            self._apply_gene_inspector_build(
+                generation, ds, dict(session.gene_payload), token=None
+            )
+            return
         try:
             (points_key, points_obj, x_col, y_col, assignment_col, gene_col,
              background_col) = self._resolve_gene_points_columns()
@@ -6519,6 +6714,10 @@ class ComparisonViewerController:
         self._gene_build_worker = None
         self._end_progress("transcripts")
         store = payload["store"]
+        session = self._dataset_sessions.get(ds)
+        if session is not None:
+            session.gene_payload = dict(payload)
+            session.last_used = time.monotonic()
         points_key = str(payload["points_key"])
         if store.total_points == 0 or not store.genes:
             self._set_status(f"{ds} inspect genes: no transcripts found.")
@@ -6609,6 +6808,7 @@ class ComparisonViewerController:
             ds, len(store.genes), source_total, store.total_points, len(layer_names), store.sampled,
             float(payload.get("build_seconds", 0.0)),
         )
+        self._evict_dataset_sessions()
 
     def _handle_gene_inspector_build_error(
         self, generation: int, ds: str, exc, token: Event | None = None
@@ -8170,15 +8370,19 @@ class ComparisonViewerController:
         widget = self._cell_type_widget
         if widget is None or self.active_dataset is None:
             return
-        cfg = self.datasets.get(self.active_dataset)
-        zarr_path = getattr(cfg, "zarr_path", None)
-        available = {
-            source.key: (
-                zarr_path is not None
-                and clustering_table_key_for_segmentation(zarr_path, source.key) is not None
-            )
-            for source in CELL_TYPE_SOURCES
-        }
+        session = self._dataset_sessions.get(self.active_dataset)
+        if session is not None:
+            available = dict(session.cell_type_available)
+        else:
+            cfg = self.datasets.get(self.active_dataset)
+            zarr_path = getattr(cfg, "zarr_path", None)
+            available = {
+                source.key: (
+                    zarr_path is not None
+                    and clustering_table_key_for_segmentation(zarr_path, source.key) is not None
+                )
+                for source in CELL_TYPE_SOURCES
+            }
         state = self._cell_type_state(self.active_dataset)
         # The previous overlay layer (if any) was dropped by _clear_layers().
         state.layer_name = None
@@ -8627,6 +8831,24 @@ def parse_args() -> argparse.Namespace:
             "else the first channel."
         ),
     )
+    parser.add_argument(
+        "--session-cache-gb",
+        default=None,
+        type=float,
+        help=(
+            "RAM budget for prepared inactive dataset sessions. Default: 20%% of "
+            "physical RAM, capped at 8 GB. Set 0 to disable cross-dataset reuse."
+        ),
+    )
+    parser.add_argument(
+        "--background-io-workers",
+        default=2,
+        type=int,
+        help=(
+            "Maximum simultaneous zarr-heavy image, mask, and transcript builds. "
+            "Keeping this small avoids storage contention while Qt remains responsive."
+        ),
+    )
     parser.add_argument("--random-state", default=42, type=int, help="Random seed used for sampling")
 
     parser.add_argument(
@@ -8703,6 +8925,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--label-contour-width must be non-negative.")
     if args.image_pyramid_downsample < 2:
         parser.error("--image-pyramid-downsample must be >= 2.")
+    if args.session_cache_gb is not None and args.session_cache_gb < 0:
+        parser.error("--session-cache-gb must be non-negative.")
+    if args.background_io_workers <= 0:
+        parser.error("--background-io-workers must be positive.")
     return args
 
 
