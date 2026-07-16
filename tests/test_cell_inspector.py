@@ -338,7 +338,22 @@ def _controller(qapp):
 
 def _event(x_um, y_um):
     # napari world position is (y, x) for a 2D viewer.
-    return types.SimpleNamespace(type="mouse_press", position=(y_um, x_um))
+    return types.SimpleNamespace(
+        type="mouse_press",
+        position=(y_um, x_um),
+        pos=(x_um, y_um),
+        view_direction=None,
+        dims_displayed=(0, 1),
+    )
+
+
+def _dispatch_click(ctrl, event):
+    event.type = "mouse_press"
+    callback = ctrl._on_viewer_mouse_press(ctrl.viewer, event)
+    next(callback)
+    event.type = "mouse_release"
+    with pytest.raises(StopIteration):
+        next(callback)
 
 
 def test_pick_cell_from_event_uses_proseg_shapes(qapp):
@@ -357,7 +372,7 @@ def test_cell_picking_gated_on_proseg_layer_visibility(qapp):
     ctrl.viewer.layers.append(seg)
 
     # Visible ProSeg layer -> a click inside a mask highlights the cell.
-    ctrl._on_viewer_mouse_press(ctrl.viewer, _event(5.0, 5.0))
+    _dispatch_click(ctrl, _event(5.0, 5.0))
     assert ctrl._selected_cells.get("TEST")
 
     # Hiding the ProSeg layer drops current highlights...
@@ -366,12 +381,12 @@ def test_cell_picking_gated_on_proseg_layer_visibility(qapp):
     assert not ctrl._selected_cells
 
     # ...and while hidden, clicks no longer highlight cells.
-    ctrl._on_viewer_mouse_press(ctrl.viewer, _event(5.0, 5.0))
+    _dispatch_click(ctrl, _event(5.0, 5.0))
     assert not ctrl._selected_cells.get("TEST")
 
     # Showing it again re-enables click-to-highlight.
     seg.visible = True
-    ctrl._on_viewer_mouse_press(ctrl.viewer, _event(5.0, 5.0))
+    _dispatch_click(ctrl, _event(5.0, 5.0))
     assert ctrl._selected_cells.get("TEST")
 
 
@@ -448,7 +463,7 @@ def test_empty_click_keeps_cells_and_close_clears_all(qapp):
     ctrl._add_cell_selection("TEST", 202, geom)
 
     # A click in empty space must NOT deselect the cell.
-    ctrl._on_viewer_mouse_press(ctrl.viewer, _event(50.0, 50.0))
+    _dispatch_click(ctrl, _event(50.0, 50.0))
     assert ctrl._selected_cells.get("TEST")
     assert ctrl._get_layer_by_name(V.CELL_INSPECTOR_BOUNDARY_LAYER) is not None
 
@@ -497,6 +512,6 @@ def test_transcript_click_still_highlights_gene(qapp):
     gi = state.store.gene_offsets["AAA"][0]
     layer = ctrl._get_layer_by_name(state.layer_names[gi])
     layer._pick_value = 0  # first display index in this group -> a gene
-    ctrl._on_viewer_mouse_press(ctrl.viewer, _event(2.0, 2.0))
+    _dispatch_click(ctrl, _event(2.0, 2.0))
     assert state.highlighted_genes            # a gene got highlighted
     assert "TEST" not in ctrl._selected_cells  # and no cell was selected
