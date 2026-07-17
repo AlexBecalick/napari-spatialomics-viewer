@@ -20,7 +20,9 @@ from shapely.geometry import Polygon
 
 from napari_compare_xenium_merscope import viewer as V
 from napari_compare_xenium_merscope.utils import (
+    CellTypeAssignments,
     GENE_MARKER_SYMBOLS,
+    build_cell_type_color_schemes,
     build_cell_transcript_index,
     build_gene_point_groups,
     darken_rgba,
@@ -162,6 +164,10 @@ def _cell_dict(cell_id="202", color="#ffe14d"):
         "total": 9,
         "area": 123.4,
         "intensities": [("DAPI", 42.0), ("PolyT", None)],
+        "broad_cell_type": "Astrocytes",
+        "fine_cell_type": "Astrocytes:0",
+        "broad_cell_type_rgba": (0.2, 0.7, 0.9, 1.0),
+        "fine_cell_type_rgba": (0.9, 0.3, 0.5, 1.0),
     }
 
 
@@ -181,6 +187,14 @@ def test_cell_info_overlay_shows_instruction_and_scales_panels(qapp):
 
     overlay.set_cells([_cell_dict("202")])
     assert len(overlay.cell_panels()) == 1
+    panel = overlay.cell_panels()[0]
+    broad = panel.findChild(V.QLabel, "BroadCellType")
+    fine = panel.findChild(V.QLabel, "FineCellType")
+    assert broad.text() == "Broad: Astrocytes"
+    assert fine.text() == "Fine: Astrocytes:0"
+    assert "font-size: 22pt" in broad.styleSheet()
+    assert "rgb(51,178,230)" in broad.styleSheet()
+    assert "rgb(230,76,128)" in fine.styleSheet()
     assert _divider_count(overlay) == 0  # no divider for a single cell
     assert not overlay.grab().isNull()
 
@@ -266,6 +280,22 @@ class _FakeViewer:
         self.layers = _FakeLayerList()
         self.mouse_drag_callbacks = []
         self.window = types.SimpleNamespace(_qt_viewer=None)
+        self.cursor = types.SimpleNamespace(position=(0.0, 0.0))
+        self.mouse_over_canvas = True
+
+    def _calc_status_from_cursor(self):
+        return (
+            {
+                "coordinates": " [0 0]",
+                "coords": " [0 0]",
+                "layer_base": "Cell inspector | transcript links",
+                "layer_name": "Cell inspector | transcript links",
+                "plugin": "",
+                "source_type": "",
+                "value": "",
+            },
+            "",
+        )
 
     def add_points(self, coords, name=None, **kw):
         layer = _FakeLayer(name, coords, **kw)
@@ -327,6 +357,16 @@ def _controller(qapp):
         {"points_key": "transcripts", "store": _demo_store(), "build_seconds": 0.0},
     )
     ctrl._active_sdata = _fake_sdata()
+    assignments = CellTypeAssignments(
+        segmentation="proseg",
+        table_key="table_MOSAIK_proseg_clustering_squidpy",
+        instance_key="cell",
+        cell_ids=np.asarray([202, 303], dtype=np.int64),
+        broad=np.asarray(["Astrocytes", "Neurons"], dtype=object),
+        fine=np.asarray(["Astrocytes:0", "Neurons:1"], dtype=object),
+    )
+    cell_type_state = ctrl._cell_type_state("TEST")
+    ctrl._cache_cell_type_data(cell_type_state, "proseg", assignments)
     # An identity-affine image channel so intensities can be computed.
     img = np.zeros((12, 12), dtype=np.float32)
     img[0:10, 0:10] = 7.0
@@ -361,6 +401,27 @@ def test_pick_cell_from_event_uses_proseg_shapes(qapp):
     picked = ctrl._pick_cell_from_event(_event(5.0, 5.0))
     assert picked is not None and picked[0] == 202
     assert ctrl._pick_cell_from_event(_event(50.0, 50.0)) is None
+
+
+def test_cursor_status_shows_cell_and_types_with_or_without_inspector(qapp):
+    ctrl = _controller(qapp)
+    ctrl.viewer.cursor.position = (5.0, 5.0)
+
+    status, tooltip = ctrl.viewer._calc_status_from_cursor()
+    assert status["layer_base"] == "Cell"
+    assert "x: 5.00 µm, y: 5.00 µm" in status["coordinates"]
+    assert "Cell 202" in status["coordinates"]
+    assert "Broad: Astrocytes" in status["coordinates"]
+    assert "Fine: Astrocytes:0" in status["coordinates"]
+    assert "transcript links" not in str(status).lower()
+    assert tooltip == ""
+
+    # The same cell-aware status remains after the inspector dock is populated.
+    _cid, geometry = ctrl._pick_cell_from_event(_event(5.0, 5.0))
+    ctrl._add_cell_selection("TEST", 202, geometry)
+    status, _tooltip = ctrl.viewer._calc_status_from_cursor()
+    assert "Cell 202" in status["coordinates"]
+    assert "transcript links" not in str(status).lower()
 
 
 def test_cell_picking_gated_on_proseg_layer_visibility(qapp):
@@ -411,6 +472,13 @@ def test_add_cell_selection_draws_layers_and_populates_overlay(qapp):
     entries = ctrl._selected_cells["TEST"]
     assert [e["cell_id"] for e in entries] == [202]
     assert entries[0]["color"] == V.CELL_HIGHLIGHT_COLORS[0]
+    assert entries[0]["broad_cell_type"] == "Astrocytes"
+    assert entries[0]["fine_cell_type"] == "Astrocytes:0"
+    schemes = build_cell_type_color_schemes(
+        ["Astrocytes", "Neurons"], ["Astrocytes:0", "Neurons:1"]
+    )
+    assert entries[0]["broad_cell_type_rgba"] == schemes["broad"].colors["Astrocytes"]
+    assert entries[0]["fine_cell_type_rgba"] == schemes["fine"].colors["Astrocytes:0"]
     overlay = ctrl._cell_info_overlay
     assert overlay is not None and len(overlay.cell_panels()) == 1
     assert entries[0]["intensities"] and entries[0]["intensities"][0][0] == "DAPI"
