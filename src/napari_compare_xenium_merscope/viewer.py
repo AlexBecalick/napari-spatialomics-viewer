@@ -333,6 +333,8 @@ class CellTypeOverlayState:
     schemes: dict = field(default_factory=dict)
     #: segmentation -> {"broad": set(enabled labels), "fine": set(enabled labels)}.
     enabled: dict = field(default_factory=dict)
+    #: segmentation -> normalized cell id -> (broad label, fine label).
+    annotation_lookup: dict = field(default_factory=dict)
 
 
 DEFAULT_GENE_SPOT_SIZE = 0.5
@@ -2991,6 +2993,20 @@ def _cell_gene_list_html(cell: dict) -> str:
     return "".join(lines) or "<i>No transcripts assigned</i>"
 
 
+def _rgba_css_color(rgba, fallback: str = "#9aa4b2") -> str:
+    """Return an opaque CSS rgb colour from a normalized RGBA sequence."""
+    try:
+        rgb = tuple(
+            max(0, min(255, int(round(float(value) * 255))))
+            for value in tuple(rgba)[:3]
+        )
+    except Exception:
+        return str(fallback)
+    if len(rgb) != 3:
+        return str(fallback)
+    return f"rgb({rgb[0]},{rgb[1]},{rgb[2]})"
+
+
 class _CellPanel(QWidget):
     """One selected cell's column: coloured Cell ID + summary, pie, gene list.
 
@@ -3013,21 +3029,39 @@ class _CellPanel(QWidget):
 
         # -- Left: Cell ID (in the cell's highlight colour) + summary -------
         left = QVBoxLayout()
-        left.setSpacing(8)
+        left.setSpacing(5)
         title = QLabel(f"Cell {html.escape(str(cell.get('cell_id', '')))}")
         title.setStyleSheet(f"color: {color}; font-size: 22pt; font-weight: bold;")
         title.setTextFormat(Qt.RichText)
+        broad_text = str(cell.get("broad_cell_type", "Unannotated"))
+        fine_text = str(cell.get("fine_cell_type", "Unannotated"))
+        broad = QLabel(f"Broad: {broad_text}")
+        broad.setObjectName("BroadCellType")
+        broad.setTextFormat(Qt.PlainText)
+        broad.setStyleSheet(
+            f"color: {_rgba_css_color(cell.get('broad_cell_type_rgba'))}; "
+            "font-size: 22pt; font-weight: bold;"
+        )
+        fine = QLabel(f"Fine: {fine_text}")
+        fine.setObjectName("FineCellType")
+        fine.setTextFormat(Qt.PlainText)
+        fine.setStyleSheet(
+            f"color: {_rgba_css_color(cell.get('fine_cell_type_rgba'))}; "
+            "font-size: 22pt; font-weight: bold;"
+        )
         summary = QLabel(_cell_summary_html(cell))
         summary.setTextFormat(Qt.RichText)
         summary.setWordWrap(True)
         summary.setStyleSheet("color: #e6ebf2; font-size: 12pt;")
         summary.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         left.addWidget(title)
+        left.addWidget(broad)
+        left.addWidget(fine)
         left.addWidget(summary)
         left.addStretch(1)  # keep title + summary pinned to the top
         left_widget = QWidget()
         left_widget.setLayout(left)
-        left_widget.setFixedWidth(250)
+        left_widget.setFixedWidth(360)
         outer.addWidget(left_widget)
 
         # -- Middle: pie chart (slices darkened a shade), pinned to the top -
@@ -3795,6 +3829,7 @@ class ComparisonViewerController:
         self._cell_type_widget = None
         self._cell_type_generation = 0
         self._cell_type_worker: object | None = None
+        self._cell_annotation_workers: dict[tuple[str, str], object] = {}
         # Click-to-inspect cell state: a lazily-built per-dataset transcript
         # index, the currently selected cell, and the floating summary box.
         self._cell_transcript_index: dict[str, CellTranscriptIndex] = {}
@@ -3811,6 +3846,7 @@ class ComparisonViewerController:
         self._scale_bar: ScaleBarOverlay | None = None
         self._canvas_resize_relay: _WidgetResizeRelay | None = None
         self._install_gene_pick_callback()
+        self._install_cell_hover_status()
 
     def set_status_callback(self, fn):
         self._status_callback = fn
@@ -3832,6 +3868,84 @@ class ComparisonViewerController:
             callbacks.append(self._on_viewer_mouse_press)
         except Exception as exc:
             log.debug("Could not install transcript pick callback: %s", exc)
+
+    def _install_cell_hover_status(self):
+        """Replace napari's active-layer cursor text with cell-aware status.
+
+        napari normally reports the selected layer name in the status bar, so
+        opening the inspector often replaces useful coordinates with
+        ``Cell inspector | transcript links``. Its status checker calls the
+        viewer model's private calculator on a worker thread; wrapping that
+        calculator keeps the hit-test off the GUI thread and works regardless
+        of which layer is selected or whether the inspector dock is open.
+        """
+        original = getattr(self.viewer, "_calc_status_from_cursor", None)
+        cursor = getattr(self.viewer, "cursor", None)
+        if original is None or cursor is None:
+            self._napari_status_calculator = None
+            return
+        self._napari_status_calculator = original
+
+        def calculate():
+            return self._cell_aware_status_from_cursor()
+
+        try:
+            object.__setattr__(self.viewer, "_calc_status_from_cursor", calculate)
+        except Exception as exc:
+            log.debug("Could not install cell-aware cursor status: %s", exc)
+            self._napari_status_calculator = None
+
+    def _cell_aware_status_from_cursor(self):
+        """Return napari status with world coordinates and hovered-cell data."""
+        original = getattr(self, "_napari_status_calculator", None)
+        if self.active_dataset is None or self._active_sdata is None:
+            return original() if original is not None else None
+        if not bool(getattr(self.viewer, "mouse_over_canvas", True)):
+            return original() if original is not None else None
+        cursor = getattr(self.viewer, "cursor", None)
+        position = getattr(cursor, "position", None)
+        try:
+            coords = np.asarray(position, dtype=float).ravel()
+        except Exception:
+            return original() if original is not None else None
+        if coords.size < 2 or not np.isfinite(coords[-2:]).all():
+            return original() if original is not None else None
+        return self._cell_hover_status(coords), ""
+
+    def _cell_hover_status(self, position) -> dict[str, str]:
+        """Build the plain-text status dictionary for one world position."""
+        coords = np.asarray(position, dtype=float).ravel()
+        y_um, x_um = float(coords[-2]), float(coords[-1])
+        coords_text = f"x: {x_um:,.2f} µm, y: {y_um:,.2f} µm"
+        value_text = "No cell"
+        if self._cell_inspector_pickable():
+            shape_key = self._cell_inspector_shape_key()
+            if shape_key is not None:
+                try:
+                    gdf = self._active_sdata.shapes[shape_key]
+                    picked = pick_cell_at_point(gdf, x_um, y_um)
+                except Exception as exc:
+                    log.debug("Cell hover failed: %s", exc)
+                    picked = None
+                if picked is not None:
+                    cell_id = picked[0]
+                    annotation = self._cell_type_annotation_for_cell(
+                        str(self.active_dataset), cell_id, load=False
+                    )
+                    broad = str(annotation.get("broad_cell_type", "Unannotated"))
+                    fine = str(annotation.get("fine_cell_type", "Unannotated"))
+                    value_text = (
+                        f"Cell {cell_id} • Broad: {broad} • Fine: {fine}"
+                    )
+        return {
+            "coordinates": f"{coords_text} • {value_text}",
+            "coords": coords_text,
+            "layer_base": "Cell",
+            "layer_name": "Cell",
+            "plugin": "",
+            "source_type": "",
+            "value": value_text,
+        }
 
     # -- Canvas overlays: micron scale bar + zoom-aware outline crispness ------
     def install_canvas_overlays(self):
@@ -3993,6 +4107,12 @@ class ComparisonViewerController:
                     worker.quit()
             except Exception:
                 pass
+        for worker in list(self._cell_annotation_workers.values()):
+            try:
+                worker.quit()
+            except Exception:
+                pass
+        self._cell_annotation_workers.clear()
         self._image_build_generation += 1
         self._label_build_generation += 1
         self._gene_build_generation += 1
@@ -7277,6 +7397,102 @@ class ComparisonViewerController:
             log.debug("Cell pick failed: %s", exc)
             return None
 
+    def _cell_inspector_annotation_source(
+        self, state: CellTypeOverlayState
+    ) -> str | None:
+        """Choose annotations joined to the same masks the inspector picks.
+
+        Prefer the source currently selected in the Cell type labels panel when
+        it annotates the inspector mask. Otherwise use the first available
+        matching source (normally ProSeg reseg for ``MOSAIK_proseg``).
+        """
+        shape_key = self._cell_inspector_shape_key()
+        if shape_key is None:
+            return None
+        session = self._dataset_sessions.get(state.dataset)
+        available = dict(session.cell_type_available) if session is not None else {}
+        candidates = [state.segmentation]
+        candidates.extend(
+            source.key
+            for source in CELL_TYPE_SOURCES
+            if source.key != state.segmentation
+        )
+        for key in candidates:
+            source = cell_type_source(key)
+            if source is None or shape_key not in source.mask_shape_keys:
+                continue
+            if available.get(key) is False and state.assignments.get(key) is None:
+                continue
+            return str(key)
+        return None
+
+    @staticmethod
+    def _unannotated_cell_type_fields() -> dict[str, object]:
+        neutral = (0.6, 0.64, 0.7, 1.0)
+        return {
+            "broad_cell_type": "Unannotated",
+            "fine_cell_type": "Unannotated",
+            "broad_cell_type_rgba": neutral,
+            "fine_cell_type_rgba": neutral,
+        }
+
+    def _cell_type_annotation_for_cell(
+        self, dataset_name: str, cell_id, *, load: bool = False
+    ) -> dict[str, object]:
+        """Return broad/fine labels and their Cell type panel palette colours."""
+        ds = str(dataset_name).upper()
+        state = self._cell_type_states.get(ds)
+        if state is None:
+            state = self._cell_type_state(ds)
+        segmentation = self._cell_inspector_annotation_source(state)
+        if segmentation is None:
+            return self._unannotated_cell_type_fields()
+        if load and segmentation not in state.assignments:
+            self._load_cell_type_data(state, segmentation)
+        assignments = state.assignments.get(segmentation)
+        schemes = state.schemes.get(segmentation)
+        if assignments is None or schemes is None:
+            return self._unannotated_cell_type_fields()
+
+        lookup = state.annotation_lookup.get(segmentation)
+        if lookup is None:
+            lookup = {
+                normalize_cell_key(cid): (str(broad), str(fine))
+                for cid, broad, fine in zip(
+                    np.asarray(assignments.cell_ids).tolist(),
+                    np.asarray(assignments.broad).tolist(),
+                    np.asarray(assignments.fine).tolist(),
+                )
+            }
+            state.annotation_lookup[segmentation] = lookup
+        labels = lookup.get(normalize_cell_key(cell_id))
+        if labels is None:
+            return self._unannotated_cell_type_fields()
+        broad, fine = labels
+        neutral = (0.6, 0.64, 0.7, 1.0)
+        return {
+            "broad_cell_type": broad,
+            "fine_cell_type": fine,
+            "broad_cell_type_rgba": schemes["broad"].colors.get(broad, neutral),
+            "fine_cell_type_rgba": schemes["fine"].colors.get(fine, neutral),
+        }
+
+    def _refresh_cell_selection_annotations(self, dataset_name: str):
+        """Refresh existing inspector panels after background annotation load."""
+        ds = str(dataset_name).upper()
+        entries = self._selected_cells.get(ds, [])
+        changed = False
+        for entry in entries:
+            annotation = self._cell_type_annotation_for_cell(
+                ds, entry.get("cell_id"), load=False
+            )
+            for key, value in annotation.items():
+                if entry.get(key) != value:
+                    entry[key] = value
+                    changed = True
+        if changed and self.active_dataset == ds:
+            self._rebuild_cell_highlights(ds)
+
     def _empty_cell_transcript_index(self) -> CellTranscriptIndex:
         return CellTranscriptIndex.empty()
 
@@ -7387,6 +7603,7 @@ class ComparisonViewerController:
             intensities = self._compute_cell_channel_intensities_from_specs(geometry, specs)
             self._cell_intensity_cache[cache_key] = intensities
 
+        annotation = self._cell_type_annotation_for_cell(key, cell_id, load=True)
         return {
             "cell_id": cell_id,
             "color": str(color),
@@ -7398,9 +7615,12 @@ class ComparisonViewerController:
             "area": area_um2,
             "intensities": intensities,
             "loading": False,
+            **annotation,
         }
 
-    def _cell_selection_placeholder(self, cell_id, geometry, color: str) -> dict:
+    def _cell_selection_placeholder(
+        self, dataset_name: str, cell_id, geometry, color: str
+    ) -> dict:
         try:
             centroid = geometry.centroid
             centroid_yx = (float(centroid.y), float(centroid.x))
@@ -7410,6 +7630,9 @@ class ComparisonViewerController:
             area_um2 = float(geometry.area)
         except Exception:
             area_um2 = None
+        annotation = self._cell_type_annotation_for_cell(
+            dataset_name, cell_id, load=False
+        )
         return {
             "cell_id": cell_id,
             "color": str(color),
@@ -7421,6 +7644,7 @@ class ComparisonViewerController:
             "area": area_um2,
             "intensities": [],
             "loading": True,
+            **annotation,
         }
 
     def _cell_index_build_inputs(self):
@@ -7532,7 +7756,9 @@ class ComparisonViewerController:
         if any(normalize_cell_key(entry["cell_id"]) == norm for entry in entries):
             return  # already highlighted; ignore repeat clicks on the same cell
         color = CELL_HIGHLIGHT_COLORS[len(entries) % len(CELL_HIGHLIGHT_COLORS)]
-        entries.append(self._cell_selection_placeholder(cell_id, geometry, color))
+        entries.append(
+            self._cell_selection_placeholder(key, cell_id, geometry, color)
+        )
         self._rebuild_cell_highlights(ds)
         self._set_status(f"{ds}: loading statistics for cell {cell_id}…")
         self._start_cell_selection_build(ds, cell_id, geometry, color)
@@ -8190,8 +8416,19 @@ class ComparisonViewerController:
         cfg = self.datasets.get(state.dataset)
         zarr_path = getattr(cfg, "zarr_path", None)
         assignments = load_cell_type_assignments(zarr_path, seg) if zarr_path is not None else None
+        return self._cache_cell_type_data(state, seg, assignments)
+
+    @staticmethod
+    def _cache_cell_type_data(
+        state: CellTypeOverlayState, segmentation: str, assignments
+    ) -> bool:
+        """Install assignments, palette schemes and the normalized-id lookup."""
+        seg = str(segmentation)
         state.assignments[seg] = assignments
         if assignments is None:
+            state.schemes.pop(seg, None)
+            state.enabled.pop(seg, None)
+            state.annotation_lookup.pop(seg, None)
             return False
         schemes = build_cell_type_color_schemes(assignments.broad, assignments.fine, alpha=1.0)
         state.schemes[seg] = schemes
@@ -8200,7 +8437,57 @@ class ComparisonViewerController:
             "broad": set(schemes["broad"].order),
             "fine": set(schemes["fine"].order),
         }
+        state.annotation_lookup[seg] = {
+            normalize_cell_key(cid): (str(broad), str(fine))
+            for cid, broad, fine in zip(
+                np.asarray(assignments.cell_ids).tolist(),
+                np.asarray(assignments.broad).tolist(),
+                np.asarray(assignments.fine).tolist(),
+            )
+        }
         return True
+
+    def _start_cell_annotation_prefetch(
+        self, state: CellTypeOverlayState, available: dict[str, bool]
+    ) -> None:
+        """Load hover/inspector annotations without blocking cursor movement."""
+        segmentation = self._cell_inspector_annotation_source(state)
+        if segmentation is None or available.get(segmentation) is False:
+            return
+        if segmentation in state.assignments:
+            return
+        cfg = self.datasets.get(state.dataset)
+        zarr_path = getattr(cfg, "zarr_path", None)
+        if zarr_path is None:
+            return
+        key = (state.dataset, str(segmentation))
+        if key in self._cell_annotation_workers:
+            return
+
+        def compute():
+            with self._store_io_slots:
+                return load_cell_type_assignments(zarr_path, segmentation)
+
+        def apply(assignments):
+            self._cell_annotation_workers.pop(key, None)
+            current = self._cell_type_states.get(state.dataset)
+            if current is None:
+                return
+            self._cache_cell_type_data(current, segmentation, assignments)
+            self._refresh_cell_selection_annotations(state.dataset)
+
+        def handle_error(exc):
+            self._cell_annotation_workers.pop(key, None)
+            log.debug("Cell annotation prefetch failed: %s", exc)
+
+        if thread_worker is None:
+            apply(compute())
+            return
+        worker = thread_worker(compute)()
+        worker.returned.connect(apply)
+        worker.errored.connect(handle_error)
+        self._cell_annotation_workers[key] = worker
+        worker.start()
 
     @staticmethod
     def _cell_type_counts(assignments, kind: str) -> dict[str, int]:
@@ -8253,6 +8540,7 @@ class ComparisonViewerController:
             if self._cell_type_widget is not None:
                 self._cell_type_widget.set_dataset(state.dataset)
             return
+        self._refresh_cell_selection_annotations(state.dataset)
         # Re-colour for the new segmentation only when a level is already active.
         if state.kind:
             self._populate_cell_type_panel(state)
@@ -8519,8 +8807,7 @@ class ComparisonViewerController:
 
     def _publish_cell_type_options(self):
         """Refresh the cell-type panel for the active dataset (on dataset load)."""
-        widget = self._cell_type_widget
-        if widget is None or self.active_dataset is None:
+        if self.active_dataset is None:
             return
         session = self._dataset_sessions.get(self.active_dataset)
         if session is not None:
@@ -8541,6 +8828,11 @@ class ComparisonViewerController:
         state.kind = ""
         if available.get(state.segmentation) is False:
             state.segmentation = next((s for s, ok in available.items() if ok), state.segmentation)
+        self._start_cell_annotation_prefetch(state, available)
+
+        widget = self._cell_type_widget
+        if widget is None:
+            return
         widget.set_dataset(self.active_dataset)
         widget.set_segmentation_available(available)
         if any(available.values()):

@@ -245,6 +245,15 @@ viewer only *reads* it). For the P7513 panel it was written both as
 `cell_type_marker_reference.{csv,json}` beside the `.zarr` and as the
 `cell_type_marker_reference` table element inside the store.
 
+### Cell inspector
+
+Hovering over the canvas reports world `x`/`y`, the cell ID under the cursor,
+and its broad and fine cell-type annotations in napari's status bar. This
+readout remains active whether or not the Cell inspector dock is open. Clicking
+a cell adds its exact transcript and image summary to that dock; the broad and
+fine annotations appear directly below the Cell ID using the same colours as
+the corresponding entries in the **Cell type labels** panel.
+
 ```bash
 napari-compare-xenium-merscope ... \
   --gene-spot-size 2.0 \            # initial world-micron spot size
