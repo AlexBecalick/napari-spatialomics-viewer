@@ -66,6 +66,21 @@ def test_parse_args_allows_launch_without_dataset(monkeypatch):
     assert args.xenium_zarr is None
     assert args.background_io_workers == 2
     assert args.session_cache_gb is None
+    assert args.disable_async_slicing is False
+    assert args.label_interpolation == "nearest"
+
+
+def test_configure_napari_async_slicing_can_be_enabled_and_disabled():
+    from napari.settings import get_settings
+
+    original = bool(get_settings().experimental.async_)
+    try:
+        assert V.configure_napari_async_slicing(True)
+        assert get_settings().experimental.async_ is True
+        assert V.configure_napari_async_slicing(False) is False
+        assert get_settings().experimental.async_ is False
+    finally:
+        V.configure_napari_async_slicing(original)
 
 
 def test_empty_startup_selects_dataset_loader(qapp):

@@ -279,15 +279,18 @@ spots stay 2px and blanket the view into a solid mass. Two defaults address this
   (e.g. cortical layering) shows through when zoomed out. Set `--gene-antialiasing 0`
   for hard-edged spots if antialiasing costs too much on your GPU.
 
-Label outlines are rasterised, so a downsampled multiscale level can make thin
-outlines look thick and blocky (merging into blocks of colour) when zoomed out.
-`--label-interpolation` (default `linear`) anti-aliases the outlines on screen so
-they stay thin and fade rather than blocking up; use `nearest` for crisper — but
-blockier when zoomed out — outlines. In the default `linear` mode the outlines
-automatically switch to crisp `nearest` interpolation once you zoom in far enough
-that the field of view is ≤ ~150 µm (so single-cell close-ups stay sharp), and
-back to `linear` when you zoom out. All of these are display-only settings with no
-material performance cost (antialiasing aside).
+Label outlines use crisp `nearest` interpolation at every zoom by default, with
+no filter change during navigation. Their cached coarse levels store fractional
+coverage of the full-resolution boundary, so very thin outlines fade
+proportionally instead of becoming fully opaque, oversized blocks when napari
+switches pyramid levels. A square-root opacity curve keeps partially covered
+boundaries readable and reduces the brightness difference between ordinary
+lines and intersections. `--label-interpolation linear` remains available as
+an explicit compatibility option.
+
+Lazy raster viewport reads run asynchronously by default, so obsolete image and
+segmentation requests are cancelled instead of blocking camera input. Use
+`--disable-async-slicing` only as a compatibility fallback.
 
 ### Scale bar
 

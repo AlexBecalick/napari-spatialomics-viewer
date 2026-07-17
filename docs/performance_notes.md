@@ -36,6 +36,11 @@ gesture moving more than four canvas pixels is classified as a pan and skips all
 Points-layer and cell-polygon picking, so those synchronous queries cannot delay
 the first movement of the view.
 
+napari's asynchronous slicer is enabled by default for image and segmentation
+layers. Lazy viewport reads happen outside the GUI thread and stale requests are
+cancelled as newer camera positions arrive. This improves frame pacing and makes
+rapid image zooms less likely to expose unloaded black edge tiles.
+
 Status/progress updates from worker threads are marshalled to the GUI thread via
 Qt signals (`ViewerControlPanel.status_message` / `ViewerControlPanel.progress_message`).
 A busy progress bar with a stage label below the tabs shows which stage is
@@ -52,7 +57,16 @@ caches, rechunked to ~1024² tiles:
 - images: mean-downsampled (`_napari_compare_imgpyr__<key>__ds<N>`),
 - label value overlays: max-pooled so label ids survive
   (`_napari_compare_labelpyr__<key>__ds<N>`),
-- label outlines were already a materialized cache.
+- label outlines, coverage-downsampled and rechunked to bounded ~1024² display
+  tiles. Fractional uint8 coverage keeps nearest-neighbour outlines crisp while
+  preventing them from becoming overwhelmingly thick at coarse pyramid levels.
+  A square-root opacity curve compensates for the lost coverage at each level,
+  keeping ordinary boundaries visible without returning to fully opaque blocks.
+
+Pyramids continue to a ~1024-pixel overview level, including shallow pyramids
+provided by upstream stores. That small whole-tissue fallback reduces data and
+texture upload at the widest zooms. Existing derived image/outline caches with
+the older 4096-pixel stopping point are detected as stale and rebuilt once.
 
 The full-resolution base is reused as level 0 (never duplicated), so a pyramid
 adds only a fraction of the base size (~8 GB at 4x downsample for the reference
@@ -94,6 +108,8 @@ at 8 GiB; inactive sessions are evicted first.
   `0` disables cross-dataset reuse.
 - `--background-io-workers INT` (default 2): maximum concurrent zarr-heavy
   builders. Increase only if profiling shows the storage device is underused.
+- `--disable-async-slicing`: compatibility fallback for napari's background
+  image/segmentation viewport slicing.
 - `--gl-core-profile` (experimental): request an OpenGL 4.1 core context instead
   of the macOS default legacy 2.1 context; see below.
 

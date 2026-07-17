@@ -339,10 +339,6 @@ DEFAULT_GENE_SPOT_SIZE = 0.5
 MAX_RECENT_DATASETS = 10
 RECENT_DATASETS_SETTINGS_KEY = "dataset_loader/recent_datasets"
 GENE_HIGHLIGHT_SPOT_SIZE = 2.0
-#: When the (smaller) visible field of view is at or below this many microns, the
-#: label outlines switch to crisp nearest-neighbour interpolation; above it they
-#: use anti-aliased linear interpolation. Only active with --label-interpolation linear.
-LABEL_CRISP_ZOOM_UM = 150.0
 GENE_SPOT_SIZE_MIN = 0.1
 GENE_SPOT_SIZE_MAX = 5.0
 GENE_SPOT_SIZE_STEP = 0.1
@@ -367,15 +363,22 @@ GENE_STATUS_SYMBOL_GLYPHS = {
     "clobber": "✣",
 }
 
-SYNTHETIC_IMAGE_PYRAMID_MIN_SIZE = 4096
+# A small final overview level is cheap to retain and gives rapid zoom-out a
+# ready fallback instead of repeatedly exposing unloaded black edge tiles.
+SYNTHETIC_IMAGE_PYRAMID_MIN_SIZE = 1024
 SYNTHETIC_IMAGE_PYRAMID_MAX_LEVELS = 10
 LABEL_CACHE_ATTR = "napari_compare_label_cache"
 # Raster layers use napari's bounded opportunistic RAM cache. At startup we
 # replace its thread-unsafe callback bookkeeping with ThreadSafeDaskCache so
 # concurrent layers retain hot chunks without Cache._posttask races.
 NAPARI_DASK_CACHE_ENABLED = True
-LABEL_OUTLINE_PYRAMID_MIN_SIZE = 4096
+LABEL_OUTLINE_PYRAMID_MIN_SIZE = 1024
 LABEL_OUTLINE_PYRAMID_MAX_LEVELS = 10
+RASTER_DISPLAY_TILE_SIZE = 1024
+OUTLINE_COVERAGE_MAX = 255
+# Square-root tone mapping keeps partially covered coarse boundary pixels
+# readable without making every non-zero pixel fully opaque.
+OUTLINE_COVERAGE_GAMMA = 0.5
 # v2: the label-pyramid cache format changed from base+coarse to coarse-only
 # (the base is re-prepended at display time in _build_cellpose_label_display).
 # A v1 cache still stores the full-res base as its finest level, which would
@@ -520,6 +523,23 @@ def memory_snapshot_gb() -> dict[str, float]:
     return {"rss_gb": float(rss), "sys_used_gb": float(used)}
 
 
+def configure_napari_async_slicing(enabled: bool = True) -> bool:
+    """Enable napari's cancellable background slicing for lazy raster layers.
+
+    Multiscale image and outline viewport reads otherwise run on the Qt thread.
+    napari's slicer cancels obsolete requests as the camera moves, which keeps
+    pan/zoom events flowing even when the backing zarr still has work to do.
+    """
+    try:
+        from napari.settings import get_settings
+
+        get_settings().experimental.async_ = bool(enabled)
+        return bool(get_settings().experimental.async_)
+    except Exception as exc:
+        log.warning("Could not configure napari asynchronous slicing (%s)", exc)
+        return False
+
+
 def stable_layer_color(key: str, alpha: float = 1.0) -> tuple[float, float, float, float]:
     """Generate deterministic RGBA color for a layer key."""
     digest = hashlib.md5(key.encode("utf-8")).hexdigest()
@@ -583,7 +603,7 @@ def lazy_coarsened_pyramid(
     reducer=None,
     min_size: int = SYNTHETIC_IMAGE_PYRAMID_MIN_SIZE,
     max_levels: int = SYNTHETIC_IMAGE_PYRAMID_MAX_LEVELS,
-    tile: int = 1024,
+    tile: int = RASTER_DISPLAY_TILE_SIZE,
 ) -> list[object]:
     """Build materialized-ready coarse levels for an image or label array.
 
@@ -641,10 +661,43 @@ def lazy_outline_pyramid(
     min_size: int = LABEL_OUTLINE_PYRAMID_MIN_SIZE,
     max_levels: int = LABEL_OUTLINE_PYRAMID_MAX_LEVELS,
 ) -> list[object]:
-    """Build a lazy multiscale uint8 outline pyramid from a 2D label image."""
+    """Build a coverage-preserving uint8 outline pyramid from a label image.
+
+    Coarse levels average the finest outline instead of tracing a new opaque
+    one-pixel boundary at every resolution. The resulting 0..255 values encode
+    line coverage, preventing a coarse pixel from turning a sub-pixel boundary
+    into a fully opaque block when napari switches multiscale levels.
+    """
     width = max(1, int(width))
-    label_levels = lazy_label_pyramid(label_data, min_size=min_size, max_levels=max_levels)
-    return lazy_outline_pyramid_from_label_levels(label_levels, width=width)
+    base_outline = lazy_outline_mask(label_data, width=width)
+    if da is not None:
+        data = da.asarray(base_outline).astype(np.uint8) * np.uint8(OUTLINE_COVERAGE_MAX)
+        levels: list[object] = [data]
+        levels.extend(
+            lazy_coarsened_pyramid(
+                data,
+                step=2,
+                reducer=np.mean,
+                min_size=min_size,
+                max_levels=max(0, int(max_levels) - 1),
+                tile=RASTER_DISPLAY_TILE_SIZE,
+            )
+        )
+        return levels[: int(max_levels)]
+
+    data = np.asarray(base_outline, dtype=np.uint8) * np.uint8(OUTLINE_COVERAGE_MAX)
+    levels = [data]
+    while len(levels) < int(max_levels) and max(int(axis) for axis in data.shape) > int(min_size):
+        y = (data.shape[0] // 2) * 2
+        x = (data.shape[1] // 2) * 2
+        if y < 2 or x < 2:
+            break
+        reduced = data[:y, :x].reshape(y // 2, 2, x // 2, 2).mean(axis=(1, 3))
+        data = np.rint(reduced).astype(np.uint8)
+        if data.shape == levels[-1].shape:
+            break
+        levels.append(data)
+    return levels
 
 
 def lazy_label_pyramid(
@@ -695,27 +748,51 @@ def lazy_outline_mask(label_data, width: int) -> object:
     return label_outline_mask_chunk(label_data, width=width)
 
 
-def _outline_width_for_level(width: int, base_shape: tuple[int, int], level_shape: tuple[int, int]) -> int:
-    """Scale outline width down for coarser pyramid levels."""
-    if width <= 1:
-        return 1
-    y_factor = float(base_shape[0]) / max(1.0, float(level_shape[0]))
-    x_factor = float(base_shape[1]) / max(1.0, float(level_shape[1]))
-    scale_factor = max(1.0, y_factor, x_factor)
-    return max(1, int(np.ceil(float(width) / scale_factor)))
+def complete_image_pyramid_for_display(
+    scale_levels: list[tuple[str, xr.DataArray]],
+    min_size: int = SYNTHETIC_IMAGE_PYRAMID_MIN_SIZE,
+    max_levels: int = SYNTHETIC_IMAGE_PYRAMID_MAX_LEVELS,
+) -> list[tuple[str, xr.DataArray]]:
+    """Append lightweight overview levels when a stored image pyramid is shallow."""
+    levels = list(scale_levels)
+    if not levels or len(levels) >= int(max_levels) or da is None:
+        return levels
+    last = ensure_cyx(levels[-1][1])
+    if max(int(axis) for axis in last.shape[-2:]) <= int(min_size):
+        return levels
+    arrays = lazy_coarsened_pyramid(
+        last.data,
+        step=2,
+        reducer=np.mean,
+        min_size=int(min_size),
+        max_levels=int(max_levels) - len(levels),
+        tile=RASTER_DISPLAY_TILE_SIZE,
+    )
+    channel_coords = None
+    if "c" in last.coords:
+        channel_coords = {"c": np.asarray(last.coords["c"].values)}
+    for index, array in enumerate(arrays, start=len(levels)):
+        levels.append(
+            (
+                f"runtime_overview_{index}",
+                xr.DataArray(array, dims=("c", "y", "x"), coords=channel_coords),
+            )
+        )
+    return levels[: int(max_levels)]
 
 
-def lazy_outline_pyramid_from_label_levels(label_levels: list[object], width: int) -> list[object]:
-    """Build outline masks independently from existing or synthetic label levels."""
-    if len(label_levels) == 0:
-        return []
-    base_shape = tuple(int(axis) for axis in getattr(label_levels[0], "shape"))
-    outlines: list[object] = []
-    for level in label_levels:
-        level_shape = tuple(int(axis) for axis in getattr(level, "shape"))
-        level_width = _outline_width_for_level(int(width), base_shape, level_shape)
-        outlines.append(lazy_outline_mask(level, width=level_width))
-    return outlines
+def rechunk_raster_levels_for_display(levels: list[object]) -> list[object]:
+    """Bound 2D dask chunks so a small pan does not trigger large over-reads."""
+    if da is None:
+        return list(levels)
+    tiled = []
+    for level in levels:
+        arr = da.asarray(level)
+        chunks = tuple(
+            min(RASTER_DISPLAY_TILE_SIZE, int(axis)) for axis in arr.shape
+        )
+        tiled.append(arr.rechunk(chunks))
+    return tiled
 
 
 def lazy_density_pyramid(
@@ -792,19 +869,30 @@ def rgba_array(color, alpha: float = 1.0) -> np.ndarray:
     return np.asarray([1.0, 1.0, 1.0, float(alpha)], dtype=np.float32)
 
 
-def transparent_colormap(name: str, color, alpha: float = 1.0) -> Colormap:
-    """Return a transparent-to-color colormap for binary/density overlays."""
+def outline_coverage_colormap(
+    name: str,
+    color,
+    alpha: float = 1.0,
+    gamma: float = OUTLINE_COVERAGE_GAMMA,
+) -> Colormap:
+    """Map outline coverage to a stable hue and compressed opacity.
+
+    Interpolating from transparent black to the layer colour attenuates both
+    RGB and alpha, making partially covered pixels effectively fade twice. Keep
+    RGB fixed instead and apply a square-root alpha curve: ordinary one-pixel
+    boundaries remain visible after a pyramid transition, while pixels holding
+    several intersecting boundaries are only moderately brighter.
+    """
     rgba = rgba_array(color, alpha=alpha)
+    controls = np.linspace(0.0, 1.0, OUTLINE_COVERAGE_MAX + 1, dtype=np.float32)
+    opacity = np.power(controls, max(float(gamma), np.finfo(np.float32).eps))
+    colors = np.empty((controls.size, 4), dtype=np.float32)
+    colors[:, :3] = rgba[:3]
+    colors[:, 3] = rgba[3] * opacity
     return Colormap(
-        np.asarray(
-            [
-                [0.0, 0.0, 0.0, 0.0],
-                rgba,
-            ],
-            dtype=np.float32,
-        ),
+        colors,
         name=name,
-        controls=np.asarray([0.0, 1.0], dtype=np.float32),
+        controls=controls,
     )
 
 
@@ -3818,20 +3906,8 @@ class ComparisonViewerController:
         self._apply_label_zoom_interpolation(um_per_px)
 
     def _apply_label_zoom_interpolation(self, um_per_px: float | None = None):
-        """Crisp (nearest) outlines when zoomed in past the threshold, else linear.
-
-        Only runs when the outline mode is the default 'linear'; an explicit
-        --label-interpolation nearest keeps outlines crisp at every zoom.
-        """
-        if str(getattr(self.args, "label_interpolation", "linear")) != "linear":
-            return
-        if um_per_px is None:
-            um_per_px = self._um_per_canvas_px()
-        size = self._canvas_size_px()
-        if um_per_px is None or size is None:
-            return
-        visible_um = min(size) * um_per_px
-        mode = "nearest" if visible_um <= LABEL_CRISP_ZOOM_UM else "linear"
+        """Keep outline filtering stable while the camera moves and zooms."""
+        mode = str(getattr(self.args, "label_interpolation", "nearest"))
         for layer in list(self.viewer.layers):
             name = str(getattr(layer, "name", ""))
             if name.startswith("Segmentation | ") and hasattr(layer, "interpolation2d"):
@@ -4989,7 +5065,9 @@ class ComparisonViewerController:
         if len(stored) == 0:
             return [], "none"
         if len(stored) > 1:
-            return stored, "stored"
+            completed = complete_image_pyramid_for_display(stored)
+            source = "stored+overview" if len(completed) > len(stored) else "stored"
+            return completed, source
 
         if da is not None and build_cache:
             try:
@@ -5004,7 +5082,7 @@ class ComparisonViewerController:
                 coarse = []
             if coarse:
                 extended = stored + [(f"imgpyr{idx + 1}", cyx) for idx, cyx in enumerate(coarse)]
-                return extended, "materialized"
+                return complete_image_pyramid_for_display(extended), "materialized"
         return stored, "single"
 
     def _prime_image_pyramid_caches(
@@ -5804,6 +5882,10 @@ class ComparisonViewerController:
             "kind": "label_outline",
             "source_label_key": str(label_key),
             "width": int(width),
+            "min_size": int(LABEL_OUTLINE_PYRAMID_MIN_SIZE),
+            "tile_size": int(RASTER_DISPLAY_TILE_SIZE),
+            "pyramid_mode": "coverage_mean_v1",
+            "value_max": int(OUTLINE_COVERAGE_MAX),
         }
         if (
             not bool(getattr(self.args, "overwrite_labels", False))
@@ -5831,15 +5913,18 @@ class ComparisonViewerController:
         if len(label_scale_levels) == 0:
             raise ValueError(f"Expected 2D labels for {label_key}, found no readable 2D scale levels")
 
-        if len(label_scale_levels) > 1:
-            outline_levels = lazy_outline_pyramid_from_label_levels(
-                [level_data for _scale_name, level_data in label_scale_levels],
-                width=width,
-            )
-            source = "stored"
-        else:
-            outline_levels = lazy_outline_pyramid(label_scale_levels[0][1], width=width)
-            source = "synthetic" if len(outline_levels) > 1 else "single"
+        # Always derive the pyramid from the finest label level. Averaging its
+        # binary outline records the fractional line coverage at coarse scales;
+        # independently tracing stored label levels would make every coarse
+        # boundary pixel fully opaque and visually much too thick.
+        outline_levels = lazy_outline_pyramid(label_scale_levels[0][1], width=width)
+        source = "coverage_mean"
+
+        # Outline caches inherit the source mask's chunks by default. Those can
+        # be several thousand pixels wide, making a small pan decompress far
+        # more data than the new viewport needs. Use bounded display tiles at
+        # every level for steadier latency in both directions.
+        outline_levels = rechunk_raster_levels_for_display(outline_levels)
 
         tf = get_transformation(label_elem, to_coordinate_system="global")
         outline_tree = self._datatree_from_levels(
@@ -5942,6 +6027,7 @@ class ComparisonViewerController:
             "outline_data": outline_data,
             "n_levels": len(outline_levels),
             "outline_width": outline_width,
+            "contrast_limits": (0.0, float(OUTLINE_COVERAGE_MAX)),
             "base_shape": tuple(int(x) for x in data.shape),
             "base_dtype": getattr(data, "dtype", "unknown"),
         }
@@ -5954,16 +6040,22 @@ class ComparisonViewerController:
         layer_name = make_layer_name(ds, "labels", label_key)
         self._remove_layer_by_name(layer_name)
         layer_color = np.asarray(stable_layer_color(label_key, alpha=1.0), dtype=np.float32)
-        color_map = transparent_colormap(f"{label_key}_outline", layer_color, alpha=float(self.args.shape_opacity))
+        color_map = outline_coverage_colormap(
+            f"{label_key}_outline",
+            layer_color,
+            alpha=float(self.args.shape_opacity),
+        )
 
         seg_layer = self.viewer.add_image(
             prepared["outline_data"],
             name=layer_name,
             affine=prepared["napari_affine"],
             colormap=color_map,
-            contrast_limits=(0.0, 1.0),
+            contrast_limits=tuple(
+                prepared.get("contrast_limits", (0.0, float(OUTLINE_COVERAGE_MAX)))
+            ),
             cache=NAPARI_DASK_CACHE_ENABLED,
-            interpolation2d=str(getattr(self.args, "label_interpolation", "linear")),
+            interpolation2d=str(getattr(self.args, "label_interpolation", "nearest")),
             multiscale=n_levels > 1,
             opacity=self.args.shape_opacity,
             blending="additive",
@@ -5975,8 +6067,7 @@ class ComparisonViewerController:
             seg_layer.events.visible.connect(self._on_segmentation_visibility_changed)
         except Exception:
             pass
-        # Give the new outline the crisp/linear interpolation matching the current
-        # zoom (a fresh layer would otherwise start at the base 'linear' setting).
+        # Apply the configured fixed interpolation to a freshly created layer.
         self._apply_label_zoom_interpolation()
         log.info(
             "[%s] Added label outline layer %s from cache=%s shape=%s dtype=%s levels=%s width=%s source=cache",
@@ -8855,13 +8946,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--label-interpolation",
-        default="linear",
+        default="nearest",
         choices=("linear", "nearest"),
         help=(
-            "Screen interpolation for label-outline layers. 'linear' anti-aliases "
-            "the outlines when zoomed out so they stay thin and fade rather than "
-            "merging into blocks of colour; 'nearest' is crisper up close but blocky "
-            "when zoomed out."
+            "Fixed screen interpolation for label-outline layers. The default "
+            "'nearest' stays crisp and stable at every zoom; 'linear' remains "
+            "available as an opt-in compatibility choice."
         ),
     )
     parser.add_argument(
@@ -8967,6 +9057,14 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--hide-images", action="store_true", help="Start with image layers hidden")
     parser.add_argument("--hide-shapes", action="store_true", help="Start with segmentation layers hidden")
+    parser.add_argument(
+        "--disable-async-slicing",
+        action="store_true",
+        help=(
+            "Disable napari's background viewport slicing. The viewer enables it "
+            "by default so lazy image and segmentation reads cannot block camera input."
+        ),
+    )
     parser.add_argument(
         "--gl-core-profile",
         action="store_true",
@@ -9080,6 +9178,10 @@ def main():
         "Installed thread-safe napari Dask cache (budget %.1f GB)",
         float(dask_cache.cache.available_bytes) / (1024**3),
     )
+    async_enabled = configure_napari_async_slicing(
+        not bool(getattr(args, "disable_async_slicing", False))
+    )
+    log.info("napari asynchronous viewport slicing: %s", async_enabled)
     viewer = napari.Viewer(title="Spatialomics Viewer")
     install_application_icon(viewer)
     log_environment_diagnostics(viewer)
