@@ -245,6 +245,51 @@ def test_dismissed_welcome_overlay_redraws_canvas_when_layer_arrives(qapp):
     assert scene_canvas._backend.resize_calls[-1] == (1000, 800)
 
 
+def test_canvas_visibility_repair_nudges_and_restores_dock_width(qapp):
+    from qtpy.QtTest import QTest
+    from qtpy.QtWidgets import QDockWidget, QWidget
+
+    class SceneCanvas:
+        def __init__(self):
+            self.updates = 0
+
+        def update(self):
+            self.updates += 1
+
+    class MainWindow:
+        def __init__(self):
+            self.calls = []
+
+        def resizeDocks(self, docks, sizes, orientation):
+            self.calls.append((list(sizes), orientation))
+            dock = docks[0]
+            dock.resize(int(sizes[0]), dock.height())
+
+    viewer = _fake_zoom_viewer(zoom=4.0)
+    native = QWidget()
+    native.resize(900, 700)
+    scene_canvas = SceneCanvas()
+    viewer.window._qt_viewer.canvas = types.SimpleNamespace(
+        native=native, _scene_canvas=scene_canvas
+    )
+    main_window = MainWindow()
+    viewer.window._qt_window = main_window
+    dock = QDockWidget()
+    dock.resize(280, 500)
+    ctrl = _controller(viewer)
+    ctrl.set_viewer_controls_dock(dock)
+
+    original_width = dock.width()
+    assert ctrl._nudge_canvas_dock_layout()
+    assert main_window.calls[0][0] == [original_width + 1]
+
+    QTest.qWait(30)
+    qapp.processEvents()
+    assert main_window.calls[-1][0] == [original_width]
+    assert dock.width() == original_width
+    assert scene_canvas.updates >= 1
+
+
 def test_label_outline_uses_thread_safe_global_dask_cache(qapp):
     captured = {}
 

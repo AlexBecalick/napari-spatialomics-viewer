@@ -3845,6 +3845,12 @@ class ComparisonViewerController:
         # Bottom-right micron scale bar overlay + its canvas-resize relay.
         self._scale_bar: ScaleBarOverlay | None = None
         self._canvas_resize_relay: _WidgetResizeRelay | None = None
+        # Qt/VisPy can retain a stale zero/old canvas viewport after progressive
+        # startup loads. A real dock resize reliably repairs it; these fields
+        # coordinate an imperceptible one-pixel resize/restore after each batch.
+        self._viewer_controls_dock = None
+        self._canvas_visibility_repair_serial = 0
+        self._canvas_visibility_repair_active = False
         self._install_gene_pick_callback()
         self._install_cell_hover_status()
 
@@ -3859,6 +3865,10 @@ class ComparisonViewerController:
 
     def set_cell_type_widget(self, widget):
         self._cell_type_widget = widget
+
+    def set_viewer_controls_dock(self, dock):
+        """Keep the right dock used for the startup canvas-layout repair."""
+        self._viewer_controls_dock = dock
 
     def _install_gene_pick_callback(self):
         callbacks = getattr(self.viewer, "mouse_drag_callbacks", None)
@@ -3947,7 +3957,103 @@ class ComparisonViewerController:
             "value": value_text,
         }
 
-    # -- Canvas overlays: micron scale bar + zoom-aware outline crispness ------
+    # -- Canvas overlays and startup visibility repair -------------------------
+    def _force_canvas_redraw(self):
+        """Request both VisPy and the native Qt canvas to paint again."""
+        try:
+            canvas = self.viewer.window._qt_viewer.canvas
+        except Exception:
+            return
+        scene_canvas = getattr(canvas, "_scene_canvas", None)
+        native = getattr(canvas, "native", None)
+        try:
+            scene_canvas.update()
+        except Exception:
+            pass
+        try:
+            native.update()
+            native.repaint()
+        except Exception:
+            pass
+
+    def _canvas_dock_layout_target(self):
+        """Return the Qt dock-resize callback and dock used for canvas repair."""
+        window = getattr(self.viewer, "window", None)
+        main_window = getattr(window, "_qt_window", None)
+        resize_docks = getattr(main_window, "resizeDocks", None)
+        dock = self._viewer_controls_dock
+        if dock is None:
+            qt_viewer = getattr(window, "_qt_viewer", None)
+            dock = getattr(qt_viewer, "dockLayerList", None)
+        if resize_docks is None or dock is None:
+            return None
+        return resize_docks, dock
+
+    def _nudge_canvas_dock_layout(self) -> bool:
+        """Resize a side dock by one pixel and restore it on the next frame.
+
+        This deliberately reproduces the user action known to reveal an
+        otherwise blank VisPy canvas. Unlike calling ``resizeGL`` directly, a
+        real ``QMainWindow.resizeDocks`` pass updates the Qt layout, native
+        QOpenGLWidget geometry and VisPy viewport together.
+        """
+        if self._canvas_visibility_repair_active:
+            return False
+        target = self._canvas_dock_layout_target()
+        if target is None:
+            self._force_canvas_redraw()
+            return False
+        resize_docks, dock = target
+        try:
+            original_width = max(1, int(dock.width()))
+            self._canvas_visibility_repair_active = True
+            resize_docks([dock], [original_width + 1], Qt.Horizontal)
+        except Exception:
+            self._canvas_visibility_repair_active = False
+            self._force_canvas_redraw()
+            return False
+
+        def restore():
+            try:
+                resize_docks([dock], [original_width], Qt.Horizontal)
+            except Exception:
+                pass
+            finally:
+                self._canvas_visibility_repair_active = False
+                self._force_canvas_redraw()
+
+        # Keep the one-pixel geometry for one frame so Qt cannot coalesce the
+        # nudge and restore into a no-op layout pass.
+        QTimer.singleShot(16, restore)
+        return True
+
+    def _schedule_canvas_visibility_repair(self, dataset_name: str | None = None):
+        """Debounce a small series of post-load dock nudges for one dataset."""
+        ds = str(dataset_name or self.active_dataset or "").upper()
+        if not ds:
+            return
+        # Do not leave delayed callbacks retaining incomplete/headless viewers.
+        # There is no layout event to reproduce without a real dock target, so
+        # one immediate best-effort paint request is sufficient in that case.
+        if self._canvas_dock_layout_target() is None:
+            self._force_canvas_redraw()
+            return
+        self._canvas_visibility_repair_serial += 1
+        serial = self._canvas_visibility_repair_serial
+
+        def repair():
+            if serial != self._canvas_visibility_repair_serial:
+                return
+            if self.active_dataset != ds:
+                return
+            self._nudge_canvas_dock_layout()
+
+        # Immediate repair handles ordinary layer insertion. Delayed passes
+        # cover asynchronous dask slicing/texture upload that completes after
+        # the layer itself was added.
+        for delay_ms in (0, 100, 500, 1500):
+            QTimer.singleShot(delay_ms, repair)
+
     def install_canvas_overlays(self):
         """Attach the bottom-right scale bar and start tracking camera zoom.
 
@@ -4953,6 +5059,7 @@ class ComparisonViewerController:
         )
         self._evict_dataset_sessions()
         self._start_startup_autoload(ds)
+        self._schedule_canvas_visibility_repair(ds)
 
     def _handle_dataset_load_error(self, generation: int, ds: str, exc) -> None:
         if generation != self._dataset_load_generation:
@@ -6368,6 +6475,8 @@ class ComparisonViewerController:
             f"RSS {mem_before['rss_gb']:.1f}->{mem_after['rss_gb']:.1f} GB "
             f"(build={float(payload.get('build_seconds', 0.0)):.1f}s)"
         )
+        if added_layers:
+            self._schedule_canvas_visibility_repair(ds)
 
     def _handle_label_build_error(
         self,
@@ -7024,6 +7133,8 @@ class ComparisonViewerController:
             float(payload.get("build_seconds", 0.0)),
         )
         self._evict_dataset_sessions()
+        if layer_names:
+            self._schedule_canvas_visibility_repair(ds)
 
     def _handle_gene_inspector_build_error(
         self, generation: int, ds: str, exc, token: Event | None = None
@@ -8774,6 +8885,7 @@ class ComparisonViewerController:
             f"{state.dataset}: filled {state.segmentation} masks by {kind} cell type "
             f"({n_shown} types shown, {n_cells:,} annotated cells)."
         )
+        self._schedule_canvas_visibility_repair(state.dataset)
         log.info(
             "[%s] Cell-type overlay label=%s seg=%s kind=%s types_shown=%s cells=%s levels=%s",
             state.dataset, label_key, state.segmentation, kind, n_shown, n_cells, len(label_levels),
@@ -9019,6 +9131,8 @@ class ComparisonViewerController:
             f"{ds} loaded image layers={stats['layers']} (failed={stats['failed_keys']}); "
             f"pyramid build={float(payload.get('build_seconds', 0.0)):.1f}s."
         )
+        if int(stats.get("layers", 0)):
+            self._schedule_canvas_visibility_repair(ds)
 
     def _handle_image_build_error(
         self, generation: int, ds: str, exc, token: Event | None = None
@@ -9548,7 +9662,10 @@ def main():
     controller.set_cellpose_value_options_callback(panel.set_cellpose_value_options)
     controller.set_gene_inspector_widget(gene_inspector)
     controller.set_cell_type_widget(cell_type_widget)
-    viewer.window.add_dock_widget(panel, area="right", name="Viewer Controls")
+    viewer_controls_dock = viewer.window.add_dock_widget(
+        panel, area="right", name="Viewer Controls"
+    )
+    controller.set_viewer_controls_dock(viewer_controls_dock)
 
     simplify_napari_welcome_screen(viewer)
     welcome_overlay = DatasetWelcomeOverlay(
