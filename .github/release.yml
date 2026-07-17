@@ -1,0 +1,32 @@
+# Controls how GitHub's automatic release notes group changes.
+# Grouping is driven by the labels on merged pull requests. If you commit
+# straight to main without PRs, GitHub falls back to a flat list of commits and
+# these categories will be mostly empty — see RELEASING.md for the caveat.
+changelog:
+  exclude:
+    labels:
+      - ignore-for-release
+    authors:
+      - dependabot
+      - github-actions
+  categories:
+    - title: 🚀 Features
+      labels:
+        - feature
+        - enhancement
+    - title: 🐛 Fixes
+      labels:
+        - bug
+        - bugfix
+    - title: ⚡ Performance
+      labels:
+        - performance
+    - title: 🧹 Maintenance & Docs
+      labels:
+        - documentation
+        - docs
+        - chore
+        - maintenance
+    - title: Other Changes
+      labels:
+        - "*"

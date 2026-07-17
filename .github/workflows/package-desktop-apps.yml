@@ -1,14 +1,36 @@
 name: Package desktop applications
 
 on:
-  workflow_dispatch:
+  workflow_dispatch:        # manual test builds (no release is created)
+  push:
+    tags:
+      - "v*"                # pushing a version tag builds and publishes a release
 
 permissions:
   contents: read
 
 jobs:
+  verify-version:
+    name: Verify tag matches package version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      # Builds read the version from the installed package metadata (i.e. from
+      # pyproject.toml), not from the tag. Fail fast if a tag is pushed that
+      # disagrees with pyproject, which would otherwise mislabel every artifact.
+      - name: Compare tag against pyproject version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          pkg="$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")"
+          if [ "v$pkg" != "${{ github.ref_name }}" ]; then
+            echo "Tag ${{ github.ref_name }} does not match pyproject version v$pkg" >&2
+            exit 1
+          fi
+          echo "Tag ${{ github.ref_name }} matches pyproject version v$pkg"
+
   macos-package:
     name: macOS ${{ matrix.architecture }} disk image
+    needs: verify-version
     strategy:
       fail-fast: false
       matrix:
@@ -46,6 +68,7 @@ jobs:
 
   windows-installer:
     name: Windows installer
+    needs: verify-version
     runs-on: windows-2025
     timeout-minutes: 90
     steps:
@@ -91,6 +114,7 @@ jobs:
 
   linux-package:
     name: Linux package
+    needs: verify-version
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     steps:
@@ -158,3 +182,36 @@ jobs:
           name: linux-deb
           path: artifacts/*.deb
           if-no-files-found: error
+
+  release:
+    name: Publish GitHub release
+    # Only publish when a version tag was pushed; manual runs still build and
+    # upload workflow artifacts above without creating a release.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [verify-version, macos-package, windows-installer, linux-package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # required to create the release and upload assets
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: dist-artifacts
+      - name: Generate SHA-256 checksums
+        run: |
+          cd dist-artifacts
+          # Checksum each packaged file (dmg/exe/deb) into one SHA256SUMS.txt
+          # using basenames, replacing the manual step. The subshell makes
+          # sha256sum record the basename rather than the download subfolder.
+          find . -type f | sort | while read -r f; do
+            ( cd "$(dirname "$f")" && sha256sum "$(basename "$f")" )
+          done > ../SHA256SUMS.txt
+          cat ../SHA256SUMS.txt
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist-artifacts/**/*
+            SHA256SUMS.txt
+          generate_release_notes: true
+          fail_on_unmatched_files: true
