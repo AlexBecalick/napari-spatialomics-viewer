@@ -1,4 +1,4 @@
-"""Tests for the micron scale-bar overlay and zoom-aware label interpolation."""
+"""Tests for scale-bar overlays and segmentation display behaviour."""
 from __future__ import annotations
 
 import os
@@ -34,7 +34,7 @@ def _fake_zoom_viewer(zoom: float, size=(1000.0, 800.0)):
     )
 
 
-def _controller(viewer, interpolation="linear"):
+def _controller(viewer, interpolation="nearest"):
     return V.ComparisonViewerController(
         viewer, {}, types.SimpleNamespace(label_interpolation=interpolation)
     )
@@ -77,29 +77,89 @@ def test_scale_bar_overlay_sizing_and_position(qapp):
     bar.repaint()
 
 
-def test_label_interpolation_toggles_with_zoom(qapp):
-    viewer = _fake_zoom_viewer(zoom=8.0)  # min(1000,800)=800; 800/8 = 100 µm <= 150
-    ctrl = _controller(viewer, "linear")
+def test_label_interpolation_stays_nearest_at_every_zoom(qapp):
+    viewer = _fake_zoom_viewer(zoom=8.0)
+    ctrl = _controller(viewer, "nearest")
     layer = types.SimpleNamespace(
         name="Segmentation | Proseg", interpolation2d="linear"
     )
     viewer.layers.append(layer)
 
     ctrl._apply_label_zoom_interpolation()
-    assert layer.interpolation2d == "nearest"  # zoomed in past 150 µm -> crisp
+    assert layer.interpolation2d == "nearest"
 
-    viewer.camera.zoom = 1.0  # 800 µm visible -> smooth
+    viewer.camera.zoom = 0.5
+    ctrl._apply_label_zoom_interpolation()
+    assert layer.interpolation2d == "nearest"
+
+
+def test_label_interpolation_respects_explicit_linear_compatibility(qapp):
+    viewer = _fake_zoom_viewer(zoom=1.0)
+    ctrl = _controller(viewer, "linear")
+    layer = types.SimpleNamespace(name="Segmentation | Seg", interpolation2d="nearest")
+    viewer.layers.append(layer)
     ctrl._apply_label_zoom_interpolation()
     assert layer.interpolation2d == "linear"
 
 
-def test_label_interpolation_respects_explicit_nearest(qapp):
-    viewer = _fake_zoom_viewer(zoom=1.0)  # 800 µm visible (would be 'linear' if auto)
-    ctrl = _controller(viewer, "nearest")
-    layer = types.SimpleNamespace(name="Segmentation | Seg", interpolation2d="nearest")
-    viewer.layers.append(layer)
-    ctrl._apply_label_zoom_interpolation()
-    assert layer.interpolation2d == "nearest"  # explicit choice not overridden
+def test_outline_coverage_colormap_keeps_partial_boundaries_readable():
+    alpha = 0.8
+    colormap = V.outline_coverage_colormap(
+        "outline",
+        np.asarray([1.0, 0.25, 0.0, 1.0], dtype=np.float32),
+        alpha=alpha,
+    )
+    mapped = colormap.map(np.asarray([0.0, 0.25, 1.0], dtype=np.float32))
+
+    assert mapped[0, 3] == pytest.approx(0.0)
+    assert mapped[1, 3] == pytest.approx(alpha * 0.5, abs=1e-3)
+    assert mapped[2, 3] == pytest.approx(alpha)
+    assert np.allclose(mapped[:, :3], np.asarray([1.0, 0.25, 0.0]))
+
+
+def test_display_pyramids_append_small_tiled_overview_levels():
+    if V.da is None:
+        pytest.skip("dask is unavailable")
+
+    labels = np.zeros((16, 16), dtype=np.uint32)
+    labels[2:14, 2:14] = 1
+    outlines = V.lazy_outline_pyramid(labels, width=1, min_size=4, max_levels=4)
+    finest = np.asarray(outlines[0].compute())
+    coarse = np.asarray(outlines[1].compute())
+    assert finest.dtype == np.uint8
+    assert finest.max() == V.OUTLINE_COVERAGE_MAX
+    assert np.any((coarse > 0) & (coarse < V.OUTLINE_COVERAGE_MAX))
+    assert max(outlines[-1].shape) <= 4
+
+    tiled = V.rechunk_raster_levels_for_display(outlines)
+    assert all(
+        max(max(chunks) for chunks in level.chunks) <= V.RASTER_DISPLAY_TILE_SIZE
+        for level in tiled
+    )
+
+    image_levels = [
+        (
+            "scale0",
+            V.xr.DataArray(
+                V.da.zeros((1, 4096, 4096), chunks=(1, 1024, 1024)),
+                dims=("c", "y", "x"),
+                coords={"c": ["DAPI"]},
+            ),
+        ),
+        (
+            "scale1",
+            V.xr.DataArray(
+                V.da.zeros((1, 2048, 2048), chunks=(1, 1024, 1024)),
+                dims=("c", "y", "x"),
+                coords={"c": ["DAPI"]},
+            ),
+        ),
+    ]
+    completed_images = V.complete_image_pyramid_for_display(image_levels)
+    assert (
+        max(completed_images[-1][1].shape[-2:])
+        <= V.SYNTHETIC_IMAGE_PYRAMID_MIN_SIZE
+    )
 
 
 def test_install_canvas_overlays_without_canvas_is_safe(qapp):
@@ -224,6 +284,7 @@ def test_label_outline_uses_thread_safe_global_dask_cache(qapp):
 
     assert added == 1
     assert captured["cache"] is True
+    assert captured["contrast_limits"] == (0.0, float(V.OUTLINE_COVERAGE_MAX))
 
 
 def test_named_object_layer_uses_string_object_ids(qapp):
