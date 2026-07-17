@@ -41,6 +41,13 @@ layers. Lazy viewport reads happen outside the GUI thread and stale requests are
 cancelled as newer camera positions arrive. This improves frame pacing and makes
 rapid image zooms less likely to expose unloaded black edge tiles.
 
+Some Qt/VisPy combinations can finish progressive startup with valid layers and
+camera extents but a stale blank OpenGL viewport. Because manually resizing a
+side dock reliably refreshes all three layout layers, the viewer performs the
+same operation imperceptibly after each startup layer batch: the Viewer Controls
+dock grows by one pixel for one frame and is restored. A few delayed retries
+cover asynchronous slicing and texture upload that settle after layer insertion.
+
 Status/progress updates from worker threads are marshalled to the GUI thread via
 Qt signals (`ViewerControlPanel.status_message` / `ViewerControlPanel.progress_message`).
 A busy progress bar with a stage label below the tabs shows which stage is
