@@ -8,17 +8,19 @@ dependencies:
   - conda-forge::pyopengl-accelerate=3.1.10
   - pip:
       - -e .[dev]
-      - dask==2025.3.0
-      - geopandas==1.0.1
+      # Storage-format stack. These must stay aligned with the MerXen pipeline
+      # that writes the .zarr stores this viewer reads; see MerXen's
+      # pyproject.toml and requirements/requirements.lock. anndata is held below
+      # 0.13 because 0.13 writes zarr v3 into groups created as zarr v2, which
+      # makes AnnData tables invisible to the readers here.
+      - anndata>=0.12,<0.13
+      - ome-zarr==0.18.0
+      - spatialdata==0.8.0
+      - zarr==3.1.6
+      # GUI stack.
       - napari==0.7.0
-      - numpy==2.2.5
-      - ome-zarr==0.12.2
-      - packaging==25.0
-      - pandas==2.2.3
-      - psutil==7.0.0
       - pyqt5==5.15.11
       - qtpy==2.4.3
-      - shapely==2.1.0
-      - spatialdata==0.7.3a1
-      - xarray==2025.3.0
-      - zarr==3.1.6
+      # dask, geopandas, numpy, pandas, shapely and xarray are deliberately left
+      # unpinned: spatialdata already constrains them, and pinning them here is
+      # what previously made this file unresolvable as those constraints moved.
