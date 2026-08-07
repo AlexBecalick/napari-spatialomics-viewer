@@ -1,22 +1,25 @@
 # Reproducible application-build environment. Keep these aligned with the
-# versions exercised by the repository's development environment.
+# versions exercised by the repository's development environment (environment.yml)
+# and with the MerXen pipeline that writes the .zarr stores this viewer reads.
+# anndata is held below 0.13: 0.13 writes zarr v3 into groups created as zarr v2,
+# which makes AnnData tables invisible to the readers here.
 -e .
-anndata==0.12.17
-dask[dataframe]==2026.1.1
-geopandas==1.0.1
-llvmlite==0.45.1
+anndata==0.12.19
+dask[dataframe]==2026.7.1
+geopandas==1.1.4
+llvmlite==0.48.0
 napari[pyqt5]==0.7.0
-numba==0.62.1
-numpy==2.2.5
-ome-zarr==0.15.0
-packaging==25.0
-pandas==2.2.3
-psutil==7.0.0
+numba==0.66.0
+numpy==2.4.6
+ome-zarr==0.18.0
+packaging==26.2
+pandas==2.3.3
+psutil==7.2.2
 PyQt5==5.15.11
 PyInstaller==6.21.0
-pytest==9.1.0
+pytest==9.1.1
 qtpy==2.4.3
-shapely==2.1.0
-spatialdata==0.7.3
-xarray==2025.3.0
+shapely==2.1.2
+spatialdata==0.8.0
+xarray==2026.7.0
 zarr==3.1.6
