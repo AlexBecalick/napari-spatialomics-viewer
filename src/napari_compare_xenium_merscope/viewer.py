@@ -322,6 +322,10 @@ class CellTypeOverlayState:
     """
 
     dataset: str
+    #: Absolute store path whose assignments are cached in this state. Dataset
+    #: names are reused when the loader opens another MERSCOPE/XENIUM store, so
+    #: the name alone is not a safe cache identity.
+    store_path: str | None = None
     segmentation: str = "proseg"
     kind: str = "broad"
     opacity: float = 0.95
@@ -5093,6 +5097,10 @@ class ComparisonViewerController:
         mem_before = memory_snapshot_gb()
         t0 = time.time()
         cfg = self.datasets[ds]
+        if force:
+            # A forced reload may follow an in-place table update. Do not reuse
+            # per-cell annotations read before that update.
+            self._cell_type_states.pop(ds, None)
         self._dataset_load_generation += 1
         generation = self._dataset_load_generation
         self._dataset_load_cancel.set()
@@ -5151,6 +5159,10 @@ class ComparisonViewerController:
         self._active_sdata = None
         self._active_images_sdata = None
         self._dataset_sessions.clear()
+        # MERSCOPE/XENIUM are presentation names, not store identities. Keeping
+        # these states would join the newly opened masks to the previous store's
+        # prefetched cell ids (usually visible first for default ProSeg).
+        self._cell_type_states.clear()
         self._update_scale_bar_visibility()
         self.datasets = datasets
         if self._datasets_changed_callback is not None:
@@ -6530,9 +6542,17 @@ class ComparisonViewerController:
 
         step = max(2, int(step))
         cache_key = derived_label_pyramid_cache_key(label_key, step)
+        source_cache_attrs = self._label_cache_attrs(label_key)
         expected = {
             "kind": "label_pyramid",
             "source_label_key": str(label_key),
+            # A label cache format change can alter the meaning of every pixel
+            # without changing its key or shape. In particular, label-cache v1
+            # used positional polygon numbers while v2 uses true instance ids.
+            # Tie the derived pyramid to that source format so a stale v1
+            # pyramid is rebuilt along with the v2 base raster.
+            "source_label_cache_version": source_cache_attrs.get("version"),
+            "source_shape_key": source_cache_attrs.get("source_shape_key"),
             "downsample": int(step),
             "min_size": int(LABEL_OUTLINE_PYRAMID_MIN_SIZE),
         }
@@ -6671,8 +6691,8 @@ class ComparisonViewerController:
                 for key, value in shapes_sdata.shapes.items():
                     self._active_sdata.shapes[key] = value
 
-        # Trust an external mask, but rebuild a stale viewer cache (v1 used
-        # positional id+1, which mis-joined the per-cell value overlay).
+        # This ``*_labels`` name is viewer-generated, so require its cache
+        # marker. Markerless legacy caches may still use positional id+1.
         if (
             not self.args.overwrite_labels
             and (
@@ -6680,8 +6700,7 @@ class ComparisonViewerController:
                 or self._refresh_label_key_from_store(CELLPOSE_LABEL_KEY)
             )
         ):
-            cache_attrs = self._label_cache_attrs(CELLPOSE_LABEL_KEY)
-            if not cache_attrs or self._label_cache_is_complete(CELLPOSE_LABEL_KEY, CELLPOSE_SHAPE_KEY):
+            if self._label_cache_is_complete(CELLPOSE_LABEL_KEY, CELLPOSE_SHAPE_KEY):
                 return CELLPOSE_LABEL_KEY
 
         return self.ensure_label_for_shape_key(
@@ -8488,10 +8507,19 @@ class ComparisonViewerController:
     # -- Cell-type mask colouring ------------------------------------------
     def _cell_type_state(self, dataset_name: str) -> CellTypeOverlayState:
         ds = str(dataset_name).upper()
+        cfg = self.datasets.get(ds)
+        zarr_path = getattr(cfg, "zarr_path", None)
+        store_path = (
+            str(Path(zarr_path).expanduser().absolute())
+            if zarr_path is not None
+            else None
+        )
         state = self._cell_type_states.get(ds)
-        if state is None:
+        if state is None or state.store_path != store_path:
             state = CellTypeOverlayState(
-                dataset=ds, opacity=float(getattr(self.args, "shape_opacity", 0.95))
+                dataset=ds,
+                store_path=store_path,
+                opacity=float(getattr(self.args, "shape_opacity", 0.95)),
             )
             self._cell_type_states[ds] = state
         return state
@@ -8754,9 +8782,10 @@ class ComparisonViewerController:
         ``segmentation`` is a cell-type source key; the mask it colours is resolved
         via :meth:`_mask_shape_key_for_source`. An externally-authored label mask
         (no viewer cache marker) is trusted -- its pixel ids are already the
-        instance keys. A viewer-built cache is reused only when it is the current
-        version; a stale one (v1 used positional ``id+1``) is rebuilt so the raster
-        pixel ids match the instance keys the cell-type overlay joins on.
+        instance keys. A viewer-built ``<shape>_labels`` cache is reused only when
+        it has the current marker; a stale or markerless legacy cache (v1 used
+        positional ``id+1``) is rebuilt so raster pixels match the instance keys
+        the cell-type overlay joins on.
         """
         self._raise_if_task_cancelled(cancel_check, expected_dataset)
         if self._active_sdata is None:
@@ -8772,8 +8801,11 @@ class ComparisonViewerController:
             not self.args.overwrite_labels
             and (label_key in self._active_sdata.labels or self._refresh_label_key_from_store(label_key))
         ):
-            cache_attrs = self._label_cache_attrs(label_key)
-            if not cache_attrs or self._label_cache_is_complete(label_key, shape_key):
+            # An exact-name label is upstream-authored and can be trusted without
+            # our private marker. A generated ``*_labels`` element cannot: old
+            # viewer releases wrote precisely that name with positional ids.
+            exact_external_label = label_key == shape_key
+            if exact_external_label or self._label_cache_is_complete(label_key, shape_key):
                 return label_key
         return self.ensure_label_for_shape_key(
             shape_key,
