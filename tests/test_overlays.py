@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import types
+from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -437,6 +438,90 @@ def test_cell_type_overlay_fills_masks_by_broad_type(qapp, monkeypatch):
     assert np.array_equal(color_dict[1], color_dict[2])
     assert np.array_equal(color_dict[3], color_dict[4])
     assert not np.array_equal(color_dict[1], color_dict[3])
+
+
+def test_cell_type_state_is_scoped_to_store_path(qapp, monkeypatch):
+    from napari_compare_xenium_merscope.utils import CellTypeAssignments
+
+    _viewer, ctrl = _cell_type_controller_with_synthetic_store(qapp, monkeypatch)
+    old = ctrl._cell_type_state("MERSCOPE")
+    ctrl._cache_cell_type_data(
+        old,
+        "proseg",
+        CellTypeAssignments(
+            segmentation="proseg",
+            table_key="old",
+            instance_key="cell",
+            cell_ids=np.array([91], dtype=np.int64),
+            broad=np.array(["Old store"]),
+            fine=np.array(["Old store:0"]),
+        ),
+    )
+
+    # Dataset-loader replacements reuse the presentation name MERSCOPE. The
+    # cached assignments must not follow that name to a different Zarr store.
+    ctrl.datasets["MERSCOPE"] = V.DatasetConfig(
+        name="MERSCOPE", zarr_path=Path("/a/different/store.zarr")
+    )
+    new = ctrl._cell_type_state("MERSCOPE")
+
+    assert new is not old
+    assert new.store_path.endswith("/a/different/store.zarr")
+    assert new.assignments == {}
+
+
+def test_label_pyramid_cache_tracks_source_label_id_version(qapp, monkeypatch):
+    _viewer, ctrl = _cell_type_controller_with_synthetic_store(qapp, monkeypatch)
+    cache_key = V.derived_label_pyramid_cache_key("MOSAIK_proseg_labels", 4)
+    ctrl._active_sdata = types.SimpleNamespace(labels={cache_key: object()})
+    captured = {}
+
+    monkeypatch.setattr(
+        ctrl,
+        "_label_cache_attrs",
+        lambda _key: {"version": 2, "source_shape_key": "MOSAIK_proseg"},
+    )
+
+    def cache_complete(_element_type, _key, expected, _dataset):
+        captured.update(expected)
+        return True
+
+    monkeypatch.setattr(ctrl, "_derived_cache_complete", cache_complete)
+    monkeypatch.setattr(ctrl, "_refresh_label_key_from_store", lambda *a, **k: True)
+    monkeypatch.setattr(ctrl, "_label_pyramid_levels_from_element", lambda _elem: ["coarse"])
+
+    assert ctrl._ensure_label_pyramid_cache("MOSAIK_proseg_labels", 4) == ["coarse"]
+    assert captured["source_label_cache_version"] == 2
+    assert captured["source_shape_key"] == "MOSAIK_proseg"
+
+
+def test_markerless_generated_label_cache_is_rebuilt(qapp, monkeypatch):
+    from napari.components import ViewerModel
+
+    ctrl = V.ComparisonViewerController(
+        ViewerModel(),
+        {"MERSCOPE": V.DatasetConfig(name="MERSCOPE", zarr_path=Path("/store.zarr"))},
+        types.SimpleNamespace(
+            overwrite_labels=False,
+            shape_opacity=0.9,
+            background_io_workers=1,
+        ),
+    )
+    ctrl.active_dataset = "MERSCOPE"
+    ctrl._active_sdata = types.SimpleNamespace(
+        shapes={"MOSAIK_proseg": object()},
+        labels={"MOSAIK_proseg_labels": object()},
+    )
+    rebuilt = []
+    monkeypatch.setattr(ctrl, "_label_cache_is_complete", lambda *_args: False)
+    monkeypatch.setattr(
+        ctrl,
+        "ensure_label_for_shape_key",
+        lambda key, **_kwargs: rebuilt.append(key) or f"{key}_labels",
+    )
+
+    assert ctrl._ensure_label_key_for_segmentation("proseg") == "MOSAIK_proseg_labels"
+    assert rebuilt == ["MOSAIK_proseg"]
 
 
 def test_cell_type_overlay_toggle_and_level_and_opacity(qapp, monkeypatch):
