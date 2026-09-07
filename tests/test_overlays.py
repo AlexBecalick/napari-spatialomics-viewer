@@ -422,9 +422,23 @@ def _labels_layer(viewer):
 def test_cell_type_overlay_fills_masks_by_broad_type(qapp, monkeypatch):
     viewer, ctrl = _cell_type_controller_with_synthetic_store(qapp, monkeypatch)
 
+    recolors = 0
+    original_recolor = ctrl._recolor_cell_type_layer
+
+    def record_recolor(state):
+        nonlocal recolors
+        recolors += 1
+        return original_recolor(state)
+
+    monkeypatch.setattr(ctrl, "_recolor_cell_type_layer", record_recolor)
+
     ctrl.set_cell_type_kind("MERSCOPE", "broad")
 
     layer = _labels_layer(viewer)
+    # Creation re-applies the direct colormap once the layer is registered. This
+    # is the refresh that prevents a lazy layer staying blank until Show all is
+    # toggled.
+    assert recolors == 1
     assert layer.opacity == pytest.approx(0.9)
     color_dict = layer.colormap.color_dict
     # Background (0) + unmapped (None) transparent; the 4 annotated cells coloured.
