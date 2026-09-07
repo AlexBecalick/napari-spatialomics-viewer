@@ -8770,6 +8770,46 @@ class ComparisonViewerController:
             return False
         return True
 
+    def _refresh_cell_type_layer_after_load(self, state: CellTypeOverlayState, layer) -> None:
+        """Re-apply a new direct colormap after napari finishes its first slice.
+
+        With large lazy Labels layers, napari can finish the initial dask slice
+        after the DirectLabelColormap supplied to ``add_labels`` was installed.
+        The canvas then remains blank until a checkbox change assigns another
+        colormap. Re-applying it once immediately and once after ``loaded`` makes
+        the first Broad/Fine click visible without user interaction.
+        """
+
+        def refresh_if_current():
+            current = self._get_layer_by_name(state.layer_name) if state.layer_name else None
+            if self.active_dataset != state.dataset or current is not layer:
+                return
+            self._recolor_cell_type_layer(state)
+            try:
+                layer.refresh()
+            except Exception as exc:
+                log.debug("Could not refresh cell-type overlay after load: %s", exc)
+            self._force_canvas_redraw()
+
+        # This also handles eager/in-memory layers, for which no later loaded
+        # transition may be emitted by a headless or model-only viewer.
+        refresh_if_current()
+
+        loaded_event = getattr(getattr(layer, "events", None), "loaded", None)
+        if loaded_event is None or bool(getattr(layer, "loaded", True)):
+            return
+
+        def on_loaded(_event=None):
+            if not bool(getattr(layer, "loaded", True)):
+                return
+            try:
+                loaded_event.disconnect(on_loaded)
+            except Exception:
+                pass
+            QTimer.singleShot(0, refresh_if_current)
+
+        loaded_event.connect(on_loaded, ref=False)
+
     def _ensure_label_key_for_segmentation(
         self,
         segmentation: str,
@@ -8909,6 +8949,7 @@ class ComparisonViewerController:
         self._send_cell_types_below_transcripts(layer)
         state.layer_name = name
         state.label_key = label_key
+        self._refresh_cell_type_layer_after_load(state, layer)
         assignments = state.assignments.get(state.segmentation)
         kind = state.kind or "broad"
         n_shown = len(state.enabled[state.segmentation][kind])
