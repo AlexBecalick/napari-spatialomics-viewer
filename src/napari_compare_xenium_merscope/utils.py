@@ -6,6 +6,7 @@ from __future__ import annotations
 import colorsys
 import json
 import logging
+import os
 import re
 from dataclasses import dataclass
 from hashlib import blake2s
@@ -1853,6 +1854,7 @@ _CONTROL_GENE_PATTERNS = (
     "intergenic",
     "deprecated",
     "unassigned_codeword",
+    "unassignedcodeword",
     "genomic_control",
 )
 
@@ -1940,6 +1942,7 @@ CELL_TYPE_BROAD_COL = "broad_cell_type"
 CELL_TYPE_FINE_COL = "fine_cell_type"
 CELL_TYPE_MARKER_UNS_KEY = "cell_type_marker_reference"
 CONTROL_GROUP_TITLE = "Control / blank probes"
+UNCLASSIFIED_GROUP_TITLE = "Unclassified"
 
 COARSE_CELL_TYPE_ORDER = (
     "Astrocyte",
@@ -1973,7 +1976,38 @@ FUNCTIONAL_GROUP_HUES = {
 }
 #: Broad groups rendered as neutral greys rather than a colour family (controls
 #: and the catch-all functional bucket).
-GREY_GROUP_TITLES = {CONTROL_GROUP_TITLE, "Other / signalling"}
+GREY_GROUP_TITLES = {CONTROL_GROUP_TITLE, UNCLASSIFIED_GROUP_TITLE, "Other / signalling"}
+
+
+@dataclass(frozen=True)
+class MarkerReferenceResolution:
+    """A panel-matched marker reference plus user-facing provenance."""
+
+    reference: dict[str, dict[str, str]] | None
+    source: str = ""
+    panel_fingerprint: str = ""
+    panel_gene_count: int = 0
+    matched_gene_count: int = 0
+    broad_gene_count: int = 0
+    fine_gene_count: int = 0
+    warnings: tuple[str, ...] = ()
+
+    @property
+    def broad_available(self) -> bool:
+        return self.broad_gene_count > 0
+
+    @property
+    def fine_available(self) -> bool:
+        return self.fine_gene_count > 0
+
+    @property
+    def summary(self) -> str:
+        if self.reference is None:
+            return "No cell-type marker reference matched this gene panel."
+        return (
+            f"Cell-type reference: {self.source} "
+            f"({self.matched_gene_count}/{self.panel_gene_count} panel genes classified)."
+        )
 
 
 @dataclass
@@ -2076,7 +2110,11 @@ def _symbols_by_broad(genes: Iterable[str], reference: Mapping[str, dict]) -> di
     grouped: dict[str, list[str]] = {}
     for gene in genes:
         info = reference.get(str(gene))
-        broad = info["broad"] if info else CONTROL_GROUP_TITLE
+        broad = (
+            info["broad"]
+            if info
+            else CONTROL_GROUP_TITLE if is_control_gene(gene) else UNCLASSIFIED_GROUP_TITLE
+        )
         grouped.setdefault(broad, []).append(str(gene))
     symbols: dict[str, str] = {}
     for names in grouped.values():
@@ -2086,16 +2124,21 @@ def _symbols_by_broad(genes: Iterable[str], reference: Mapping[str, dict]) -> di
 
 
 def _coarse_groups(genes: Iterable[str], reference: Mapping[str, dict]) -> list[tuple[str, list[str]]]:
-    """Ordered ``(broad, genes)`` sections, broad types alphabetical, controls last."""
+    """Ordered ``(broad, genes)`` sections, with unclassified/control tails."""
     by_broad: dict[str, list[str]] = {}
+    unclassified: list[str] = []
     controls: list[str] = []
     for gene in genes:
         info = reference.get(str(gene))
         if info:
             by_broad.setdefault(info["broad"], []).append(str(gene))
-        else:
+        elif is_control_gene(gene):
             controls.append(str(gene))
+        else:
+            unclassified.append(str(gene))
     groups = [(broad, sorted(by_broad[broad])) for broad in sorted(by_broad)]
+    if unclassified:
+        groups.append((UNCLASSIFIED_GROUP_TITLE, sorted(unclassified)))
     if controls:
         groups.append((CONTROL_GROUP_TITLE, sorted(controls)))
     return groups
@@ -2106,17 +2149,24 @@ def _fine_groups(
 ) -> list[tuple[str, str, str, list[str]]]:
     """Ordered ``(title, broad, fine, genes)`` sections by (broad, fine) alphabetical."""
     keyed: dict[tuple[str, str], list[str]] = {}
+    unclassified: list[str] = []
     controls: list[str] = []
     for gene in genes:
         info = reference.get(str(gene))
         if info:
             keyed.setdefault((info["broad"], info["fine"]), []).append(str(gene))
-        else:
+        elif is_control_gene(gene):
             controls.append(str(gene))
+        else:
+            unclassified.append(str(gene))
     groups: list[tuple[str, str, str, list[str]]] = []
     for broad, fine in sorted(keyed):
         title = f"{broad} — {fine}" if fine else broad
         groups.append((title, broad, fine, sorted(keyed[(broad, fine)])))
+    if unclassified:
+        groups.append(
+            (UNCLASSIFIED_GROUP_TITLE, UNCLASSIFIED_GROUP_TITLE, "", sorted(unclassified))
+        )
     if controls:
         groups.append((CONTROL_GROUP_TITLE, CONTROL_GROUP_TITLE, "", sorted(controls)))
     return groups
@@ -2153,9 +2203,9 @@ def build_cell_type_gene_visuals(
 
     ``kind="coarse"`` gives each broad type one hue (shaded per gene); ``"fine"``
     gives each fine subtype its own hue near its broad type's hue. Symbols are the
-    same in both. Genes absent from ``reference`` (e.g. controls) form a trailing
-    grey group. Falls back to :func:`assign_gene_visuals` when no reference genes
-    match, so callers get a usable scheme regardless.
+    same in both. Unmatched biological genes and control/codeword probes form
+    separate trailing grey groups. Falls back to :func:`assign_gene_visuals` when
+    no reference genes match, so callers get a usable scheme regardless.
     """
     names = sorted({str(g) for g in genes})
     ref = _normalize_reference(reference)
@@ -2198,17 +2248,38 @@ def build_cell_type_gene_visuals(
     return GeneVisualScheme(kind=str(kind), visuals=visuals, groups=display_groups)
 
 
+def _reference_from_frame(frame: Any) -> dict[str, dict[str, str]]:
+    """Read marker columns from an AnnData ``obs`` or ``var`` frame."""
+    if frame is None or CELL_TYPE_BROAD_COL not in getattr(frame, "columns", []):
+        return {}
+    out: dict[str, dict[str, str]] = {}
+    fine_present = CELL_TYPE_FINE_COL in frame.columns
+    for gene, broad in frame[CELL_TYPE_BROAD_COL].items():
+        if broad is None or (isinstance(broad, float) and np.isnan(broad)):
+            continue
+        text = str(broad).strip()
+        if not text or text.lower() in _MISSING_LABEL_TEXTS:
+            continue
+        fine = str(frame[CELL_TYPE_FINE_COL].get(gene, "")).strip() if fine_present else ""
+        out[str(gene)] = {
+            "broad": text,
+            "fine": "" if fine.lower() in _MISSING_LABEL_TEXTS else fine,
+        }
+    return out
+
+
 def load_cell_type_marker_reference(source: Any) -> dict[str, dict[str, str]] | None:
-    """Load a marker reference from a SpatialData object, AnnData table, or path.
+    """Load an embedded marker reference from SpatialData/AnnData or a store path.
 
     Looks (in order) for a ``cell_type_marker_reference`` entry in the table's
     ``uns``, then for ``broad_cell_type`` / ``fine_cell_type`` columns in the
-    table's ``var``. Returns ``{gene: {"broad", "fine"}}`` or ``None`` if absent.
-    Never raises -- a missing or older store simply yields ``None``.
+    table's ``obs`` or ``var``. Returns ``{gene: {"broad", "fine"}}`` or ``None``
+    if absent. Read failures are logged and treated as an absent reference.
     """
     try:
         table = _resolve_marker_table(source)
-    except Exception:
+    except Exception as exc:
+        log.warning("Could not inspect cell-type marker reference in %s: %s", source, exc)
         return None
     if table is None:
         return None
@@ -2219,21 +2290,142 @@ def load_cell_type_marker_reference(source: Any) -> dict[str, dict[str, str]] | 
         if ref:
             return ref
 
-    var = getattr(table, "var", None)
-    if var is not None and CELL_TYPE_BROAD_COL in getattr(var, "columns", []):
-        out: dict[str, dict[str, str]] = {}
-        fine_present = CELL_TYPE_FINE_COL in var.columns
-        for gene, broad in var[CELL_TYPE_BROAD_COL].items():
-            if broad is None or (isinstance(broad, float) and np.isnan(broad)):
-                continue
-            text = str(broad).strip()
-            if not text or text.lower() in ("nan", "none", ""):
-                continue
-            fine = str(var[CELL_TYPE_FINE_COL].get(gene, "")) if fine_present else ""
-            out[str(gene)] = {"broad": text, "fine": "" if fine.lower() in ("nan", "none") else fine}
+    # Dedicated marker tables conventionally put one gene per obs row. Older
+    # stores used var rows, so retain both encodings.
+    for frame_name in ("obs", "var"):
+        out = _reference_from_frame(getattr(table, frame_name, None))
         if out:
             return out
     return None
+
+
+def gene_panel_fingerprint(genes: Iterable[Any]) -> str:
+    """Stable identity for a biological panel, excluding controls/codewords."""
+    names = sorted({str(gene).strip() for gene in genes if not is_control_gene(gene)})
+    return blake2s("\n".join(names).encode("utf-8"), digest_size=16).hexdigest()
+
+
+def _load_marker_reference_file(path: Path) -> tuple[dict[str, dict[str, str]], dict[str, Any]]:
+    """Read a standalone JSON/CSV marker reference and its metadata."""
+    if path.suffix.lower() == ".json":
+        raw = json.loads(path.read_text())
+        return _normalize_reference(raw), raw if isinstance(raw, Mapping) else {}
+    frame = pd.read_csv(path)
+    gene_col = next((name for name in ("gene", "feature_name", "target") if name in frame), None)
+    if gene_col is None or CELL_TYPE_BROAD_COL not in frame:
+        raise ValueError("expected gene and broad_cell_type columns")
+    frame = frame.set_index(gene_col)
+    return _reference_from_frame(frame), {}
+
+
+def _reference_resolution(
+    reference: Mapping[str, Any] | None,
+    genes: Iterable[Any],
+    *,
+    source: str,
+    warnings: Iterable[str] = (),
+) -> MarkerReferenceResolution | None:
+    """Align one candidate reference to actual panel spelling and measure coverage."""
+    normalized = _normalize_reference(reference)
+    panel_genes = sorted({str(g).strip() for g in genes if not is_control_gene(g)})
+    folded: dict[str, dict[str, str] | None] = {}
+    for name, info in normalized.items():
+        key = name.casefold()
+        folded[key] = info if key not in folded else None
+    matched: dict[str, dict[str, str]] = {}
+    for gene in panel_genes:
+        info = normalized.get(gene)
+        if info is None:
+            info = folded.get(gene.casefold())
+        if info:
+            matched[gene] = dict(info)
+    if not matched:
+        return None
+    return MarkerReferenceResolution(
+        reference=matched,
+        source=str(source),
+        panel_fingerprint=gene_panel_fingerprint(panel_genes),
+        panel_gene_count=len(panel_genes),
+        matched_gene_count=len(matched),
+        broad_gene_count=sum(bool(info.get("broad")) for info in matched.values()),
+        fine_gene_count=sum(bool(info.get("fine")) for info in matched.values()),
+        warnings=tuple(str(item) for item in warnings),
+    )
+
+
+def _marker_reference_sidecars(zarr_path: Path) -> list[Path]:
+    directories = [zarr_path.parent, zarr_path.parent.parent]
+    paths: list[Path] = []
+    for directory in directories:
+        for suffix in ("json", "csv"):
+            candidate = directory / f"{CELL_TYPE_MARKER_UNS_KEY}.{suffix}"
+            if candidate.is_file() and candidate not in paths:
+                paths.append(candidate)
+    return paths
+
+
+def _bundled_marker_reference_files() -> list[Path]:
+    directory = Path(__file__).parent / "resources" / "cell_type_marker_references"
+    paths = sorted(directory.glob("*.json")) if directory.is_dir() else []
+    configured = os.environ.get("NAPARI_COMPARE_MARKER_REFERENCE_DIR", "")
+    for value in configured.split(os.pathsep):
+        external = Path(value).expanduser() if value else None
+        if external is not None and external.is_dir():
+            paths.extend(path for path in sorted(external.glob("*.json")) if path not in paths)
+    return paths
+
+
+def resolve_cell_type_marker_reference(
+    zarr_path: str | Path | None,
+    genes: Iterable[Any],
+) -> MarkerReferenceResolution:
+    """Resolve embedded, sidecar, or bundled metadata for an exact gene panel.
+
+    Store-local metadata wins. Bundled catalogue entries are selected only by
+    exact panel fingerprint, so similarly named samples cannot silently receive
+    an incompatible reference.
+    """
+    panel_genes = tuple(str(g).strip() for g in genes if not is_control_gene(g))
+    fingerprint = gene_panel_fingerprint(panel_genes)
+    problems: list[str] = []
+    path = Path(zarr_path) if zarr_path is not None else None
+
+    if path is not None:
+        embedded = load_cell_type_marker_reference(path)
+        resolution = _reference_resolution(embedded, panel_genes, source="embedded SpatialData table")
+        if resolution is not None:
+            return resolution
+
+        for candidate in _marker_reference_sidecars(path):
+            try:
+                reference, _metadata = _load_marker_reference_file(candidate)
+                resolution = _reference_resolution(reference, panel_genes, source=str(candidate))
+            except Exception as exc:
+                problems.append(f"Could not read {candidate}: {exc}")
+                log.warning(problems[-1])
+                continue
+            if resolution is not None:
+                return resolution
+
+    for candidate in _bundled_marker_reference_files():
+        try:
+            reference, metadata = _load_marker_reference_file(candidate)
+        except Exception as exc:
+            problems.append(f"Could not read bundled reference {candidate.name}: {exc}")
+            log.warning(problems[-1])
+            continue
+        if str(metadata.get("panel_fingerprint", "")) != fingerprint:
+            continue
+        resolution = _reference_resolution(reference, panel_genes, source=f"bundled {candidate.name}")
+        if resolution is not None:
+            return resolution
+
+    return MarkerReferenceResolution(
+        reference=None,
+        panel_fingerprint=fingerprint,
+        panel_gene_count=len(set(panel_genes)),
+        warnings=tuple(problems),
+    )
 
 
 def _resolve_marker_table(source: Any):
@@ -2259,12 +2451,18 @@ def _resolve_marker_table(source: Any):
         for key in ordered_keys:
             if key not in table_keys:
                 continue
-            table = ad.read_zarr(str(path / "tables" / key))
+            try:
+                table = ad.read_zarr(str(path / "tables" / key))
+            except Exception as exc:
+                log.warning("Could not read marker candidate table %s in %s: %s", key, path, exc)
+                continue
             uns = getattr(table, "uns", {})
+            obs = getattr(table, "obs", None)
             var = getattr(table, "var", None)
             has_uns = isinstance(uns, Mapping) and CELL_TYPE_MARKER_UNS_KEY in uns
+            has_obs = obs is not None and CELL_TYPE_BROAD_COL in getattr(obs, "columns", [])
             has_var = var is not None and CELL_TYPE_BROAD_COL in getattr(var, "columns", [])
-            if has_uns or has_var:
+            if has_uns or has_obs or has_var:
                 return table
         return None
     tables = getattr(source, "tables", None)
@@ -2274,10 +2472,12 @@ def _resolve_marker_table(source: Any):
             if table is None:
                 continue
             uns = getattr(table, "uns", {})
+            obs = getattr(table, "obs", None)
             var = getattr(table, "var", None)
             has_uns = isinstance(uns, Mapping) and CELL_TYPE_MARKER_UNS_KEY in uns
+            has_obs = obs is not None and CELL_TYPE_BROAD_COL in getattr(obs, "columns", [])
             has_var = var is not None and CELL_TYPE_BROAD_COL in getattr(var, "columns", [])
-            if has_uns or has_var:
+            if has_uns or has_obs or has_var:
                 return table
         return tables.get("table")
     return source  # assume already an AnnData-like table
@@ -2773,6 +2973,7 @@ def build_gene_point_groups(
     background_col: str | None = None,
     gene_visuals: Mapping[str, GeneVisual] | None = None,
     reference: Mapping[str, Any] | None = None,
+    reference_resolver: Callable[[Iterable[str]], Mapping[str, Any] | None] | None = None,
     max_points: int | None = None,
     random_state: int = 42,
     alpha: float = 1.0,
@@ -2835,6 +3036,8 @@ def build_gene_point_groups(
         return _empty_gene_point_store()
 
     source_genes = sorted(source_gene_counts)
+    if reference is None and reference_resolver is not None:
+        reference = reference_resolver(source_genes)
     gene_to_code = {name: index for index, name in enumerate(source_genes)}
     gene_code_dtype = _unsigned_code_dtype(len(source_genes))
 

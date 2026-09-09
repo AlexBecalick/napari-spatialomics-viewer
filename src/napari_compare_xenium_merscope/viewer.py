@@ -163,7 +163,7 @@ from .utils import (
     cell_type_source,
     clustering_table_key_for_segmentation,
     load_cell_type_assignments,
-    load_cell_type_marker_reference,
+    resolve_cell_type_marker_reference,
     build_cell_transcript_index,
     darken_rgba,
     mean_intensity_in_polygon,
@@ -303,6 +303,10 @@ class GeneInspectorState:
     #: picked (coarse/fine/alphabetical); ``color_kind`` is which scheme's colours
     #: are currently painted on the points (A–Z keeps whichever was last applied).
     reference: dict | None = None
+    reference_source: str = ""
+    reference_summary: str = ""
+    broad_ordering_available: bool = False
+    fine_ordering_available: bool = False
     coarse_scheme: object | None = None       # utils.GeneVisualScheme
     fine_scheme: object | None = None          # utils.GeneVisualScheme
     ordering: str = "coarse"
@@ -2217,15 +2221,29 @@ class GeneInspectorWidget(QWidget):
     def spot_size(self) -> float:
         return self._slider_to_spot_size(self._spot_slider.value())
 
-    def set_ordering_available(self, available: bool, ordering: str = "coarse"):
-        """Enable/disable the broad/fine ordering buttons (off with no reference)."""
+    def set_ordering_available(
+        self,
+        broad_available: bool,
+        ordering: str = "coarse",
+        fine_available: bool | None = None,
+        reference_summary: str = "",
+    ):
+        """Enable broad/fine independently and expose reference diagnostics."""
+        if fine_available is None:  # backwards-compatible single availability flag
+            fine_available = broad_available
         self._ordering = str(ordering)
         for kind, button in self._order_buttons.items():
             button.blockSignals(True)
-            # A–Z always works; broad/fine only when a marker reference exists.
-            button.setEnabled(bool(available) or kind == "alphabetical")
+            available = {
+                "coarse": bool(broad_available),
+                "fine": bool(fine_available),
+                "alphabetical": True,
+            }[kind]
+            button.setEnabled(available)
             button.setChecked(kind == self._ordering)
+            button.setToolTip(reference_summary)
             button.blockSignals(False)
+        self._order_label.setToolTip(reference_summary)
         self._order_label.setVisible(True)
 
     def populate(
@@ -7131,11 +7149,18 @@ class ComparisonViewerController:
 
         def compute():
             t0 = time.time()
-            # Group genes by the cell type they mark when the store carries a
-            # marker reference; otherwise fall back to the deterministic rainbow.
+            resolution = None
+
+            def resolve_reference(genes):
+                nonlocal resolution
+                resolution = resolve_cell_type_marker_reference(zarr_path, genes)
+                return resolution.reference
+
+            # The transcript store's first streaming pass discovers the exact
+            # panel, then resolves embedded/sidecar/bundled reference metadata
+            # before symbols and point groups are assigned.
             with self._store_io_slots:
                 self._raise_if_task_cancelled(cancel_token.is_set, ds)
-                reference = load_cell_type_marker_reference(zarr_path) if zarr_path is not None else None
                 store = build_gene_point_groups(
                     points_obj,
                     x_col=x_col,
@@ -7143,7 +7168,7 @@ class ComparisonViewerController:
                     gene_col=gene_col,
                     assignment_col=assignment_col,
                     background_col=background_col,
-                    reference=reference,
+                    reference_resolver=resolve_reference,
                     max_points=max_points if max_points > 0 else None,
                     random_state=random_state,
                     build_cell_index=assignment_col is not None,
@@ -7152,7 +7177,8 @@ class ComparisonViewerController:
             return {
                 "points_key": points_key,
                 "store": store,
-                "reference": reference,
+                "reference": None if resolution is None else resolution.reference,
+                "reference_resolution": resolution,
                 "build_seconds": time.time() - t0,
             }
 
@@ -7203,14 +7229,20 @@ class ComparisonViewerController:
             return
 
         reference = payload.get("reference")
+        resolution = payload.get("reference_resolution")
         # Two precomputed schemes over the same symbols (so switching only
         # recolours). Without a reference both fall back to the rainbow and only
         # A–Z ordering is offered.
         coarse_scheme = build_cell_type_gene_visuals(store.genes, reference, kind="coarse")
         fine_scheme = build_cell_type_gene_visuals(store.genes, reference, kind="fine")
-        has_reference = bool(reference)
+        broad_available = bool(
+            reference and any(bool(info.get("broad")) for info in reference.values())
+        )
+        fine_available = bool(
+            reference and any(bool(info.get("fine")) for info in reference.values())
+        )
         gene_visuals = store.gene_visuals or coarse_scheme.visuals
-        ordering = "coarse" if has_reference else "alphabetical"
+        ordering = "coarse" if broad_available else "fine" if fine_available else "alphabetical"
 
         hide_assigned = bool(getattr(self.args, "gene_hide_assigned", False))
         hide_background = bool(getattr(self.args, "gene_hide_background", False))
@@ -7239,6 +7271,14 @@ class ComparisonViewerController:
                 np.zeros(len(coords), dtype=bool) for coords in store.group_coords
             ],
             reference=reference,
+            reference_source=getattr(resolution, "source", ""),
+            reference_summary=getattr(
+                resolution,
+                "summary",
+                "No cell-type marker reference matched this gene panel.",
+            ),
+            broad_ordering_available=broad_available,
+            fine_ordering_available=fine_available,
             coarse_scheme=coarse_scheme,
             fine_scheme=fine_scheme,
             ordering=ordering,
@@ -7283,8 +7323,10 @@ class ComparisonViewerController:
         source_total = int(store.source_total_points if store.source_total_points is not None else store.total_points)
         self._set_status("Click on any transcript to highlight that gene")
         log.info(
-            "[%s] Gene inspector: genes=%s source_points=%s rendered_points=%s layers=%s sampled=%s build=%.1fs",
+            "[%s] Gene inspector: genes=%s source_points=%s rendered_points=%s layers=%s "
+            "sampled=%s reference=%s build=%.1fs",
             ds, len(store.genes), source_total, store.total_points, len(layer_names), store.sampled,
+            getattr(resolution, "summary", "none"),
             float(payload.get("build_seconds", 0.0)),
         )
         self._evict_dataset_sessions()
@@ -8496,7 +8538,12 @@ class ComparisonViewerController:
             return
         store = state.store
         layout, labels = self._gene_ordering_layout(state)
-        widget.set_ordering_available(bool(state.reference), state.ordering)
+        widget.set_ordering_available(
+            state.broad_ordering_available,
+            state.ordering,
+            fine_available=state.fine_ordering_available,
+            reference_summary=state.reference_summary,
+        )
         widget.populate(
             state.dataset,
             layout,
@@ -8525,6 +8572,10 @@ class ComparisonViewerController:
             return
         kind = str(kind)
         if kind in ("coarse", "fine"):
+            if kind == "coarse" and not state.broad_ordering_available:
+                return
+            if kind == "fine" and not state.fine_ordering_available:
+                return
             scheme = state.coarse_scheme if kind == "coarse" else state.fine_scheme
             if scheme is None:
                 return
