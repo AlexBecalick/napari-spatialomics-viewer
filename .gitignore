@@ -9,3 +9,4 @@ __pycache__/
 artifacts/
 build/
 dist/
+/src/napari_compare_xenium_merscope/resources/cell_type_marker_references/
