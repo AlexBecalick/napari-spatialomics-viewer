@@ -240,10 +240,21 @@ Marker shapes are stable across all three modes, so only the colours change when
 switching — the same transcript keeps its shape. Without a reference the panel
 falls back to the flat alphabetical rainbow (only **A–Z** is available).
 
-The reference is a standalone data artefact produced outside this package (the
-viewer only *reads* it). For the P7513 panel it was written both as
-`cell_type_marker_reference.{csv,json}` beside the `.zarr` and as the
-`cell_type_marker_reference` table element inside the store.
+Reference discovery is panel-based rather than sample-name-based. The viewer
+checks, in order, an embedded `cell_type_marker_reference` table, JSON/CSV
+sidecars beside the store (and one directory above it), and the bundled
+catalogue in `src/napari_compare_xenium_merscope/resources/`. Bundled entries
+are accepted only when their fingerprint exactly matches the store's complete
+non-control gene panel. Hover over an ordering button to see the selected source
+and coverage. Partially mapped biological genes appear under **Unclassified**,
+separately from control/codeword probes.
+
+The catalogue contains portable JSON and CSV references for the P-series
+MERSCOPE and Xenium panels, NMV2P35-18, ag7, and the Vizgen 815-gene mouse-brain
+panel. Rebuild the portable files with `scripts/build_marker_reference_catalog.py`
+and inject one into one or more SpatialData stores with
+`scripts/inject_marker_reference.py`. Set
+`NAPARI_COMPARE_MARKER_REFERENCE_DIR` to add an external catalogue directory.
 
 ### Cell inspector
 
