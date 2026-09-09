@@ -14,9 +14,13 @@ import zarr
 from napari_compare_xenium_merscope.utils import (
     COARSE_CELL_TYPE_HUES,
     GENE_MARKER_SYMBOLS,
+    UNCLASSIFIED_GROUP_TITLE,
     build_cell_type_gene_visuals,
     build_gene_point_groups,
+    gene_panel_fingerprint,
+    is_control_gene,
     load_cell_type_marker_reference,
+    resolve_cell_type_marker_reference,
 )
 
 # A tiny reference spanning several broad types (two neuron subtypes so we can
@@ -90,6 +94,22 @@ def test_no_reference_falls_back_to_rainbow():
     assert set(scheme.visuals) == {"AAA", "BBB", "ZZZ"}
 
 
+def test_partial_reference_separates_unclassified_genes_from_controls():
+    scheme = build_cell_type_gene_visuals(
+        ["SLC17A7", "UNKNOWN", "UnassignedCodeword_0001"],
+        {"SLC17A7": REF["SLC17A7"]},
+        kind="coarse",
+    )
+    grouped = dict(scheme.groups)
+    assert grouped[UNCLASSIFIED_GROUP_TITLE] == ["UNKNOWN"]
+    assert grouped["Control / blank probes"] == ["UnassignedCodeword_0001"]
+
+
+def test_unassigned_codeword_is_control_and_excluded_from_fingerprint():
+    assert is_control_gene("UnassignedCodeword_0042")
+    assert gene_panel_fingerprint(["A", "UnassignedCodeword_0042"]) == gene_panel_fingerprint(["A"])
+
+
 def test_normalize_reference_accepts_json_string_and_wrapped():
     # A JSON string (as stored in uns) and a {"genes": ...} wrapper both work.
     scheme = build_cell_type_gene_visuals(["APP", "MAPT"], json.dumps({"genes": REF}), kind="coarse")
@@ -143,6 +163,39 @@ def test_load_reference_from_zarr_path_reads_anndata_table_directly(tmp_path):
 
     assert ref is not None
     assert ref["SLC17A7"] == {"broad": "Neuron", "fine": "L2/3 IT"}
+
+
+def test_resolver_reads_json_sidecar_and_reports_coverage(tmp_path):
+    path = tmp_path / "dataset" / "spatialdata.zarr"
+    zarr.open_group(path, mode="w", zarr_format=2)
+    sidecar = path.parent / "cell_type_marker_reference.json"
+    sidecar.write_text(json.dumps({"genes": {"Slc17a7": REF["SLC17A7"]}}))
+
+    result = resolve_cell_type_marker_reference(path, ["Slc17a7", "Blank-1"])
+
+    assert result.reference == {"Slc17a7": REF["SLC17A7"]}
+    assert result.matched_gene_count == result.panel_gene_count == 1
+    assert result.broad_available and result.fine_available
+    assert str(sidecar) in result.source
+
+
+def test_resolver_uses_only_an_exact_external_panel_fingerprint(tmp_path, monkeypatch):
+    catalogue = tmp_path / "catalogue"
+    catalogue.mkdir()
+    genes = ["SLC17A7", "AQP4"]
+    payload = {
+        "panel_fingerprint": gene_panel_fingerprint(genes),
+        "genes": {name: REF[name] for name in genes},
+    }
+    (catalogue / "matching.json").write_text(json.dumps(payload))
+    monkeypatch.setenv("NAPARI_COMPARE_MARKER_REFERENCE_DIR", str(catalogue))
+
+    matching = resolve_cell_type_marker_reference(None, genes)
+    nonmatching = resolve_cell_type_marker_reference(None, [*genes, "MOG"])
+
+    assert matching.reference == payload["genes"]
+    assert matching.source.endswith("matching.json")
+    assert nonmatching.reference is None
 
 
 def test_build_store_groups_points_by_cell_type_symbol():
