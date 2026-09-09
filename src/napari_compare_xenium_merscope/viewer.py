@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event, RLock, Semaphore
 from types import SimpleNamespace
-from weakref import WeakSet
+from weakref import WeakKeyDictionary, WeakSet
 
 import numpy as np
 import pandas as pd
@@ -3407,6 +3407,9 @@ class NapariLeftPanelAdapter(QObject):
         # Weak references are essential here: each Points layer can own millions
         # of coordinates and must be collectable when a dataset is replaced.
         self._observed_gene_layers = WeakSet()
+        self._layer_base_affines = WeakKeyDictionary()
+        self._layer_base_bounds = WeakKeyDictionary()
+        self._rotation_angle = 0.0
         self._layer_controls_expanded = True
         self._expanded_layer_controls_height = 260
         self._collapse_button = None
@@ -3439,10 +3442,12 @@ class NapariLeftPanelAdapter(QObject):
         # row belongs immediately below the list, where the underlying gene block
         # previously appeared.
         layer_list_layout.insertWidget(2, self.gene_row)
+        self.rotation_control = self._build_rotation_control(layer_list_container)
+        layer_list_layout.insertWidget(3, self.rotation_control)
         # Once the layer view is sized to its visible rows, this spacer absorbs
         # the rest of the dock height while the reset-view button stays at the
         # bottom. The Genes row therefore remains attached to the final layer.
-        layer_list_layout.insertStretch(3, 1)
+        layer_list_layout.insertStretch(4, 1)
         self._layer_view.setMinimumHeight(0)
 
         for event_name in ("inserted", "removed", "moved", "reordered", "renamed"):
@@ -3459,7 +3464,136 @@ class NapariLeftPanelAdapter(QObject):
         self.set_layer_controls_expanded(False)
 
     def _on_layers_changed(self, _event=None):
+        self._register_layers_for_rotation()
+        self._apply_rotation_to_layers()
         self._schedule_gene_refresh()
+
+    def _build_rotation_control(self, parent) -> QWidget:
+        control = QWidget(parent)
+        control.setObjectName("DatasetRotationControl")
+        control.setToolTip("Rotate all dataset layers together around their shared centre")
+
+        label = QLabel("Rotation", control)
+        self.rotation_slider = QSlider(Qt.Horizontal, control)
+        self.rotation_slider.setObjectName("DatasetRotationSlider")
+        # Hundredths of a degree keep the slider and precise input lossless.
+        self.rotation_slider.setRange(0, 36000)
+        self.rotation_slider.setSingleStep(100)
+        self.rotation_slider.setPageStep(1000)
+        self.rotation_slider.setToolTip("Dataset rotation from 0° to 360°")
+
+        self.rotation_spin = QDoubleSpinBox(control)
+        self.rotation_spin.setObjectName("DatasetRotationAngle")
+        self.rotation_spin.setRange(0.0, 360.0)
+        self.rotation_spin.setDecimals(2)
+        self.rotation_spin.setSingleStep(0.1)
+        self.rotation_spin.setSuffix("°")
+        self.rotation_spin.setKeyboardTracking(False)
+        self.rotation_spin.setToolTip("Enter an exact dataset rotation angle")
+
+        layout = QHBoxLayout(control)
+        layout.setContentsMargins(6, 2, 6, 2)
+        layout.setSpacing(6)
+        layout.addWidget(label)
+        layout.addWidget(self.rotation_slider, 1)
+        layout.addWidget(self.rotation_spin)
+
+        self.rotation_slider.valueChanged.connect(self._on_rotation_slider_changed)
+        self.rotation_spin.valueChanged.connect(self._on_rotation_spin_changed)
+        self._register_layers_for_rotation()
+        control.setEnabled(any(layer in self._layer_base_affines for layer in self.viewer.layers))
+        return control
+
+    def _on_rotation_slider_changed(self, value: int):
+        angle = float(value) / 100.0
+        self.rotation_spin.blockSignals(True)
+        self.rotation_spin.setValue(angle)
+        self.rotation_spin.blockSignals(False)
+        self.set_rotation_angle(angle)
+
+    def _on_rotation_spin_changed(self, value: float):
+        angle = float(value)
+        self.rotation_slider.blockSignals(True)
+        self.rotation_slider.setValue(int(round(angle * 100.0)))
+        self.rotation_slider.blockSignals(False)
+        self.set_rotation_angle(angle)
+
+    def set_rotation_angle(self, angle: float):
+        """Rotate every layer by ``angle`` degrees in their shared world space."""
+        self._rotation_angle = min(360.0, max(0.0, float(angle)))
+        self._register_layers_for_rotation()
+        self._apply_rotation_to_layers()
+
+    def _register_layers_for_rotation(self):
+        for layer in self.viewer.layers:
+            if layer in self._layer_base_affines or int(getattr(layer, "ndim", 0)) < 2:
+                continue
+            affine = getattr(layer, "affine", None)
+            matrix = getattr(affine, "affine_matrix", None)
+            if matrix is None:
+                continue
+            self._layer_base_affines[layer] = np.asarray(matrix, dtype=float).copy()
+            try:
+                extent = np.asarray(layer.extent.world, dtype=float)
+                bounds = extent[:, -2:]
+            except Exception:
+                continue
+            if bounds.shape == (2, 2) and np.all(np.isfinite(bounds)):
+                self._layer_base_bounds[layer] = bounds.copy()
+
+    def _rotation_origin(self) -> np.ndarray | None:
+        bounds = [
+            self._layer_base_bounds[layer]
+            for layer in self.viewer.layers
+            if layer in self._layer_base_bounds
+        ]
+        if not bounds:
+            return None
+        minima = np.min(np.stack([bound[0] for bound in bounds]), axis=0)
+        maxima = np.max(np.stack([bound[1] for bound in bounds]), axis=0)
+        return (minima + maxima) / 2.0
+
+    @staticmethod
+    def _world_rotation_matrix(ndim: int, angle: float, origin: np.ndarray) -> np.ndarray:
+        matrix = np.eye(ndim + 1, dtype=float)
+        radians = np.deg2rad(angle)
+        cosine = float(np.cos(radians))
+        sine = float(np.sin(radians))
+        first, second = ndim - 2, ndim - 1
+        matrix[first, first] = cosine
+        matrix[first, second] = -sine
+        matrix[second, first] = sine
+        matrix[second, second] = cosine
+
+        pivot = np.asarray(origin, dtype=float)
+        rotation = matrix[np.ix_([first, second], [first, second])]
+        matrix[[first, second], -1] = pivot - rotation @ pivot
+        return matrix
+
+    def _apply_rotation_to_layers(self):
+        origin = self._rotation_origin()
+        if origin is None:
+            self._update_rotation_control_enabled()
+            return
+        for layer in self.viewer.layers:
+            base = self._layer_base_affines.get(layer)
+            if base is None:
+                continue
+            ndim = int(base.shape[0] - 1)
+            rotation = self._world_rotation_matrix(ndim, self._rotation_angle, origin)
+            target = rotation @ base
+            current = getattr(getattr(layer, "affine", None), "affine_matrix", None)
+            if current is not None and np.allclose(
+                np.asarray(current, dtype=float), target, rtol=0.0, atol=1e-12
+            ):
+                continue
+            layer.affine = target
+        self._update_rotation_control_enabled()
+
+    def _update_rotation_control_enabled(self):
+        enabled = any(layer in self._layer_base_affines for layer in self.viewer.layers)
+        if hasattr(self, "rotation_control"):
+            self.rotation_control.setEnabled(enabled)
 
     def _observe_gene_layer(self, layer):
         if layer in self._observed_gene_layers:
@@ -3478,6 +3612,8 @@ class NapariLeftPanelAdapter(QObject):
 
     def _refresh_gene_presentation(self):
         self._refresh_pending = False
+        self._register_layers_for_rotation()
+        self._update_rotation_control_enabled()
         for layer in self.viewer.layers:
             if str(getattr(layer, "name", "")).startswith("Genes | "):
                 self._observe_gene_layer(layer)
