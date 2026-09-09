@@ -257,7 +257,12 @@ def test_left_panel_adapter_collapses_controls_and_aggregates_gene_rows(qapp):
     # Only the one non-gene row contributes to the native list height, so the
     # separate aggregate row sits directly beneath Image | DAPI.
     assert layer_view.maximumHeight() <= 40
-    assert layer_layout.itemAt(3).spacerItem() is not None
+    assert layer_layout.indexOf(adapter.rotation_control) == 3
+    assert adapter.rotation_slider.minimum() == 0
+    assert adapter.rotation_slider.maximum() == 36000
+    assert adapter.rotation_spin.minimum() == 0.0
+    assert adapter.rotation_spin.maximum() == 360.0
+    assert layer_layout.itemAt(4).spacerItem() is not None
     assert layer_buttons.newPointsButton.isHidden()
     assert layer_buttons.newShapesButton.isHidden()
     assert layer_buttons.newLabelsButton.isHidden()
@@ -272,3 +277,83 @@ def test_left_panel_adapter_collapses_controls_and_aggregates_gene_rows(qapp):
     adapter.expand_layer_controls()
     assert adapter._layer_controls_expanded
     assert not controls.isHidden()
+
+
+def test_left_panel_rotation_keeps_layers_registered_and_inputs_synchronised(qapp):
+    from napari._qt.containers.qt_layer_list import QtLayerList
+    from napari.components import ViewerModel
+    from qtpy.QtWidgets import QDockWidget, QHBoxLayout, QPushButton, QVBoxLayout, QWidget
+
+    class Buttons(QWidget):
+        def __init__(self, names):
+            super().__init__()
+            layout = QHBoxLayout(self)
+            for name in names:
+                button = QPushButton(name)
+                setattr(self, name, button)
+                layout.addWidget(button)
+
+    class Dock(QDockWidget):
+        def __init__(self, widget):
+            super().__init__()
+            self.title = QWidget()
+            self.title.setLayout(QHBoxLayout())
+            self.setTitleBarWidget(self.title)
+            self.setWidget(widget)
+
+        def inner_widget(self):
+            return self.widget()
+
+    model = ViewerModel()
+    image = model.add_image(np.zeros((2, 2)), name="Image | DAPI")
+    points = model.add_points(np.asarray([[0.0, 0.0]]), name="Genes | Disc")
+    layer_buttons = Buttons(
+        ["newPointsButton", "newShapesButton", "newLabelsButton", "deleteButton"]
+    )
+    viewer_buttons = Buttons(
+        [
+            "consoleButton",
+            "ndisplayButton",
+            "rollDimsButton",
+            "transposeDimsButton",
+            "gridViewButton",
+            "resetViewButton",
+        ]
+    )
+    layer_view = QtLayerList(model.layers)
+    layer_container = QWidget()
+    layer_layout = QVBoxLayout(layer_container)
+    layer_layout.addWidget(layer_buttons)
+    layer_layout.addWidget(layer_view)
+    layer_layout.addWidget(viewer_buttons)
+    controls = QWidget()
+    qt_viewer = QWidget()
+    qt_viewer.layerButtons = layer_buttons
+    qt_viewer.viewerButtons = viewer_buttons
+    qt_viewer.layers = layer_view
+    qt_viewer.dockLayerList = Dock(layer_container)
+    qt_viewer.dockLayerControls = Dock(controls)
+    viewer = types.SimpleNamespace(
+        layers=model.layers,
+        window=types.SimpleNamespace(
+            _qt_viewer=qt_viewer,
+            _qt_window=types.SimpleNamespace(resizeDocks=lambda *_args: None),
+        ),
+    )
+    adapter = V.NapariLeftPanelAdapter(viewer)
+
+    adapter.rotation_spin.setValue(90.0)
+    expected_origin_rotation = np.asarray([1.0, 0.0])
+    assert np.allclose(image.data_to_world((0.0, 0.0)), expected_origin_rotation)
+    assert np.allclose(points.data_to_world((0.0, 0.0)), expected_origin_rotation)
+    assert adapter.rotation_slider.value() == 9000
+
+    # Layers loaded after the user rotates inherit the same world transform.
+    labels = model.add_labels(np.zeros((2, 2), dtype=np.uint8), name="Segmentation")
+    assert np.allclose(labels.data_to_world((0.0, 0.0)), expected_origin_rotation)
+
+    adapter.rotation_slider.setValue(12345)
+    assert adapter.rotation_spin.value() == pytest.approx(123.45)
+    adapter.rotation_spin.setValue(360.0)
+    assert adapter.rotation_slider.value() == 36000
+    assert np.allclose(image.affine.affine_matrix, np.eye(3), atol=1e-12)
