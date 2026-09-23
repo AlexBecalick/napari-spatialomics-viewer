@@ -68,6 +68,20 @@ def test_parse_args_allows_launch_without_dataset(monkeypatch):
     assert args.session_cache_gb is None
     assert args.disable_async_slicing is False
     assert args.label_interpolation == "nearest"
+    assert args.paired_view is None
+
+
+@pytest.mark.parametrize("paired_view", ["side-by-side", "stacked-overlay"])
+def test_parse_args_accepts_paired_view(monkeypatch, paired_view):
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["napari-compare-xenium-merscope", "--paired-view", paired_view],
+    )
+
+    args = V.parse_args()
+
+    assert args.paired_view == paired_view
 
 
 def test_configure_napari_async_slicing_can_be_enabled_and_disabled():
@@ -103,6 +117,78 @@ def test_dataset_startup_keeps_gene_inspector_selected(qapp):
     assert panel.current_dataset == "MERSCOPE"
     assert panel._tab_stack.currentIndex() == 0
     assert panel._reload_button.isEnabled()
+
+
+def test_paired_load_buttons_pass_their_view_modes(qapp, tmp_path, monkeypatch):
+    from qtpy.QtCore import QSettings
+    from qtpy.QtWidgets import QPushButton
+
+    settings = QSettings(str(tmp_path / "viewer-settings.ini"), QSettings.IniFormat)
+    opened = []
+    panel = _panel(
+        [],
+        settings=settings,
+        load_paired_callback=lambda merscope, xenium, mode: opened.append(
+            (merscope, xenium, mode)
+        )
+        or True,
+    )
+
+    paired_button_labels = [
+        button.text()
+        for button in panel.findChildren(QPushButton)
+        if button.text().startswith("Load new paired dataset")
+    ]
+    assert paired_button_labels == [
+        "Load new paired dataset side-by-side",
+        "Load new paired dataset stacked overlay",
+    ]
+
+    merscope = str(tmp_path / "merscope" / "spatialdata.zarr")
+    xenium = str(tmp_path / "xenium" / "spatialdata.zarr")
+    browsed = iter([merscope, xenium, merscope, xenium])
+    monkeypatch.setattr(panel, "_browse_zarr", lambda _title: next(browsed))
+
+    panel._load_paired_side_button.click()
+    panel._load_paired_overlay_button.click()
+
+    assert opened == [
+        (merscope, xenium, V.ViewMode.SIDE_BY_SIDE),
+        (merscope, xenium, V.ViewMode.STACKED_OVERLAY),
+    ]
+
+
+def test_pending_paired_load_is_recorded_only_after_validation(
+    qapp, tmp_path, monkeypatch
+):
+    from qtpy.QtCore import QSettings
+
+    settings = QSettings(str(tmp_path / "viewer-settings.ini"), QSettings.IniFormat)
+    panel = _panel(
+        [],
+        settings=settings,
+        load_paired_callback=lambda *_args: None,
+    )
+    merscope = tmp_path / "merscope" / "spatialdata.zarr"
+    xenium = tmp_path / "xenium" / "spatialdata.zarr"
+    browsed = iter([str(merscope), str(xenium)])
+    monkeypatch.setattr(panel, "_browse_zarr", lambda _title: next(browsed))
+    opened = []
+    panel.dataset_open_requested.connect(lambda: opened.append(True))
+
+    panel._load_paired_side_button.click()
+
+    assert panel.recent_datasets == []
+    assert opened == []
+
+    panel.paired_dataset_loaded(
+        merscope,
+        xenium,
+        V.ViewMode.SIDE_BY_SIDE,
+    )
+
+    assert panel.recent_datasets[0]["kind"] == "paired"
+    assert opened == [True]
 
 
 def test_annotations_tab_only_offers_combined_cortical_depth_export(qapp):
@@ -167,9 +253,59 @@ def test_recent_datasets_persist_newest_ten_and_reopen(qapp, tmp_path):
     assert len(restored.recent_datasets) == V.MAX_RECENT_DATASETS
 
 
+def test_paired_recent_persists_as_one_entry_and_reopens_with_mode(qapp, tmp_path):
+    from qtpy.QtCore import QSettings
+
+    settings = QSettings(str(tmp_path / "viewer-settings.ini"), QSettings.IniFormat)
+    merscope = tmp_path / "merscope-sample" / "spatialdata.zarr"
+    xenium = tmp_path / "xenium-sample" / "spatialdata.zarr"
+    panel = _panel([], settings=settings)
+
+    panel.record_recent_pair(merscope, xenium, V.ViewMode.STACKED_OVERLAY)
+
+    assert panel.recent_datasets == [
+        {
+            "kind": "paired",
+            "merscope_path": str(merscope.absolute()),
+            "xenium_path": str(xenium.absolute()),
+            "view_mode": "stacked-overlay",
+        }
+    ]
+    label = panel._recent_dataset_list.item(0).text()
+    assert label == (
+        "PAIRED (stacked-overlay) — "
+        "merscope-sample/spatialdata.zarr + xenium-sample/spatialdata.zarr"
+    )
+
+    opened = []
+    restored = _panel(
+        [],
+        settings=settings,
+        load_paired_callback=lambda merscope_path, xenium_path, mode: opened.append(
+            (merscope_path, xenium_path, mode)
+        )
+        or True,
+    )
+    restored._recent_dataset_list.setCurrentRow(0)
+    restored._open_recent_dataset_button.click()
+
+    assert opened == [
+        (
+            str(merscope.absolute()),
+            str(xenium.absolute()),
+            V.ViewMode.STACKED_OVERLAY,
+        )
+    ]
+    assert restored.recent_datasets == panel.recent_datasets
+
+
 def test_left_panel_adapter_collapses_controls_and_aggregates_gene_rows(qapp):
     from napari._qt.containers.qt_layer_list import QtLayerList
     from napari.components import ViewerModel
+    from napari_compare_xenium_merscope.paired_views import (
+        LayerIdentity,
+        attach_layer_identity,
+    )
     from qtpy.QtWidgets import (
         QDockWidget,
         QHBoxLayout,
@@ -246,6 +382,8 @@ def test_left_panel_adapter_collapses_controls_and_aggregates_gene_rows(qapp):
     adapter = V.NapariLeftPanelAdapter(viewer)
     qapp.processEvents()
     adapter._refresh_gene_presentation()
+    default_drag_mode = layer_view.dragDropMode()
+    default_edit_triggers = layer_view.editTriggers()
 
     hidden_names = {
         str(layer_view.model().index(row, 0).data())
@@ -254,15 +392,20 @@ def test_left_panel_adapter_collapses_controls_and_aggregates_gene_rows(qapp):
     }
     assert hidden_names == {"Genes | Disc", "Genes | Ring"}
     assert not adapter.gene_row.isHidden()
-    # Only the one non-gene row contributes to the native list height, so the
-    # separate aggregate row sits directly beneath Image | DAPI.
-    assert layer_view.maximumHeight() <= 40
+    # The native layer list consumes spare dock height instead of being capped
+    # to its current rows; the separate aggregate remains immediately below it.
+    assert layer_view.maximumHeight() == 16777215
+    assert (
+        layer_view.sizePolicy().verticalPolicy()
+        == layer_view.sizePolicy().Expanding
+    )
+    assert layer_layout.stretch(layer_layout.indexOf(layer_view)) == 1
     assert layer_layout.indexOf(adapter.rotation_control) == 3
     assert adapter.rotation_slider.minimum() == 0
     assert adapter.rotation_slider.maximum() == 36000
     assert adapter.rotation_spin.minimum() == 0.0
     assert adapter.rotation_spin.maximum() == 360.0
-    assert layer_layout.itemAt(4).spacerItem() is not None
+    assert layer_layout.indexOf(viewer_buttons) == 4
     assert layer_buttons.newPointsButton.isHidden()
     assert layer_buttons.newShapesButton.isHidden()
     assert layer_buttons.newLabelsButton.isHidden()
@@ -271,6 +414,51 @@ def test_left_panel_adapter_collapses_controls_and_aggregates_gene_rows(qapp):
     assert not viewer_buttons.resetViewButton.isHidden()
     assert not adapter._layer_controls_expanded
     assert controls.isHidden()
+
+    merscope_genes = [
+        attach_layer_identity(
+            model.add_points(np.zeros((1, 2)), name=f"merscope-{symbol}"),
+            LayerIdentity("MERSCOPE", "genes", channel=symbol),
+        )
+        for symbol in ("disc", "ring")
+    ]
+    xenium_genes = [
+        attach_layer_identity(
+            model.add_points(np.zeros((1, 2)), name=f"xenium-{symbol}"),
+            LayerIdentity("XENIUM", "genes", channel=symbol),
+        )
+        for symbol in ("disc", "ring")
+    ]
+    adapter.set_paired_mode(True)
+    qapp.processEvents()
+    adapter._refresh_gene_presentation()
+    assert not layer_buttons.deleteButton.isEnabled()
+    assert layer_view.dragDropMode() == layer_view.NoDragDrop
+    assert layer_view.editTriggers() == layer_view.NoEditTriggers
+    assert adapter.gene_row.isHidden()
+    assert all(not row.isHidden() for row in adapter.paired_gene_rows.values())
+    hidden_names = {
+        str(layer_view.model().index(row, 0).data())
+        for row in range(layer_view.model().rowCount())
+        if layer_view.isRowHidden(row)
+    }
+    assert hidden_names == {
+        "Genes | Disc",
+        "Genes | Ring",
+        *(str(layer.name) for layer in merscope_genes),
+        *(str(layer.name) for layer in xenium_genes),
+    }
+
+    adapter.paired_gene_rows["MERSCOPE"].toggle_visibility()
+    assert not any(layer.visible for layer in merscope_genes)
+    assert all(layer.visible for layer in xenium_genes)
+
+    adapter.set_paired_mode(False)
+    assert layer_buttons.deleteButton.isEnabled()
+    assert layer_view.dragDropMode() == default_drag_mode
+    assert layer_view.editTriggers() == default_edit_triggers
+    assert not adapter.gene_row.isHidden()
+    assert all(row.isHidden() for row in adapter.paired_gene_rows.values())
 
     adapter.gene_row.toggle_visibility()
     assert not any(layer.visible for layer in model.layers if layer.name.startswith("Genes | "))
