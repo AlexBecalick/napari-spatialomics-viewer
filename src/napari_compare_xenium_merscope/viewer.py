@@ -140,6 +140,25 @@ except Exception:  # pragma: no cover - depends on the installed napari runtime
     thread_worker = None
 
 from .dask_cache import install_thread_safe_napari_dask_cache
+from .paired_data import (
+    PairedDataContract,
+    PairedDataContractError,
+    SegmentationProfile,
+    resolve_paired_data_contract,
+)
+from .paired_views import (
+    LayerIdentity,
+    LayerSlotKey,
+    PairedLayerRegistry,
+    PairedViewInvariantError,
+    ViewMode,
+    layer_identity_from_layer,
+)
+from .transcript_cache import (
+    load_transcript_payload,
+    make_transcript_cache_request,
+    save_transcript_payload,
+)
 from .utils import (
     CELLPOSE_LABEL_KEY,
     CELLPOSE_QUANTIFICATION_TABLE_KEY,
@@ -152,6 +171,7 @@ from .utils import (
     OBJECT_ID_PROPERTY,
     ObjectAnnotationShapeInput,
     GeneVisual,
+    GENE_MARKER_SYMBOLS,
     CellTranscriptIndex,
     CorticalDepthShapeInput,
     DERIVED_CACHE_ATTR,
@@ -275,6 +295,45 @@ class DatasetSession:
         return int(sum(int(getattr(array, "nbytes", 0)) for array in arrays))
 
 
+@dataclass(frozen=True)
+class PairedImageSource:
+    """One platform's SpatialData image/channel backing a logical image slot."""
+
+    platform: str
+    image_key: str
+    channel: str
+
+
+@dataclass(frozen=True)
+class PairedImageSlot:
+    """A channel-level image control shared by the two aligned platforms."""
+
+    key: str
+    label: str
+    sources: tuple[PairedImageSource, ...]
+
+    def source_for(self, platform: str) -> PairedImageSource | None:
+        wanted = str(platform).upper()
+        return next(
+            (source for source in self.sources if source.platform == wanted),
+            None,
+        )
+
+
+@dataclass
+class PairedDatasetSession:
+    """Validated, viewer-ready state for one simultaneous aligned pair."""
+
+    configs: dict[str, DatasetConfig]
+    sdata: dict[str, object]
+    contract: PairedDataContract
+    view_mode: ViewMode
+    image_slots: tuple[PairedImageSlot, ...]
+    segmentation_keys: tuple[str, ...]
+    loaded_segmentations: set[str] = field(default_factory=set)
+    loaded_image_slots: set[str] = field(default_factory=set)
+
+
 
 @dataclass
 class GeneInspectorState:
@@ -312,6 +371,12 @@ class GeneInspectorState:
     ordering: str = "coarse"
     color_kind: str = "coarse"
     colour_by_assignment: bool = False
+    # Paired viewing presents one shared control surface over the union of both
+    # panels while each state continues to own only its platform's point arrays.
+    # These remain ``None`` for standalone datasets.
+    panel_genes: list[str] | None = None
+    panel_gene_counts: dict[str, int] | None = None
+    panel_control_genes: set[str] | None = None
 
 
 @dataclass
@@ -1025,6 +1090,7 @@ class ViewerControlPanel(QWidget):
         initial_dataset: str | None = None,
         expand_layer_controls_callback=None,
         settings: QSettings | None = None,
+        switch_paired_view_callback=None,
     ):
         super().__init__()
         self._gene_inspector_widget = gene_inspector_widget
@@ -1039,6 +1105,7 @@ class ViewerControlPanel(QWidget):
         self._unload_selected_image_callback = unload_selected_image_callback
         self._load_paired_callback = load_paired_callback
         self._load_standalone_callback = load_standalone_callback
+        self._switch_paired_view_callback = switch_paired_view_callback
         self._expand_layer_controls_callback = expand_layer_controls_callback
         self._settings = settings or QSettings(
             "Napari Compare Xenium MERSCOPE",
@@ -1071,8 +1138,36 @@ class ViewerControlPanel(QWidget):
         self._reload_button = QPushButton("Reload Dataset")
         self._reload_button.setEnabled(bool(datasets))
         self._reload_button.clicked.connect(self._on_reload_clicked)
-        self._load_paired_button = QPushButton("Load new paired dataset")
-        self._load_paired_button.clicked.connect(self._on_load_paired)
+        self._load_paired_side_button = QPushButton(
+            "Load new paired dataset side-by-side"
+        )
+        self._load_paired_side_button.clicked.connect(
+            lambda _checked=False: self._on_load_paired(ViewMode.SIDE_BY_SIDE)
+        )
+        self._load_paired_overlay_button = QPushButton(
+            "Load new paired dataset stacked overlay"
+        )
+        self._load_paired_overlay_button.clicked.connect(
+            lambda _checked=False: self._on_load_paired(ViewMode.STACKED_OVERLAY)
+        )
+        # Compatibility alias used by the empty-view welcome arrow.
+        self._load_paired_button = self._load_paired_side_button
+        self._switch_side_by_side_button = QPushButton(
+            "Switch to side-by-side view"
+        )
+        self._switch_side_by_side_button.clicked.connect(
+            lambda _checked=False: self._on_switch_paired_view(
+                ViewMode.SIDE_BY_SIDE
+            )
+        )
+        self._switch_stacked_overlay_button = QPushButton(
+            "Switch to Stacked overlay view"
+        )
+        self._switch_stacked_overlay_button.clicked.connect(
+            lambda _checked=False: self._on_switch_paired_view(
+                ViewMode.STACKED_OVERLAY
+            )
+        )
         self._load_standalone_merscope_button = QPushButton("Load new standalone MERSCOPE dataset")
         self._load_standalone_merscope_button.clicked.connect(self._on_load_standalone_merscope)
         self._load_standalone_xenium_button = QPushButton("Load new standalone Xenium dataset")
@@ -1164,6 +1259,7 @@ class ViewerControlPanel(QWidget):
         self._load_object_annotations_button.clicked.connect(
             self._on_load_object_annotations
         )
+        self.set_paired_view_mode(None)
 
         # -- Progress + status (shared, below the tabs) ---------------------
         self._progress_bar = QProgressBar()
@@ -1364,9 +1460,14 @@ class ViewerControlPanel(QWidget):
         line.setFrameShadow(QFrame.Sunken)
         layout.addWidget(line)
         layout.addWidget(QLabel("Open a different dataset"))
-        layout.addWidget(self._load_paired_button)
+        layout.addWidget(self._load_paired_side_button)
+        layout.addWidget(self._load_paired_overlay_button)
         layout.addWidget(self._load_standalone_merscope_button)
         layout.addWidget(self._load_standalone_xenium_button)
+        layout.addSpacing(10)
+        layout.addWidget(QLabel("Paired dataset layout"))
+        layout.addWidget(self._switch_side_by_side_button)
+        layout.addWidget(self._switch_stacked_overlay_button)
         layout.addSpacing(10)
         layout.addWidget(QLabel("Recently viewed"))
         layout.addWidget(self._recent_dataset_list)
@@ -1506,6 +1607,34 @@ class ViewerControlPanel(QWidget):
             self._dataset_combo.blockSignals(False)
         self._reload_button.setEnabled(bool(names))
 
+    def set_paired_view_mode(self, mode: ViewMode | str | None):
+        """Update dataset controls for standalone or simultaneous paired viewing."""
+        paired_mode = None if mode is None else ViewMode.coerce(mode)
+        paired = paired_mode is not None
+        self._dataset_combo.setEnabled(not paired)
+        self._reload_button.setEnabled(not paired and self._dataset_combo.count() > 0)
+        self._switch_side_by_side_button.setEnabled(
+            paired and paired_mode is not ViewMode.SIDE_BY_SIDE
+        )
+        self._switch_stacked_overlay_button.setEnabled(
+            paired and paired_mode is not ViewMode.STACKED_OVERLAY
+        )
+        # These tools currently have one-dataset export semantics. Keep them
+        # unavailable rather than accidentally attaching an unmanaged grid layer.
+        for widget in (
+            self._create_annotations_button,
+            self._new_piece_button,
+            self._apply_piece_button,
+            self._snap_side_edges_button,
+            self._validate_annotations_button,
+            self._export_annotations_button,
+            self._create_object_annotations_button,
+            self._validate_object_annotations_button,
+            self._export_object_annotations_button,
+            self._load_object_annotations_button,
+        ):
+            widget.setEnabled(not paired)
+
     @property
     def recent_datasets(self) -> list[dict[str, str]]:
         """Return a copy of the persisted most-recently-opened dataset list."""
@@ -1524,15 +1653,40 @@ class ViewerControlPanel(QWidget):
             return []
 
         cleaned: list[dict[str, str]] = []
-        seen_paths: set[str] = set()
+        seen: set[tuple[str, ...]] = set()
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
+            if str(entry.get("kind", "")).lower() == "paired":
+                merscope_path = str(entry.get("merscope_path", "")).strip()
+                xenium_path = str(entry.get("xenium_path", "")).strip()
+                try:
+                    view_mode = ViewMode.coerce(
+                        entry.get("view_mode", ViewMode.SIDE_BY_SIDE.value)
+                    ).value
+                except ValueError:
+                    continue
+                identity = ("paired", merscope_path, xenium_path)
+                if not merscope_path or not xenium_path or identity in seen:
+                    continue
+                seen.add(identity)
+                cleaned.append(
+                    {
+                        "kind": "paired",
+                        "merscope_path": merscope_path,
+                        "xenium_path": xenium_path,
+                        "view_mode": view_mode,
+                    }
+                )
+                if len(cleaned) >= MAX_RECENT_DATASETS:
+                    break
+                continue
             platform = str(entry.get("platform", "")).upper()
             path = str(entry.get("path", "")).strip()
-            if platform not in {"MERSCOPE", "XENIUM"} or not path or path in seen_paths:
+            identity = ("standalone", path)
+            if platform not in {"MERSCOPE", "XENIUM"} or not path or identity in seen:
                 continue
-            seen_paths.add(path)
+            seen.add(identity)
             cleaned.append({"platform": platform, "path": path})
             if len(cleaned) >= MAX_RECENT_DATASETS:
                 break
@@ -1547,12 +1701,24 @@ class ViewerControlPanel(QWidget):
 
     @staticmethod
     def _recent_dataset_label(entry: dict[str, str]) -> str:
-        path = Path(entry["path"])
+        if entry.get("kind") == "paired":
+            mode = ViewMode.coerce(entry.get("view_mode", "side-by-side"))
+            merscope = ViewerControlPanel._recent_path_label(
+                Path(entry["merscope_path"])
+            )
+            xenium = ViewerControlPanel._recent_path_label(Path(entry["xenium_path"]))
+            return f"PAIRED ({mode.value}) — {merscope} + {xenium}"
+        return (
+            f"{entry['platform']} — "
+            f"{ViewerControlPanel._recent_path_label(Path(entry['path']))}"
+        )
+
+    @staticmethod
+    def _recent_path_label(path: Path) -> str:
+        path = Path(path)
         if path.name.lower() == "spatialdata.zarr" and path.parent.name:
-            folder = f"{path.parent.name}/{path.name}"
-        else:
-            folder = path.name or str(path)
-        return f"{entry['platform']} — {folder}"
+            return f"{path.parent.name}/{path.name}"
+        return path.name or str(path)
 
     def _refresh_recent_dataset_list(self):
         self._recent_dataset_list.clear()
@@ -1565,7 +1731,13 @@ class ViewerControlPanel(QWidget):
         for entry in self._recent_datasets:
             item = QListWidgetItem(self._recent_dataset_label(entry))
             item.setData(Qt.UserRole, dict(entry))
-            item.setToolTip(entry["path"])
+            if entry.get("kind") == "paired":
+                item.setToolTip(
+                    f"MERSCOPE: {entry['merscope_path']}\n"
+                    f"Xenium: {entry['xenium_path']}"
+                )
+            else:
+                item.setToolTip(entry["path"])
             self._recent_dataset_list.addItem(item)
         self._open_recent_dataset_button.setEnabled(False)
 
@@ -1584,10 +1756,54 @@ class ViewerControlPanel(QWidget):
         self._write_recent_datasets()
         self._refresh_recent_dataset_list()
 
+    def record_recent_pair(
+        self,
+        merscope_path,
+        xenium_path,
+        view_mode: ViewMode | str,
+    ) -> None:
+        """Move one validated pair to the top of recents as a single entry."""
+        merscope = str(Path(merscope_path).expanduser().absolute())
+        xenium = str(Path(xenium_path).expanduser().absolute())
+        entry = {
+            "kind": "paired",
+            "merscope_path": merscope,
+            "xenium_path": xenium,
+            "view_mode": ViewMode.coerce(view_mode).value,
+        }
+        self._recent_datasets = [
+            existing
+            for existing in self._recent_datasets
+            if not (
+                existing.get("kind") == "paired"
+                and existing.get("merscope_path") == merscope
+                and existing.get("xenium_path") == xenium
+            )
+        ]
+        self._recent_datasets.insert(0, entry)
+        del self._recent_datasets[MAX_RECENT_DATASETS:]
+        self._write_recent_datasets()
+        self._refresh_recent_dataset_list()
+
+    def paired_dataset_loaded(
+        self,
+        merscope_path,
+        xenium_path,
+        view_mode: ViewMode | str,
+    ) -> None:
+        """Finalize UI state only after the controller validates both stores."""
+        self.record_recent_pair(merscope_path, xenium_path, view_mode)
+        self.dataset_open_requested.emit()
+
     def _recent_browse_directory(self) -> str:
         if not self._recent_datasets:
             return ""
-        path = Path(self._recent_datasets[0]["path"])
+        recent = self._recent_datasets[0]
+        path = Path(
+            recent.get("merscope_path")
+            if recent.get("kind") == "paired"
+            else recent["path"]
+        )
         candidate = path.parent if path.name.lower() == "spatialdata.zarr" else path
         return str(candidate) if candidate.exists() else ""
 
@@ -1609,7 +1825,8 @@ class ViewerControlPanel(QWidget):
         )
         return path or None
 
-    def _on_load_paired(self):
+    def _on_load_paired(self, mode: ViewMode | str = ViewMode.SIDE_BY_SIDE):
+        mode = ViewMode.coerce(mode)
         merscope_path = self._browse_zarr(
             "Select the spatialdata.zarr folder for the MERSCOPE dataset"
         )
@@ -1620,12 +1837,24 @@ class ViewerControlPanel(QWidget):
         )
         if not xenium_path:
             return
-        result = self._load_paired_callback(merscope_path, xenium_path)
+        result = self._load_paired_callback(merscope_path, xenium_path, mode)
         if result is False:
             return
-        self.record_recent_dataset("MERSCOPE", merscope_path)
-        self.record_recent_dataset("XENIUM", xenium_path)
-        self.dataset_open_requested.emit()
+        if result is True:
+            # Lightweight/synchronous callbacks used by embedders and tests can
+            # acknowledge completion immediately. The normal controller returns
+            # None while its validation worker runs and calls
+            # paired_dataset_loaded only after a successful atomic install.
+            self.paired_dataset_loaded(merscope_path, xenium_path, mode)
+
+    def _on_switch_paired_view(self, mode: ViewMode | str):
+        mode = ViewMode.coerce(mode)
+        if self._switch_paired_view_callback is None:
+            return
+        result = self._switch_paired_view_callback(mode)
+        if result is False:
+            return
+        self.set_paired_view_mode(mode)
 
     def _on_load_standalone_merscope(self):
         path = self._browse_zarr(
@@ -1665,6 +1894,20 @@ class ViewerControlPanel(QWidget):
     def _open_recent_dataset_item(self, item):
         entry = item.data(Qt.UserRole) if item is not None else None
         if not entry:
+            return
+        if entry.get("kind") == "paired":
+            mode = ViewMode.coerce(entry.get("view_mode", "side-by-side"))
+            result = self._load_paired_callback(
+                str(entry["merscope_path"]),
+                str(entry["xenium_path"]),
+                mode,
+            )
+            if result is False:
+                return
+            if result is True:
+                self.paired_dataset_loaded(
+                    entry["merscope_path"], entry["xenium_path"], mode
+                )
             return
         platform = str(entry["platform"])
         path = str(entry["path"])
@@ -3052,7 +3295,8 @@ class _CellPanel(QWidget):
         # -- Left: Cell ID (in the cell's highlight colour) + summary -------
         left = QVBoxLayout()
         left.setSpacing(5)
-        title = QLabel(f"Cell {html.escape(str(cell.get('cell_id', '')))}")
+        display_cell_id = cell.get("display_cell_id", cell.get("cell_id", ""))
+        title = QLabel(f"Cell {html.escape(str(display_cell_id))}")
         title.setStyleSheet(f"color: {color}; font-size: 22pt; font-weight: bold;")
         title.setTextFormat(Qt.RichText)
         broad_text = str(cell.get("broad_cell_type", "Unannotated"))
@@ -3332,12 +3576,15 @@ def _gene_aggregate_thumbnail(px: int = 30) -> QPixmap:
 class GeneLayerAggregateRow(QFrame):
     """One layer-list row controlling all hidden transcript marker layers."""
 
-    def __init__(self, viewer, parent=None):
+    def __init__(self, viewer, parent=None, *, platform: str | None = None):
         super().__init__(parent)
         self.viewer = viewer
+        self.platform = None if platform is None else str(platform).upper()
+        self._display_enabled = True
         self.setObjectName("GeneLayerAggregateRow")
         self.setFixedHeight(38)
-        self.setToolTip("Controls the visibility of all transcript gene layers")
+        row_label = "Genes" if self.platform is None else f"{self.platform} Genes"
+        self.setToolTip(f"Controls the visibility of {row_label} layers")
         self.setStyleSheet(
             "#GeneLayerAggregateRow {"
             " background: rgba(104, 116, 132, 105);"
@@ -3355,7 +3602,7 @@ class GeneLayerAggregateRow(QFrame):
         self.visibility_button.setIconSize(QSize(20, 20))
         self.visibility_button.clicked.connect(self.toggle_visibility)
 
-        label = QLabel("Genes")
+        label = QLabel(row_label)
         font = label.font()
         font.setBold(True)
         label.setFont(font)
@@ -3377,15 +3624,40 @@ class GeneLayerAggregateRow(QFrame):
         self.setVisible(False)
 
     def gene_layers(self) -> list:
-        return [
-            layer
-            for layer in self.viewer.layers
-            if str(getattr(layer, "name", "")).startswith("Genes | ")
-        ]
+        layers = []
+        for layer in self.viewer.layers:
+            identity = layer_identity_from_layer(layer)
+            if self.platform is None:
+                if identity is None and str(getattr(layer, "name", "")).startswith(
+                    "Genes | "
+                ):
+                    layers.append(layer)
+                continue
+            paired_metadata = dict(getattr(layer, "metadata", {}) or {}).get(
+                "napari_compare_paired_layer", {}
+            )
+            is_placeholder = bool(
+                paired_metadata.get("placeholder", False)
+                if hasattr(paired_metadata, "get")
+                else False
+            )
+            if (
+                identity is not None
+                and identity.platform == self.platform
+                and identity.role in {"genes", "transcripts"}
+                and not is_placeholder
+            ):
+                layers.append(layer)
+        return layers
+
+    def set_display_enabled(self, enabled: bool) -> None:
+        """Show this aggregate only in its corresponding viewer mode."""
+        self._display_enabled = bool(enabled)
+        self.refresh()
 
     def refresh(self):
         layers = self.gene_layers()
-        self.setVisible(bool(layers))
+        self.setVisible(self._display_enabled and bool(layers))
         if not layers:
             return
         all_visible = all(bool(getattr(layer, "visible", False)) for layer in layers)
@@ -3397,9 +3669,11 @@ class GeneLayerAggregateRow(QFrame):
         except Exception:
             self.visibility_button.setText("●" if all_visible else "○")
         action = "Hide" if all_visible else "Show"
-        self.visibility_button.setToolTip(f"{action} all gene layers")
+        scope = "gene" if self.platform is None else f"{self.platform} gene"
+        self.visibility_button.setToolTip(f"{action} all {scope} layers")
+        row_label = "Genes" if self.platform is None else f"{self.platform} Genes"
         self.setToolTip(
-            f"Genes — {len(layers)} underlying transcript marker layer(s); "
+            f"{row_label} — {len(layers)} underlying transcript marker layer(s); "
             f"click the eye to {action.lower()} all"
         )
 
@@ -3431,8 +3705,10 @@ class NapariLeftPanelAdapter(QObject):
         self._layer_controls_expanded = True
         self._expanded_layer_controls_height = 260
         self._collapse_button = None
+        self._paired_mode = False
 
-        # Remove layer creation shortcuts while retaining the delete action.
+        # Remove layer creation shortcuts. Deletion remains available for
+        # standalone sessions and is guarded while a paired grid is active.
         layer_buttons = qt_viewer.layerButtons
         for name in ("newPointsButton", "newShapesButton", "newLabelsButton"):
             button = getattr(layer_buttons, name, None)
@@ -3453,20 +3729,54 @@ class NapariLeftPanelAdapter(QObject):
                 button.hide()
 
         self._layer_view = qt_viewer.layers
+        self._delete_button = getattr(layer_buttons, "deleteButton", None)
+        self._delete_button_was_enabled = (
+            bool(self._delete_button.isEnabled())
+            if self._delete_button is not None
+            else False
+        )
+        self._delete_button_tooltip = (
+            str(self._delete_button.toolTip())
+            if self._delete_button is not None
+            else ""
+        )
+        self._default_drag_drop_mode = self._layer_view.dragDropMode()
+        self._default_edit_triggers = self._layer_view.editTriggers()
         layer_list_container = qt_viewer.dockLayerList.inner_widget()
-        self.gene_row = GeneLayerAggregateRow(viewer, layer_list_container)
+        self._gene_rows_container = QWidget(layer_list_container)
+        gene_rows_layout = QVBoxLayout(self._gene_rows_container)
+        gene_rows_layout.setContentsMargins(0, 0, 0, 0)
+        gene_rows_layout.setSpacing(2)
+        self.gene_row = GeneLayerAggregateRow(
+            viewer, self._gene_rows_container
+        )
+        gene_rows_layout.addWidget(self.gene_row)
+        self.paired_gene_rows = {
+            platform: GeneLayerAggregateRow(
+                viewer, self._gene_rows_container, platform=platform
+            )
+            for platform in ("MERSCOPE", "XENIUM")
+        }
+        for row in self.paired_gene_rows.values():
+            gene_rows_layout.addWidget(row)
         layer_list_layout = layer_list_container.layout()
         # Native order is layer buttons, layer list, viewer buttons. The custom
         # row belongs immediately below the list, where the underlying gene block
         # previously appeared.
-        layer_list_layout.insertWidget(2, self.gene_row)
+        layer_list_layout.insertWidget(2, self._gene_rows_container)
         self.rotation_control = self._build_rotation_control(layer_list_container)
         layer_list_layout.insertWidget(3, self.rotation_control)
-        # Once the layer view is sized to its visible rows, this spacer absorbs
-        # the rest of the dock height while the reset-view button stays at the
-        # bottom. The Genes row therefore remains attached to the final layer.
-        layer_list_layout.insertStretch(4, 1)
+        # Let the native list consume the dock's spare vertical space.  The gene
+        # aggregate rows and rotation/reset controls retain their size hints and
+        # remain directly below it, while substantially more layers are visible
+        # before Qt needs to show a scrollbar.
         self._layer_view.setMinimumHeight(0)
+        self._layer_view.setMaximumHeight(16777215)
+        self._layer_view.setSizePolicy(
+            self._layer_view.sizePolicy().horizontalPolicy(),
+            QSizePolicy.Expanding,
+        )
+        layer_list_layout.setStretchFactor(self._layer_view, 1)
 
         for event_name in ("inserted", "removed", "moved", "reordered", "renamed"):
             emitter = getattr(viewer.layers.events, event_name, None)
@@ -3485,6 +3795,31 @@ class NapariLeftPanelAdapter(QObject):
         self._register_layers_for_rotation()
         self._apply_rotation_to_layers()
         self._schedule_gene_refresh()
+
+    def set_paired_mode(self, enabled: bool) -> None:
+        """Guard paired grid membership while preserving visibility toggles."""
+        enabled = bool(enabled)
+        self._paired_mode = enabled
+        if self._delete_button is not None:
+            self._delete_button.setEnabled(
+                False if enabled else self._delete_button_was_enabled
+            )
+            self._delete_button.setToolTip(
+                "Unload paired layers from the Viewer Controls panel."
+                if enabled
+                else self._delete_button_tooltip
+            )
+        self._layer_view.setDragDropMode(
+            QAbstractItemView.NoDragDrop
+            if enabled
+            else self._default_drag_drop_mode
+        )
+        self._layer_view.setEditTriggers(
+            QAbstractItemView.NoEditTriggers
+            if enabled
+            else self._default_edit_triggers
+        )
+        self._refresh_gene_presentation()
 
     def _build_rotation_control(self, parent) -> QWidget:
         control = QWidget(parent)
@@ -3632,37 +3967,37 @@ class NapariLeftPanelAdapter(QObject):
         self._refresh_pending = False
         self._register_layers_for_rotation()
         self._update_rotation_control_enabled()
+        hidden_gene_names: set[str] = set()
         for layer in self.viewer.layers:
-            if str(getattr(layer, "name", "")).startswith("Genes | "):
+            identity = layer_identity_from_layer(layer)
+            is_gene_layer = (
+                identity is not None
+                and identity.role in {"genes", "transcripts"}
+            ) or (
+                identity is None
+                and str(getattr(layer, "name", "")).startswith("Genes | ")
+            )
+            if is_gene_layer:
                 self._observe_gene_layer(layer)
+                hidden_gene_names.add(str(getattr(layer, "name", "")))
 
         # The visible Qt model is reverse-proxied, so filter by displayed name
         # rather than assuming a relationship between list/model row numbers.
         model = self._layer_view.model()
-        visible_row_heights: list[int] = []
         for row in range(model.rowCount()):
             index = model.index(row, 0)
             name = str(index.data(Qt.DisplayRole) or "")
-            hidden = name.startswith("Genes | ")
+            hidden = name in hidden_gene_names
             self._layer_view.setRowHidden(row, hidden)
-            if hidden:
-                continue
-            hint = index.data(Qt.SizeHintRole)
-            height = int(hint.height()) if isinstance(hint, QSize) else -1
-            if height <= 0:
-                height = int(self._layer_view.sizeHintForRow(row))
-            visible_row_heights.append(max(1, height if height > 0 else 34))
-
-        # QListView normally expands to fill the dock, which left a large gap
-        # between the last native layer and the separate aggregate row. Cap its
-        # height at exactly its visible content; if there are more rows than fit,
-        # Qt still gives it the available space and its scrollbar remains usable.
-        spacing = max(0, int(self._layer_view.spacing()))
-        content_height = 2 * int(self._layer_view.frameWidth())
-        content_height += sum(visible_row_heights)
-        content_height += spacing * max(0, len(visible_row_heights) - 1)
-        self._layer_view.setMaximumHeight(max(2, content_height))
-        self.gene_row.refresh()
+        self.gene_row.set_display_enabled(not self._paired_mode)
+        for row in self.paired_gene_rows.values():
+            row.set_display_enabled(self._paired_mode)
+        self._gene_rows_container.setVisible(
+            any(
+                not row.isHidden()
+                for row in (self.gene_row, *self.paired_gene_rows.values())
+            )
+        )
 
     def _on_controls_dock_visibility(self, visible: bool):
         if visible:
@@ -3946,10 +4281,15 @@ class ComparisonViewerController:
         self._image_entries_callback = None
         self._loaded_image_entries_callback = None
         self._datasets_changed_callback = None
+        self._paired_view_mode_callback = None
+        self._paired_dataset_loaded_callback = None
         self._cellpose_value_options_callback = None
         self._current_cortical_depth_piece_id = CORTICAL_DEPTH_DEFAULT_PIECE_ID
         self._active_sdata = None
         self._active_images_sdata = None
+        self._paired_session: PairedDatasetSession | None = None
+        self._paired_registry: PairedLayerRegistry | None = None
+        self._paired_registry_repair_pending = False
         self._dataset_sessions: OrderedDict[str, DatasetSession] = OrderedDict()
         self._dataset_load_generation = 0
         self._dataset_load_worker: object | None = None
@@ -3997,6 +4337,10 @@ class ComparisonViewerController:
         # Per dataset, an ordered list of highlighted cells (each a dict with the
         # cell id, highlight colour, geometry-derived draw data and panel stats).
         self._selected_cells: dict[str, list[dict]] = {}
+        self._paired_selected_cells: dict[str, list[tuple[object, object]]] = {
+            "MERSCOPE": [],
+            "XENIUM": [],
+        }
         self._cell_info_overlay: CellInfoOverlay | None = None
         self._cell_info_dock = None
         self._suppress_dock_visibility = False
@@ -4009,6 +4353,13 @@ class ComparisonViewerController:
         self._viewer_controls_dock = None
         self._canvas_visibility_repair_serial = 0
         self._canvas_visibility_repair_active = False
+        try:
+            for event_name in ("inserted", "removed", "moved", "reordered", "renamed"):
+                emitter = getattr(self.viewer.layers.events, event_name, None)
+                if emitter is not None:
+                    emitter.connect(self._on_paired_layer_list_changed)
+        except Exception:
+            log.debug("Could not install paired layer-list guards", exc_info=True)
         self._install_gene_pick_callback()
         self._install_cell_hover_status()
 
@@ -4027,6 +4378,36 @@ class ComparisonViewerController:
     def set_viewer_controls_dock(self, dock):
         """Keep the right dock used for the startup canvas-layout repair."""
         self._viewer_controls_dock = dock
+
+    @property
+    def paired_view_mode(self) -> ViewMode | None:
+        """Current simultaneous paired mode, or ``None`` in standalone mode."""
+        if self._paired_session is None:
+            return None
+        return self._paired_session.view_mode
+
+    def _on_paired_layer_list_changed(self, _event=None) -> None:
+        """Debounce restoration after native delete, rename, or drag actions."""
+        if self._paired_registry is None or self._paired_registry_repair_pending:
+            return
+        self._paired_registry_repair_pending = True
+
+        def repair() -> None:
+            self._paired_registry_repair_pending = False
+            registry = self._paired_registry
+            if registry is None:
+                return
+            try:
+                registry.repair_order()
+            except PairedViewInvariantError as exc:
+                # An external plugin may have inserted an unmanaged layer. A
+                # disabled grid is safer than silently routing layers into the
+                # wrong platform pane; normal paired controls never hit this.
+                registry.grid.enabled = False
+                self._set_status(f"Paired layer layout needs attention: {exc}")
+                log.warning("Could not repair paired layer layout: %s", exc)
+
+        QTimer.singleShot(0, repair)
 
     def _install_gene_pick_callback(self):
         callbacks = getattr(self.viewer, "mouse_drag_callbacks", None)
@@ -4078,13 +4459,33 @@ class ComparisonViewerController:
             return original() if original is not None else None
         if coords.size < 2 or not np.isfinite(coords[-2:]).all():
             return original() if original is not None else None
-        return self._cell_hover_status(coords), ""
+        paired_platform = None
+        if self._paired_registry is not None:
+            paired_platform = self._paired_registry.platform_for_viewbox(
+                getattr(cursor, "viewbox", None)
+            )
+        return self._cell_hover_status(
+            coords,
+            paired_platform=paired_platform,
+        ), ""
 
-    def _cell_hover_status(self, position) -> dict[str, str]:
+    def _cell_hover_status(
+        self,
+        position,
+        *,
+        paired_platform: str | None = None,
+    ) -> dict[str, str]:
         """Build the plain-text status dictionary for one world position."""
         coords = np.asarray(position, dtype=float).ravel()
         y_um, x_um = float(coords[-2]), float(coords[-1])
         coords_text = f"x: {x_um:,.2f} µm, y: {y_um:,.2f} µm"
+        if self._paired_session is not None:
+            return self._paired_cell_hover_status(
+                x_um,
+                y_um,
+                coords_text,
+                platform=paired_platform,
+            )
         value_text = "No cell"
         if self._cell_inspector_pickable():
             shape_key = self._cell_inspector_shape_key()
@@ -4105,6 +4506,62 @@ class ComparisonViewerController:
                     value_text = (
                         f"Cell {cell_id} • Broad: {broad} • Fine: {fine}"
                     )
+        return {
+            "coordinates": f"{coords_text} • {value_text}",
+            "coords": coords_text,
+            "layer_base": "Cell",
+            "layer_name": "Cell",
+            "plugin": "",
+            "source_type": "",
+            "value": value_text,
+        }
+
+    def _paired_cell_hover_status(
+        self,
+        x_um: float,
+        y_um: float,
+        coords_text: str,
+        *,
+        platform: str | None,
+    ) -> dict[str, str]:
+        """Report the hovered pane's cell, or both cells in stacked overlay."""
+        session = self._paired_session
+        platforms = (
+            (str(platform).upper(),)
+            if platform is not None
+            else ("MERSCOPE", "XENIUM")
+        )
+        values: list[str] = []
+        if session is not None:
+            for dataset in platforms:
+                segmentation = self._paired_pick_segmentation(dataset)
+                if segmentation is None:
+                    continue
+                try:
+                    picked = pick_cell_at_point(
+                        session.sdata[dataset].shapes[segmentation.shape_key],
+                        x_um,
+                        y_um,
+                    )
+                except Exception as exc:
+                    log.debug("%s paired cell hover failed: %s", dataset, exc)
+                    picked = None
+                if picked is None:
+                    continue
+                cell_id = picked[0]
+                annotation = self._cell_type_annotation_for_cell(
+                    dataset,
+                    cell_id,
+                    load=False,
+                )
+                broad = str(
+                    annotation.get("broad_cell_type", "Unannotated")
+                )
+                fine = str(annotation.get("fine_cell_type", "Unannotated"))
+                values.append(
+                    f"{dataset} cell {cell_id} • Broad: {broad} • Fine: {fine}"
+                )
+        value_text = "; ".join(values) if values else "No cell"
         return {
             "coordinates": f"{coords_text} • {value_text}",
             "coords": coords_text,
@@ -4288,7 +4745,11 @@ class ComparisonViewerController:
         mode = str(getattr(self.args, "label_interpolation", "nearest"))
         for layer in list(self.viewer.layers):
             name = str(getattr(layer, "name", ""))
-            if name.startswith("Segmentation | ") and hasattr(layer, "interpolation2d"):
+            identity = layer_identity_from_layer(layer)
+            is_segmentation = name.startswith("Segmentation | ") or (
+                identity is not None and identity.role == "segmentation"
+            )
+            if is_segmentation and hasattr(layer, "interpolation2d"):
                 try:
                     if layer.interpolation2d != mode:
                         layer.interpolation2d = mode
@@ -4309,6 +4770,12 @@ class ComparisonViewerController:
 
     def set_datasets_changed_callback(self, fn):
         self._datasets_changed_callback = fn
+
+    def set_paired_view_mode_callback(self, fn):
+        self._paired_view_mode_callback = fn
+
+    def set_paired_dataset_loaded_callback(self, fn):
+        self._paired_dataset_loaded_callback = fn
 
     def set_cellpose_value_options_callback(self, fn):
         self._cellpose_value_options_callback = fn
@@ -4397,6 +4864,8 @@ class ComparisonViewerController:
 
     def _segmentation_key_is_loaded(self, shape_key: str) -> bool:
         """True if any layer for this segmentation key is currently present."""
+        if self._paired_session is not None:
+            return str(shape_key) in self._paired_session.loaded_segmentations
         if self.active_dataset is None:
             return False
         ds = self.active_dataset
@@ -4440,6 +4909,14 @@ class ComparisonViewerController:
     def _publish_loaded_image_entries(self):
         if self._loaded_image_entries_callback is None:
             return
+        if self._paired_session is not None:
+            loaded = [
+                (slot.key, slot.label)
+                for slot in self._paired_session.image_slots
+                if slot.key in self._paired_session.loaded_image_slots
+            ]
+            self._loaded_image_entries_callback(loaded)
+            return
         ds = self.active_dataset
         loaded = [
             (image_key, channel)
@@ -4450,6 +4927,9 @@ class ComparisonViewerController:
 
     def _publish_cellpose_value_options(self):
         if self._cellpose_value_options_callback is None:
+            return
+        if self._paired_session is not None:
+            self._cellpose_value_options_callback([], [], False)
             return
         if self.active_dataset is None or self.active_dataset != "MERSCOPE":
             self._cellpose_value_options_callback([], [], False)
@@ -5185,6 +5665,12 @@ class ComparisonViewerController:
         self._dataset_load_worker = None
         self._dataset_loading_key = None
         self._cancel_background_tasks()
+        # A controller-level standalone activation can occur while a pair is
+        # visible (for example through an integration calling load_dataset
+        # directly).  Tear down the grid registry only once the replacement
+        # session is ready, so a failed metadata read leaves the pair intact.
+        if self._paired_session is not None:
+            self._deactivate_paired_view()
         self._clear_layers()
         gc.collect()
         ds = session.dataset
@@ -5303,11 +5789,691 @@ class ComparisonViewerController:
             xenium_spec_path=getattr(self.args, "xenium_spec_path", None),
         )
 
+    @staticmethod
+    def _paired_image_slots(
+        contract: PairedDataContract,
+        stores: dict[str, object],
+    ) -> tuple[PairedImageSlot, ...]:
+        """Pair exact image channels by normalized channel name and occurrence."""
+        grouped: dict[tuple[str, int], list[PairedImageSource]] = {}
+        labels: dict[tuple[str, int], str] = {}
+        order: list[tuple[str, int]] = []
+        for platform in ("MERSCOPE", "XENIUM"):
+            profile = contract.profile(platform)
+            occurrences: dict[str, int] = {}
+            for image_key in profile.image_keys:
+                image = ensure_cyx(get_scale0_dataarray(stores[platform].images[image_key]))
+                for channel in channel_labels(image):
+                    token = str(channel).strip().casefold()
+                    occurrence = occurrences.get(token, 0)
+                    occurrences[token] = occurrence + 1
+                    group_key = (token, occurrence)
+                    if group_key not in grouped:
+                        grouped[group_key] = []
+                        labels[group_key] = str(channel)
+                        order.append(group_key)
+                    grouped[group_key].append(
+                        PairedImageSource(platform, str(image_key), str(channel))
+                    )
+        slots: list[PairedImageSlot] = []
+        for token, occurrence in order:
+            group_key = (token, occurrence)
+            label = labels[group_key]
+            key = label if occurrence == 0 else f"{label} ({occurrence + 1})"
+            slots.append(
+                PairedImageSlot(
+                    key=key,
+                    label=label,
+                    sources=tuple(grouped[group_key]),
+                )
+            )
+        return tuple(slots)
+
+    def _prepare_paired_dataset_session(
+        self,
+        configs: dict[str, DatasetConfig],
+        view_mode: ViewMode,
+        cancel_token: Event,
+    ) -> PairedDatasetSession:
+        """Open both stores lazily and validate the complete MerXen handoff."""
+        stores: dict[str, object] = {}
+        for platform in ("MERSCOPE", "XENIUM"):
+            if cancel_token.is_set():
+                raise RuntimeError("Paired dataset load cancelled")
+            stores[platform] = sd.read_zarr(str(configs[platform].zarr_path))
+        contract = resolve_paired_data_contract(
+            stores["MERSCOPE"], stores["XENIUM"]
+        )
+        self._validate_paired_raster_grid(contract, stores)
+        segmentation_keys = tuple(
+            dict.fromkeys(
+                segmentation.logical_key
+                for platform in ("MERSCOPE", "XENIUM")
+                for segmentation in contract.profile(platform).segmentations
+            )
+        )
+        return PairedDatasetSession(
+            configs=configs,
+            sdata=stores,
+            contract=contract,
+            view_mode=view_mode,
+            image_slots=self._paired_image_slots(contract, stores),
+            segmentation_keys=segmentation_keys,
+        )
+
+    def _validate_paired_raster_grid(
+        self,
+        contract: PairedDataContract,
+        stores: dict[str, object],
+    ) -> None:
+        """Reject paired rasters that do not occupy the declared fixed grid."""
+        expected = (int(contract.fixed_height), int(contract.fixed_width))
+        mismatches: list[str] = []
+        for platform in ("MERSCOPE", "XENIUM"):
+            profile = contract.profile(platform)
+            store = stores[platform]
+            for image_key in profile.image_keys:
+                levels = [
+                    (str(name), ensure_cyx(level))
+                    for name, level in image_scale_dataarrays(
+                        store.images[image_key]
+                    )
+                ]
+                if len(levels) == 1:
+                    pyramid_key = profile.image_pyramid_keys.get(image_key)
+                    if pyramid_key and pyramid_key in store.images:
+                        levels.extend(
+                            (f"pyramid:{name}", ensure_cyx(level))
+                            for name, level in image_scale_dataarrays(
+                                store.images[pyramid_key]
+                            )
+                        )
+                if not levels:
+                    mismatches.append(
+                        f"{platform} images/{image_key} has no 2D scale"
+                    )
+                    continue
+                image = levels[0][1]
+                actual = tuple(int(value) for value in image.shape[-2:])
+                if actual != expected:
+                    mismatches.append(
+                        f"{platform} images/{image_key} is {actual}"
+                    )
+                expected_channels = channel_labels(image)
+                previous_shape = actual
+                for level_name, level in levels[1:]:
+                    level_channels = channel_labels(level)
+                    shape = tuple(int(value) for value in level.shape[-2:])
+                    if level_channels != expected_channels:
+                        mismatches.append(
+                            f"{platform} images/{image_key} changes channels "
+                            f"at {level_name}"
+                        )
+                    if not (
+                        all(
+                            current <= previous
+                            for current, previous in zip(shape, previous_shape)
+                        )
+                        and any(
+                            current < previous
+                            for current, previous in zip(shape, previous_shape)
+                        )
+                    ):
+                        mismatches.append(
+                            f"{platform} images/{image_key} is not coarser "
+                            f"at {level_name}: {previous_shape} -> {shape}"
+                        )
+                    previous_shape = shape
+            for segmentation in profile.segmentations:
+                for collection_key, pyramid_key in (
+                    (
+                        segmentation.label_key,
+                        segmentation.label_pyramid_key,
+                    ),
+                    (segmentation.outline_key, None),
+                ):
+                    if not collection_key or collection_key not in store.labels:
+                        continue
+                    levels = self._raster_scale_levels(
+                        store.labels[collection_key]
+                    )
+                    if (
+                        len(levels) == 1
+                        and pyramid_key
+                        and pyramid_key in store.labels
+                    ):
+                        levels.extend(
+                            (f"pyramid:{name}", data)
+                            for name, data in self._raster_scale_levels(
+                                store.labels[pyramid_key]
+                            )
+                        )
+                    if not levels:
+                        mismatches.append(
+                            f"{platform} labels/{collection_key} has no 2D scale"
+                        )
+                        continue
+                    actual = tuple(
+                        int(value) for value in levels[0][1].shape[-2:]
+                    )
+                    if actual != expected:
+                        mismatches.append(
+                            f"{platform} labels/{collection_key} is {actual}"
+                        )
+                    previous_shape = actual
+                    for level_name, level in levels[1:]:
+                        shape = tuple(
+                            int(value) for value in level.shape[-2:]
+                        )
+                        if not (
+                            all(
+                                current <= previous
+                                for current, previous in zip(
+                                    shape, previous_shape
+                                )
+                            )
+                            and any(
+                                current < previous
+                                for current, previous in zip(
+                                    shape, previous_shape
+                                )
+                            )
+                        ):
+                            mismatches.append(
+                                f"{platform} labels/{collection_key} is not "
+                                f"coarser at {level_name}: "
+                                f"{previous_shape} -> {shape}"
+                            )
+                        previous_shape = shape
+        if mismatches:
+            raise PairedDataContractError(
+                "Materialized paired rasters do not match the MerXen fixed "
+                f"grid {expected}: " + "; ".join(mismatches)
+            )
+
+    @staticmethod
+    def _paired_napari_affine(contract: PairedDataContract) -> np.ndarray:
+        """Convert the manifest's x/y affine into Napari's y/x convention."""
+        matrix = np.asarray(contract.merscope.pixel_to_world_affine, dtype=float)
+        return np.asarray(
+            [
+                [matrix[1, 1], matrix[1, 0], matrix[1, 2]],
+                [matrix[0, 1], matrix[0, 0], matrix[0, 2]],
+                [0.0, 0.0, 1.0],
+            ],
+            dtype=float,
+        )
+
+    @staticmethod
+    def _paired_placeholder_layer(identity: LayerIdentity):
+        """Return an uninserted, invisible layer that preserves grid stride."""
+        return napari.layers.Points(
+            np.empty((0, 2), dtype=np.float32),
+            name=f"{identity.platform} placeholder",
+            size=0.1,
+            opacity=0.0,
+            visible=False,
+        )
+
+    def _paired_image_levels(
+        self,
+        platform: str,
+        image_key: str,
+    ) -> list[tuple[str, object]]:
+        """Read a base image plus its already-materialized pyramid, without writes."""
+        session = self._paired_session
+        if session is None:
+            return []
+        store = session.sdata[platform]
+        profile = session.contract.profile(platform)
+        base = [
+            (str(name), ensure_cyx(level))
+            for name, level in image_scale_dataarrays(store.images[image_key])
+        ]
+        levels = list(base)
+        if len(base) == 1:
+            pyramid_key = profile.image_pyramid_keys.get(image_key)
+            if pyramid_key and pyramid_key in store.images:
+                levels.extend(
+                    (f"pyramid:{name}", ensure_cyx(level))
+                    for name, level in image_scale_dataarrays(
+                        store.images[pyramid_key]
+                    )
+                )
+        if not levels:
+            return []
+        expected_channels = channel_labels(levels[0][1])
+        previous_shape = tuple(int(value) for value in levels[0][1].shape[-2:])
+        for level_name, level in levels[1:]:
+            actual_channels = channel_labels(level)
+            if actual_channels != expected_channels:
+                raise PairedDataContractError(
+                    f"{platform} image pyramid for {image_key!r} changes "
+                    f"channels at {level_name!r}."
+                )
+            shape = tuple(int(value) for value in level.shape[-2:])
+            if not (
+                all(current <= previous for current, previous in zip(shape, previous_shape))
+                and any(current < previous for current, previous in zip(shape, previous_shape))
+            ):
+                raise PairedDataContractError(
+                    f"{platform} image pyramid for {image_key!r} is not "
+                    f"strictly coarser at {level_name!r}: {previous_shape} -> {shape}."
+                )
+            previous_shape = shape
+        return levels
+
+    def _paired_label_levels(
+        self,
+        platform: str,
+        segmentation: SegmentationProfile,
+        *,
+        outline: bool,
+    ) -> tuple[list[object], str]:
+        """Return precomputed label/outline levels for one contract segmentation."""
+        session = self._paired_session
+        if session is None:
+            return [], ""
+        labels = session.sdata[platform].labels
+        if outline:
+            key = segmentation.outline_key
+            if not key or key not in labels:
+                return [], ""
+            levels = [
+                data for _name, data in self._raster_scale_levels(labels[key])
+            ]
+            self._validate_paired_label_level_shapes(platform, key, levels)
+            return levels, key
+        key = segmentation.label_key
+        if not key or key not in labels:
+            return [], ""
+        levels = [data for _name, data in self._raster_scale_levels(labels[key])]
+        if len(levels) == 1:
+            pyramid_key = segmentation.label_pyramid_key
+            if pyramid_key and pyramid_key in labels:
+                levels.extend(
+                    data
+                    for _name, data in self._raster_scale_levels(labels[pyramid_key])
+                )
+        self._validate_paired_label_level_shapes(platform, key, levels)
+        return levels, key
+
+    @staticmethod
+    def _validate_paired_label_level_shapes(
+        platform: str,
+        label_key: str,
+        levels: list[object],
+    ) -> None:
+        if not levels:
+            return
+        previous_shape = tuple(int(value) for value in levels[0].shape[-2:])
+        for index, level in enumerate(levels[1:], start=1):
+            shape = tuple(int(value) for value in level.shape[-2:])
+            if not (
+                all(current <= previous for current, previous in zip(shape, previous_shape))
+                and any(current < previous for current, previous in zip(shape, previous_shape))
+            ):
+                raise PairedDataContractError(
+                    f"{platform} label pyramid for {label_key!r} is not "
+                    f"strictly coarser at level {index}: {previous_shape} -> {shape}."
+                )
+            previous_shape = shape
+
+    def _remove_paired_anchor(self) -> None:
+        registry = self._paired_registry
+        if registry is not None:
+            registry.remove_slot(LayerSlotKey("reference", "layout-anchor"))
+
+    def _remove_paired_slot(self, key: LayerSlotKey) -> tuple[object, ...]:
+        """Remove a logical pair while retaining a valid empty-view anchor."""
+        registry = self._paired_registry
+        if registry is None or key not in registry.slot_keys:
+            return ()
+        anchor = LayerSlotKey("reference", "layout-anchor")
+        if registry.slot_count == 1 and key != anchor:
+            registry.ensure_slot(anchor, side_visible=False)
+        return registry.remove_slot(key)
+
+    def _load_paired_image_slots(self, slot_keys=None) -> int:
+        session = self._paired_session
+        registry = self._paired_registry
+        if session is None or registry is None:
+            return 0
+        wanted = None if slot_keys is None else {str(key) for key in slot_keys}
+        added = 0
+        affine = self._paired_napari_affine(session.contract)
+        for slot in session.image_slots:
+            if wanted is not None and slot.key not in wanted:
+                continue
+            for source in slot.sources:
+                identity = LayerIdentity(source.platform, "image", channel=slot.key)
+                if registry.layer_for(identity) is not None:
+                    continue
+                levels = self._paired_image_levels(source.platform, source.image_key)
+                if not levels:
+                    continue
+                base = levels[0][1]
+                labels = channel_labels(base)
+                try:
+                    channel_index = labels.index(source.channel)
+                except ValueError:
+                    continue
+                channel_levels = [
+                    image.isel(c=channel_index).data for _name, image in levels
+                ]
+                data = channel_levels if len(channel_levels) > 1 else channel_levels[0]
+                visible = (
+                    not self.args.hide_images
+                    and source.channel in self._default_visible_channels(labels)
+                )
+                kwargs = {
+                    "name": slot.key,
+                    "affine": affine,
+                    "colormap": image_colormap_for_channel(
+                        source.channel, channel_index
+                    ),
+                    "blending": "additive",
+                    "cache": NAPARI_DASK_CACHE_ENABLED,
+                    "opacity": self.args.image_opacity,
+                    "visible": visible,
+                    "multiscale": len(channel_levels) > 1,
+                    "metadata": {
+                        "spatialdata_element_key": source.image_key,
+                        "spatialdata_channel": source.channel,
+                    },
+                }
+                limits = contrast_limits_from_dtype(channel_levels[0])
+                if limits is not None:
+                    kwargs["contrast_limits"] = limits
+                layer = napari.layers.Image(data, **kwargs)
+                registry.register_layer(identity, layer)
+                added += 1
+            session.loaded_image_slots.add(slot.key)
+        if added:
+            self._remove_paired_anchor()
+        self._publish_loaded_image_entries()
+        return added
+
+    def _paired_segmentation_profile(
+        self, platform: str, logical_key: str
+    ) -> SegmentationProfile | None:
+        session = self._paired_session
+        if session is None:
+            return None
+        return session.contract.profile(platform).segmentation(logical_key)
+
+    def _load_paired_segmentations(self, logical_keys) -> int:
+        session = self._paired_session
+        registry = self._paired_registry
+        if session is None or registry is None:
+            return 0
+        added = 0
+        affine = self._paired_napari_affine(session.contract)
+        missing: list[str] = []
+        for logical_key in dict.fromkeys(str(key) for key in logical_keys):
+            for platform in ("MERSCOPE", "XENIUM"):
+                identity = LayerIdentity(platform, "segmentation", logical_key)
+                if registry.layer_for(identity) is not None:
+                    continue
+                segmentation = self._paired_segmentation_profile(
+                    platform, logical_key
+                )
+                if segmentation is None:
+                    continue
+                levels, outline_key = self._paired_label_levels(
+                    platform, segmentation, outline=True
+                )
+                if levels:
+                    color = np.asarray(
+                        stable_layer_color(
+                            f"{platform}:{logical_key}", alpha=1.0
+                        ),
+                        dtype=np.float32,
+                    )
+                    layer = napari.layers.Image(
+                        levels if len(levels) > 1 else levels[0],
+                        name=logical_key,
+                        affine=affine,
+                        colormap=outline_coverage_colormap(
+                            f"{platform}_{logical_key}_outline",
+                            color,
+                            alpha=float(self.args.shape_opacity),
+                        ),
+                        contrast_limits=(0.0, float(OUTLINE_COVERAGE_MAX)),
+                        cache=NAPARI_DASK_CACHE_ENABLED,
+                        interpolation2d=str(
+                            getattr(
+                                self.args,
+                                "label_interpolation",
+                                "nearest",
+                            )
+                        ),
+                        multiscale=len(levels) > 1,
+                        opacity=self.args.shape_opacity,
+                        blending="additive",
+                        visible=not self.args.hide_shapes,
+                        metadata={
+                            "spatialdata_shape_key": segmentation.shape_key,
+                            "spatialdata_label_key": segmentation.label_key,
+                            "spatialdata_outline_key": outline_key,
+                            "logical_segmentation": logical_key,
+                        },
+                    )
+                else:
+                    # MerXen normally pre-materialises coverage outlines, but a
+                    # complete aligned label pyramid is also a valid read-only
+                    # display source.  Falling back to a Labels contour keeps
+                    # paired loading cheap without rasterising shapes or writing
+                    # viewer caches into either store.
+                    levels, label_key = self._paired_label_levels(
+                        platform, segmentation, outline=False
+                    )
+                    if not levels:
+                        missing.append(
+                            f"{platform} {logical_key} materialized labels"
+                        )
+                        continue
+                    layer = napari.layers.Labels(
+                        levels if len(levels) > 1 else levels[0],
+                        name=logical_key,
+                        affine=affine,
+                        cache=NAPARI_DASK_CACHE_ENABLED,
+                        multiscale=len(levels) > 1,
+                        opacity=self.args.shape_opacity,
+                        blending="translucent",
+                        visible=not self.args.hide_shapes,
+                        metadata={
+                            "spatialdata_shape_key": segmentation.shape_key,
+                            "spatialdata_label_key": label_key,
+                            "logical_segmentation": logical_key,
+                        },
+                    )
+                    try:
+                        layer.contour = max(
+                            1,
+                            int(
+                                getattr(
+                                    self.args,
+                                    "label_contour_width",
+                                    1,
+                                )
+                            ),
+                        )
+                    except Exception:
+                        log.debug(
+                            "Napari Labels contour styling is unavailable for %s",
+                            layer.name,
+                            exc_info=True,
+                        )
+                registry.register_layer(identity, layer)
+                try:
+                    layer.events.visible.connect(
+                        self._on_segmentation_visibility_changed
+                    )
+                except Exception:
+                    pass
+                added += 1
+            if any(
+                registry.layer_for(LayerIdentity(platform, "segmentation", logical_key))
+                is not None
+                for platform in ("MERSCOPE", "XENIUM")
+            ):
+                session.loaded_segmentations.add(logical_key)
+        if added:
+            self._remove_paired_anchor()
+        if missing:
+            log.warning(
+                "Paired view skipped missing materialized layers: %s",
+                ", ".join(missing),
+            )
+        self._publish_loaded_segmentation_keys()
+        return added
+
+    def _paired_startup_segmentation_keys(self) -> list[str]:
+        session = self._paired_session
+        if session is None:
+            return []
+        selected: list[str] = []
+        for token, skip in (
+            ("cellpose", bool(getattr(self.args, "skip_cellpose", False))),
+            ("proseg", bool(getattr(self.args, "skip_proseg", False))),
+        ):
+            if skip:
+                continue
+            match = next(
+                (key for key in session.segmentation_keys if token in key.lower()),
+                None,
+            )
+            if match is not None:
+                selected.append(match)
+        return list(dict.fromkeys(selected))
+
+    def _apply_paired_dataset_session(
+        self,
+        generation: int,
+        session: PairedDatasetSession,
+        started_at: float,
+    ) -> None:
+        if generation != self._dataset_load_generation or self._dataset_load_cancel.is_set():
+            return
+        self._dataset_load_worker = None
+        self._dataset_loading_key = None
+        self._cancel_background_tasks()
+        if self._paired_registry is not None:
+            self._paired_registry.grid.enabled = False
+        self._paired_registry = None
+        self._paired_session = None
+        self._clear_layers()
+        self.datasets = dict(session.configs)
+        self._dataset_sessions.clear()
+        self._cell_type_states.clear()
+        self.active_dataset = "PAIRED"
+        self._active_sdata = session.sdata["MERSCOPE"]
+        self._active_images_sdata = session.sdata["MERSCOPE"]
+        self._paired_session = session
+        self._paired_selected_cells = {"MERSCOPE": [], "XENIUM": []}
+        left_panel = getattr(self, "_left_panel_adapter", None)
+        if left_panel is not None:
+            left_panel.set_paired_mode(True)
+        self._paired_registry = PairedLayerRegistry(
+            self.viewer,
+            self._paired_placeholder_layer,
+            strict_layers=True,
+            spacing=4.0,
+        )
+        self._segmentation_keys = list(session.segmentation_keys)
+        self._image_keys = [slot.key for slot in session.image_slots]
+        self._image_channels = [(slot.key, slot.label) for slot in session.image_slots]
+        if self._datasets_changed_callback is not None:
+            self._datasets_changed_callback(["PAIRED"], "PAIRED")
+        if self._paired_view_mode_callback is not None:
+            self._paired_view_mode_callback(session.view_mode)
+        self._publish_shape_keys()
+        self._publish_image_entries()
+        # A new pair starts with no loaded image slots.  Publish that empty
+        # state even when --skip-images prevents the loader below from doing so,
+        # otherwise overlapping rows can retain the prior session's green state.
+        self._publish_loaded_image_entries()
+        self._publish_cellpose_value_options()
+        self._publish_cell_type_options()
+        if not bool(getattr(self.args, "skip_images", False)):
+            self._load_paired_image_slots()
+        self._load_paired_segmentations(self._paired_startup_segmentation_keys())
+        if self._paired_registry.slot_count == 0:
+            self._paired_registry.ensure_slot(
+                LayerSlotKey("reference", "layout-anchor"), side_visible=False
+            )
+        self._paired_registry.set_mode(session.view_mode)
+        self._update_scale_bar_visibility()
+        self._end_progress("dataset")
+        self._set_status(
+            f"Paired dataset {session.contract.pair_id} loaded in "
+            f"{time.time() - started_at:.1f}s ({session.view_mode.value}); "
+            "using materialized aligned MERSCOPE images, masks, and transcripts."
+        )
+        if self._paired_dataset_loaded_callback is not None:
+            try:
+                self._paired_dataset_loaded_callback(
+                    session.configs["MERSCOPE"].zarr_path,
+                    session.configs["XENIUM"].zarr_path,
+                    session.view_mode,
+                )
+            except Exception:
+                log.exception("Failed to publish successful paired dataset load")
+        try:
+            self.viewer.reset_view()
+        except Exception:
+            pass
+        if not bool(getattr(self.args, "skip_transcripts", False)):
+            self.open_gene_inspector("PAIRED", reuse_cached=False)
+        self._schedule_canvas_visibility_repair("PAIRED")
+
+    def _handle_paired_dataset_load_error(
+        self, generation: int, exc
+    ) -> None:
+        if generation != self._dataset_load_generation:
+            return
+        self._dataset_load_worker = None
+        self._dataset_loading_key = None
+        self._end_progress("dataset")
+        message = exc[1] if isinstance(exc, tuple) and len(exc) > 1 else exc
+        if not self._dataset_load_cancel.is_set():
+            self._set_status(f"Could not open paired dataset: {message}")
+            log.error("Could not open paired dataset: %s", message)
+
+    def switch_paired_view(self, view_mode: ViewMode | str):
+        """Switch an already-loaded pair without reloading or replacing layers."""
+        if self._paired_session is None or self._paired_registry is None:
+            self._set_status("Load a paired dataset before switching paired views.")
+            return False
+        mode = ViewMode.coerce(view_mode)
+        self._paired_registry.set_mode(mode)
+        self._paired_session.view_mode = mode
+        if self._paired_view_mode_callback is not None:
+            self._paired_view_mode_callback(mode)
+        self._set_status(
+            f"Paired dataset switched to {mode.value}; camera navigation remains linked."
+        )
+        self._force_canvas_redraw()
+        return True
+
+    def _deactivate_paired_view(self) -> None:
+        if self._paired_registry is not None:
+            self._paired_registry.grid.enabled = False
+        self._paired_registry = None
+        self._paired_session = None
+        left_panel = getattr(self, "_left_panel_adapter", None)
+        if left_panel is not None:
+            left_panel.set_paired_mode(False)
+        if self._paired_view_mode_callback is not None:
+            self._paired_view_mode_callback(None)
+
     def _replace_datasets(self, datasets: dict[str, DatasetConfig], initial: str):
         """Swap in a freshly browsed set of datasets and load the initial one."""
         self._dataset_load_cancel.set()
         self._dataset_loading_key = None
         self._cancel_background_tasks()
+        self._deactivate_paired_view()
         self._clear_layers()
         self.active_dataset = None
         self._active_sdata = None
@@ -5323,9 +6489,15 @@ class ComparisonViewerController:
             self._datasets_changed_callback(list(datasets.keys()), initial)
         return self.load_dataset(initial, force=True)
 
-    def load_paired_dataset(self, merscope_path, xenium_path):
-        """Open a MERSCOPE + Xenium pair browsed from the Dataset loader tab."""
+    def load_paired_dataset(
+        self,
+        merscope_path,
+        xenium_path,
+        view_mode: ViewMode | str = ViewMode.SIDE_BY_SIDE,
+    ):
+        """Open and atomically validate a simultaneous MERSCOPE/Xenium pair."""
         try:
+            mode = ViewMode.coerce(view_mode)
             merscope_path = Path(merscope_path)
             xenium_path = Path(xenium_path)
             for label, path in (("MERSCOPE", merscope_path), ("Xenium", xenium_path)):
@@ -5340,7 +6512,48 @@ class ComparisonViewerController:
             self._set_status(f"Could not open paired dataset: {exc}")
             log.exception("Failed to open paired dataset")
             return False
-        return self._replace_datasets(datasets, initial="MERSCOPE")
+        self._cancel_background_tasks()
+        self._reset_progress()
+        self._dataset_load_generation += 1
+        generation = self._dataset_load_generation
+        self._dataset_load_cancel.set()
+        self._dataset_load_cancel = Event()
+        cancel_token = self._dataset_load_cancel
+        self._dataset_loading_key = ("PAIRED", mode.value)
+        started_at = time.time()
+        self._begin_progress(
+            "dataset", f"Validating paired dataset for {mode.value} viewing…"
+        )
+
+        def compute():
+            with self._store_io_slots:
+                return self._prepare_paired_dataset_session(
+                    datasets, mode, cancel_token
+                )
+
+        if thread_worker is None:
+            try:
+                session = compute()
+            except Exception as exc:
+                self._handle_paired_dataset_load_error(generation, exc)
+                return False
+            self._apply_paired_dataset_session(generation, session, started_at)
+            return None
+
+        worker = thread_worker(compute)()
+        worker.returned.connect(
+            lambda session, gen=generation, start=started_at: self._apply_paired_dataset_session(
+                gen, session, start
+            )
+        )
+        worker.errored.connect(
+            lambda exc, gen=generation: self._handle_paired_dataset_load_error(
+                gen, exc
+            )
+        )
+        self._dataset_load_worker = worker
+        worker.start()
+        return None
 
     def load_standalone_dataset(self, platform: str, path):
         """Open a single MERSCOPE or Xenium store browsed from the loader tab."""
@@ -6481,7 +7694,14 @@ class ComparisonViewerController:
             raise RuntimeError("No points available in SpatialData.")
 
         points_key = list(self._active_sdata.points.keys())[0]
-        points_obj = self._active_sdata.points[points_key]
+        return self._resolve_points_columns_for(self._active_sdata, points_key)
+
+    @staticmethod
+    def _resolve_points_columns_for(sdata_obj, points_key: str):
+        """Resolve columns from one exact points element rather than collection order."""
+        if points_key not in getattr(sdata_obj, "points", {}):
+            raise KeyError(f"points[{points_key}] is missing")
+        points_obj = sdata_obj.points[points_key]
         x_col = first_existing_col(points_obj, ["x", "x_micron", "global_x", "x_location", "observed_x"])
         y_col = first_existing_col(points_obj, ["y", "y_micron", "global_y", "y_location", "observed_y"])
         assignment_col = first_existing_col(points_obj, ["assignment", "cell", "cell_id"])
@@ -6491,6 +7711,13 @@ class ComparisonViewerController:
         return points_key, points_obj, x_col, y_col, assignment_col
 
     def load_selected_labels(self, dataset_name: str, shape_keys: list[str]):
+        if self._paired_session is not None:
+            keys = [str(key) for key in shape_keys]
+            added = self._load_paired_segmentations(keys)
+            self._set_status(
+                f"Paired view loaded {added} precomputed segmentation layer(s)."
+            )
+            return added
         if not self._ensure_dataset_is_active(dataset_name):
             self._set_status(f"Could not activate dataset {dataset_name}.")
             return
@@ -6978,6 +8205,11 @@ class ComparisonViewerController:
         statistic: str,
         colormap_name: str,
     ):
+        if self._paired_session is not None:
+            self._set_status(
+                "Per-cell statistic overlays are unavailable in paired mode."
+            )
+            return False
         if not self._ensure_dataset_is_active(dataset_name):
             self._set_status(f"Could not activate dataset {dataset_name}.")
             return
@@ -7074,6 +8306,20 @@ class ComparisonViewerController:
         self._set_status(f"{ds} removed {removed} Cellpose value overlay layer(s).")
 
     def unload_selected_shapes(self, dataset_name: str, shape_keys: list[str]):
+        if self._paired_session is not None and self._paired_registry is not None:
+            removed = 0
+            for logical_key in dict.fromkeys(str(key) for key in shape_keys):
+                removed += len(
+                    self._remove_paired_slot(
+                        LayerSlotKey("segmentation", logical_key)
+                    )
+                )
+                self._paired_session.loaded_segmentations.discard(logical_key)
+            self._publish_loaded_segmentation_keys()
+            self._set_status(
+                f"Paired view removed {removed} segmentation layer(s)."
+            )
+            return removed
         if not self._ensure_dataset_is_active(dataset_name):
             self._set_status(f"Could not activate dataset {dataset_name}.")
             return
@@ -7105,7 +8351,526 @@ class ComparisonViewerController:
         background_col = first_existing_col(points_obj, ["background"])
         return points_key, points_obj, x_col, y_col, assignment_col, gene_col, background_col
 
+    def _paired_gene_build_input(self, platform: str):
+        session = self._paired_session
+        if session is None:
+            raise RuntimeError("No paired dataset is loaded.")
+        points_key = session.contract.profile(platform).points_key
+        points_key, points_obj, x_col, y_col, assignment_col = (
+            self._resolve_points_columns_for(session.sdata[platform], points_key)
+        )
+        gene_col = resolve_gene_column(points_obj)
+        if gene_col is None:
+            raise KeyError(f"{platform} points[{points_key}] has no gene column")
+        background_col = first_existing_col(points_obj, ["background"])
+        return (
+            points_key,
+            points_obj,
+            x_col,
+            y_col,
+            assignment_col,
+            gene_col,
+            background_col,
+        )
+
+    def _open_paired_gene_inspector(self):
+        session = self._paired_session
+        if session is None:
+            return False
+        self._teardown_paired_gene_inspector(clear_widget=False)
+        self._gene_build_generation += 1
+        generation = self._gene_build_generation
+        task_key = (
+            "PAIRED",
+            session.contract.pair_id,
+            int(getattr(self.args, "gene_max_render_points", DEFAULT_GENE_MAX_RENDER_POINTS)),
+            int(getattr(self.args, "random_state", 42)),
+        )
+        cancel_token = self._begin_task_token("transcripts", task_key)
+        if cancel_token is None:
+            self._set_status("Paired transcript loading is already running.")
+            return True
+        self._begin_progress(
+            "transcripts", "Loading aligned transcripts for both datasets…"
+        )
+        max_points = int(
+            getattr(self.args, "gene_max_render_points", DEFAULT_GENE_MAX_RENDER_POINTS)
+        )
+        random_state = int(getattr(self.args, "random_state", 42))
+        pair_id = session.contract.pair_id
+
+        def compute():
+            payloads: dict[str, dict] = {}
+            with self._store_io_slots:
+                for offset, platform in enumerate(("MERSCOPE", "XENIUM")):
+                    if cancel_token.is_set():
+                        raise RuntimeError("Paired transcript build cancelled")
+                    (
+                        points_key,
+                        points_obj,
+                        x_col,
+                        y_col,
+                        assignment_col,
+                        gene_col,
+                        background_col,
+                    ) = self._paired_gene_build_input(platform)
+                    resolution = None
+
+                    def resolve_reference(genes, ds=platform):
+                        nonlocal resolution
+                        resolution = resolve_cell_type_marker_reference(
+                            session.configs[ds].zarr_path, genes
+                        )
+                        return resolution.reference
+
+                    started = time.time()
+                    seed = random_state + offset
+                    cache_request = make_transcript_cache_request(
+                        zarr_path=session.configs[platform].zarr_path,
+                        points_key=points_key,
+                        x_col=x_col,
+                        y_col=y_col,
+                        gene_col=gene_col,
+                        assignment_col=assignment_col,
+                        background_col=background_col,
+                        max_points=max_points if max_points > 0 else None,
+                        random_state=seed,
+                        build_cell_index=assignment_col is not None,
+                    )
+                    payload = (
+                        load_transcript_payload(
+                            cache_request,
+                            cancel_check=cancel_token.is_set,
+                        )
+                        if cache_request is not None
+                        else None
+                    )
+                    if payload is None:
+                        store = build_gene_point_groups(
+                            points_obj,
+                            x_col=x_col,
+                            y_col=y_col,
+                            gene_col=gene_col,
+                            assignment_col=assignment_col,
+                            background_col=background_col,
+                            reference_resolver=resolve_reference,
+                            max_points=max_points if max_points > 0 else None,
+                            random_state=seed,
+                            build_cell_index=assignment_col is not None,
+                            cancel_check=cancel_token.is_set,
+                        )
+                        payload = {
+                            "points_key": points_key,
+                            "store": store,
+                            "reference": (
+                                None
+                                if resolution is None
+                                else resolution.reference
+                            ),
+                            "reference_resolution": resolution,
+                            "cache_hit": False,
+                        }
+                        if not cancel_token.is_set() and cache_request is not None:
+                            payload["cache_saved"] = save_transcript_payload(
+                                cache_request,
+                                payload,
+                                cancel_check=cancel_token.is_set,
+                            )
+                    payload["build_seconds"] = time.time() - started
+                    payloads[platform] = payload
+            return pair_id, payloads
+
+        if thread_worker is None:
+            try:
+                result_pair_id, payloads = compute()
+            except Exception as exc:
+                self._handle_paired_gene_build_error(
+                    generation, exc, cancel_token
+                )
+                return False
+            self._apply_paired_gene_build(
+                generation, result_pair_id, payloads, cancel_token
+            )
+            return True
+        worker = thread_worker(compute)()
+        worker.returned.connect(
+            lambda result, gen=generation, token=cancel_token: self._apply_paired_gene_build(
+                gen, result[0], result[1], token
+            )
+        )
+        worker.errored.connect(
+            lambda exc, gen=generation, token=cancel_token: self._handle_paired_gene_build_error(
+                gen, exc, token
+            )
+        )
+        self._gene_build_worker = worker
+        worker.start()
+        return True
+
+    def _new_gene_inspector_state(
+        self, platform: str, payload: dict
+    ) -> GeneInspectorState:
+        store = payload["store"]
+        reference = payload.get("reference")
+        resolution = payload.get("reference_resolution")
+        coarse_scheme = build_cell_type_gene_visuals(
+            store.genes, reference, kind="coarse"
+        )
+        fine_scheme = build_cell_type_gene_visuals(
+            store.genes, reference, kind="fine"
+        )
+        broad_available = bool(
+            reference and any(bool(info.get("broad")) for info in reference.values())
+        )
+        fine_available = bool(
+            reference and any(bool(info.get("fine")) for info in reference.values())
+        )
+        ordering = (
+            "coarse"
+            if broad_available
+            else "fine" if fine_available else "alphabetical"
+        )
+        show_controls = bool(getattr(self.args, "gene_show_controls", False))
+        timer = QTimer()
+        timer.setSingleShot(True)
+        state = GeneInspectorState(
+            dataset=platform,
+            points_key=str(payload["points_key"]),
+            store=store,
+            gene_visuals=store.gene_visuals or coarse_scheme.visuals,
+            layer_names=[],
+            enabled_genes={
+                gene
+                for gene in store.genes
+                if show_controls or gene not in store.control_genes
+            },
+            spot_size=float(
+                getattr(self.args, "gene_spot_size", DEFAULT_GENE_SPOT_SIZE)
+            ),
+            hide_assigned=bool(getattr(self.args, "gene_hide_assigned", False)),
+            hide_background=bool(
+                getattr(self.args, "gene_hide_background", False)
+            ),
+            show_controls=show_controls,
+            rebuild_timer=timer,
+            pending_groups=set(),
+            highlighted_genes=[],
+            group_display_ranges=[[] for _ in store.group_symbols],
+            group_shown_masks=[
+                np.zeros(len(coords), dtype=bool) for coords in store.group_coords
+            ],
+            reference=reference,
+            reference_source=getattr(resolution, "source", ""),
+            reference_summary=getattr(
+                resolution,
+                "summary",
+                "No cell-type marker reference matched this gene panel.",
+            ),
+            broad_ordering_available=broad_available,
+            fine_ordering_available=fine_available,
+            coarse_scheme=coarse_scheme,
+            fine_scheme=fine_scheme,
+            ordering=ordering,
+            color_kind="coarse",
+            colour_by_assignment=False,
+        )
+        timer.timeout.connect(lambda ds=platform: self._flush_gene_group_rebuild(ds))
+        return state
+
+    @staticmethod
+    def _regroup_gene_store_for_visuals(store, gene_visuals: dict[str, GeneVisual]) -> None:
+        """Regroup one prepared point store for a shared paired visual scheme.
+
+        ``build_gene_point_groups`` groups coordinates by marker symbol, so merely
+        recolouring is insufficient when the union panel changes a gene's symbol.
+        This rearranges the already-materialized render arrays in memory; it never
+        rereads the SpatialData points table.
+        """
+        symbols_unchanged = all(
+            gene in gene_visuals
+            and str(gene_visuals[gene].symbol) == str(store.gene_symbol(gene))
+            for gene in store.gene_offsets
+        )
+        if symbols_unchanged:
+            # Identical (or symbol-compatible) panels are the common case.  Keep
+            # the existing coordinate/color arrays and recolour them in place so
+            # harmonisation does not transiently duplicate a multi-million-point
+            # render store.
+            store.recolor(gene_visuals)
+            return
+
+        genes_by_symbol: dict[str, list[str]] = {}
+        for gene in store.gene_offsets:
+            visual = gene_visuals.get(str(gene))
+            symbol = getattr(visual, "symbol", None)
+            if symbol is None:
+                symbol = store.gene_symbol(str(gene)) or "disc"
+            genes_by_symbol.setdefault(str(symbol), []).append(str(gene))
+
+        known_symbols = [
+            symbol for symbol in GENE_MARKER_SYMBOLS if symbol in genes_by_symbol
+        ]
+        extra_symbols = sorted(set(genes_by_symbol) - set(known_symbols))
+        group_symbols = known_symbols + extra_symbols
+        group_coords: list[np.ndarray] = []
+        group_colors: list[np.ndarray] = []
+        gene_offsets: dict[str, tuple[int, int, int, int]] = {}
+
+        for group_index, symbol in enumerate(group_symbols):
+            coords_parts: list[np.ndarray] = []
+            color_parts: list[np.ndarray] = []
+            cursor = 0
+            for gene in sorted(genes_by_symbol[symbol]):
+                old_group, fg_start, fg_end, bg_end = store.gene_offsets[gene]
+                coords = np.asarray(
+                    store.group_coords[int(old_group)][int(fg_start):int(bg_end)]
+                )
+                point_count = int(len(coords))
+                foreground_count = max(0, int(fg_end) - int(fg_start))
+                visual = gene_visuals[gene]
+                colors = np.empty((point_count, 4), dtype=np.float32)
+                colors[:] = np.asarray(visual.rgba, dtype=np.float32)
+                coords_parts.append(coords)
+                color_parts.append(colors)
+                gene_offsets[gene] = (
+                    group_index,
+                    cursor,
+                    cursor + foreground_count,
+                    cursor + point_count,
+                )
+                cursor += point_count
+            group_coords.append(
+                np.concatenate(coords_parts, axis=0)
+                if coords_parts
+                else np.empty((0, 2), dtype=np.float32)
+            )
+            group_colors.append(
+                np.concatenate(color_parts, axis=0)
+                if color_parts
+                else np.empty((0, 4), dtype=np.float32)
+            )
+
+        store.group_symbols = group_symbols
+        store.group_coords = group_coords
+        store.group_colors = group_colors
+        store.gene_offsets = gene_offsets
+        store.gene_visuals = dict(gene_visuals)
+
+    def _harmonize_paired_gene_states(
+        self, states: list[GeneInspectorState]
+    ) -> None:
+        """Give both platform states one union panel and one visual vocabulary."""
+        if not states:
+            return
+        union_genes = sorted(
+            {str(gene) for state in states for gene in state.store.genes}
+        )
+        # Let MERSCOPE win a conflicting reference entry, while retaining
+        # platform-only reference entries from Xenium.  Sort explicitly rather
+        # than relying on the caller's state order: async build payloads and
+        # focused callers must produce the same visual vocabulary too.
+        merged_reference: dict[str, dict] = {}
+        reference_priority = {"XENIUM": 0, "MERSCOPE": 1}
+        for state in sorted(
+            states,
+            key=lambda item: (
+                reference_priority.get(str(item.dataset).upper(), -1),
+                str(item.dataset).upper(),
+            ),
+        ):
+            if state.reference:
+                merged_reference.update(
+                    {str(gene): dict(info) for gene, info in state.reference.items()}
+                )
+        reference = merged_reference or None
+        coarse_scheme = build_cell_type_gene_visuals(
+            union_genes, reference, kind="coarse"
+        )
+        fine_scheme = build_cell_type_gene_visuals(
+            union_genes, reference, kind="fine"
+        )
+        broad_available = bool(
+            reference
+            and any(bool(info.get("broad")) for info in reference.values())
+        )
+        fine_available = bool(
+            reference
+            and any(bool(info.get("fine")) for info in reference.values())
+        )
+        ordering = (
+            "coarse"
+            if broad_available
+            else "fine" if fine_available else "alphabetical"
+        )
+        control_genes = {
+            str(gene)
+            for state in states
+            for gene in state.store.control_genes
+        }
+        gene_counts = {
+            gene: sum(state.store.full_gene_count(gene) for state in states)
+            for gene in union_genes
+        }
+        show_controls = any(state.show_controls for state in states)
+        enabled = {
+            gene
+            for gene in union_genes
+            if show_controls or gene not in control_genes
+        }
+        summary = (
+            f"Shared paired panel: {len(union_genes)} unique genes across "
+            f"{len(states)} datasets."
+        )
+
+        for state in states:
+            self._regroup_gene_store_for_visuals(
+                state.store, coarse_scheme.visuals
+            )
+            state.gene_visuals = coarse_scheme.visuals
+            state.reference = reference
+            state.reference_source = "paired union"
+            state.reference_summary = summary
+            state.broad_ordering_available = broad_available
+            state.fine_ordering_available = fine_available
+            state.coarse_scheme = coarse_scheme
+            state.fine_scheme = fine_scheme
+            state.ordering = ordering
+            state.color_kind = "coarse"
+            state.panel_genes = list(union_genes)
+            state.panel_gene_counts = dict(gene_counts)
+            state.panel_control_genes = set(control_genes)
+            state.show_controls = show_controls
+            # Keep the shared control vocabulary in every state, including genes
+            # absent from that platform.  Renderer methods continue to consult
+            # ``store.gene_offsets`` before scheduling work, so a platform-only
+            # gene is checked consistently in the UI but rebuilt only where it
+            # actually has points.
+            state.enabled_genes = set(enabled)
+
+    def _apply_paired_gene_build(
+        self,
+        generation: int,
+        pair_id: str,
+        payloads: dict[str, dict],
+        token: Event | None,
+    ) -> None:
+        if token is not None:
+            self._finish_task_token("transcripts", token)
+        session = self._paired_session
+        if (
+            generation != self._gene_build_generation
+            or session is None
+            or session.contract.pair_id != pair_id
+            or (token is not None and token.is_set())
+        ):
+            return
+        self._gene_build_worker = None
+        self._end_progress("transcripts")
+        registry = self._paired_registry
+        if registry is None:
+            return
+        total_layers = 0
+        total_points = 0
+        paired_states: list[GeneInspectorState] = []
+        for platform in ("MERSCOPE", "XENIUM"):
+            payload = payloads.get(platform)
+            if payload is None:
+                continue
+            store = payload["store"]
+            if store.total_points == 0 or not store.genes:
+                continue
+            state = self._new_gene_inspector_state(platform, payload)
+            self._gene_inspector_states[platform] = state
+            paired_states.append(state)
+            if store.cell_transcript_index is not None:
+                self._cell_transcript_index[platform] = store.cell_transcript_index
+            total_points += int(store.total_points)
+
+        self._harmonize_paired_gene_states(paired_states)
+        for state in paired_states:
+            platform = state.dataset
+            store = state.store
+            state.group_display_ranges = [[] for _ in store.group_symbols]
+            state.group_shown_masks = [
+                np.zeros(len(coords), dtype=bool) for coords in store.group_coords
+            ]
+            for group_index, symbol in enumerate(store.group_symbols):
+                coords, colors, sizes, ranges, shown = self._gene_group_arrays(
+                    state, group_index
+                )
+                state.group_display_ranges[group_index] = ranges
+                identity = LayerIdentity(platform, "genes", channel=str(symbol))
+                layer = self._create_gene_points_layer(
+                    str(symbol),
+                    symbol,
+                    state.spot_size,
+                    coords,
+                    colors,
+                    sizes,
+                    shown=shown,
+                    paired_identity=identity,
+                )
+                state.layer_names.append(str(layer.name))
+                total_layers += 1
+        if total_layers:
+            self._remove_paired_anchor()
+            registry.repair_order()
+        if paired_states and self._gene_inspector_widget is not None:
+            self._populate_gene_inspector(paired_states[0])
+            try:
+                self._gene_inspector_widget.show()
+            except Exception:
+                pass
+        cache_hits = sum(
+            bool(payload.get("cache_hit")) for payload in payloads.values()
+        )
+        if cache_hits == len(payloads) and payloads:
+            cache_status = " restored from persistent cache"
+        elif cache_hits:
+            cache_status = f" ({cache_hits}/{len(payloads)} restored from cache)"
+        else:
+            cache_status = ""
+        self._set_status(
+            f"Paired transcripts{cache_status}: {total_points:,} points in "
+            f"{total_layers} platform-qualified layer(s)."
+        )
+        self._schedule_canvas_visibility_repair("PAIRED")
+
+    def _handle_paired_gene_build_error(
+        self, generation: int, exc, token: Event | None
+    ) -> None:
+        if token is not None:
+            self._finish_task_token("transcripts", token)
+        if generation != self._gene_build_generation:
+            return
+        self._gene_build_worker = None
+        self._end_progress("transcripts")
+        message = exc[1] if isinstance(exc, tuple) and len(exc) > 1 else exc
+        self._set_status(f"Paired transcript load failed: {message}")
+        log.error("Paired transcript load failed: %s", message)
+
+    def _teardown_paired_gene_inspector(self, *, clear_widget: bool = True) -> None:
+        token = self._task_cancel_events.pop("transcripts", None)
+        if token is not None:
+            token.set()
+        self._task_keys.pop("transcripts", None)
+        self._gene_build_generation += 1
+        self._gene_build_worker = None
+        for platform in ("MERSCOPE", "XENIUM"):
+            state = self._gene_inspector_states.pop(platform, None)
+            if state is not None and state.rebuild_timer is not None:
+                state.rebuild_timer.stop()
+        registry = self._paired_registry
+        if registry is not None:
+            for key in list(registry.slot_keys):
+                if key.role == "genes":
+                    self._remove_paired_slot(key)
+        if clear_widget and self._gene_inspector_widget is not None:
+            self._gene_inspector_widget.clear()
+
     def open_gene_inspector(self, dataset_name: str, reuse_cached: bool = False):
+        if self._paired_session is not None:
+            return self._open_paired_gene_inspector()
         if not self._ensure_dataset_is_active(dataset_name):
             self._set_status(f"Could not activate dataset {dataset_name}.")
             return
@@ -7145,7 +8910,10 @@ class ComparisonViewerController:
         if cancel_token is None:
             self._set_status(f"{ds}: transcript build is already running.")
             return
-        self._begin_progress("transcripts", f"{ds}: building per-gene transcripts for {points_key}...")
+        self._begin_progress(
+            "transcripts",
+            f"{ds}: loading per-gene transcripts for {points_key}...",
+        )
 
         def compute():
             t0 = time.time()
@@ -7161,26 +8929,57 @@ class ComparisonViewerController:
             # before symbols and point groups are assigned.
             with self._store_io_slots:
                 self._raise_if_task_cancelled(cancel_token.is_set, ds)
-                store = build_gene_point_groups(
-                    points_obj,
+                cache_request = make_transcript_cache_request(
+                    zarr_path=zarr_path,
+                    points_key=points_key,
                     x_col=x_col,
                     y_col=y_col,
                     gene_col=gene_col,
                     assignment_col=assignment_col,
                     background_col=background_col,
-                    reference_resolver=resolve_reference,
                     max_points=max_points if max_points > 0 else None,
                     random_state=random_state,
                     build_cell_index=assignment_col is not None,
-                    cancel_check=cancel_token.is_set,
                 )
-            return {
-                "points_key": points_key,
-                "store": store,
-                "reference": None if resolution is None else resolution.reference,
-                "reference_resolution": resolution,
-                "build_seconds": time.time() - t0,
-            }
+                payload = (
+                    load_transcript_payload(
+                        cache_request,
+                        cancel_check=cancel_token.is_set,
+                    )
+                    if cache_request is not None
+                    else None
+                )
+                if payload is None:
+                    store = build_gene_point_groups(
+                        points_obj,
+                        x_col=x_col,
+                        y_col=y_col,
+                        gene_col=gene_col,
+                        assignment_col=assignment_col,
+                        background_col=background_col,
+                        reference_resolver=resolve_reference,
+                        max_points=max_points if max_points > 0 else None,
+                        random_state=random_state,
+                        build_cell_index=assignment_col is not None,
+                        cancel_check=cancel_token.is_set,
+                    )
+                    payload = {
+                        "points_key": points_key,
+                        "store": store,
+                        "reference": (
+                            None if resolution is None else resolution.reference
+                        ),
+                        "reference_resolution": resolution,
+                        "cache_hit": False,
+                    }
+                    if not cancel_token.is_set() and cache_request is not None:
+                        payload["cache_saved"] = save_transcript_payload(
+                            cache_request,
+                            payload,
+                            cancel_check=cancel_token.is_set,
+                        )
+            payload["build_seconds"] = time.time() - t0
+            return payload
 
         if thread_worker is None:
             try:
@@ -7321,7 +9120,14 @@ class ComparisonViewerController:
                 pass
 
         source_total = int(store.source_total_points if store.source_total_points is not None else store.total_points)
-        self._set_status("Click on any transcript to highlight that gene")
+        if bool(payload.get("cache_hit")):
+            self._set_status(
+                f"{ds} transcripts restored from persistent cache in "
+                f"{float(payload.get('build_seconds', 0.0)):.1f}s. "
+                "Click on any transcript to highlight that gene."
+            )
+        else:
+            self._set_status("Click on any transcript to highlight that gene")
         log.info(
             "[%s] Gene inspector: genes=%s source_points=%s rendered_points=%s layers=%s "
             "sampled=%s reference=%s build=%.1fs",
@@ -7400,7 +9206,15 @@ class ComparisonViewerController:
         return sizes
 
     def _create_gene_points_layer(
-        self, name, symbol, spot_size, coords, colors, sizes=None, shown=None
+        self,
+        name,
+        symbol,
+        spot_size,
+        coords,
+        colors,
+        sizes=None,
+        shown=None,
+        paired_identity: LayerIdentity | None = None,
     ):
         """Add a Points layer pre-populated with data + per-point colour + symbol."""
         size = sizes if sizes is not None else float(spot_size)
@@ -7412,10 +9226,27 @@ class ComparisonViewerController:
             symbol=str(symbol),
             shown=np.ones(len(coords), dtype=bool) if shown is None else shown,
         )
-        try:
-            layer = self.viewer.add_points(coords, face_color=colors, border_color=colors, **kwargs)
-        except TypeError:
-            layer = self.viewer.add_points(coords, face_color=colors, edge_color=colors, **kwargs)
+        if paired_identity is None:
+            try:
+                layer = self.viewer.add_points(
+                    coords, face_color=colors, border_color=colors, **kwargs
+                )
+            except TypeError:
+                layer = self.viewer.add_points(
+                    coords, face_color=colors, edge_color=colors, **kwargs
+                )
+        else:
+            try:
+                layer = napari.layers.Points(
+                    coords, face_color=colors, border_color=colors, **kwargs
+                )
+            except TypeError:
+                layer = napari.layers.Points(
+                    coords, face_color=colors, edge_color=colors, **kwargs
+                )
+            if self._paired_registry is None:
+                raise RuntimeError("Paired layer registry is unavailable.")
+            self._paired_registry.register_layer(paired_identity, layer)
         # Antialiasing lets sub-pixel spots contribute partial opacity so density
         # structure shows when zoomed out; the min canvas-size floor is dropped so
         # spots actually shrink with zoom instead of staying a fixed 2px blanket.
@@ -7544,7 +9375,7 @@ class ComparisonViewerController:
     def _snapshot_pick_event(event):
         """Capture the world-space fields needed after napari mutates the event."""
         values = {}
-        for name in ("position", "view_direction", "dims_displayed"):
+        for name in ("position", "view_direction", "dims_displayed", "viewbox"):
             value = getattr(event, name, None)
             if value is None:
                 values[name] = None
@@ -7587,6 +9418,9 @@ class ComparisonViewerController:
 
     def _handle_viewer_click(self, event):
         """Run the existing transcript/cell inspection logic for a true click."""
+        if self._paired_session is not None:
+            self._handle_paired_viewer_click(event)
+            return
         if self.active_dataset is None:
             return
         ds = self.active_dataset
@@ -7613,6 +9447,264 @@ class ComparisonViewerController:
         #    Cells are deselected only by closing the bottom window.
         if state is not None and state.highlighted_genes:
             self._clear_highlighted_genes(state)
+
+    def _paired_pick_segmentation(self, platform: str) -> SegmentationProfile | None:
+        session = self._paired_session
+        registry = self._paired_registry
+        if session is None or registry is None:
+            return None
+        profile = session.contract.profile(platform)
+        candidates = sorted(
+            profile.segmentations,
+            key=lambda segmentation: (
+                "proseg" not in segmentation.logical_key.lower(),
+                "cellpose" not in segmentation.logical_key.lower(),
+                segmentation.logical_key,
+            ),
+        )
+        loaded_regular_layers = []
+        for segmentation in candidates:
+            layer = registry.layer_for(
+                LayerIdentity(
+                    platform, "segmentation", segmentation.logical_key
+                )
+            )
+            if layer is None:
+                continue
+            loaded_regular_layers.append(layer)
+            if bool(getattr(layer, "visible", True)):
+                return segmentation
+        # A visible cell-type fill is itself a rendered mask and remains a valid
+        # picking gate when its separate boundary/outline layer is unloaded.
+        state = self._cell_type_states.get(str(platform).upper())
+        if state is not None:
+            sources = [state.segmentation]
+            sources.extend(
+                source.key
+                for source in CELL_TYPE_SOURCES
+                if source.key != state.segmentation
+            )
+            for source_key in sources:
+                layer = registry.layer_for(
+                    LayerIdentity(platform, "cell_types", source_key)
+                )
+                if layer is None or not bool(getattr(layer, "visible", True)):
+                    continue
+                segmentation = self._paired_segmentation_for_cell_type(
+                    platform,
+                    source_key,
+                )
+                if segmentation is not None:
+                    return segmentation
+        # Match standalone picking semantics: if no mask layer was loaded at
+        # all, the stored vector geometry can still be inspected.  A deliberately
+        # hidden loaded layer, however, suppresses picking.
+        if not loaded_regular_layers and candidates:
+            return candidates[0]
+        return None
+
+    def _replace_paired_selection_layer(self, platform: str) -> None:
+        registry = self._paired_registry
+        if registry is None:
+            return
+        identity = LayerIdentity(platform, "selection", "clicked-cells")
+        selections = self._paired_selected_cells.get(platform, [])
+        paths: list[np.ndarray] = []
+        colors: list[np.ndarray] = []
+        for index, (_cell_id, geometry) in enumerate(selections):
+            rgba = rgba_array(
+                CELL_HIGHLIGHT_COLORS[index % len(CELL_HIGHLIGHT_COLORS)],
+                alpha=1.0,
+            )
+            geometry_paths = self._polygon_to_napari_paths(geometry)
+            paths.extend(geometry_paths)
+            colors.extend([rgba] * len(geometry_paths))
+        if not paths:
+            if registry.layer_for(identity) is not None:
+                registry.unload_layer(identity)
+            return
+        layer = napari.layers.Shapes(
+            paths,
+            shape_type="polygon",
+            name="clicked cells",
+            edge_color=np.asarray(colors, dtype=float),
+            face_color="transparent",
+            edge_width=max(
+                CELL_BOUNDARY_FALLBACK_WIDTH_UM,
+                float(self.args.shape_edge_width) * 2.0,
+            ),
+            opacity=1.0,
+            metadata={"selected_cell_ids": [str(item[0]) for item in selections]},
+        )
+        registry.register_layer(identity, layer)
+
+    def _paired_cell_panel_entry(
+        self,
+        platform: str,
+        cell_id,
+        geometry,
+        color: str,
+    ) -> dict:
+        """Build a read-only summary panel for one paired cell selection."""
+        entry = self._cell_selection_placeholder(
+            platform,
+            cell_id,
+            geometry,
+            color,
+        )
+        index = self._get_cell_transcript_index(platform)
+        coords_yx, genes = index.transcripts_for(cell_id)
+        state = self._gene_inspector_states.get(platform)
+        visuals = state.gene_visuals if state is not None else {}
+        gene_rows = []
+        for gene, count in ranked_gene_counts(genes):
+            visual = visuals.get(gene) if visuals else None
+            rgba = (
+                tuple(visual.rgba)
+                if visual is not None
+                else (0.6, 0.6, 0.6, 1.0)
+            )
+            symbol = str(visual.symbol) if visual is not None else "disc"
+            gene_rows.append(
+                {
+                    "gene": gene,
+                    "count": int(count),
+                    "rgba": rgba,
+                    "glyph": GENE_STATUS_SYMBOL_GLYPHS.get(symbol, "●"),
+                }
+            )
+        entry.update(
+            {
+                "display_cell_id": f"{platform} · {cell_id}",
+                "coords_yx": np.asarray(coords_yx, dtype=float),
+                "gene_rows": gene_rows,
+                "total": int(len(genes)),
+                "loading": False,
+            }
+        )
+        return entry
+
+    def _update_paired_cell_info_overlay(self) -> None:
+        """Show both platforms' selected cells in the shared bottom dock."""
+        panels: list[dict] = []
+        selections = self._paired_selected_cells
+        count = max((len(values) for values in selections.values()), default=0)
+        for index in range(count):
+            color = CELL_HIGHLIGHT_COLORS[index % len(CELL_HIGHLIGHT_COLORS)]
+            for platform in ("MERSCOPE", "XENIUM"):
+                platform_selections = selections.get(platform, [])
+                if index >= len(platform_selections):
+                    continue
+                cell_id, geometry = platform_selections[index]
+                panels.append(
+                    self._paired_cell_panel_entry(
+                        platform,
+                        cell_id,
+                        geometry,
+                        color,
+                    )
+                )
+        if not panels:
+            if self._cell_info_overlay is not None:
+                self._cell_info_overlay.set_cells([])
+            self._hide_cell_dock()
+            return
+        overlay = self._ensure_cell_info_overlay()
+        if overlay is not None:
+            overlay.set_cells(panels)
+            self._show_cell_dock()
+
+    def _clear_paired_cell_selections(self) -> None:
+        """Remove every paired selection layer and reset the shared cell dock."""
+        self._paired_selected_cells = {"MERSCOPE": [], "XENIUM": []}
+        registry = self._paired_registry
+        if registry is not None:
+            for key in list(registry.slot_keys):
+                if key.role == "selection":
+                    self._remove_paired_slot(key)
+        if self._cell_info_overlay is not None:
+            self._cell_info_overlay.set_cells([])
+        self._hide_cell_dock()
+
+    def _handle_paired_viewer_click(self, event) -> None:
+        """Select cells at the same aligned world coordinate in both datasets."""
+        session = self._paired_session
+        registry = self._paired_registry
+        if session is None or registry is None:
+            return
+        picked_gene = None
+        states = list(self._gene_states_for_control("PAIRED"))
+        source_platform = registry.platform_for_viewbox(
+            getattr(event, "viewbox", None)
+        )
+        if source_platform is not None:
+            # In the grid, pick only from the pane that was actually clicked;
+            # once identified, the same gene action is mirrored to both stores.
+            pick_states = [
+                state for state in states if state.dataset == source_platform
+            ]
+        else:
+            # A stacked canvas has no platform-specific viewbox. Prefer the
+            # selected platform layer, then probe the other store if needed.
+            active_layer = getattr(
+                getattr(self.viewer.layers, "selection", None),
+                "active",
+                None,
+            )
+            active_identity = layer_identity_from_layer(active_layer)
+            if active_identity is not None:
+                states.sort(
+                    key=lambda state: state.dataset != active_identity.platform
+                )
+            pick_states = states
+        for state in pick_states:
+            picked_gene = self._pick_gene_from_event(state, event)
+            if picked_gene is not None:
+                break
+        if picked_gene is not None:
+            for state in states:
+                if picked_gene in state.store.gene_offsets:
+                    self._add_highlighted_gene(state, picked_gene)
+            return
+        world = self._event_world_xy(event)
+        if world is None:
+            return
+        picked_labels: list[str] = []
+        for platform in ("MERSCOPE", "XENIUM"):
+            segmentation = self._paired_pick_segmentation(platform)
+            if segmentation is None:
+                continue
+            try:
+                picked = pick_cell_at_point(
+                    session.sdata[platform].shapes[segmentation.shape_key],
+                    world[0],
+                    world[1],
+                )
+            except Exception as exc:
+                log.debug("%s paired cell pick failed: %s", platform, exc)
+                picked = None
+            if picked is None:
+                continue
+            normalized = normalize_cell_key(picked[0])
+            selections = self._paired_selected_cells.setdefault(platform, [])
+            if not any(
+                normalize_cell_key(cell_id) == normalized
+                for cell_id, _geometry in selections
+            ):
+                selections.append((picked[0], picked[1]))
+            self._replace_paired_selection_layer(platform)
+            picked_labels.append(f"{platform} cell {picked[0]}")
+        if picked_labels:
+            self._remove_paired_anchor()
+            self._update_paired_cell_info_overlay()
+            self._set_status(
+                "Selected at the same aligned coordinate: "
+                + "; ".join(picked_labels)
+            )
+        else:
+            for state in states:
+                if state.highlighted_genes:
+                    self._clear_highlighted_genes(state)
 
     # -- Cell inspector: click a mask to summarise its cell -----------------
     def _event_world_xy(self, event) -> tuple[float, float] | None:
@@ -7685,6 +9777,18 @@ class ComparisonViewerController:
 
     def _on_segmentation_visibility_changed(self, _event=None):
         """Clear highlighted cells when the gating segmentation layer is hidden."""
+        if self._paired_session is not None:
+            source = getattr(_event, "source", None)
+            identity = layer_identity_from_layer(source)
+            if (
+                identity is not None
+                and identity.role == "segmentation"
+                and not bool(getattr(source, "visible", True))
+                and self._paired_pick_segmentation(identity.platform) is None
+                and any(self._paired_selected_cells.values())
+            ):
+                self._clear_paired_cell_selections()
+            return
         layer = self._cell_inspector_layer()
         if layer is not None and not bool(getattr(layer, "visible", True)):
             if any(self._selected_cells.values()):
@@ -7714,6 +9818,27 @@ class ComparisonViewerController:
         it annotates the inspector mask. Otherwise use the first available
         matching source (normally ProSeg reseg for ``MOSAIK_proseg``).
         """
+        if self._paired_session is not None:
+            segmentation = self._paired_pick_segmentation(state.dataset)
+            if segmentation is None:
+                return None
+            candidates = [state.segmentation]
+            candidates.extend(
+                source.key
+                for source in CELL_TYPE_SOURCES
+                if source.key != state.segmentation
+            )
+            for key in candidates:
+                resolved = self._paired_segmentation_for_cell_type(
+                    state.dataset,
+                    key,
+                )
+                if (
+                    resolved is not None
+                    and resolved.logical_key == segmentation.logical_key
+                ):
+                    return str(key)
+            return None
         shape_key = self._cell_inspector_shape_key()
         if shape_key is None:
             return None
@@ -7787,6 +9912,10 @@ class ComparisonViewerController:
 
     def _refresh_cell_selection_annotations(self, dataset_name: str):
         """Refresh existing inspector panels after background annotation load."""
+        if self._paired_session is not None:
+            if any(self._paired_selected_cells.values()):
+                self._update_paired_cell_info_overlay()
+            return
         ds = str(dataset_name).upper()
         entries = self._selected_cells.get(ds, [])
         changed = False
@@ -8088,6 +10217,7 @@ class ComparisonViewerController:
 
     def _clear_all_cell_selections(self):
         """Remove every highlight (boundary, links, panels) and hide the bar."""
+        self._clear_paired_cell_selections()
         self._selected_cells.clear()
         self._remove_layer_by_name(CELL_INSPECTOR_BOUNDARY_LAYER)
         self._remove_layer_by_name(CELL_INSPECTOR_LINKS_LAYER)
@@ -8326,7 +10456,11 @@ class ComparisonViewerController:
         """
         if visible or self._suppress_dock_visibility:
             return
-        if not self._selected_cells and self._cell_info_dock is None:
+        if (
+            not self._selected_cells
+            and not any(self._paired_selected_cells.values())
+            and self._cell_info_dock is None
+        ):
             return
         self._clear_all_cell_selections()
         self._teardown_cell_info_dock()
@@ -8509,14 +10643,19 @@ class ComparisonViewerController:
         its "Broad / Fine" text (only used, and only populated, in A–Z mode).
         """
         store = state.store
+        genes = (
+            list(state.panel_genes)
+            if state.panel_genes is not None
+            else list(store.genes)
+        )
         visuals = state.gene_visuals or {}
         layout: list[tuple] = []
         labels: dict[str, str] = {}
 
         if state.ordering == "alphabetical":
-            layout = [("gene", gene) for gene in sorted(store.genes)]
+            layout = [("gene", gene) for gene in sorted(genes)]
             if state.reference:
-                for gene in store.genes:
+                for gene in genes:
                     info = state.reference.get(gene)
                     if info:
                         fine = info.get("fine")
@@ -8545,11 +10684,19 @@ class ComparisonViewerController:
             reference_summary=state.reference_summary,
         )
         widget.populate(
-            state.dataset,
+            "PAIRED" if self._paired_session is not None else state.dataset,
             layout,
             state.gene_visuals or {},
-            dict(store.source_gene_counts or store.gene_counts),
-            set(store.control_genes),
+            (
+                dict(state.panel_gene_counts)
+                if state.panel_gene_counts is not None
+                else dict(store.source_gene_counts or store.gene_counts)
+            ),
+            (
+                set(state.panel_control_genes)
+                if state.panel_control_genes is not None
+                else set(store.control_genes)
+            ),
             set(state.enabled_genes),
             labels,
             state.ordering,
@@ -8560,6 +10707,17 @@ class ComparisonViewerController:
             state.colour_by_assignment,
         )
 
+    def _gene_states_for_control(self, dataset_name: str) -> tuple[GeneInspectorState, ...]:
+        if self._paired_session is not None:
+            return tuple(
+                state
+                for platform in ("MERSCOPE", "XENIUM")
+                for state in [self._gene_inspector_states.get(platform)]
+                if state is not None
+            )
+        state = self._gene_inspector_states.get(str(dataset_name).upper())
+        return () if state is None else (state,)
+
     def set_gene_ordering(self, dataset_name: str, kind: str):
         """Switch the gene list ordering (broad / fine / A–Z).
 
@@ -8567,129 +10725,133 @@ class ComparisonViewerController:
         only colours and the list grouping change); A–Z keeps the current colours
         and just relists the genes flat with their cell-type labels.
         """
-        state = self._gene_inspector_states.get(str(dataset_name).upper())
-        if state is None:
+        states = self._gene_states_for_control(dataset_name)
+        if not states:
             return
         kind = str(kind)
-        if kind in ("coarse", "fine"):
-            if kind == "coarse" and not state.broad_ordering_available:
-                return
-            if kind == "fine" and not state.fine_ordering_available:
-                return
-            scheme = state.coarse_scheme if kind == "coarse" else state.fine_scheme
-            if scheme is None:
-                return
-            if state.color_kind != kind:
-                state.store.recolor(scheme.visuals)
-                state.gene_visuals = scheme.visuals
-                state.color_kind = kind
-                self._recolor_gene_group_layers(state, group_indices=None)
-                if state.highlighted_genes:
-                    self._set_gene_highlight_status(state)
-            state.ordering = kind
-        else:
-            state.ordering = "alphabetical"
-        self._populate_gene_inspector(state)
+        for state in states:
+            if kind in ("coarse", "fine"):
+                if kind == "coarse" and not state.broad_ordering_available:
+                    continue
+                if kind == "fine" and not state.fine_ordering_available:
+                    continue
+                scheme = state.coarse_scheme if kind == "coarse" else state.fine_scheme
+                if scheme is None:
+                    continue
+                if state.color_kind != kind:
+                    state.store.recolor(scheme.visuals)
+                    state.gene_visuals = scheme.visuals
+                    state.color_kind = kind
+                    self._recolor_gene_group_layers(state, group_indices=None)
+                    if state.highlighted_genes:
+                        self._set_gene_highlight_status(state)
+                state.ordering = kind
+            else:
+                state.ordering = "alphabetical"
+        self._populate_gene_inspector(states[0])
 
     def set_gene_visible(self, dataset_name: str, gene: str, on: bool):
-        state = self._gene_inspector_states.get(str(dataset_name).upper())
-        if state is None:
-            return
         gene = str(gene)
-        entry = state.store.gene_offsets.get(gene)
-        if entry is None:
-            return
-        if on:
-            state.enabled_genes.add(gene)
-        else:
-            state.enabled_genes.discard(gene)
-            self._discard_highlighted_genes(state, {gene})
-        self._schedule_gene_group_rebuild(state, entry[0])
+        for state in self._gene_states_for_control(dataset_name):
+            if on:
+                state.enabled_genes.add(gene)
+            else:
+                state.enabled_genes.discard(gene)
+                self._discard_highlighted_genes(state, {gene})
+            entry = state.store.gene_offsets.get(gene)
+            if entry is None:
+                continue
+            self._schedule_gene_group_rebuild(state, entry[0])
 
     def set_genes_visible(self, dataset_name: str, genes: list[str], on: bool):
         """Show/hide a batch of genes at once (used by group-heading clicks)."""
-        state = self._gene_inspector_states.get(str(dataset_name).upper())
-        if state is None:
-            return
         on = bool(on)
-        groups: set[int] = set()
-        for gene in genes:
-            entry = state.store.gene_offsets.get(str(gene))
-            if entry is None:
+        for state in self._gene_states_for_control(dataset_name):
+            groups: set[int] = set()
+            for gene in genes:
+                if on:
+                    state.enabled_genes.add(str(gene))
+                else:
+                    state.enabled_genes.discard(str(gene))
+                entry = state.store.gene_offsets.get(str(gene))
+                if entry is None:
+                    continue
+                groups.add(int(entry[0]))
+            if not groups:
                 continue
-            if on:
-                state.enabled_genes.add(str(gene))
-            else:
-                state.enabled_genes.discard(str(gene))
-            groups.add(int(entry[0]))
-        if not groups:
-            return
-        if not on:
-            self._discard_highlighted_genes(state, {str(g) for g in genes})
-        self._rebuild_gene_group_layers(state, group_indices=groups)
+            if not on:
+                self._discard_highlighted_genes(state, {str(g) for g in genes})
+            self._rebuild_gene_group_layers(state, group_indices=groups)
 
     def set_all_genes_visible(self, dataset_name: str, on: bool):
-        state = self._gene_inspector_states.get(str(dataset_name).upper())
-        if state is None:
-            return
-        store = state.store
-        if on:
-            state.enabled_genes = {
-                g for g in store.genes if state.show_controls or g not in store.control_genes
-            }
-        else:
-            state.enabled_genes = set()
-            self._clear_highlighted_genes(state)
-        self._rebuild_gene_group_layers(state, group_indices=None)
+        for state in self._gene_states_for_control(dataset_name):
+            store = state.store
+            genes = (
+                state.panel_genes
+                if state.panel_genes is not None
+                else store.genes
+            )
+            control_genes = (
+                state.panel_control_genes
+                if state.panel_control_genes is not None
+                else store.control_genes
+            )
+            if on:
+                state.enabled_genes = {
+                    gene
+                    for gene in genes
+                    if state.show_controls or gene not in control_genes
+                }
+            else:
+                state.enabled_genes = set()
+                self._clear_highlighted_genes(state)
+            self._rebuild_gene_group_layers(state, group_indices=None)
 
     def set_gene_spot_size(self, dataset_name: str, size: float):
-        state = self._gene_inspector_states.get(str(dataset_name).upper())
-        if state is None:
-            return
-        state.spot_size = float(size)
-        if state.highlighted_genes:
-            self._apply_gene_group_sizes(state, set(range(len(state.layer_names))))
-            return
-        for name in state.layer_names:
-            layer = self._get_layer_by_name(name)
-            if layer is not None:
-                try:
-                    layer.size = float(size)
-                except Exception:
-                    pass
+        for state in self._gene_states_for_control(dataset_name):
+            state.spot_size = float(size)
+            if state.highlighted_genes:
+                self._apply_gene_group_sizes(state, set(range(len(state.layer_names))))
+                continue
+            for name in state.layer_names:
+                layer = self._get_layer_by_name(name)
+                if layer is not None:
+                    try:
+                        layer.size = float(size)
+                    except Exception:
+                        pass
 
     def set_gene_hide_background(self, dataset_name: str, on: bool):
-        state = self._gene_inspector_states.get(str(dataset_name).upper())
-        if state is None:
-            return
-        state.hide_background = bool(on)
-        self._rebuild_gene_group_layers(state, group_indices=None)
+        for state in self._gene_states_for_control(dataset_name):
+            state.hide_background = bool(on)
+            self._rebuild_gene_group_layers(state, group_indices=None)
 
     def set_gene_hide_assigned(self, dataset_name: str, on: bool):
-        state = self._gene_inspector_states.get(str(dataset_name).upper())
-        if state is None:
-            return
-        state.hide_assigned = bool(on)
-        self._rebuild_gene_group_layers(state, group_indices=None)
+        for state in self._gene_states_for_control(dataset_name):
+            state.hide_assigned = bool(on)
+            self._rebuild_gene_group_layers(state, group_indices=None)
 
     def set_gene_colour_by_assignment(self, dataset_name: str, on: bool):
-        state = self._gene_inspector_states.get(str(dataset_name).upper())
-        if state is None:
-            return
-        state.colour_by_assignment = bool(on)
-        self._recolor_gene_group_layers(state, group_indices=None)
-        self._populate_gene_inspector(state)
+        states = self._gene_states_for_control(dataset_name)
+        for state in states:
+            state.colour_by_assignment = bool(on)
+            self._recolor_gene_group_layers(state, group_indices=None)
+        if states:
+            self._populate_gene_inspector(states[0])
 
     def set_gene_show_controls(self, dataset_name: str, on: bool):
-        state = self._gene_inspector_states.get(str(dataset_name).upper())
-        if state is None:
-            return
-        state.show_controls = bool(on)
-        if not on:
-            # Turning controls off hides any control genes that were enabled.
-            self._discard_highlighted_genes(state, set(state.store.control_genes))
-            state.enabled_genes -= set(state.store.control_genes)
-            self._rebuild_gene_group_layers(state, group_indices=None)
+        for state in self._gene_states_for_control(dataset_name):
+            state.show_controls = bool(on)
+            if not on:
+                # Turning controls off hides any control genes that were enabled.
+                control_genes = (
+                    state.panel_control_genes
+                    if state.panel_control_genes is not None
+                    else state.store.control_genes
+                )
+                self._discard_highlighted_genes(state, set(control_genes))
+                state.enabled_genes -= set(control_genes)
+                self._rebuild_gene_group_layers(state, group_indices=None)
 
     # -- Cell-type mask colouring ------------------------------------------
     def _cell_type_state(self, dataset_name: str) -> CellTypeOverlayState:
@@ -8856,7 +11018,281 @@ class ComparisonViewerController:
             state.opacity,
         )
 
+    def _paired_segmentation_for_cell_type(
+        self,
+        platform: str,
+        source_key: str,
+    ) -> SegmentationProfile | None:
+        """Resolve a cell-type source to its exact contract label branch."""
+        session = self._paired_session
+        source = cell_type_source(source_key)
+        if session is None or source is None:
+            return None
+        platform = str(platform).upper()
+        profile = session.contract.profile(platform)
+        candidate_shapes = set(source.mask_shape_keys)
+        if platform == "MERSCOPE":
+            shape_mapping = session.contract.mappings.get("shapes", {})
+            candidate_shapes = {
+                str(shape_mapping[shape_key])
+                for shape_key in source.mask_shape_keys
+                if shape_key in shape_mapping
+            }
+        for segmentation in profile.segmentations:
+            if (
+                segmentation.label_key is not None
+                and segmentation.shape_key in candidate_shapes
+            ):
+                return segmentation
+
+        # Schema branch names are stable in most stores, so retain a precise
+        # logical-key fallback for sources whose historical mask name differs.
+        logical_candidates = {str(source.key)}
+        if source.key == "proseg_mask":
+            logical_candidates.add("proseg")
+        return next(
+            (
+                segmentation
+                for segmentation in profile.segmentations
+                if (
+                    segmentation.label_key is not None
+                    and segmentation.logical_key in logical_candidates
+                )
+            ),
+            None,
+        )
+
+    def _paired_cell_type_states(self) -> tuple[CellTypeOverlayState, ...]:
+        if self._paired_session is None:
+            return ()
+        return tuple(
+            self._cell_type_state(platform)
+            for platform in ("MERSCOPE", "XENIUM")
+        )
+
+    def _synchronize_paired_cell_type_schemes(
+        self,
+        states: tuple[CellTypeOverlayState, ...],
+    ) -> bool:
+        """Install one union-derived label palette in every paired state."""
+        if not states:
+            return False
+        segmentation = states[0].segmentation
+        if any(state.segmentation != segmentation for state in states):
+            return False
+        assignments = [state.assignments.get(segmentation) for state in states]
+        if any(item is None for item in assignments):
+            return False
+
+        disabled_by_kind: dict[str, set[str]] = {"broad": set(), "fine": set()}
+        for state in states:
+            old_schemes = state.schemes.get(segmentation, {})
+            old_enabled = state.enabled.get(segmentation, {})
+            for kind in ("broad", "fine"):
+                old_scheme = old_schemes.get(kind)
+                if old_scheme is None:
+                    continue
+                enabled = old_enabled.get(kind, set(old_scheme.order))
+                disabled_by_kind[kind].update(set(old_scheme.order) - set(enabled))
+
+        broad = np.concatenate(
+            [np.asarray(item.broad, dtype=object) for item in assignments]
+        )
+        fine = np.concatenate(
+            [np.asarray(item.fine, dtype=object) for item in assignments]
+        )
+        shared_schemes = build_cell_type_color_schemes(broad, fine, alpha=1.0)
+        shared_enabled = {
+            kind: set(scheme.order) - disabled_by_kind[kind]
+            for kind, scheme in shared_schemes.items()
+        }
+        for state in states:
+            state.schemes[segmentation] = shared_schemes
+            state.enabled[segmentation] = {
+                kind: set(labels) for kind, labels in shared_enabled.items()
+            }
+        return True
+
+    def _populate_paired_cell_type_panel(
+        self,
+        states: tuple[CellTypeOverlayState, ...],
+    ) -> None:
+        """Populate the shared cell-type controls from both datasets' labels."""
+        widget = self._cell_type_widget
+        if widget is None or not states:
+            return
+        state = states[0]
+        segmentation = state.segmentation
+        kind = state.kind or "broad"
+        schemes = state.schemes.get(segmentation)
+        if schemes is None:
+            widget.set_dataset("PAIRED")
+            widget.set_status(
+                f"No shared cell-type annotations stored for {segmentation} segmentation."
+            )
+            return
+        scheme = schemes[kind]
+        counts: dict[str, int] = {}
+        for paired_state in states:
+            assignments = paired_state.assignments.get(segmentation)
+            if assignments is None:
+                continue
+            for label, count in self._cell_type_counts(assignments, kind).items():
+                counts[label] = counts.get(label, 0) + int(count)
+        broad_colors = schemes["broad"].colors
+        layout: list[tuple] = []
+        for title, members in scheme.groups:
+            header_rgba = (
+                broad_colors.get(title, (0.6, 0.6, 0.6, 1.0))
+                if kind == "fine"
+                else (0.6, 0.6, 0.6, 1.0)
+            )
+            layout.append(("header", title, header_rgba))
+            layout.extend(("type", member) for member in members)
+        widget.populate(
+            "PAIRED",
+            layout,
+            scheme.colors,
+            counts,
+            set(state.enabled[segmentation][kind]),
+            segmentation,
+            kind,
+            state.opacity,
+        )
+
+    def _clear_paired_cell_type_layers(self) -> None:
+        registry = self._paired_registry
+        if registry is not None:
+            for key in list(registry.slot_keys):
+                if key.role == "cell_types":
+                    self._remove_paired_slot(key)
+        for state in self._paired_cell_type_states():
+            state.layer_name = None
+
+    def _apply_paired_cell_type_layers(
+        self, states: tuple[CellTypeOverlayState, ...]
+    ) -> int:
+        session = self._paired_session
+        registry = self._paired_registry
+        if session is None or registry is None:
+            return 0
+        self._clear_paired_cell_type_layers()
+        affine = self._paired_napari_affine(session.contract)
+        added = 0
+        for state in states:
+            segmentation = self._paired_segmentation_for_cell_type(
+                state.dataset,
+                state.segmentation,
+            )
+            if segmentation is None:
+                state.layer_name = None
+                continue
+            levels, label_key = self._paired_label_levels(
+                state.dataset, segmentation, outline=False
+            )
+            color_dict = self._cell_type_color_dict(state)
+            if not levels or color_dict is None:
+                state.layer_name = None
+                continue
+            identity = LayerIdentity(
+                state.dataset, "cell_types", state.segmentation
+            )
+            layer = napari.layers.Labels(
+                levels if len(levels) > 1 else levels[0],
+                name=state.segmentation,
+                affine=affine,
+                cache=NAPARI_DASK_CACHE_ENABLED,
+                colormap=DirectLabelColormap(color_dict=color_dict),
+                multiscale=len(levels) > 1,
+                opacity=min(1.0, max(0.0, float(state.opacity))),
+                blending="translucent",
+                visible=True,
+                metadata={
+                        "spatialdata_label_key": label_key,
+                        "logical_segmentation": segmentation.logical_key,
+                        "cell_type_source": state.segmentation,
+                },
+            )
+            registry.register_layer(identity, layer)
+            state.layer_name = str(layer.name)
+            state.label_key = label_key
+            # Paired cell-type layers are constructed directly rather than via
+            # ``viewer.add_labels``.  They still need the same post-load
+            # colormap invalidation as standalone lazy Labels layers; otherwise
+            # napari can render the first slice using stale label colours until
+            # a visibility checkbox assigns the colormap a second time.
+            self._refresh_cell_type_layer_after_load(state, layer)
+            added += 1
+        if added:
+            self._remove_paired_anchor()
+            registry.repair_order()
+        return added
+
+    def _set_paired_cell_type_segmentation(self, segmentation: str) -> None:
+        states = self._paired_cell_type_states()
+        for state in states:
+            state.segmentation = str(segmentation)
+            self._load_cell_type_data(state, state.segmentation)
+        self._synchronize_paired_cell_type_schemes(states)
+        available = tuple(
+            state
+            for state in states
+            if (
+                state.assignments.get(state.segmentation) is not None
+                and self._paired_segmentation_for_cell_type(
+                    state.dataset,
+                    state.segmentation,
+                )
+                is not None
+            )
+        )
+        if len(available) != len(states):
+            self._clear_paired_cell_type_layers()
+            self._set_status(
+                f"Both datasets need matching labels and cell-type annotations "
+                f"for {segmentation}."
+            )
+            return
+        if available[0].kind:
+            self._apply_paired_cell_type_layers(available)
+            self._populate_paired_cell_type_panel(available)
+
+    def _set_paired_cell_type_kind(self, kind: str) -> None:
+        states = self._paired_cell_type_states()
+        available: list[CellTypeOverlayState] = []
+        for state in states:
+            state.kind = str(kind)
+            if (
+                self._load_cell_type_data(state, state.segmentation)
+                and self._paired_segmentation_for_cell_type(
+                    state.dataset,
+                    state.segmentation,
+                )
+                is not None
+            ):
+                available.append(state)
+        if len(available) != len(states):
+            self._clear_paired_cell_type_layers()
+            self._set_status(
+                "Both paired datasets need a matching materialized mask and "
+                "cell-type annotations for this source."
+            )
+            return
+        self._synchronize_paired_cell_type_schemes(tuple(available))
+        added = self._apply_paired_cell_type_layers(tuple(available))
+        self._populate_paired_cell_type_panel(tuple(available))
+        if added == len(states):
+            self._set_status(
+                f"Applied {kind} cell-type colouring to both paired datasets."
+            )
+        else:
+            self._set_status(
+                f"Cell-type colouring loaded for {added} of {len(states)} paired datasets."
+            )
+
     def set_cell_type_segmentation(self, dataset_name: str, segmentation: str):
+        if self._paired_session is not None:
+            return self._set_paired_cell_type_segmentation(segmentation)
         state = self._cell_type_state(dataset_name)
         state.segmentation = str(segmentation)
         if not self._load_cell_type_data(state, state.segmentation):
@@ -8873,6 +11309,8 @@ class ComparisonViewerController:
             self._start_cell_type_overlay_build(state)
 
     def set_cell_type_kind(self, dataset_name: str, kind: str):
+        if self._paired_session is not None:
+            return self._set_paired_cell_type_kind(kind)
         state = self._cell_type_state(dataset_name)
         state.kind = str(kind)
         if not self._load_cell_type_data(state, state.segmentation):
@@ -8886,6 +11324,19 @@ class ComparisonViewerController:
         self._start_cell_type_overlay_build(state)
 
     def set_cell_type_visible(self, dataset_name: str, label: str, on: bool):
+        if self._paired_session is not None:
+            for state in self._paired_cell_type_states():
+                enabled = state.enabled.get(state.segmentation, {}).get(
+                    state.kind or "broad"
+                )
+                if enabled is None:
+                    continue
+                if on:
+                    enabled.add(str(label))
+                else:
+                    enabled.discard(str(label))
+                self._recolor_cell_type_layer(state)
+            return
         state = self._cell_type_state(dataset_name)
         enabled = state.enabled.get(state.segmentation, {}).get(state.kind or "broad")
         if enabled is None:
@@ -8897,6 +11348,10 @@ class ComparisonViewerController:
         self._recolor_cell_type_layer(state)
 
     def set_cell_types_visible(self, dataset_name: str, labels: list[str], on: bool):
+        if self._paired_session is not None:
+            for label in labels:
+                self.set_cell_type_visible(dataset_name, label, on)
+            return
         state = self._cell_type_state(dataset_name)
         enabled = state.enabled.get(state.segmentation, {}).get(state.kind or "broad")
         if enabled is None:
@@ -8909,6 +11364,17 @@ class ComparisonViewerController:
         self._recolor_cell_type_layer(state)
 
     def set_all_cell_types_visible(self, dataset_name: str, on: bool):
+        if self._paired_session is not None:
+            for state in self._paired_cell_type_states():
+                seg = state.segmentation
+                kind = state.kind or "broad"
+                schemes = state.schemes.get(seg)
+                scheme = schemes.get(kind) if schemes else None
+                if scheme is None:
+                    continue
+                state.enabled[seg][kind] = set(scheme.order) if on else set()
+                self._recolor_cell_type_layer(state)
+            return
         state = self._cell_type_state(dataset_name)
         seg = state.segmentation
         kind = state.kind or "broad"
@@ -8919,6 +11385,17 @@ class ComparisonViewerController:
         self._recolor_cell_type_layer(state)
 
     def set_cell_type_opacity(self, dataset_name: str, opacity: float):
+        if self._paired_session is not None:
+            for state in self._paired_cell_type_states():
+                state.opacity = float(opacity)
+                layer = (
+                    self._get_layer_by_name(state.layer_name)
+                    if state.layer_name
+                    else None
+                )
+                if layer is not None:
+                    layer.opacity = min(1.0, max(0.0, float(opacity)))
+            return
         state = self._cell_type_state(dataset_name)
         state.opacity = float(opacity)
         layer = self._get_layer_by_name(state.layer_name) if state.layer_name else None
@@ -8969,7 +11446,25 @@ class ComparisonViewerController:
 
         def refresh_if_current():
             current = self._get_layer_by_name(state.layer_name) if state.layer_name else None
-            if self.active_dataset != state.dataset or current is not layer:
+            if self._paired_session is not None:
+                registry = self._paired_registry
+                identity = (
+                    registry.identity_for_layer(layer)
+                    if registry is not None
+                    else None
+                )
+                expected_identity = LayerIdentity(
+                    state.dataset,
+                    "cell_types",
+                    state.segmentation,
+                )
+                is_active = (
+                    self.active_dataset == "PAIRED"
+                    and identity == expected_identity
+                )
+            else:
+                is_active = self.active_dataset == state.dataset
+            if not is_active or current is not layer:
                 return
             self._recolor_cell_type_layer(state)
             try:
@@ -8983,7 +11478,7 @@ class ComparisonViewerController:
         refresh_if_current()
 
         loaded_event = getattr(getattr(layer, "events", None), "loaded", None)
-        if loaded_event is None or bool(getattr(layer, "loaded", True)):
+        if loaded_event is None:
             return
 
         def on_loaded(_event=None):
@@ -8995,6 +11490,9 @@ class ComparisonViewerController:
                 pass
             QTimer.singleShot(0, refresh_if_current)
 
+        # Subscribe even when ``loaded`` is currently true.  A lazy layer starts
+        # in that state, then the canvas can request its first slice and drive a
+        # true -> false -> true transition only after this method returns.
         loaded_event.connect(on_loaded, ref=False)
 
     def _ensure_label_key_for_segmentation(
@@ -9164,6 +11662,14 @@ class ComparisonViewerController:
         log.error("Cell-type overlay failed: %s", message)
 
     def close_cell_type_overlay(self, dataset_name: str):
+        if self._paired_session is not None and self._paired_registry is not None:
+            self._clear_paired_cell_type_layers()
+            if self._cell_type_widget is not None:
+                self._cell_type_widget.set_dataset("MERSCOPE")
+            self._set_status(
+                "Removed cell-type colouring from both paired datasets."
+            )
+            return
         state = self._cell_type_state(dataset_name)
         token = self._task_cancel_events.get("cell-types")
         if token is not None:
@@ -9180,6 +11686,56 @@ class ComparisonViewerController:
     def _publish_cell_type_options(self):
         """Refresh the cell-type panel for the active dataset (on dataset load)."""
         if self.active_dataset is None:
+            return
+        if self._paired_session is not None:
+            available_by_platform = {
+                platform: {
+                    source.key: (
+                        clustering_table_key_for_segmentation(
+                            self._paired_session.configs[platform].zarr_path,
+                            source.key,
+                        )
+                        is not None
+                        and self._paired_segmentation_for_cell_type(
+                            platform,
+                            source.key,
+                        )
+                        is not None
+                    )
+                    for source in CELL_TYPE_SOURCES
+                }
+                for platform in ("MERSCOPE", "XENIUM")
+            }
+            available = {
+                source.key: all(
+                    available_by_platform[platform][source.key]
+                    for platform in ("MERSCOPE", "XENIUM")
+                )
+                for source in CELL_TYPE_SOURCES
+            }
+            states = self._paired_cell_type_states()
+            for state in states:
+                state.layer_name = None
+                state.kind = ""
+                if available.get(state.segmentation) is False:
+                    state.segmentation = next(
+                        (key for key, present in available.items() if present),
+                        state.segmentation,
+                    )
+                self._start_cell_annotation_prefetch(state, available)
+            widget = self._cell_type_widget
+            if widget is None:
+                return
+            widget.set_dataset("MERSCOPE")
+            widget.set_segmentation_available(available)
+            if any(available.values()):
+                widget.set_status(
+                    "Choose Broad or Fine to colour both paired datasets."
+                )
+            else:
+                widget.set_status(
+                    "No cell-type annotation source is shared by both datasets."
+                )
             return
         session = self._dataset_sessions.get(self.active_dataset)
         if session is not None:
@@ -9213,6 +11769,18 @@ class ComparisonViewerController:
             widget.set_status("No stored cell-type annotations in this dataset.")
 
     def close_gene_inspector(self, dataset_name: str):
+        if self._paired_session is not None:
+            had = any(
+                platform in self._gene_inspector_states
+                for platform in ("MERSCOPE", "XENIUM")
+            )
+            self._teardown_paired_gene_inspector(clear_widget=True)
+            self._end_progress("transcripts")
+            if had:
+                self._set_status(
+                    "Paired transcripts unloaded from both datasets."
+                )
+            return
         ds = str(dataset_name).upper()
         had = ds in self._gene_inspector_states
         self._teardown_gene_inspector(ds)
@@ -9262,6 +11830,20 @@ class ComparisonViewerController:
         self.load_images_on_demand(dataset_name, image_channels=entries)
 
     def unload_selected_images(self, dataset_name: str, image_channels):
+        if self._paired_session is not None and self._paired_registry is not None:
+            removed = 0
+            for slot_key, _channel in [
+                (str(key), str(channel)) for key, channel in image_channels
+            ]:
+                removed += len(
+                    self._remove_paired_slot(
+                        LayerSlotKey("image", channel=slot_key)
+                    )
+                )
+                self._paired_session.loaded_image_slots.discard(slot_key)
+            self._publish_loaded_image_entries()
+            self._set_status(f"Paired view removed {removed} image layer(s).")
+            return removed
         if not self._ensure_dataset_is_active(dataset_name):
             self._set_status(f"Could not activate dataset {dataset_name}.")
             return
@@ -9277,6 +11859,17 @@ class ComparisonViewerController:
         self._set_status(f"{ds} removed {removed} image channel layer(s).")
 
     def load_images_on_demand(self, dataset_name: str, image_channels=None):
+        if self._paired_session is not None:
+            slot_keys = (
+                None
+                if image_channels is None
+                else [str(key) for key, _channel in image_channels]
+            )
+            added = self._load_paired_image_slots(slot_keys)
+            self._set_status(
+                f"Paired view loaded {added} materialized image layer(s)."
+            )
+            return added
         if not self._ensure_dataset_is_active(dataset_name):
             self._set_status(f"Could not activate dataset {dataset_name}.")
             return
@@ -9566,6 +12159,16 @@ def parse_args() -> argparse.Namespace:
         choices=["MERSCOPE", "XENIUM"],
         help="Dataset loaded first when the viewer opens",
     )
+    parser.add_argument(
+        "--paired-view",
+        default=None,
+        choices=(ViewMode.SIDE_BY_SIDE.value, ViewMode.STACKED_OVERLAY.value),
+        help=(
+            "Opt into simultaneous paired startup and choose its layout when "
+            "both --merscope-zarr and --xenium-zarr are supplied. Without "
+            "this option, --initial-dataset retains the standalone behavior."
+        ),
+    )
 
     parser.add_argument(
         "--segmentation-source",
@@ -9787,6 +12390,7 @@ def run_package_smoke_test_without_opengl() -> None:
         load_object_annotations_callback=callback,
         load_paired_callback=callback,
         load_standalone_callback=callback,
+        switch_paired_view_callback=callback,
         initial_dataset=None,
     )
     if panel._tab_stack.currentIndex() != 6:
@@ -9824,8 +12428,15 @@ def main():
         )
 
     available_datasets = list(datasets.keys())
-    initial_dataset: str | None = args.initial_dataset if datasets else None
-    if datasets and initial_dataset not in datasets:
+    initial_pair = (
+        "MERSCOPE" in datasets
+        and "XENIUM" in datasets
+        and args.paired_view is not None
+    )
+    initial_dataset: str | None = (
+        None if initial_pair else args.initial_dataset if datasets else None
+    )
+    if not initial_pair and datasets and initial_dataset not in datasets:
         initial_dataset = available_datasets[0]
         log.info(
             "Initial dataset %s was not supplied; starting with %s.",
@@ -9909,6 +12520,7 @@ def main():
         load_object_annotations_callback=controller.load_distance_object_annotations,
         load_paired_callback=controller.load_paired_dataset,
         load_standalone_callback=controller.load_standalone_dataset,
+        switch_paired_view_callback=controller.switch_paired_view,
         initial_dataset=initial_dataset,
         expand_layer_controls_callback=left_panel.expand_layer_controls,
     )
@@ -9919,6 +12531,8 @@ def main():
     controller.set_image_entries_callback(panel.set_image_entries)
     controller.set_loaded_image_entries_callback(panel.set_loaded_image_entries)
     controller.set_datasets_changed_callback(panel.set_datasets)
+    controller.set_paired_view_mode_callback(panel.set_paired_view_mode)
+    controller.set_paired_dataset_loaded_callback(panel.paired_dataset_loaded)
     controller.set_cellpose_value_options_callback(panel.set_cellpose_value_options)
     controller.set_gene_inspector_widget(gene_inspector)
     controller.set_cell_type_widget(cell_type_widget)
@@ -9931,7 +12545,7 @@ def main():
     welcome_overlay = DatasetWelcomeOverlay(
         viewer,
         panel._load_paired_button,
-        start_visible=initial_dataset is None,
+        start_visible=not bool(datasets),
     )
     panel.dataset_open_requested.connect(welcome_overlay.dismiss)
     # Keep the Qt helpers alive with the controller for the lifetime of the app.
@@ -9939,7 +12553,13 @@ def main():
     controller._dataset_welcome_overlay = welcome_overlay
 
     controller.install_canvas_overlays()
-    if initial_dataset is not None:
+    if initial_pair:
+        controller.load_paired_dataset(
+            datasets["MERSCOPE"].zarr_path,
+            datasets["XENIUM"].zarr_path,
+            args.paired_view,
+        )
+    elif initial_dataset is not None:
         loaded = controller.load_dataset(initial_dataset, force=True)
         if loaded:
             for dataset_name, config in datasets.items():
