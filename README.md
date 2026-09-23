@@ -1,16 +1,24 @@
 # napari-compare-xenium-merscope
 
-Napari-based viewer for visualising MERSCOPE and Xenium SpatialData `.zarr` outputs.
+Napari-based viewer for visualising MERSCOPE and Xenium SpatialData `.zarr`
+outputs, either as one standalone dataset or as a simultaneously displayed,
+pre-aligned pair.
 
 The viewer opens a single Napari window with a tabbed control panel (tabs across
 the top of the right-hand dock): **Gene inspector**, **Cell segmentation**, **Per
-cell statistics**, **Draw tissue annotations**, **Images**, and **Dataset**. On
-startup with a supplied dataset it automatically loads all image channels, the
-Cellpose and ProSeg cell segmentations, and all transcripts (rendered as per-gene coloured points). A busy
-progress bar with a stage label below the tabs shows what is loading (image
-pyramids, cell masks, transcripts, …). Image channels appear first as lazy
-previews while optimized pyramids build in the background; switching datasets
-keeps recent prepared sessions in an LRU cache for fast return visits.
+cell statistics**, **Draw tissue annotations**, **Images**, and **Dataset**. With
+a supplied dataset it automatically loads all image channels, the Cellpose and
+ProSeg cell segmentations, and all transcripts (rendered as per-gene coloured
+points). A busy progress bar with a stage label below the tabs shows what is
+loading (image pyramids, cell masks, transcripts, …).
+
+Standalone mode keeps one dataset active at a time. Image channels appear first
+as lazy previews while optimized pyramids build in the background, missing
+segmentation rasters can be generated and saved to the store, and recent
+prepared sessions remain in an LRU cache for fast return visits. Paired mode is
+a strict read-only view of already materialized MerXen alignment output; it does
+not build registration products or write derived artifacts into either source
+store. Prepared transcripts can still use the viewer's external user cache.
 
 ## Install
 
@@ -45,13 +53,14 @@ napari-compare-xenium-merscope-install-macos-app
 ```
 
 Launching the `.app` from Finder, the Dock, or Sidebar opens with no dataset
-loaded and selects the **Dataset loader** tab. Choose a paired MERSCOPE/Xenium
-dataset or a standalone store there by selecting the dataset's
+loaded and selects the **Dataset loader** tab. Choose one of the two paired
+layouts or open a standalone store there by selecting each dataset's
 `spatialdata.zarr` folder. The empty canvas points toward these controls and
-keeps napari's rotating **Did you know?** tip. The loader also retains the ten
-most recently opened dataset folders; select an entry and click **Open selected
-recent dataset** (or double-click it) to reopen it. Dataset paths passed
-explicitly on the command line still load immediately.
+keeps napari's rotating **Did you know?** tip. The loader retains the ten most
+recently opened entries: a standalone store is one entry, while a MERSCOPE and
+Xenium pair is saved as one logical entry together with its view mode. Select an
+entry and click **Open selected recent dataset** (or double-click it) to reopen
+it. Dataset paths passed explicitly on the command line still load immediately.
 
 ### Self-contained desktop installers
 
@@ -95,13 +104,28 @@ Launch without a dataset to choose one in the viewer:
 napari-compare-xenium-merscope
 ```
 
-Or supply dataset paths to load them immediately:
+Or supply both dataset paths and opt into a paired layout explicitly:
 
 ```bash
 napari-compare-xenium-merscope \
   --merscope-zarr /path/to/merscope.zarr \
-  --xenium-zarr /path/to/xenium.zarr
+  --xenium-zarr /path/to/xenium.zarr \
+  --paired-view side-by-side
 ```
+
+Open the same pair as a stacked overlay with:
+
+```bash
+napari-compare-xenium-merscope \
+  --merscope-zarr /path/to/merscope.zarr \
+  --xenium-zarr /path/to/xenium.zarr \
+  --paired-view stacked-overlay
+```
+
+`--paired-view` is used only when both dataset paths are supplied; one path
+continues to open the corresponding store in standalone mode. Supplying both
+paths without `--paired-view` preserves the original behavior: both stores are
+available, but only `--initial-dataset` is displayed at startup.
 
 You can also open just one dataset:
 
@@ -110,11 +134,49 @@ napari-compare-xenium-merscope --merscope-zarr /path/to/merscope.zarr
 napari-compare-xenium-merscope --xenium-zarr /path/to/xenium.zarr
 ```
 
+### Paired viewing
+
+The **Dataset loader** offers two explicit choices: **Load new paired dataset
+side-by-side** and **Load new paired dataset stacked overlay**. Both choices ask
+for the MERSCOPE store first and the Xenium store second, then keep both loaded
+in the same Napari window with one shared control panel.
+
+- **Side-by-side** places MERSCOPE on the left and Xenium on the right. Pan,
+  zoom, and camera navigation are linked, and changing the visibility of an
+  image, segmentation, transcript, or other logical layer also changes its
+  counterpart. Cell and transcript clicks are resolved at the same aligned
+  coordinate and highlighted in both datasets. The Images, Cell segmentation,
+  Gene inspector, and shared cell-type controls load, unload, or update both
+  platforms together.
+- **Stacked overlay** draws both platforms in their common coordinate system on
+  one canvas. Every underlying layer has an unambiguous platform-qualified name,
+  such as `MERSCOPE | Image | DAPI` or `XENIUM | Segmentation | Cellpose`, and
+  each platform layer can be shown or hidden independently.
+
+Use **Switch to side-by-side view** or **Switch to Stacked overlay view** to
+change presentation without reopening the stores or rebuilding the layers. The
+independent visibility choices made in stacked mode are restored when returning
+to it. Per-cell statistic overlays and tissue-annotation creation/export are
+unavailable while a pair is active because those tools currently have
+single-dataset semantics.
+
+Paired viewing is deliberately a strict, read-only consumer of MerXen v2
+materialized data. The moving MERSCOPE store must contain a complete version-2
+`merxen_alignment` manifest, and the fixed Xenium store must contain its matching
+`merxen_alignment_pair_reference`. Their pair identity, transform, source
+fingerprint, common coordinate system, fixed grid, schemas, and all declared
+artifacts must agree and be present. The viewer does not calculate a
+registration, rasterize shapes, generate image/label pyramids or outlines, or
+write either store in paired mode. If validation reports that a pair is missing,
+incomplete, stale, or mismatched, rerun the upstream MerXen materialization and
+then reopen both stores.
+
 ### Default startup and low-RAM flags
 
-By default the viewer eagerly loads everything: all image channels, the Cellpose
+In either workflow, the viewer loads all available image channels, the Cellpose
 and ProSeg segmentations (shown as lazy label outlines), and all transcripts as
-per-gene points. Per-cell statistic overlays are **not** loaded automatically.
+per-gene points by default. Per-cell statistic overlays are **not** loaded
+automatically and are unavailable in paired mode.
 
 On low-memory systems you can suppress the startup load of any layer type; each
 `--skip-*` flag only skips the *automatic* load — you can still load that layer
@@ -137,39 +199,50 @@ they stand out as the main controls, and they wrap onto extra rows on a narrow
 dock so every full name stays readable.
 
 - **Gene inspector** — the transcript view (see below). **Load / reload
-  transcripts** rebuilds the per-gene points; **Unload transcripts** frees them.
+  transcripts** restores or builds the per-gene points; **Unload transcripts**
+  frees them.
+  With a pair active, these actions and the gene filters apply to both platforms.
 - **Cell segmentation** — a list of every segmentation key; currently-loaded
   segmentations are shown in **green**. Select one or more and use **Load
   selected cell segmentation** / **Unload selected cell segmentation**. Cellpose
-  and ProSeg load automatically at startup.
+  and ProSeg load automatically at startup. In paired mode, each logical key
+  controls its MERSCOPE and Xenium layers together.
 - **Per cell statistics** — Channel / Statistic / Colormap dropdowns plus
-  **Load / Unload per-cell statistic overlay** (MERSCOPE Cellpose quantification).
+  **Load / Unload per-cell statistic overlay** (MERSCOPE Cellpose
+  quantification). This tab is unavailable in paired mode.
 - **Draw tissue annotations** — the cortical-depth drawing tools (see below).
   Selecting this tab automatically expands napari's layer controls so the active
-  drawing layer can be edited.
+  drawing layer can be edited. Creation, validation, and export controls are
+  unavailable in paired mode.
 - **Images** — a list of every individual image **channel** (across all image
   elements, for both MERSCOPE and Xenium); currently-loaded channels are shown in
   **green**. Use **Load selected image(s)**, **Load all images**, and **Unload
-  selected image(s)**.
-- **Dataset loader** — the MERSCOPE/XENIUM switcher for the currently open
-  stores, **Reload Dataset**, and buttons to open a different dataset: **Load new
-  paired dataset** (browse for a MERSCOPE store then a Xenium store) or **Load new
-  standalone MERSCOPE / Xenium dataset** (browse for a single store). Each
-  browser expects the store's `spatialdata.zarr` folder. **Recently viewed**
-  lists up to ten stores and persists between launches.
+  selected image(s)**. In paired mode, a channel is one logical slot whose
+  available MERSCOPE and Xenium layers are controlled together.
+- **Dataset loader** — the MERSCOPE/XENIUM switcher and **Reload Dataset** for a
+  standalone session; paired loads disable those single-dataset controls. Use
+  **Load new paired dataset side-by-side** or **Load new paired dataset stacked
+  overlay** (browse for a MERSCOPE store then a Xenium store), or **Load new
+  standalone MERSCOPE / Xenium dataset** (browse for a single store). While a
+  pair is active, use the two **Switch to... view** buttons to change layouts.
+  Each browser expects the store's `spatialdata.zarr` folder. **Recently viewed**
+  lists up to ten logical entries and persists between launches.
 
 The left dock is simplified for the spatial-transcriptomics workflow. **Layer
 controls** starts collapsed and can be expanded or collapsed with the arrow in
 its title. The create-points, create-shapes, create-labels, console, 2D/3D,
-axis, and grid buttons are hidden; delete and **Reset view to original state**
-remain available.
+axis, and grid buttons are hidden. Delete remains available in standalone mode
+but is disabled while a paired grid is active; use the shared unload controls
+instead. **Reset view to original state** remains available in both modes.
 
-Segmentations display as memory-efficient label outlines. If a matching label
-element is already present in the SpatialData store, it is loaded lazily. If it
-is missing, the viewer rasterizes the selected polygon layer chunk by chunk,
-saves it back to `labels/<shape-key>_labels` in the zarr, and then displays the
-label outlines as a lazy multiscale image. Future runs reuse the saved label
-layer and only rebuild the lightweight outline view.
+In standalone mode, segmentations display as memory-efficient label outlines.
+If a matching label element is already present in the SpatialData store, it is
+loaded lazily. If it is missing, the viewer rasterizes the selected polygon
+layer chunk by chunk, saves it back to `labels/<shape-key>_labels` in the zarr,
+and then displays the label outlines as a lazy multiscale image. Future
+standalone runs reuse the saved label layer and only rebuild the lightweight
+outline view. Paired mode only reads the materialized labels or outlines named
+by the validated MerXen contract and never takes this cache-generation path.
 
 Clicking inside a cell mask highlights that cell (repeated clicks accumulate
 highlights). This is gated on the **ProSeg** (cell-inspector) layer's visibility:
@@ -177,20 +250,31 @@ hiding that layer in the napari layer list disables click-to-highlight and clear
 any current highlights, and showing it again re-enables clicking.
 
 The transcript renderer still uses one real napari Points layer for each marker
-symbol behind the scenes, but the layer list presents them as one **Genes** row.
-The row sits immediately beneath the final visible native layer, and its
-visibility control shows or hides every gene layer together. The real gene layer
-block remains pinned to the bottom of napari's model, so transcript points sit
-*below* image and mask layers; toggle image visibility if you need the spots in
-front.
+symbol behind the scenes, but those implementation layers are hidden from the
+layer list. A standalone dataset is presented as one **Genes** row; a paired
+dataset is presented as separate **MERSCOPE Genes** and **XENIUM Genes** rows.
+Their visibility controls are linked in side-by-side mode and independent in
+stacked overlay mode. Shared genes use the same marker and colour in both
+platforms. The aggregate rows sit immediately beneath the final visible native
+layer. The real gene-layer blocks remain pinned to the bottom of napari's model,
+so transcript points sit *below* image and mask layers; toggle image visibility
+if you need the spots in front.
+
+The label-cache generation options below apply to standalone mode only. They do
+not repair or add files to a paired dataset:
 
 ```bash
-# Rebuild cached labels instead of reusing existing labels.
+# Rebuild standalone cached labels instead of reusing existing labels.
 napari-compare-xenium-merscope ... --overwrite-labels
 
-# Use smaller chunks while generating labels.
+# Use smaller chunks while generating standalone labels.
 napari-compare-xenium-merscope ... --label-chunk-size 1024
+```
 
+Napari's label-contour display width can be adjusted where applicable. This is
+a display option and does not create or modify materialized paired outlines:
+
+```bash
 # Thicker label outlines in napari.
 napari-compare-xenium-merscope ... --label-contour-width 2
 ```
@@ -203,7 +287,24 @@ memory as points. The **Gene inspector** tab loads the full gene panel for the
 current dataset alphabetically and gives every gene a unique **colour + marker
 shape** shown as a large icon beside its name. Assigned and unassigned transcripts
 are shown by default; control/blank probes are hidden. Use **Load / reload
-transcripts** to rebuild the panel and **Unload transcripts** to free the points.
+transcripts** to restore or build the panel and **Unload transcripts** to free the
+points.
+
+The first transcript load for a dataset builds an external persistent cache;
+later loads restore that prepared point store instead of streaming the complete
+transcript table twice. Cached coordinates and cell-assignment indexes are
+memory-mapped, while display colours remain mutable. The cache is automatically
+invalidated when the source point files, selected columns, render cap, random
+seed, cell-index option, or marker reference changes. It never writes into the
+SpatialData zarr (including in paired mode).
+
+By default the cache is stored in the platform user-cache directory: under
+`~/Library/Caches/napari-compare-xenium-merscope/transcripts` on macOS,
+`$XDG_CACHE_HOME/napari-compare-xenium-merscope/transcripts` (or
+`~/.cache/...`) on Linux, and
+`%LOCALAPPDATA%/napari-compare-xenium-merscope/transcripts` on Windows. Set
+`NAPARI_COMPARE_TRANSCRIPT_CACHE_DIR` to use another external directory. Delete
+that directory to force all transcript caches to be rebuilt.
 
 Genes are grouped by marker shape into at most 14 napari Points layers, so per-gene
 toggles stay fast even with hundreds of genes. Each layer keeps fixed point
@@ -322,11 +423,20 @@ bold white text with a black outline).
 
 ## Data Assumptions
 
-MERSCOPE inputs may include `micron_to_mosaic_pixel_transform.csv` inside the zarr directory. If missing, the viewer falls back to `0.108 um/px`.
+In standalone mode, MERSCOPE inputs may include
+`micron_to_mosaic_pixel_transform.csv` inside the zarr directory. If missing,
+the viewer falls back to `0.108 um/px`.
 
-Xenium inputs may include `experiment.xenium` either inside the zarr directory or beside it. If missing, the viewer falls back to `0.2125 um/px`.
+In standalone mode, Xenium inputs may include `experiment.xenium` either inside
+the zarr directory or beside it. If missing, the viewer falls back to `0.2125
+um/px`.
 
-The SpatialData stores should contain points for transcripts, images for channel display, and either vector `shapes` or raster `labels` for segmentations.
+Standalone SpatialData stores should contain points for transcripts, images for
+channel display, and either vector `shapes` or raster `labels` for
+segmentations. Paired mode does not use the standalone transform fallbacks or
+infer equivalent elements: it requires the exact common coordinate system,
+fixed grid, and materialized artifact mappings declared by a valid MerXen v2
+pair.
 
 ## Cortical-depth annotations for MerXen
 
