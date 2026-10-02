@@ -372,6 +372,7 @@ def _controller(qapp):
     )
     ctrl._dataset_sessions["MERSCOPE"] = types.SimpleNamespace(
         cell_type_available={"proseg": True, "proseg_mask": False, "cellpose": True, "original": False},
+        umap_available={"proseg": True, "cellpose": True},
         cellpose_channels=["DAPI", "PolyT"],
         cellpose_statistics=["median", "mean"],
         cellpose_values_available=True,
@@ -1048,3 +1049,162 @@ def test_control_panel_has_a_umap_tab(qapp):
     assert titles[-1] == "UMAP"
     # An empty launch still opens on the Dataset loader.
     assert panel._tab_group.checkedButton().text() == "Dataset loader"
+
+
+@pytest.mark.parametrize("zarr_format", [2, 3])
+def test_hybrid_allen_hierarchy_joins_masks_and_umap_without_loading_expression(tmp_path, monkeypatch, zarr_format):
+    import anndata as ad
+    from napari_compare_xenium_merscope.utils import (
+        cell_type_levels, load_cell_type_assignments, build_assignment_color_schemes,
+        build_cell_type_color_dict,
+    )
+    from napari_compare_xenium_merscope.cell_umap import cell_umap_available
+
+    ids = [3715213700018100064, 3715213700018100066, 3715213700018100069]
+    obs = pd.DataFrame({
+        "instance_id": np.array(ids, dtype=np.uint64),
+        "ct_final_name": pd.Categorical(["Astro", "Excitatory", "Unassigned"]),
+        "ct_broad_name": pd.Categorical(["Astro", "Neurons", None]),
+        "ct_supercluster_name": pd.Categorical([None, "L2/3 IT", None]),
+        "ct_supercluster_status": pd.Categorical(["not_applicable", "confident", "low_counts"]),
+        "ct_cluster_name": pd.Categorical([None, None, None]),
+    }, index=["a", "b", "c"])
+    store = tmp_path / "store.zarr"
+    root = zarr.open_group(str(store), mode="w", zarr_format=zarr_format)
+    root.create_group("tables")
+    with ad.settings.override(zarr_write_format=zarr_format):
+        store = _write_clustering_table(tmp_path, "table_MOSAIK_proseg_hybrid_clustering_squidpy",
+                                        obs, np.array([[2, 3], [4, 5], [6, 7]], dtype=float))
+    monkeypatch.setattr(ad, "read_zarr", lambda *a, **k: pytest.fail("Do not load the expression matrix"))
+    assert cell_type_levels(store, "proseg_hybrid") == {
+        "ct_final": "Allen · final assignment", "ct_broad": "Allen · broad type",
+        "ct_supercluster": "Allen · supercluster",
+    }
+    assert cell_type_levels(store, "proseg") == {}
+    assignments = load_cell_type_assignments(store, "proseg_hybrid")
+    assert assignments.cell_ids.tolist() == ids
+    assert assignments.labels_for("ct_supercluster").tolist() == [None, "L2/3 IT", None]
+    assert assignments.labels_for("ct_cluster").tolist() == [None] * 3
+    assert cell_umap_available(store, "proseg_hybrid")
+    embedding = load_cell_umap(store, "proseg_hybrid")
+    assert embedding.cell_ids.tolist() == ids
+    labels = labels_for_cell_ids(assignments.cell_ids, assignments.labels_for("ct_supercluster"),
+                                 embedding.cell_ids[::-1])
+    assert labels.tolist() == [None, "L2/3 IT", None]
+    scheme = build_assignment_color_schemes([assignments])["ct_supercluster"]
+    mapping = build_cell_type_color_dict(assignments.cell_ids, assignments.labels_for("ct_supercluster"), scheme)
+    assert ids[0] not in mapping and ids[2] not in mapping
+    assert mapping[ids[1]] == scheme.colors["L2/3 IT"]
+    assert V.ComparisonViewerController._cell_type_counts(assignments, "ct_supercluster") == {"L2/3 IT": 1}
+
+
+def test_missing_hierarchy_and_embedding_are_not_offered(tmp_path, qapp):
+    from napari_compare_xenium_merscope.utils import cell_type_levels
+    from napari_compare_xenium_merscope.cell_umap import cell_umap_available
+
+    obs = pd.DataFrame({"instance_id": [1, 2], "ct_broad_name": pd.Categorical([None, None])},
+                       index=["a", "b"])
+    store = _write_clustering_table(tmp_path, "table_MOSAIK_proseg_hybrid_clustering_squidpy", obs, None)
+    assert cell_type_levels(store, "proseg_hybrid") == {}
+    assert not cell_umap_available(store, "proseg_hybrid")
+    ctrl, widget = _controller(qapp)
+    ctrl.datasets = {"MERSCOPE": types.SimpleNamespace(zarr_path=store)}
+    ctrl._dataset_sessions.clear()
+    ctrl._publish_umap_options()
+    assert widget._source_combo.count() == 0
+    assert not widget._window_button.isEnabled()
+    assert widget._colour_combo.findData("ct_broad") == -1
+
+
+def _add_allen_levels(ctrl, platform, source="proseg", second_level=True):
+    state = ctrl._cell_type_state(platform)
+    assignments = state.assignments[source]
+    assignments.levels = {"broad": assignments.broad, "fine": assignments.fine,
+                          "ct_final": np.array(["Astro", "L2/3 IT"], dtype=object)}
+    if second_level:
+        assignments.levels["ct_supercluster"] = np.array([None, "L2/3 IT"], dtype=object)
+    ctrl._cache_cell_type_data(state, source, assignments)
+    return state
+
+
+def test_allen_level_syncs_spatial_umap_and_roi_and_resets_on_source_change(qapp, monkeypatch):
+    ctrl, widget = _controller(qapp)
+    cell_state = _add_allen_levels(ctrl, "MERSCOPE")
+    monkeypatch.setattr(ctrl, "_start_cell_type_overlay_build", lambda state: None)
+    window = _open_window(ctrl, widget)
+    ctrl.set_cell_type_kind("MERSCOPE", "ct_supercluster")
+    assert widget.current_colour()[0] == "ct_supercluster"
+    assert window.colouring.title == "Allen · supercluster"
+    assert window.describe_row(0) == "Cell 303 · L2/3 IT"
+    assert window.describe_row(1) == "Cell 202 · Unannotated"
+    scheme = cell_state.schemes["proseg"]["ct_supercluster"]
+    assert tuple(window.colouring.colors[0]) == _u8(scheme.colors["L2/3 IT"])
+    ctrl.set_cell_type_visible("MERSCOPE", "L2/3 IT", False)
+    assert tuple(window.colouring.colors[0]) == _u8(UMAP_MUTED_RGBA)
+    ctrl.set_cell_type_visible("MERSCOPE", "L2/3 IT", True)
+    ctrl._on_umap_lasso_completed("", np.array([[-10, -10], [10, -10], [10, 10], [-10, 10]]))
+    summary = ctrl._umap_roi_summary(ctrl._umap_state(), ctrl._umap_state().primary,
+                                     ctrl._umap_state().embeddings["proseg"], window.colouring)
+    assert summary.level == "Allen · supercluster"
+    ctrl.set_cell_type_segmentation("MERSCOPE", "cellpose")
+    assert widget._colour_combo.findData("ct_supercluster") == -1
+    assert ctrl._umap_state().colour_by == "broad"
+    assert cell_state.kind == "broad"
+    window.close()
+
+
+def test_paired_allen_colours_match_spatial_and_both_umaps(qapp, monkeypatch):
+    ctrl, widget, registry = _paired_controller(qapp, monkeypatch)
+    states = [_add_allen_levels(ctrl, platform) for platform in ("MERSCOPE", "XENIUM")]
+    states[1].assignments["proseg"].levels["ct_final"] = np.array(["L2/3 IT", "Oligo"], dtype=object)
+    window = _open_window(ctrl, widget)
+    ctrl.set_cell_type_kind("MERSCOPE", "ct_final")
+    for state in states:
+        assert state.kind == "ct_final"
+        assert state.schemes["proseg"]["ct_final"].colors == states[0].schemes["proseg"]["ct_final"].colors
+    palette = states[0].schemes["proseg"]["ct_final"].colors
+    for view in ctrl._umap_state().views.values():
+        scheme = ctrl._umap_scheme(ctrl._umap_state(), view, "ct_final")
+        assert scheme.colors == palette
+    assert tuple(window.panel("MERSCOPE").colouring.colors[0]) == tuple(window.panel("XENIUM").colouring.colors[0])
+    window.close()
+
+
+def test_cell_type_widget_hides_unavailable_hierarchy_levels(qapp):
+    callback = lambda *args: None
+    widget = V.CellTypeWidget(
+        close_callback=callback, set_segmentation_callback=callback, set_kind_callback=callback,
+        set_type_visible_callback=callback, set_types_visible_callback=callback,
+        set_all_types_callback=callback, set_opacity_callback=callback,
+    )
+    widget.set_levels_available({"ct_final": "Allen · final assignment"})
+    assert widget._level_buttons["ct_final"].isEnabled()
+    assert not widget._level_buttons["ct_final"].isHidden()
+    assert widget._level_buttons["ct_supercluster"].isHidden()
+    assert not widget._level_buttons["ct_supercluster"].isEnabled()
+    widget.set_levels_available({"broad": "Broad cell type", "fine": "Fine cell type"})
+    assert widget._level_buttons["ct_final"].isHidden()
+    assert widget._level_buttons["broad"].isEnabled()
+
+
+def test_paired_hierarchy_missing_on_one_platform_stays_unannotated(qapp, monkeypatch):
+    ctrl, widget, registry = _paired_controller(qapp, monkeypatch)
+    _add_allen_levels(ctrl, "MERSCOPE")
+    window = _open_window(ctrl, widget)
+    ctrl.set_umap_colour("ct_supercluster")
+    assert window.panel("MERSCOPE").describe_row(0) == "Cell 303 · L2/3 IT"
+    assert window.panel("XENIUM").describe_row(0) == "Cell 11 · Unannotated"
+    assert window.panel("XENIUM").describe_row(1) == "Cell 12 · Unannotated"
+    recorded = []
+    ctrl._cell_type_widget = types.SimpleNamespace(set_levels_available=recorded.append)
+    ctrl._publish_cell_type_levels()
+    assert "ct_supercluster" not in recorded[-1]
+    window.close()
+
+
+def test_unreadable_annotation_store_fails_closed(tmp_path):
+    from napari_compare_xenium_merscope.utils import cell_type_levels, load_cell_type_assignments
+    root = zarr.open_group(str(tmp_path / "broken.zarr"), mode="w")
+    root.create_group("tables").create_group("table_MOSAIK_proseg_hybrid_clustering_squidpy")
+    assert cell_type_levels(tmp_path / "broken.zarr", "proseg_hybrid") == {}
+    assert load_cell_type_assignments(tmp_path / "broken.zarr", "proseg_hybrid") is None

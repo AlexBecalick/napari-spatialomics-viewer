@@ -974,7 +974,7 @@ def test_cell_type_sources_resolve_to_their_own_tables(tmp_path):
     assert clustering_table_key_for_segmentation(store, "not_a_source") is None
 
     # The registry pins each source to the masks it may colour.
-    assert {s.key for s in CELL_TYPE_SOURCES} == {"proseg", "proseg_mask", "cellpose", "original"}
+    assert {s.key for s in CELL_TYPE_SOURCES} == {"proseg_hybrid", "proseg", "proseg_mask", "cellpose", "original"}
     assert "MOSAIK_proseg" in cell_type_source("proseg_mask").mask_shape_keys
     assert "merscope_cell_boundaries" in cell_type_source("original").mask_shape_keys
     assert cell_type_source("not_a_source") is None

@@ -51,6 +51,8 @@ from qtpy.QtWidgets import (
 
 from .utils import (
     CELL_TYPE_SOURCES,
+    cell_id_to_int,
+    cell_ids_as_int64,
     _resolve_instance_key,
     cell_type_source,
     cellpose_value_clip_range,
@@ -91,49 +93,6 @@ UMAP_LASSO_MIN_STEP_PX = 2.0
 # ---------------------------------------------------------------------------
 # Data
 # ---------------------------------------------------------------------------
-
-
-def cell_id_to_int(value: Any) -> int | None:
-    """Return an exact integer cell id, or ``None`` when ``value`` is not one.
-
-    Unlike :func:`utils.normalize_cell_key` this never routes through ``float``,
-    so 19-digit MERSCOPE EntityIDs keep every digit.
-    """
-    if value is None or isinstance(value, (bool, np.bool_)):
-        return None
-    if isinstance(value, (int, np.integer)):
-        return int(value)
-    if isinstance(value, (float, np.floating)):
-        as_float = float(value)
-        return int(as_float) if np.isfinite(as_float) and as_float.is_integer() else None
-    text = str(value).strip()
-    try:
-        return int(text)
-    except ValueError:
-        pass
-    try:
-        as_float = float(text)
-    except ValueError:
-        return None
-    return int(as_float) if np.isfinite(as_float) and as_float.is_integer() else None
-
-
-def cell_ids_as_int64(values: Iterable[Any]) -> tuple[np.ndarray, np.ndarray]:
-    """Convert cell ids to ``int64`` plus a validity mask, without float rounding."""
-    arr = np.asarray(values)
-    if arr.dtype.kind in "iu":
-        return arr.astype(np.int64, copy=False), np.ones(arr.shape[0], dtype=bool)
-    parsed = pd.to_numeric(pd.Series(arr, copy=False), errors="coerce")
-    if parsed.dtype.kind in "iu":
-        return parsed.to_numpy(dtype=np.int64), np.ones(arr.shape[0], dtype=bool)
-    ids = np.zeros(arr.shape[0], dtype=np.int64)
-    valid = np.zeros(arr.shape[0], dtype=bool)
-    for i, value in enumerate(arr.tolist()):
-        as_int = cell_id_to_int(value)
-        if as_int is not None:
-            ids[i] = as_int
-            valid[i] = True
-    return ids, valid
 
 
 def _unique_id_index(ids: np.ndarray) -> tuple[pd.Index, np.ndarray]:
@@ -183,6 +142,18 @@ def _read_elem():
     except ImportError:  # pragma: no cover - anndata < 0.11
         from anndata.experimental import read_elem
     return read_elem
+
+
+def cell_umap_available(zarr_path: Any, segmentation: str) -> bool:
+    """Check for a stored two-dimensional embedding without loading its data."""
+    try:
+        key = clustering_table_key_for_segmentation(zarr_path, segmentation)
+        if key is None:
+            return False
+        array = open_zarr_group_unconsolidated(zarr_path)[f"tables/{key}/obsm/{UMAP_OBSM_KEY}"]
+        return len(array.shape) == 2 and array.shape[0] > 0 and array.shape[1] >= 2
+    except Exception:
+        return False
 
 
 def load_cell_umap(
@@ -1737,6 +1708,23 @@ class UmapControlWidget(QWidget):
             self._source_combo.setEnabled(self._source_combo.count() > 0)
         finally:
             self._suppress = False
+
+    def set_colour_levels(self, levels: Mapping[str, str], current: str) -> None:
+        """Offer only annotation levels present in the selected source."""
+        self._suppress = True
+        try:
+            self._colour_combo.clear()
+            for key, label in levels.items():
+                self._colour_combo.addItem(label, key)
+            self._colour_combo.addItem("Per-cell statistic", "statistic")
+            self._colour_combo.model().item(self._colour_combo.count() - 1).setEnabled(
+                self._statistics_available
+            )
+            index = self._colour_combo.findData(current)
+            self._colour_combo.setCurrentIndex(index)
+        finally:
+            self._suppress = False
+        self._refresh_statistic_box()
 
     def set_statistic_options(
         self, channels: list[str], statistics: list[str], available: bool

@@ -155,6 +155,7 @@ from .cell_umap import (
     emphasise_rows,
     labels_for_cell_ids,
     load_cell_umap,
+    cell_umap_available,
     points_in_polygon,
     statistic_joins_source,
     summarise_roi_labels,
@@ -198,10 +199,11 @@ from .utils import (
     assign_gene_visuals,
     build_cell_type_gene_visuals,
     build_cell_type_color_dict,
-    build_cell_type_color_schemes,
+    build_assignment_color_schemes,
+    cell_type_levels,
+    CELL_TYPE_LEVEL_LABELS,
     CELL_TYPE_SOURCES,
     cell_type_source,
-    clustering_table_key_for_segmentation,
     load_cell_type_assignments,
     resolve_cell_type_marker_reference,
     build_cell_transcript_index,
@@ -297,6 +299,7 @@ class DatasetSession:
     cellpose_statistics: list[str] = field(default_factory=list)
     cellpose_values_available: bool = False
     cell_type_available: dict[str, bool] = field(default_factory=dict)
+    umap_available: dict[str, bool] = field(default_factory=dict)
     gene_payload: dict | None = None
     label_specs: dict[str, dict] = field(default_factory=dict)
     last_used: float = field(default_factory=time.monotonic)
@@ -429,6 +432,7 @@ class CellTypeOverlayState:
     enabled: dict = field(default_factory=dict)
     #: segmentation -> normalized cell id -> (broad label, fine label).
     annotation_lookup: dict = field(default_factory=dict)
+    available_levels: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -746,6 +750,24 @@ def stable_layer_color(key: str, alpha: float = 1.0) -> tuple[float, float, floa
     val = 0.95
     r, g, b = colorsys.hsv_to_rgb(hue, sat, val)
     return (float(r), float(g), float(b), float(alpha))
+
+
+def segmentation_method(key: str) -> str:
+    """Identify a segmentation, checking hybrid before the ProSeg prefix."""
+    token = str(key).lower()
+    for method in ("proseg_hybrid", "cellpose", "proseg"):
+        if method in token:
+            return method
+    return token
+
+
+def segmentation_color(key: str) -> tuple[float, float, float, float]:
+    """Use the same segmentation outline colour on both platforms."""
+    return {
+        "cellpose": (0.0, 1.0, 0.0, 1.0),
+        "proseg_hybrid": (1.0, 0.0, 1.0, 1.0),
+        "proseg": (0.0, 1.0, 1.0, 1.0),
+    }.get(segmentation_method(key), stable_layer_color(str(key)))
 
 
 def image_colormap_for_channel(channel_name: str, fallback_index: int = 0) -> str:
@@ -2970,6 +2992,9 @@ class CellTypeWidget(QWidget):
         self._level_broad_btn = QPushButton("Broad cell type")
         self._level_fine_btn = QPushButton("Fine cell type")
         self._level_buttons = {"broad": self._level_broad_btn, "fine": self._level_fine_btn}
+        for key, label in CELL_TYPE_LEVEL_LABELS.items():
+            if key not in self._level_buttons:
+                self._level_buttons[key] = QPushButton(label)
         # Exclusive, but allow starting with none checked until the user picks.
         self._level_group.setExclusive(False)
         for kind, button in self._level_buttons.items():
@@ -3014,6 +3039,11 @@ class CellTypeWidget(QWidget):
         level_row.addWidget(self._level_broad_btn)
         level_row.addWidget(self._level_fine_btn)
         root.addLayout(level_row)
+        for key, button in self._level_buttons.items():
+            if key not in ("broad", "fine"):
+                root.addWidget(button)
+                button.setVisible(False)
+                button.setEnabled(False)
         opacity_row = QHBoxLayout()
         opacity_row.addWidget(QLabel("Mask opacity"))
         opacity_row.addWidget(self._opacity_slider)
@@ -3025,6 +3055,7 @@ class CellTypeWidget(QWidget):
         root.addWidget(self._status_label)
         self.setLayout(root)
         self.setMinimumWidth(240)
+        self.set_levels_available({})
 
     # -- public API ---------------------------------------------------------
     def set_status(self, text: str):
@@ -3071,6 +3102,16 @@ class CellTypeWidget(QWidget):
             button.setVisible(ok)
             button.setChecked(seg == self._segmentation)
             button.blockSignals(False)
+
+    def set_levels_available(self, levels: dict[str, str]):
+        """Hide levels absent from this source (or either member of a pair)."""
+        for key, button in self._level_buttons.items():
+            button.setVisible(key in levels)
+            button.setEnabled(key in levels)
+            if key not in levels:
+                button.setChecked(False)
+        if self._kind not in levels:
+            self._kind = ""
 
     def clear(self):
         self._suppress = True
@@ -5657,11 +5698,10 @@ class ComparisonViewerController:
         self._active_images_sdata = sd.read_zarr(str(cfg.zarr_path), selection=("images",))
 
     def _startup_segmentation_keys(self) -> list[str]:
-        """Segmentation keys to auto-load at startup (Cellpose + ProSeg masks).
+        """Auto-load available Cellpose, ProSeg and ProSeg hybrid masks.
 
-        Both platforms write ``MOSAIK_cellpose`` and ``MOSAIK_proseg`` (see the
-        MerXen ``segment`` stage). Prefer those exact keys; otherwise fall back to
-        the first key containing the token so aligned/variant names still resolve.
+        Prefer MerXen's exact ``MOSAIK_*`` keys, otherwise resolve aligned or
+        variant names while keeping ProSeg and ProSeg hybrid distinct.
         Each mask is skipped when its ``--skip-*`` flag is set.
         """
         keys = list(self._segmentation_keys)
@@ -5669,6 +5709,7 @@ class ComparisonViewerController:
         for token, skip in (
             ("cellpose", bool(getattr(self.args, "skip_cellpose", False))),
             ("proseg", bool(getattr(self.args, "skip_proseg", False))),
+            ("proseg_hybrid", bool(getattr(self.args, "skip_proseg_hybrid", False))),
         ):
             if skip:
                 continue
@@ -5676,7 +5717,7 @@ class ComparisonViewerController:
             if exact in keys:
                 selected.append(exact)
                 continue
-            match = next((k for k in keys if token in k.lower()), None)
+            match = next((k for k in keys if segmentation_method(k) == token), None)
             if match is not None:
                 selected.append(match)
         return list(dict.fromkeys(selected))
@@ -5684,7 +5725,7 @@ class ComparisonViewerController:
     def _start_startup_autoload(self, ds: str):
         """Kick off the default background loads once dataset metadata is ready.
 
-        Images, Cellpose+ProSeg masks and per-gene transcripts each load in their
+        Images, Cellpose/ProSeg/ProSeg hybrid masks and transcripts load in their
         own napari thread_worker, so this returns immediately and the UI stays
         responsive while the busy progress bar tracks each stage. Cell-mask value
         overlays are intentionally NOT loaded here (on-demand only).
@@ -5779,7 +5820,7 @@ class ComparisonViewerController:
             )
             cellpose_available = True
         cell_type_available = {
-            source.key: clustering_table_key_for_segmentation(cfg.zarr_path, source.key) is not None
+            source.key: bool(cell_type_levels(cfg.zarr_path, source.key))
             for source in CELL_TYPE_SOURCES
         }
         return DatasetSession(
@@ -5796,6 +5837,8 @@ class ComparisonViewerController:
             cellpose_statistics=cellpose_statistics,
             cellpose_values_available=cellpose_available,
             cell_type_available=cell_type_available,
+            umap_available={source.key: cell_umap_available(cfg.zarr_path, source.key)
+                            for source in CELL_TYPE_SOURCES},
         )
 
     def _session_cache_budget_bytes(self) -> int:
@@ -6391,9 +6434,7 @@ class ComparisonViewerController:
                 )
                 if levels:
                     color = np.asarray(
-                        stable_layer_color(
-                            f"{platform}:{logical_key}", alpha=1.0
-                        ),
+                        segmentation_color(logical_key),
                         dtype=np.float32,
                     )
                     layer = napari.layers.Image(
@@ -6454,6 +6495,9 @@ class ComparisonViewerController:
                             "logical_segmentation": logical_key,
                         },
                     )
+                    layer.colormap = DirectLabelColormap(color_dict={
+                        0: (0.0, 0.0, 0.0, 0.0), None: segmentation_color(logical_key),
+                    })
                     try:
                         layer.contour = max(
                             1,
@@ -6503,11 +6547,12 @@ class ComparisonViewerController:
         for token, skip in (
             ("cellpose", bool(getattr(self.args, "skip_cellpose", False))),
             ("proseg", bool(getattr(self.args, "skip_proseg", False))),
+            ("proseg_hybrid", bool(getattr(self.args, "skip_proseg_hybrid", False))),
         ):
             if skip:
                 continue
             match = next(
-                (key for key in session.segmentation_keys if token in key.lower()),
+                (key for key in session.segmentation_keys if segmentation_method(key) == token),
                 None,
             )
             if match is not None:
@@ -7812,7 +7857,7 @@ class ComparisonViewerController:
         n_levels = int(prepared["n_levels"])
         layer_name = make_layer_name(ds, "labels", label_key)
         self._remove_layer_by_name(layer_name)
-        layer_color = np.asarray(stable_layer_color(label_key, alpha=1.0), dtype=np.float32)
+        layer_color = np.asarray(segmentation_color(label_key), dtype=np.float32)
         color_map = outline_coverage_colormap(
             f"{label_key}_outline",
             layer_color,
@@ -10078,11 +10123,13 @@ class ComparisonViewerController:
             return self._unannotated_cell_type_fields()
         broad, fine = labels
         neutral = (0.6, 0.64, 0.7, 1.0)
+        broad_scheme = schemes.get("broad", schemes.get("ct_broad"))
+        fine_scheme = schemes.get("fine", schemes.get("ct_final"))
         return {
-            "broad_cell_type": broad,
-            "fine_cell_type": fine,
-            "broad_cell_type_rgba": schemes["broad"].colors.get(broad, neutral),
-            "fine_cell_type_rgba": schemes["fine"].colors.get(fine, neutral),
+            "broad_cell_type": broad if broad != "None" else "Unannotated",
+            "fine_cell_type": fine if fine != "None" else "Unannotated",
+            "broad_cell_type_rgba": broad_scheme.colors.get(broad, neutral) if broad_scheme else neutral,
+            "fine_cell_type_rgba": fine_scheme.colors.get(fine, neutral) if fine_scheme else neutral,
         }
 
     def _refresh_cell_selection_annotations(self, dataset_name: str):
@@ -11095,12 +11142,11 @@ class ComparisonViewerController:
             state.enabled.pop(seg, None)
             state.annotation_lookup.pop(seg, None)
             return False
-        schemes = build_cell_type_color_schemes(assignments.broad, assignments.fine, alpha=1.0)
+        schemes = build_assignment_color_schemes([assignments])
         state.schemes[seg] = schemes
         # Default: every type shown, tracked independently for each level.
         state.enabled[seg] = {
-            "broad": set(schemes["broad"].order),
-            "fine": set(schemes["fine"].order),
+            kind: set(scheme.order) for kind, scheme in schemes.items()
         }
         state.annotation_lookup[seg] = {
             normalize_cell_key(cid): (str(broad), str(fine))
@@ -11157,7 +11203,7 @@ class ComparisonViewerController:
     @staticmethod
     def _cell_type_counts(assignments, kind: str) -> dict[str, int]:
         labels = np.asarray(assignments.labels_for(kind))
-        values, counts = np.unique(labels, return_counts=True)
+        values, counts = np.unique(labels[pd.notna(labels)], return_counts=True)
         return {str(v): int(c) for v, c in zip(values.tolist(), counts.tolist())}
 
     def _populate_cell_type_panel(self, state: CellTypeOverlayState):
@@ -11176,7 +11222,7 @@ class ComparisonViewerController:
         scheme = schemes[kind]
         enabled = state.enabled[seg][kind]
         counts = self._cell_type_counts(assignments, kind)
-        broad_colors = schemes["broad"].colors
+        broad_colors = schemes["broad"].colors if "broad" in schemes else {}
         layout: list[tuple] = []
         for title, members in scheme.groups:
             # Fine headers take their broad class's hue; the single broad header
@@ -11261,24 +11307,18 @@ class ComparisonViewerController:
         if any(item is None for item in assignments):
             return False
 
-        disabled_by_kind: dict[str, set[str]] = {"broad": set(), "fine": set()}
+        disabled_by_kind: dict[str, set[str]] = {key: set() for key in CELL_TYPE_LEVEL_LABELS}
         for state in states:
             old_schemes = state.schemes.get(segmentation, {})
             old_enabled = state.enabled.get(segmentation, {})
-            for kind in ("broad", "fine"):
+            for kind in CELL_TYPE_LEVEL_LABELS:
                 old_scheme = old_schemes.get(kind)
                 if old_scheme is None:
                     continue
                 enabled = old_enabled.get(kind, set(old_scheme.order))
                 disabled_by_kind[kind].update(set(old_scheme.order) - set(enabled))
 
-        broad = np.concatenate(
-            [np.asarray(item.broad, dtype=object) for item in assignments]
-        )
-        fine = np.concatenate(
-            [np.asarray(item.fine, dtype=object) for item in assignments]
-        )
-        shared_schemes = build_cell_type_color_schemes(broad, fine, alpha=1.0)
+        shared_schemes = build_assignment_color_schemes(assignments)
         shared_enabled = {
             kind: set(scheme.order) - disabled_by_kind[kind]
             for kind, scheme in shared_schemes.items()
@@ -11316,7 +11356,7 @@ class ComparisonViewerController:
                 continue
             for label, count in self._cell_type_counts(assignments, kind).items():
                 counts[label] = counts.get(label, 0) + int(count)
-        broad_colors = schemes["broad"].colors
+        broad_colors = schemes["broad"].colors if "broad" in schemes else {}
         layout: list[tuple] = []
         for title, members in scheme.groups:
             header_rgba = (
@@ -11430,6 +11470,7 @@ class ComparisonViewerController:
                 f"for {segmentation}."
             )
             return
+        self._publish_cell_type_levels()
         if available[0].kind:
             self._apply_paired_cell_type_layers(available)
             self._populate_paired_cell_type_panel(available)
@@ -11454,6 +11495,9 @@ class ComparisonViewerController:
                 "Both paired datasets need a matching materialized mask and "
                 "cell-type annotations for this source."
             )
+            return
+        if any(kind not in state.schemes.get(state.segmentation, {}) for state in available):
+            self._publish_cell_type_levels()
             return
         self._synchronize_paired_cell_type_schemes(tuple(available))
         added = self._apply_paired_cell_type_layers(tuple(available))
@@ -11484,6 +11528,7 @@ class ComparisonViewerController:
             if self._cell_type_widget is not None:
                 self._cell_type_widget.set_dataset(state.dataset)
             return
+        self._publish_cell_type_levels()
         self._refresh_cell_selection_annotations(state.dataset)
         # Re-colour for the new segmentation only when a level is already active.
         if state.kind:
@@ -11507,6 +11552,9 @@ class ComparisonViewerController:
             )
             if self._cell_type_widget is not None:
                 self._cell_type_widget.set_dataset(state.dataset)
+            return
+        if kind not in state.schemes.get(state.segmentation, {}):
+            self._publish_cell_type_levels()
             return
         self._populate_cell_type_panel(state)
         self._start_cell_type_overlay_build(state)
@@ -11907,6 +11955,44 @@ class ComparisonViewerController:
             self._cell_type_widget.set_dataset(state.dataset)
         self._set_status(f"{state.dataset}: removed cell-type colouring.")
 
+    def _source_levels(self, dataset: str, source: str) -> dict[str, str]:
+        state = self._cell_type_state(dataset)
+        assignments = state.assignments.get(source)
+        if assignments is not None:
+            keys = assignments.levels or {"broad": None, "fine": None}
+            return {key: CELL_TYPE_LEVEL_LABELS[key] for key in keys}
+        if source not in state.available_levels:
+            cfg = self.datasets.get(dataset)
+            state.available_levels[source] = cell_type_levels(getattr(cfg, "zarr_path", None), source)
+        return state.available_levels[source]
+
+    def _publish_cell_type_levels(self):
+        states = (self._paired_cell_type_states() if self._paired_session is not None
+                  else (self._cell_type_state(self.active_dataset),))
+        if not states:
+            return
+        levels = dict(self._source_levels(states[0].dataset, states[0].segmentation))
+        for state in states[1:]:
+            other = self._source_levels(state.dataset, state.segmentation)
+            levels = {key: label for key, label in levels.items() if key in other}
+        for state in states:
+            if state.kind and state.kind not in levels:
+                state.kind = next(iter(levels), "")
+        widget = self._cell_type_widget
+        if widget is not None and hasattr(widget, "set_levels_available"):
+            widget.set_levels_available(levels)
+
+    def _publish_umap_levels(self, state):
+        levels = {}
+        for view in state.views.values():
+            if view.available_sources.get(state.source):
+                levels.update(self._source_levels(view.dataset, state.source))
+        if state.colour_by != "statistic" and state.colour_by not in levels:
+            state.colour_by = next(iter(levels), "broad")
+        widget = self._umap_widget
+        if widget is not None and hasattr(widget, "set_colour_levels"):
+            widget.set_colour_levels(levels, state.colour_by)
+
     def _publish_cell_type_options(self):
         """Refresh the cell-type panel for the active dataset (on dataset load)."""
         if self.active_dataset is None:
@@ -11915,11 +12001,7 @@ class ComparisonViewerController:
             available_by_platform = {
                 platform: {
                     source.key: (
-                        clustering_table_key_for_segmentation(
-                            self._paired_session.configs[platform].zarr_path,
-                            source.key,
-                        )
-                        is not None
+                        bool(self._source_levels(platform, source.key))
                         and self._paired_segmentation_for_cell_type(
                             platform,
                             source.key,
@@ -11952,9 +12034,10 @@ class ComparisonViewerController:
                 return
             widget.set_dataset("MERSCOPE")
             widget.set_segmentation_available(available)
+            self._publish_cell_type_levels()
             if any(available.values()):
                 widget.set_status(
-                    "Choose Broad or Fine to colour both paired datasets."
+                    "Choose a stored cell-type level to colour both paired datasets."
                 )
             else:
                 widget.set_status(
@@ -11970,7 +12053,7 @@ class ComparisonViewerController:
             available = {
                 source.key: (
                     zarr_path is not None
-                    and clustering_table_key_for_segmentation(zarr_path, source.key) is not None
+                    and bool(cell_type_levels(zarr_path, source.key))
                 )
                 for source in CELL_TYPE_SOURCES
             }
@@ -11987,8 +12070,9 @@ class ComparisonViewerController:
             return
         widget.set_dataset(self.active_dataset)
         widget.set_segmentation_available(available)
+        self._publish_cell_type_levels()
         if any(available.values()):
-            widget.set_status("Choose Broad or Fine cell type to colour the masks.")
+            widget.set_status("Choose a stored cell-type level to colour the masks.")
         else:
             widget.set_status("No stored cell-type annotations in this dataset.")
 
@@ -12047,13 +12131,13 @@ class ComparisonViewerController:
         if not state.paired:
             session = self._dataset_sessions.get(view.dataset)
             if session is not None:
-                return dict(session.cell_type_available)
+                return dict(session.umap_available)
         zarr_path = getattr(self.datasets.get(view.dataset), "zarr_path", None)
         available = {}
         for source in CELL_TYPE_SOURCES:
             ok = (
                 zarr_path is not None
-                and clustering_table_key_for_segmentation(zarr_path, source.key) is not None
+                and cell_umap_available(zarr_path, source.key)
             )
             if ok and state.paired:
                 # A pair shows the aligned, materialized masks only.
@@ -12126,6 +12210,7 @@ class ComparisonViewerController:
                 "median" if "median" in statistics else statistics[0]
             )
 
+        self._publish_umap_levels(state)
         if widget is not None:
             widget.set_sources(available, state.source)
             widget.set_statistic_options(channels, statistics, stat_source is not None)
@@ -12206,6 +12291,7 @@ class ComparisonViewerController:
                     "Per-cell statistics only colour the Cellpose UMAP, so the "
                     "UMAP is now coloured by broad cell type."
                 )
+        self._publish_umap_levels(state)
         self._refresh_umap()
 
     def set_umap_colour(
@@ -12238,6 +12324,7 @@ class ComparisonViewerController:
                         "Per-cell statistics are measured on the Cellpose masks, so "
                         "the UMAP now shows the Cellpose clustering."
                     )
+        self._publish_umap_levels(state)
         self._refresh_umap()
 
     def set_umap_point_size(self, radius_px: float):
@@ -12258,12 +12345,13 @@ class ComparisonViewerController:
             return
         if segmentation and state.available_sources.get(str(segmentation), False):
             state.source = str(segmentation)
-        if kind in ("broad", "fine"):
+        if kind in CELL_TYPE_LEVEL_LABELS:
             state.colour_by = str(kind)
         elif state.colour_by == "statistic" and not statistic_joins_source(
             state.source, CELLPOSE_SHAPE_KEY
         ):
             state.colour_by = "broad"
+        self._publish_umap_levels(state)
         if self._umap_widget is not None:
             self._umap_widget.set_selection(source=state.source, colour_by=state.colour_by)
         self._refresh_umap()
@@ -12337,7 +12425,7 @@ class ComparisonViewerController:
             cell_type_state = self._cell_type_state(view.dataset)
             need_embedding = source not in view.embeddings
             need_assignments = source not in cell_type_state.assignments and (
-                state.colour_by in ("broad", "fine") or view.roi is not None
+                state.colour_by in CELL_TYPE_LEVEL_LABELS or view.roi is not None
             )
             if need_embedding or need_assignments:
                 needs[name] = (need_embedding, need_assignments)
@@ -12538,11 +12626,7 @@ class ComparisonViewerController:
         key = (state.source, tuple(id(item) for item in assignments))
         schemes = state.paired_schemes.get(key)
         if schemes is None:
-            schemes = build_cell_type_color_schemes(
-                np.concatenate([np.asarray(item.broad, dtype=object) for item in present]),
-                np.concatenate([np.asarray(item.fine, dtype=object) for item in present]),
-                alpha=1.0,
-            )
+            schemes = build_assignment_color_schemes(present)
             state.paired_schemes = {key: schemes}
         return schemes.get(kind)
 
@@ -12573,7 +12657,7 @@ class ComparisonViewerController:
             )
             return colouring, f"UMAP — {title}", subtitle
 
-        kind = "fine" if state.colour_by == "fine" else "broad"
+        kind = state.colour_by
         scheme = self._umap_scheme(state, view, kind)
         labels = self._umap_labels(state, view, embedding, kind)
         enabled = None
@@ -12581,7 +12665,7 @@ class ComparisonViewerController:
             enabled = (
                 self._cell_type_state(view.dataset).enabled.get(state.source, {}).get(kind)
             )
-        title = "Fine cell type" if kind == "fine" else "Broad cell type"
+        title = CELL_TYPE_LEVEL_LABELS.get(kind, "Cell type")
         colouring = categorical_umap_colouring(
             labels,
             scheme.colors if scheme is not None else {},
@@ -13465,7 +13549,7 @@ class ComparisonViewerController:
         roi = view.roi
         if roi is None or roi.rows is None:
             return None
-        kind = state.colour_by if state.colour_by in ("broad", "fine") else "broad"
+        kind = state.colour_by if state.colour_by in CELL_TYPE_LEVEL_LABELS else "broad"
         labels = self._umap_labels(state, view, embedding, kind)
         scheme = self._umap_scheme(state, view, kind)
         note = ""
@@ -13482,7 +13566,7 @@ class ComparisonViewerController:
         return summarise_roi_labels(
             labels[roi.rows],
             scheme.colors if scheme is not None else {},
-            level="Fine cell type" if kind == "fine" else "Broad cell type",
+            level=CELL_TYPE_LEVEL_LABELS.get(kind, "Cell type"),
             drawn_in=(
                 "the spatial view"
                 if roi.space == "spatial"
@@ -13918,6 +14002,11 @@ def parse_args() -> argparse.Namespace:
         "--skip-proseg",
         action="store_true",
         help="Do not auto-load the ProSeg segmentation at startup (load it manually from the Cell segmentation tab).",
+    )
+    parser.add_argument(
+        "--skip-proseg-hybrid",
+        action="store_true",
+        help="Do not auto-load the ProSeg hybrid segmentation at startup.",
     )
     parser.add_argument(
         "--skip-transcripts",
