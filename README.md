@@ -5,8 +5,9 @@ outputs, either as one standalone dataset or as a simultaneously displayed,
 pre-aligned pair.
 
 The viewer opens a single Napari window with a tabbed control panel (tabs across
-the top of the right-hand dock): **Gene inspector**, **Cell segmentation**, **Per
-cell statistics**, **Draw tissue annotations**, **Images**, and **Dataset**. With
+the top of the right-hand dock): **Gene inspector**, **Cell segmentation**,
+**Cell type labels**, **Per cell statistics**, **Draw tissue annotations**,
+**Images**, **Dataset loader**, and **UMAP**. With
 a supplied dataset it automatically loads all image channels, the Cellpose and
 ProSeg cell segmentations, and all transcripts (rendered as per-gene coloured
 points). A busy progress bar with a stage label below the tabs shows what is
@@ -158,7 +159,8 @@ change presentation without reopening the stores or rebuilding the layers. The
 independent visibility choices made in stacked mode are restored when returning
 to it. Per-cell statistic overlays and tissue-annotation creation/export are
 unavailable while a pair is active because those tools currently have
-single-dataset semantics.
+single-dataset semantics. The UMAP view works with pairs; see
+[Paired UMAPs](#paired-umaps).
 
 Paired viewing is deliberately a strict, read-only consumer of MerXen v2
 materialized data. The moving MERSCOPE store must contain a complete version-2
@@ -227,6 +229,11 @@ dock so every full name stays readable.
   pair is active, use the two **Switch to... view** buttons to change layouts.
   Each browser expects the store's `spatialdata.zarr` folder. **Recently viewed**
   lists up to ten logical entries and persists between launches.
+- **UMAP** — **Open UMAP window** shows the stored UMAP of the cells in an
+  optional floating window, with **Cell type source**, **Colour by**, and point
+  size controls, plus **Draw region of interest** for lassoing cells in either
+  view (see [UMAP view](#umap-view)). With a pair active it shows both
+  platforms' UMAPs, one above the other.
 
 The left dock is simplified for the spatial-transcriptomics workflow. **Layer
 controls** starts collapsed and can be expanded or collapsed with the arrow in
@@ -420,6 +427,104 @@ canvas. It remains hidden on the empty launch screen. Its length is fixed at
 about a quarter of the canvas width; as you zoom, the **bar stays the same size**
 and only its **label** changes to show how many microns it currently spans (large
 bold white text with a black outline).
+
+## UMAP view
+
+The **UMAP** tab opens a floating window with the UMAP embedding MerXen stores
+in each clustering table (`obsm['X_umap']` of `table_*_clustering_squidpy`).
+Only that array and the cell-id column are read, so opening it takes about a
+second even for ~170k cells. The window can be closed and reopened at any time
+and stays above the viewer.
+
+- **Cell type source** picks which clustering's UMAP is shown (ProSeg reseg,
+  ProSeg in-mask, Cellpose, or the original segmentation). Only sources stored
+  in the dataset are offered.
+- **Colour by** offers **Broad cell type**, **Fine cell type**, or a
+  **Per-cell statistic** (Channel / Statistic / Colormap, as on the Per cell
+  statistics tab). Cell-type colours are identical to the **Cell type labels**
+  masks. Statistics use the same 1st–99th percentile clipping as the spatial
+  overlay, so a cell has the same colour in both views. The statistics are
+  measured on the Cellpose masks, so choosing one switches the UMAP to the
+  Cellpose clustering.
+- With **Follow the Cell type labels and Per cell statistics tabs** ticked
+  (the default), the UMAP follows those tabs. Clicking a source, **Broad**, or
+  **Fine** on Cell type labels, or **Load per-cell statistic overlay** on Per
+  cell statistics, recolours the UMAP to match. Cell types unticked on the
+  Cell type labels tab are dimmed in the UMAP.
+- Selection is linked both ways. Cells clicked in the spatial view are ringed
+  in the UMAP in their highlight colour. Clicking a point in the UMAP selects
+  that cell in the spatial view: it gets a boundary highlight and a Cell
+  inspector panel, and the view pans to it (untick **Centre the spatial view
+  on cells picked in the UMAP** to turn off the panning). When the UMAP's source
+  uses different masks from the cell inspector (e.g. a Cellpose UMAP while
+  clicks pick ProSeg cells), the selection is matched by location: the cell
+  whose mask contains the other cell's centre.
+
+Scroll to zoom, drag to pan, and double-click (or **Reset view**) to fit the
+embedding. Hovering a point shows its cell ID and its label or value.
+
+### Regions of interest
+
+Click **Draw region of interest** in the UMAP tab, then hold the mouse button
+and drag around cells, either in the spatial view or in the UMAP window.
+Releasing the button closes the outline with a straight line from the last
+point back to the first. Each press of the button draws one region; the
+button then switches off again so dragging pans as usual (click it again
+while drawing to cancel).
+
+- **Which cells.** A region drawn in the spatial view takes the cells whose
+  mask centre lies inside it. A region drawn in the UMAP takes the points
+  inside it. Only cells with a UMAP row from the current cell type source
+  count, so both views show the same set. Outlines that cross themselves
+  keep both loops.
+- **Spatial view.** The region's cells get a thick white outline around
+  their masks, drawn as a single raster layer (`Region of interest | cells`)
+  however many cells are selected. No Cell inspector panels, transcript
+  links or per-cell shapes are added, so selecting tens of thousands of
+  cells stays fast. A region drawn in the spatial view also keeps its drawn
+  outline (`Region of interest | outline`).
+- **UMAP.** Cells outside the region are muted grey and drawn behind it. A
+  panel on the right shows a donut chart of the region's make-up by the
+  current level (broad or fine cell type) with the total in the middle, and
+  a table of counts and percentages per type. When colouring by a per-cell
+  statistic, it also compares the region's mean with the whole UMAP.
+- **Changing the source.** A spatial region is re-evaluated against the new
+  source's cells and masks. A region drawn in the UMAP is cleared, because
+  its outline only means something on the embedding it was drawn on.
+
+**Clear region of interest** (in the tab or the UMAP window) removes the
+region from both views. Individual cell selections are independent of
+regions and keep working as before.
+
+### Paired UMAPs
+
+With a MERSCOPE/Xenium pair open, the UMAP window shows two UMAPs, one above
+the other: **MERSCOPE** on top and **Xenium** below. Each one comes from its
+own store's clustering table for the chosen cell type source. The two UMAPs are
+not harmonised, so each is only ever compared with its own spatial view.
+
+- **Colours.** Both UMAPs use the palette of the paired Cell type labels fill,
+  built over both stores' labels, so a cell type has the same colour in both
+  UMAPs and both spatial panes. The Cell type labels tab's source, level and
+  ticks sync as in standalone mode. Per-cell statistics are unavailable for
+  pairs.
+- **Selecting cells.** A spatial click already selects the cells of both
+  stores at the same aligned point; each UMAP rings its own store's cell.
+  Clicking a point in one UMAP selects only that store's cell.
+- **Regions drawn in the spatial view.** An outline drawn in either pane (or
+  on the stacked canvas) is drawn identically in both panes. The stores share
+  the aligned MerXen coordinate system, so the outline covers the same tissue
+  in both. Each store's cells inside it are outlined on its own masks,
+  emphasised in its own UMAP, and summarised in its own pie chart.
+- **Regions drawn in a UMAP.** These apply to that modality only. Circling
+  cells in the MERSCOPE UMAP outlines only MERSCOPE cells in the spatial view,
+  shows only the MERSCOPE pie, and clears any region shown for Xenium.
+
+The region layers are registered with the paired layout as
+`<PLATFORM> | Annotation | Region of interest | …` (outline and cells), so they
+follow side-by-side/stacked switching like every other paired layer. Clicking
+**Draw region of interest** does the one-off preparation up front (a second or
+so on large pairs), so the drawing itself stays smooth.
 
 ## Data Assumptions
 
