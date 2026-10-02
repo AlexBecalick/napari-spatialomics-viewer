@@ -23,6 +23,7 @@ import sys
 import time
 import warnings
 from collections import OrderedDict
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event, RLock, Semaphore
@@ -140,6 +141,25 @@ except Exception:  # pragma: no cover - depends on the installed napari runtime
     thread_worker = None
 
 from .dask_cache import install_thread_safe_napari_dask_cache
+from .cell_umap import (
+    UMAP_LASSO_MIN_STEP_PX,
+    UMAP_ROI_COLOR,
+    CellUmapEmbedding,
+    UmapControlWidget,
+    UmapWindow,
+    categorical_umap_colouring,
+    cell_id_to_int,
+    cell_ids_as_int64,
+    cell_type_source_label,
+    continuous_umap_colouring,
+    emphasise_rows,
+    labels_for_cell_ids,
+    load_cell_umap,
+    points_in_polygon,
+    statistic_joins_source,
+    summarise_roi_labels,
+    values_for_cell_ids,
+)
 from .paired_data import (
     PairedDataContract,
     PairedDataContractError,
@@ -198,6 +218,7 @@ from .utils import (
     build_napari_affine_from_px_to_um,
     cellpose_quantification_features,
     cellpose_quantification_table_available,
+    cellpose_value_clip_range,
     channel_labels,
     derived_image_pyramid_cache_key,
     derived_label_pyramid_cache_key,
@@ -410,6 +431,98 @@ class CellTypeOverlayState:
     annotation_lookup: dict = field(default_factory=dict)
 
 
+@dataclass
+class UmapView:
+    """Per-store half of the UMAP state: one per platform in a paired session.
+
+    ``dataset`` names the store (``MERSCOPE``/``XENIUM``) and keys its cell-type
+    state, selections and panel. Embeddings, joined labels and the region of
+    interest describe one store's cells, so they live here rather than on the
+    shared :class:`CellUmapState`.
+    """
+
+    dataset: str
+    #: source -> CellUmapEmbedding (None means "looked up, no UMAP stored").
+    embeddings: dict = field(default_factory=dict)
+    #: (source, kind, id(assignments)) -> per-row labels joined to the embedding.
+    label_cache: dict = field(default_factory=dict)
+    #: (source, cell id text) -> embedding row for cross-segmentation selections.
+    row_cache: dict = field(default_factory=dict)
+    #: mask shape key -> (cell ids, centroid x, centroid y) for spatial lassos.
+    centroids: dict = field(default_factory=dict)
+    #: The lassoed region of interest over this store's cells, if any.
+    roi: "UmapRoi | None" = None
+    #: source -> whether this store has that source's clustering table.
+    available_sources: dict = field(default_factory=dict)
+
+
+@dataclass
+class CellUmapState:
+    """Live state for the floating UMAP view.
+
+    Display settings are shared; per-store data lives in ``views``: one
+    :class:`UmapView` for a standalone dataset, or MERSCOPE and XENIUM when
+    ``dataset == "PAIRED"``. ``source`` is a :data:`utils.CELL_TYPE_SOURCES` key
+    naming whose clustering table's ``obsm['X_umap']`` is shown. ``colour_by`` is
+    ``"broad"``, ``"fine"`` or ``"statistic"`` (a Cellpose per-cell statistic,
+    standalone MERSCOPE only, which joins only the Cellpose clustering).
+    """
+
+    dataset: str
+    #: Absolute store path(s) of the views, the cache identity of this state.
+    store_path: tuple = ()
+    source: str = "proseg"
+    colour_by: str = "broad"
+    channel: str = ""
+    statistic: str = ""
+    colormap: str = "viridis"
+    #: source -> whether any view has that source's clustering table.
+    available_sources: dict = field(default_factory=dict)
+    statistics_available: bool = False
+    #: (channel, statistic) -> (label_ids, values, (clip_low, clip_high)) or None.
+    statistic_values: dict = field(default_factory=dict)
+    views: dict = field(default_factory=dict)
+    #: (source, assignment ids) -> one palette spanning both paired stores.
+    paired_schemes: dict = field(default_factory=dict)
+
+    @property
+    def paired(self) -> bool:
+        return self.dataset == "PAIRED"
+
+    @property
+    def primary(self) -> UmapView:
+        return next(iter(self.views.values()))
+
+    # Standalone conveniences: the single view's data.
+    @property
+    def embeddings(self) -> dict:
+        return self.primary.embeddings
+
+    @property
+    def roi(self) -> "UmapRoi | None":
+        return self.primary.roi
+
+    @roi.setter
+    def roi(self, value) -> None:
+        self.primary.roi = value
+
+
+@dataclass
+class UmapRoi:
+    """A lassoed region: its outline, where it was drawn, and the cells inside.
+
+    ``space`` is ``"spatial"`` (``polygon`` in world microns, x/y) or ``"umap"``
+    (UMAP units). ``rows`` index the ``source`` embedding (``None`` until that
+    embedding is loaded); ``cell_ids`` are the same cells' mask ids.
+    """
+
+    space: str
+    polygon: np.ndarray
+    source: str
+    rows: np.ndarray | None = None
+    cell_ids: np.ndarray | None = None
+
+
 DEFAULT_GENE_SPOT_SIZE = 0.5
 MAX_RECENT_DATASETS = 10
 RECENT_DATASETS_SETTINGS_KEY = "dataset_loader/recent_datasets"
@@ -502,6 +615,16 @@ CELL_HIGHLIGHT_COLORS = (
 #: mask outline layer is loaded to measure against.
 CELL_BOUNDARY_WIDTH_FACTOR = 1.6
 CELL_BOUNDARY_FALLBACK_WIDTH_UM = 0.3
+#: Region-of-interest layers: the drawn outline, and a Labels layer outlining
+#: every cell inside it (one raster layer however many cells are selected).
+#: Standalone layers use these names; a pair registers one per platform in the
+#: ``annotation`` slot below (drawn above selections and never cleared with them).
+ROI_OUTLINE_LAYER = "Region of interest | outline"
+ROI_CELLS_LAYER = "Region of interest | cells"
+ROI_PAIRED_ROLE = "annotation"
+ROI_PAIRED_ELEMENT = "region_of_interest"
+ROI_OUTLINE_CANVAS_PX = 2.0
+ROI_CELL_CONTOUR_PX = 3
 CELL_LINK_COLOR = (1.0, 1.0, 1.0, 0.35)
 CELL_LINK_WIDTH = 0.25
 CELL_PIE_SLICE_DARKEN = 0.6
@@ -1048,8 +1171,8 @@ class ViewerControlPanel(QWidget):
     """Right-dock control panel: tabbed controls with a shared progress bar.
 
     Tabs (a wrapping button bar across the top): Gene inspector, Cell segmentation, Cell type labels,
-    Per cell statistics, Draw tissue annotations, Images, Dataset. A busy progress bar plus a stage
-    label sit below the tabs and stay visible whatever tab is selected.
+    Per cell statistics, Draw tissue annotations, Images, Dataset, UMAP. A busy progress bar plus a
+    stage label sit below the tabs and stay visible whatever tab is selected.
     """
 
     # Thread-safe status/progress updates: heavy work runs in napari
@@ -1091,10 +1214,12 @@ class ViewerControlPanel(QWidget):
         expand_layer_controls_callback=None,
         settings: QSettings | None = None,
         switch_paired_view_callback=None,
+        umap_widget=None,
     ):
         super().__init__()
         self._gene_inspector_widget = gene_inspector_widget
         self._cell_type_widget = cell_type_widget
+        self._umap_widget = umap_widget
         self._load_callback = load_callback
         self._load_selected_labels_callback = load_selected_labels_callback
         self._unload_selected_shapes_callback = unload_selected_shapes_callback
@@ -1286,7 +1411,7 @@ class ViewerControlPanel(QWidget):
         _tab_bar_policy.setVerticalPolicy(QSizePolicy.Minimum)
         self._tab_bar.setSizePolicy(_tab_bar_policy)
         self._tab_stack = QStackedWidget()
-        for title, builder in (
+        tabs = (
             ("Gene inspector", self._build_genes_tab),
             ("Cell segmentation", self._build_segmentation_tab),
             ("Cell type labels", self._build_cell_type_tab),
@@ -1294,9 +1419,12 @@ class ViewerControlPanel(QWidget):
             ("Draw tissue annotations", self._build_annotations_tab),
             ("Images", self._build_images_tab),
             ("Dataset loader", self._build_dataset_tab),
-        ):
+            ("UMAP", self._build_umap_tab),
+        )
+        for title, builder in tabs:
             self._add_tab(title, builder())
-        initial_tab_index = 0 if datasets else 6
+        tab_titles = [title for title, _builder in tabs]
+        initial_tab_index = 0 if datasets else tab_titles.index("Dataset loader")
         initial_tab_button = self._tab_group.button(initial_tab_index)
         if initial_tab_button is not None:
             initial_tab_button.setChecked(True)
@@ -1380,6 +1508,18 @@ class ViewerControlPanel(QWidget):
         tab = QWidget()
         tab.setLayout(layout)
         return tab
+
+    def _build_umap_tab(self) -> QWidget:
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        # The UMAP widget holds the open-window toggle plus source/colour controls;
+        # the scatter itself lives in a separate floating window.
+        if self._umap_widget is not None:
+            layout.addWidget(self._umap_widget)
+        else:
+            layout.addWidget(QLabel("UMAP view unavailable."))
+        layout.addStretch(1)
+        return self._scrollable(layout)
 
     def _build_segmentation_tab(self) -> QWidget:
         layout = QVBoxLayout()
@@ -4328,6 +4468,21 @@ class ComparisonViewerController:
         self._cell_type_generation = 0
         self._cell_type_worker: object | None = None
         self._cell_annotation_workers: dict[tuple[str, str], object] = {}
+        # Floating UMAP view (see cell_umap.py): tab controls, window, state.
+        self._umap_widget = None
+        self._umap_window: UmapWindow | None = None
+        self._umap_state_obj: CellUmapState | None = None
+        self._umap_workers: dict[tuple, object] = {}
+        #: panel key -> (dataset, source, id(embedding)) currently drawn in it.
+        self._umap_displayed_keys: dict[str, tuple] = {}
+        self._umap_refresh_hold = 0
+        self._umap_refresh_pending = False
+        self._umap_point_radius = 1.0
+        self._umap_lasso_armed = False
+        self._roi_layer_generation = 0
+        self._roi_cells_layer_key: tuple | None = None
+        #: One-shot explanation appended to the UMAP tab's next status line.
+        self._umap_status_note = ""
         # Click-to-inspect cell state: a lazily-built per-dataset transcript
         # index, the currently selected cell, and the floating summary box.
         self._cell_transcript_index: dict[str, CellTranscriptIndex] = {}
@@ -4374,6 +4529,10 @@ class ComparisonViewerController:
 
     def set_cell_type_widget(self, widget):
         self._cell_type_widget = widget
+
+    def set_umap_widget(self, widget):
+        self._umap_widget = widget
+        self._publish_umap_options()
 
     def set_viewer_controls_dock(self, dock):
         """Keep the right dock used for the startup canvas-layout repair."""
@@ -4739,6 +4898,12 @@ class ComparisonViewerController:
         if self._scale_bar is not None:
             self._scale_bar.set_um_per_px(um_per_px)
         self._apply_label_zoom_interpolation(um_per_px)
+        if um_per_px:
+            for outline in self._roi_outline_layers():
+                try:
+                    outline.edge_width = ROI_OUTLINE_CANVAS_PX * um_per_px
+                except Exception as exc:
+                    log.debug("Could not rescale the region outline: %s", exc)
 
     def _apply_label_zoom_interpolation(self, um_per_px: float | None = None):
         """Keep outline filtering stable while the camera moves and zooms."""
@@ -5691,6 +5856,7 @@ class ComparisonViewerController:
         self._publish_loaded_image_entries()
         self._publish_cellpose_value_options()
         self._publish_cell_type_options()
+        self._publish_umap_options()
         self._update_scale_bar_visibility()
         self._end_progress("dataset")
         elapsed = time.time() - started_at
@@ -6396,6 +6562,7 @@ class ComparisonViewerController:
         self._publish_loaded_image_entries()
         self._publish_cellpose_value_options()
         self._publish_cell_type_options()
+        self._publish_umap_options()
         if not bool(getattr(self.args, "skip_images", False)):
             self._load_paired_image_slots()
         self._load_paired_segmentations(self._paired_startup_segmentation_keys())
@@ -8235,6 +8402,7 @@ class ComparisonViewerController:
         self._cellpose_value_generation += 1
         generation = self._cellpose_value_generation
         self._set_status(f"MERSCOPE building Cellpose value overlay: {channel} {statistic}...")
+        self._sync_umap_from_statistic(channel, statistic, colormap_name)
 
         def compute():
             # Heavy: prepares (rasterizes if needed) the Cellpose labels, builds
@@ -9396,6 +9564,11 @@ class ComparisonViewerController:
         event_type = str(getattr(event, "type", "mouse_press"))
         if "press" not in event_type:
             return
+        if self._umap_lasso_armed:
+            # "Draw region of interest" is armed: this drag draws a lasso
+            # instead of panning or picking (in either pane of a pair).
+            yield from self._spatial_lasso_gesture(event)
+            return
         pick_event = self._snapshot_pick_event(event)
         press_position = self._event_canvas_position(event)
         dragged = False
@@ -9586,6 +9759,7 @@ class ComparisonViewerController:
 
     def _update_paired_cell_info_overlay(self) -> None:
         """Show both platforms' selected cells in the shared bottom dock."""
+        self._refresh_umap_highlights()
         panels: list[dict] = []
         selections = self._paired_selected_cells
         count = max((len(values) for values in selections.values()), default=0)
@@ -9625,6 +9799,7 @@ class ComparisonViewerController:
         if self._cell_info_overlay is not None:
             self._cell_info_overlay.set_cells([])
         self._hide_cell_dock()
+        self._refresh_umap_highlights()
 
     def _handle_paired_viewer_click(self, event) -> None:
         """Select cells at the same aligned world coordinate in both datasets."""
@@ -10205,6 +10380,7 @@ class ComparisonViewerController:
         entries = self._selected_cells.get(str(ds).upper(), [])
         self._update_cell_boundary_layer(entries)
         self._update_cell_links_layer(entries)
+        self._refresh_umap_highlights()
         if not entries:
             if self._cell_info_overlay is not None:
                 self._cell_info_overlay.set_cells([])
@@ -10224,6 +10400,7 @@ class ComparisonViewerController:
         if self._cell_info_overlay is not None:
             self._cell_info_overlay.set_cells([])
         self._hide_cell_dock()
+        self._refresh_umap_highlights()
 
     def _polygon_to_napari_paths(self, geometry) -> list[np.ndarray]:
         """Return ``(N, 2)`` napari ``(y, x)`` ring arrays for a (multi)polygon."""
@@ -11292,7 +11469,12 @@ class ComparisonViewerController:
 
     def set_cell_type_segmentation(self, dataset_name: str, segmentation: str):
         if self._paired_session is not None:
-            return self._set_paired_cell_type_segmentation(segmentation)
+            self._set_paired_cell_type_segmentation(segmentation)
+            states = self._paired_cell_type_states()
+            self._sync_umap_from_cell_types(
+                segmentation, (states[0].kind or None) if states else None
+            )
+            return
         state = self._cell_type_state(dataset_name)
         state.segmentation = str(segmentation)
         if not self._load_cell_type_data(state, state.segmentation):
@@ -11307,10 +11489,16 @@ class ComparisonViewerController:
         if state.kind:
             self._populate_cell_type_panel(state)
             self._start_cell_type_overlay_build(state)
+        self._sync_umap_from_cell_types(state.segmentation, state.kind or None)
 
     def set_cell_type_kind(self, dataset_name: str, kind: str):
         if self._paired_session is not None:
-            return self._set_paired_cell_type_kind(kind)
+            self._set_paired_cell_type_kind(kind)
+            states = self._paired_cell_type_states()
+            self._sync_umap_from_cell_types(
+                states[0].segmentation if states else None, kind
+            )
+            return
         state = self._cell_type_state(dataset_name)
         state.kind = str(kind)
         if not self._load_cell_type_data(state, state.segmentation):
@@ -11322,6 +11510,7 @@ class ComparisonViewerController:
             return
         self._populate_cell_type_panel(state)
         self._start_cell_type_overlay_build(state)
+        self._sync_umap_from_cell_types(state.segmentation, state.kind)
 
     def set_cell_type_visible(self, dataset_name: str, label: str, on: bool):
         if self._paired_session is not None:
@@ -11336,6 +11525,7 @@ class ComparisonViewerController:
                 else:
                     enabled.discard(str(label))
                 self._recolor_cell_type_layer(state)
+            self._refresh_umap()
             return
         state = self._cell_type_state(dataset_name)
         enabled = state.enabled.get(state.segmentation, {}).get(state.kind or "broad")
@@ -11346,11 +11536,13 @@ class ComparisonViewerController:
         else:
             enabled.discard(str(label))
         self._recolor_cell_type_layer(state)
+        self._refresh_umap()
 
     def set_cell_types_visible(self, dataset_name: str, labels: list[str], on: bool):
         if self._paired_session is not None:
-            for label in labels:
-                self.set_cell_type_visible(dataset_name, label, on)
+            with self._hold_umap_refresh():
+                for label in labels:
+                    self.set_cell_type_visible(dataset_name, label, on)
             return
         state = self._cell_type_state(dataset_name)
         enabled = state.enabled.get(state.segmentation, {}).get(state.kind or "broad")
@@ -11362,6 +11554,7 @@ class ComparisonViewerController:
             else:
                 enabled.discard(str(label))
         self._recolor_cell_type_layer(state)
+        self._refresh_umap()
 
     def set_all_cell_types_visible(self, dataset_name: str, on: bool):
         if self._paired_session is not None:
@@ -11374,6 +11567,7 @@ class ComparisonViewerController:
                     continue
                 state.enabled[seg][kind] = set(scheme.order) if on else set()
                 self._recolor_cell_type_layer(state)
+            self._refresh_umap()
             return
         state = self._cell_type_state(dataset_name)
         seg = state.segmentation
@@ -11383,6 +11577,7 @@ class ComparisonViewerController:
             return
         state.enabled[seg][kind] = set(scheme.order) if on else set()
         self._recolor_cell_type_layer(state)
+        self._refresh_umap()
 
     def set_cell_type_opacity(self, dataset_name: str, opacity: float):
         if self._paired_session is not None:
@@ -11434,6 +11629,32 @@ class ComparisonViewerController:
             return False
         return True
 
+    @staticmethod
+    def _reapply_labels_colormap_after_first_slice(layer, recolor) -> None:
+        """Run ``recolor`` once napari has displayed a lazy Labels layer's first slice.
+
+        With async slicing (napari 0.7) a large multiscale Labels layer receives
+        its first slice after the DirectLabelColormap given to ``add_labels`` was
+        installed, so it draws blank until the colormap is assigned again; once
+        re-assigned it stays correct across later slices and zoom levels. Such
+        layers do not emit ``loaded``, so key off the first ``set_data`` (one per
+        applied slice). Callers recolour immediately as well, which covers a
+        slice that landed before this hook was connected.
+        """
+        set_data = getattr(getattr(layer, "events", None), "set_data", None)
+        if set_data is None:
+            return
+
+        def on_set_data(_event=None):
+            try:
+                set_data.disconnect(on_set_data)
+            except Exception:
+                pass
+            # Let napari's own vispy handler upload the slice first.
+            QTimer.singleShot(0, recolor)
+
+        set_data.connect(on_set_data)
+
     def _refresh_cell_type_layer_after_load(self, state: CellTypeOverlayState, layer) -> None:
         """Re-apply a new direct colormap after napari finishes its first slice.
 
@@ -11476,6 +11697,9 @@ class ComparisonViewerController:
         # This also handles eager/in-memory layers, for which no later loaded
         # transition may be emitted by a headless or model-only viewer.
         refresh_if_current()
+        # napari 0.7's async slicing never emits ``loaded`` for these layers, so
+        # also re-apply once the first slice has actually been displayed.
+        self._reapply_labels_colormap_after_first_slice(layer, refresh_if_current)
 
         loaded_event = getattr(getattr(layer, "events", None), "loaded", None)
         if loaded_event is None:
@@ -11767,6 +11991,1505 @@ class ComparisonViewerController:
             widget.set_status("Choose Broad or Fine cell type to colour the masks.")
         else:
             widget.set_status("No stored cell-type annotations in this dataset.")
+
+    # -- UMAP view ----------------------------------------------------------
+    def _umap_state(self) -> CellUmapState | None:
+        """UMAP state for the active dataset, or for both stores of a pair."""
+        if self.active_dataset is None:
+            return None
+        if self._paired_session is not None:
+            dataset = "PAIRED"
+            view_names = ("MERSCOPE", "XENIUM")
+        else:
+            dataset = str(self.active_dataset).upper()
+            view_names = (dataset,)
+        store_path = tuple(self._umap_store_path(name) for name in view_names)
+        state = self._umap_state_obj
+        if state is None or state.dataset != dataset or state.store_path != store_path:
+            state = CellUmapState(
+                dataset=dataset,
+                store_path=store_path,
+                views={name: UmapView(dataset=name) for name in view_names},
+            )
+            self._umap_state_obj = state
+        return state
+
+    def _umap_store_path(self, dataset: str) -> str | None:
+        cfg = self.datasets.get(str(dataset).upper())
+        zarr_path = getattr(cfg, "zarr_path", None)
+        return str(Path(zarr_path).expanduser().absolute()) if zarr_path is not None else None
+
+    @staticmethod
+    def _umap_panel_key(state: CellUmapState, view: UmapView) -> str:
+        """The UMAP window panel showing ``view`` (``""`` when standalone)."""
+        return view.dataset if state.paired else ""
+
+    @staticmethod
+    def _umap_view_for_panel(state: CellUmapState, key: str) -> UmapView | None:
+        if not state.paired:
+            return state.primary
+        return state.views.get(str(key))
+
+    @staticmethod
+    def _umap_statistic_source(state: CellUmapState) -> str | None:
+        """The cell-type source whose cells carry the Cellpose statistics."""
+        if not state.statistics_available:
+            return None
+        for source in CELL_TYPE_SOURCES:
+            if state.available_sources.get(source.key) and statistic_joins_source(
+                source.key, CELLPOSE_SHAPE_KEY
+            ):
+                return source.key
+        return None
+
+    def _umap_view_sources(self, state: CellUmapState, view: UmapView) -> dict[str, bool]:
+        """Which cell-type sources ``view``'s store can show a UMAP for."""
+        if not state.paired:
+            session = self._dataset_sessions.get(view.dataset)
+            if session is not None:
+                return dict(session.cell_type_available)
+        zarr_path = getattr(self.datasets.get(view.dataset), "zarr_path", None)
+        available = {}
+        for source in CELL_TYPE_SOURCES:
+            ok = (
+                zarr_path is not None
+                and clustering_table_key_for_segmentation(zarr_path, source.key) is not None
+            )
+            if ok and state.paired:
+                # A pair shows the aligned, materialized masks only.
+                ok = self._paired_segmentation_for_cell_type(view.dataset, source.key) is not None
+            available[source.key] = bool(ok)
+        return available
+
+    def _publish_umap_options(self):
+        """Point the UMAP tab (and an open window) at the active dataset or pair."""
+        widget = self._umap_widget
+        self._umap_displayed_keys = {}
+        self._reset_umap_roi_views()
+        state = self._umap_state()
+        if state is None:
+            if widget is not None:
+                widget.set_sources({}, None)
+                widget.set_statistic_options([], [], False)
+                widget.set_controls_enabled(False)
+                widget.set_status("Load a dataset to view its UMAP.")
+            if self._umap_window is not None:
+                self._umap_window.hide()
+            return
+
+        for view in state.views.values():
+            view.available_sources = self._umap_view_sources(state, view)
+        available = {
+            source.key: any(
+                view.available_sources.get(source.key, False)
+                for view in state.views.values()
+            )
+            for source in CELL_TYPE_SOURCES
+        }
+        channels: list[str] = []
+        statistics: list[str] = []
+        stats_ok = False
+        session = None if state.paired else self._dataset_sessions.get(state.dataset)
+        if session is not None:
+            channels = list(session.cellpose_channels)
+            statistics = list(session.cellpose_statistics)
+            stats_ok = bool(session.cellpose_values_available)
+        state.available_sources = available
+        state.statistics_available = bool(stats_ok and channels and statistics)
+        if not state.statistics_available:
+            channels, statistics = [], []
+        stat_source = self._umap_statistic_source(state)
+
+        if not available.get(state.source, False):
+            preferred = self._cell_type_state(state.primary.dataset).segmentation
+            state.source = (
+                preferred
+                if available.get(preferred, False)
+                else next((key for key, ok in available.items() if ok), state.source)
+            )
+        if widget is not None:
+            mode, channel, statistic, colormap = widget.current_colour()
+            state.colour_by = mode
+            state.colormap = colormap or state.colormap
+            state.channel = channel if channel in channels else ""
+            state.statistic = statistic if statistic in statistics else ""
+        if state.colour_by == "statistic":
+            if stat_source is None:
+                state.colour_by = "broad"
+            else:
+                state.source = stat_source
+        if state.statistics_available:
+            state.channel = state.channel or (
+                "DAPI" if "DAPI" in channels else channels[0]
+            )
+            state.statistic = state.statistic or (
+                "median" if "median" in statistics else statistics[0]
+            )
+
+        if widget is not None:
+            widget.set_sources(available, state.source)
+            widget.set_statistic_options(channels, statistics, stat_source is not None)
+            widget.set_selection(
+                source=state.source,
+                colour_by=state.colour_by,
+                channel=state.channel,
+                statistic=state.statistic,
+                colormap=state.colormap,
+            )
+            widget.set_controls_enabled(any(available.values()))
+            if not any(available.values()):
+                widget.set_status(
+                    "Neither paired dataset has a cell-type clustering table, so no UMAP."
+                    if state.paired
+                    else "This dataset has no cell-type clustering tables, so no UMAP."
+                )
+            elif state.paired:
+                widget.set_status(
+                    "Paired UMAPs: MERSCOPE above, Xenium below. Per-cell statistics "
+                    "are unavailable for pairs."
+                )
+            else:
+                widget.set_status("")
+        self._refresh_umap()
+
+    def _ensure_umap_window(self) -> UmapWindow | None:
+        if self._umap_window is not None:
+            return self._umap_window
+        parent = getattr(getattr(self.viewer, "window", None), "_qt_window", None)
+        if not isinstance(parent, QWidget):
+            parent = None
+        try:
+            window = UmapWindow(parent)
+        except Exception as exc:
+            log.warning("Could not create the UMAP window: %s", exc)
+            return None
+        window.panel_point_clicked.connect(self._on_umap_point_clicked)
+        window.panel_lasso_completed.connect(self._on_umap_lasso_completed)
+        window.visibility_changed.connect(self._on_umap_window_visibility_changed)
+        window.roi_clear_requested.connect(self.clear_umap_roi)
+        window.set_point_radius(self._umap_point_radius)
+        window.set_lasso_mode(self._umap_lasso_armed)
+        self._umap_window = window
+        return window
+
+    def _on_umap_window_visibility_changed(self, visible: bool):
+        if self._umap_widget is not None:
+            self._umap_widget.set_window_open(bool(visible))
+
+    def set_umap_window_visible(self, visible: bool):
+        """Open (and refresh) or hide the floating UMAP window."""
+        if not visible:
+            if self._umap_window is not None:
+                self._umap_window.hide()
+            return
+        window = self._ensure_umap_window()
+        if window is None:
+            if self._umap_widget is not None:
+                self._umap_widget.set_window_open(False)
+            return
+        window.show()
+        window.raise_()
+        self._refresh_umap()
+
+    def set_umap_source(self, source: str):
+        state = self._umap_state()
+        if state is None:
+            return
+        state.source = str(source)
+        if state.colour_by == "statistic" and not statistic_joins_source(
+            state.source, CELLPOSE_SHAPE_KEY
+        ):
+            state.colour_by = "broad"
+            if self._umap_widget is not None:
+                self._umap_widget.set_selection(colour_by="broad")
+                self._umap_widget.set_status(
+                    "Per-cell statistics only colour the Cellpose UMAP, so the "
+                    "UMAP is now coloured by broad cell type."
+                )
+        self._refresh_umap()
+
+    def set_umap_colour(
+        self, colour_by: str, channel: str = "", statistic: str = "", colormap: str = ""
+    ):
+        state = self._umap_state()
+        if state is None:
+            return
+        state.colour_by = str(colour_by)
+        state.channel = str(channel or state.channel)
+        state.statistic = str(statistic or state.statistic)
+        state.colormap = str(colormap or state.colormap)
+        if state.colour_by == "statistic":
+            stat_source = self._umap_statistic_source(state)
+            if stat_source is None:
+                state.colour_by = "broad"
+                if self._umap_widget is not None:
+                    self._umap_widget.set_selection(colour_by="broad")
+                    self._umap_widget.set_status(
+                        "Per-cell statistics are unavailable for paired datasets."
+                        if state.paired
+                        else "Per-cell statistics need the Cellpose quantification and "
+                        "the Cellpose clustering, which this dataset lacks."
+                    )
+            elif state.source != stat_source:
+                state.source = stat_source
+                if self._umap_widget is not None:
+                    self._umap_widget.set_selection(source=stat_source)
+                    self._umap_widget.set_status(
+                        "Per-cell statistics are measured on the Cellpose masks, so "
+                        "the UMAP now shows the Cellpose clustering."
+                    )
+        self._refresh_umap()
+
+    def set_umap_point_size(self, radius_px: float):
+        self._umap_point_radius = float(radius_px)
+        if self._umap_window is not None:
+            self._umap_window.set_point_radius(self._umap_point_radius)
+
+    def _umap_follows_other_tabs(self) -> bool:
+        widget = self._umap_widget
+        return widget is None or bool(widget.follow_other_tabs)
+
+    def _sync_umap_from_cell_types(self, segmentation: str | None, kind: str | None):
+        """Mirror a Cell type labels source/level click in the UMAP."""
+        if not self._umap_follows_other_tabs():
+            return
+        state = self._umap_state()
+        if state is None:
+            return
+        if segmentation and state.available_sources.get(str(segmentation), False):
+            state.source = str(segmentation)
+        if kind in ("broad", "fine"):
+            state.colour_by = str(kind)
+        elif state.colour_by == "statistic" and not statistic_joins_source(
+            state.source, CELLPOSE_SHAPE_KEY
+        ):
+            state.colour_by = "broad"
+        if self._umap_widget is not None:
+            self._umap_widget.set_selection(source=state.source, colour_by=state.colour_by)
+        self._refresh_umap()
+
+    def _sync_umap_from_statistic(self, channel: str, statistic: str, colormap: str):
+        """Mirror a Per cell statistics overlay load in the UMAP."""
+        if not self._umap_follows_other_tabs():
+            return
+        state = self._umap_state()
+        if state is None:
+            return
+        stat_source = self._umap_statistic_source(state)
+        if stat_source is None:
+            return
+        state.source = stat_source
+        state.colour_by = "statistic"
+        state.channel = str(channel)
+        state.statistic = str(statistic)
+        state.colormap = str(colormap)
+        if self._umap_widget is not None:
+            self._umap_widget.set_selection(
+                source=state.source,
+                colour_by="statistic",
+                channel=state.channel,
+                statistic=state.statistic,
+                colormap=state.colormap,
+            )
+        self._refresh_umap()
+
+    def _hold_umap_refresh(self):
+        """Context manager: coalesce UMAP refreshes into one on exit."""
+        controller = self
+
+        class _Hold:
+            def __enter__(self):
+                controller._umap_refresh_hold += 1
+
+            def __exit__(self, *_exc):
+                controller._umap_refresh_hold -= 1
+                if controller._umap_refresh_hold == 0 and controller._umap_refresh_pending:
+                    controller._umap_refresh_pending = False
+                    controller._refresh_umap()
+
+        return _Hold()
+
+    def _refresh_umap(self):
+        """Redraw the open UMAP window, loading whatever it still needs."""
+        # Also reached from shared cell-type/selection paths, so tolerate a
+        # controller whose UMAP view was never set up.
+        if getattr(self, "_umap_refresh_hold", 0):
+            self._umap_refresh_pending = True
+            return
+        window = getattr(self, "_umap_window", None)
+        if window is None or not window.isVisible():
+            return
+        state = self._umap_state()
+        if state is None:
+            self._umap_displayed_keys = {}
+            window.set_panel_keys(("",))
+            window.panel().set_message("UMAP", "Load a dataset to view its UMAP.")
+            return
+        window.set_panel_keys(
+            self._umap_panel_key(state, view) for view in state.views.values()
+        )
+        source = state.source
+        label = cell_type_source_label(source)
+        needs: dict[str, tuple[bool, bool]] = {}
+        for name, view in state.views.items():
+            if not view.available_sources.get(source, False):
+                continue
+            cell_type_state = self._cell_type_state(view.dataset)
+            need_embedding = source not in view.embeddings
+            need_assignments = source not in cell_type_state.assignments and (
+                state.colour_by in ("broad", "fine") or view.roi is not None
+            )
+            if need_embedding or need_assignments:
+                needs[name] = (need_embedding, need_assignments)
+        stat_key = (
+            (state.channel, state.statistic)
+            if state.colour_by == "statistic" and not state.paired
+            else None
+        )
+        need_statistic = stat_key is not None and stat_key not in state.statistic_values
+        if needs or need_statistic:
+            for view in state.views.values():
+                key = self._umap_panel_key(state, view)
+                displayed = self._umap_displayed_keys.get(key)
+                if displayed is None or displayed[:2] != (view.dataset, source):
+                    self._umap_displayed_keys.pop(key, None)
+                    window.panel(key).set_message("UMAP", f"Loading the {label} UMAP…")
+            self._start_umap_load(state, source, needs, stat_key if need_statistic else None)
+            return
+
+        counts: list[str] = []
+        colouring_title = ""
+        with self._paired_layer_batch():  # a source change may re-register region layers
+            for view in state.views.values():
+                drawn = self._draw_umap_view(state, view, window.panel(self._umap_panel_key(state, view)))
+                if drawn is not None:
+                    counts.append(drawn[0])
+                    colouring_title = drawn[1]
+        if self._umap_widget is not None and counts:
+            note, self._umap_status_note = self._umap_status_note, ""
+            self._umap_widget.set_status(
+                f"{label}: {' and '.join(counts)}, coloured by {colouring_title}."
+                + (f" {note}" if note else "")
+            )
+        self._refresh_umap_highlights()
+
+    def _draw_umap_view(self, state: CellUmapState, view: UmapView, panel):
+        """Draw one view's embedding, colouring and region into its panel.
+
+        Returns ``(cell count text, colouring title)``, or ``None`` when the
+        panel shows a message instead of a UMAP.
+        """
+        source = state.source
+        label = cell_type_source_label(source)
+        key = self._umap_panel_key(state, view)
+        where = f"{view.dataset} " if state.paired else ""
+        if not view.available_sources.get(source, False):
+            self._umap_displayed_keys.pop(key, None)
+            panel.set_message("UMAP", f"{view.dataset} has no {label} clustering table.")
+            return None
+        embedding = view.embeddings.get(source)
+        if embedding is None:
+            self._umap_displayed_keys.pop(key, None)
+            panel.set_message(
+                "UMAP",
+                f"The {where}{label} clustering table has no stored UMAP (obsm['X_umap']).",
+            )
+            return None
+        display_key = (view.dataset, source, id(embedding))
+        if self._umap_displayed_keys.get(key) != display_key:
+            panel.set_embedding(embedding.cell_ids, embedding.coords)
+            self._umap_displayed_keys[key] = display_key
+        self._sync_roi_to_source(state, view)
+        colouring, title, subtitle = self._umap_colouring(state, view, embedding)
+        roi = view.roi
+        if roi is not None and roi.rows is not None:
+            panel.set_colouring(emphasise_rows(colouring, roi.rows), title, subtitle)
+        else:
+            panel.set_colouring(colouring, title, subtitle)
+        panel.canvas.set_roi_polygon(
+            roi.polygon if roi is not None and roi.space == "umap" else None
+        )
+        panel.set_roi_summary(self._umap_roi_summary(state, view, embedding, colouring))
+        return f"{len(embedding):,} {where}cells", colouring.title
+
+    def _start_umap_load(
+        self,
+        state: CellUmapState,
+        source: str,
+        needs: dict[str, tuple[bool, bool]],
+        stat_key: tuple[str, str] | None,
+    ):
+        """Load missing embeddings/assignments (per view) and a statistic column."""
+        load_key = (
+            state.dataset,
+            state.store_path,
+            source,
+            tuple(sorted(needs.items())),
+            stat_key,
+        )
+        if load_key in self._umap_workers:
+            return  # the same load is already in flight
+        paths = {
+            name: getattr(self.datasets.get(name), "zarr_path", None)
+            for name in state.views
+        }
+        stat_path = paths.get(state.primary.dataset)
+        if self._umap_widget is not None:
+            self._umap_widget.set_status(f"Loading the {cell_type_source_label(source)} UMAP…")
+
+        def compute():
+            result: dict[str, object] = {"views": {}}
+            with self._store_io_slots:
+                for name, (need_embedding, need_assignments) in needs.items():
+                    zarr_path = paths.get(name)
+                    entry: dict[str, object] = {}
+                    if need_embedding:
+                        entry["embedding"] = load_cell_umap(zarr_path, source)
+                    if need_assignments:
+                        entry["assignments"] = (
+                            load_cell_type_assignments(zarr_path, source)
+                            if zarr_path is not None
+                            else None
+                        )
+                    result["views"][name] = entry
+                if stat_key is not None:
+                    try:
+                        values = load_cellpose_quantification_values(
+                            stat_path, channel=stat_key[0], statistic=stat_key[1]
+                        )
+                        clip = cellpose_value_clip_range(values.values)
+                        result["statistic"] = (values.label_ids, values.values, clip)
+                    except Exception as exc:
+                        result["statistic"] = None
+                        result["statistic_error"] = str(exc)
+            return result
+
+        def apply(result):
+            self._umap_workers.pop(load_key, None)
+            self._apply_umap_load(state, source, stat_key, result)
+
+        def handle_error(exc):
+            self._umap_workers.pop(load_key, None)
+            message = exc[1] if isinstance(exc, tuple) and len(exc) > 1 else exc
+            log.error("[%s] UMAP load failed: %s", state.dataset, message)
+            if self._umap_widget is not None:
+                self._umap_widget.set_status(f"UMAP load failed: {message}")
+
+        if thread_worker is None:
+            self._umap_workers[load_key] = None
+            try:
+                result = compute()
+            except Exception as exc:
+                handle_error(exc)
+                return
+            apply(result)
+            return
+        worker = thread_worker(compute)()
+        worker.returned.connect(apply)
+        worker.errored.connect(handle_error)
+        self._umap_workers[load_key] = worker
+        worker.start()
+
+    def _apply_umap_load(
+        self,
+        state: CellUmapState,
+        source: str,
+        stat_key: tuple[str, str] | None,
+        result: dict,
+    ):
+        if self._umap_state_obj is not state:
+            return  # the dataset changed while this was loading
+        for name, entry in dict(result.get("views", {})).items():
+            view = state.views.get(name)
+            if view is None:
+                continue
+            if "embedding" in entry:
+                view.embeddings[source] = entry["embedding"]
+            if "assignments" in entry:
+                cell_type_state = self._cell_type_state(view.dataset)
+                if source not in cell_type_state.assignments:
+                    self._cache_cell_type_data(cell_type_state, source, entry["assignments"])
+        if stat_key is not None and "statistic" in result:
+            state.statistic_values[stat_key] = result["statistic"]
+            if result["statistic"] is None and self._umap_widget is not None:
+                self._umap_widget.set_status(
+                    f"Could not load {stat_key[0]} {stat_key[1]}: "
+                    f"{result.get('statistic_error', 'unknown error')}"
+                )
+        self._refresh_umap()
+
+    def _umap_scheme(self, state: CellUmapState, view: UmapView, kind: str):
+        """The Cell type labels palette for ``view`` (one shared palette per pair).
+
+        A pair's cell-type fill colours both stores from one palette built over
+        both stores' labels; building the UMAP's palette the same way keeps each
+        type the same colour in both UMAPs and both spatial panes.
+        """
+        if not state.paired:
+            schemes = self._cell_type_state(view.dataset).schemes.get(state.source) or {}
+            return schemes.get(kind)
+        assignments = [
+            self._cell_type_state(other.dataset).assignments.get(state.source)
+            for other in state.views.values()
+        ]
+        present = [item for item in assignments if item is not None]
+        if not present:
+            return None
+        key = (state.source, tuple(id(item) for item in assignments))
+        schemes = state.paired_schemes.get(key)
+        if schemes is None:
+            schemes = build_cell_type_color_schemes(
+                np.concatenate([np.asarray(item.broad, dtype=object) for item in present]),
+                np.concatenate([np.asarray(item.fine, dtype=object) for item in present]),
+                alpha=1.0,
+            )
+            state.paired_schemes = {key: schemes}
+        return schemes.get(kind)
+
+    def _umap_colouring(
+        self, state: CellUmapState, view: UmapView, embedding: CellUmapEmbedding
+    ):
+        """Build the colouring, title and subtitle for one view."""
+        n = len(embedding)
+        source_label = cell_type_source_label(state.source)
+        subtitle = f"{source_label} · {n:,} cells · {embedding.table_key}"
+        if state.colour_by == "statistic" and not state.paired:
+            stat = state.statistic_values.get((state.channel, state.statistic))
+            if stat is None:
+                values = np.full(n, np.nan, dtype=np.float64)
+                clip = None
+            else:
+                label_ids, all_values, clip = stat
+                values = values_for_cell_ids(label_ids, all_values, embedding.cell_ids)
+            lut = ensure_colormap(state.colormap).map(
+                np.linspace(0.0, 1.0, CELLPOSE_VALUE_BINS, dtype=np.float32)
+            )
+            title = f"{state.channel} {state.statistic}".strip()
+            colouring = continuous_umap_colouring(values, lut, clip=clip, title=title)
+            finite = int(np.isfinite(values).sum())
+            subtitle = (
+                f"{source_label} · {finite:,} of {n:,} cells with a value · "
+                f"{state.colormap}"
+            )
+            return colouring, f"UMAP — {title}", subtitle
+
+        kind = "fine" if state.colour_by == "fine" else "broad"
+        scheme = self._umap_scheme(state, view, kind)
+        labels = self._umap_labels(state, view, embedding, kind)
+        enabled = None
+        if self._umap_follows_other_tabs():
+            enabled = (
+                self._cell_type_state(view.dataset).enabled.get(state.source, {}).get(kind)
+            )
+        title = "Fine cell type" if kind == "fine" else "Broad cell type"
+        colouring = categorical_umap_colouring(
+            labels,
+            scheme.colors if scheme is not None else {},
+            order=scheme.order if scheme is not None else None,
+            enabled=enabled,
+            title=title,
+        )
+        return colouring, f"UMAP — {title}", subtitle
+
+    def _umap_labels(
+        self,
+        state: CellUmapState,
+        view: UmapView,
+        embedding: CellUmapEmbedding,
+        kind: str,
+    ) -> np.ndarray:
+        """Per-row broad/fine labels for the embedding (``None`` = unannotated)."""
+        cell_type_state = self._cell_type_state(view.dataset)
+        assignments = cell_type_state.assignments.get(state.source)
+        cache_key = (state.source, kind, id(assignments))
+        labels = view.label_cache.get(cache_key)
+        if labels is None:
+            if assignments is None:
+                labels = np.full(len(embedding), None, dtype=object)
+            else:
+                labels = labels_for_cell_ids(
+                    assignments.cell_ids, assignments.labels_for(kind), embedding.cell_ids
+                )
+            view.label_cache = {
+                k: v for k, v in view.label_cache.items() if k[:2] != cache_key[:2]
+            }
+            view.label_cache[cache_key] = labels
+        return labels
+
+    def _umap_source_shapes(
+        self, state: CellUmapState, view: UmapView, source: str | None = None
+    ):
+        """``(shape key, GeoDataFrame)`` of the masks a source's cells are drawn on."""
+        source = state.source if source is None else str(source)
+        if state.paired:
+            session = self._paired_session
+            segmentation = (
+                self._paired_segmentation_for_cell_type(view.dataset, source)
+                if session is not None
+                else None
+            )
+            if segmentation is None:
+                return None, None
+            shapes = session.sdata[view.dataset].shapes
+            key = segmentation.shape_key
+            return key, (shapes[key] if key in shapes else None)
+        key = self._mask_shape_key_for_source(source)
+        shapes = getattr(self._active_sdata, "shapes", None)
+        return key, (shapes[key] if shapes is not None and key in shapes else None)
+
+    def _umap_pick_shapes(self, state: CellUmapState, view: UmapView):
+        """``(shape key, GeoDataFrame)`` of the masks spatial clicks select from."""
+        if state.paired:
+            session = self._paired_session
+            segmentation = (
+                self._paired_pick_segmentation(view.dataset) if session is not None else None
+            )
+            if segmentation is None:
+                return None, None
+            shapes = session.sdata[view.dataset].shapes
+            key = segmentation.shape_key
+            return key, (shapes[key] if key in shapes else None)
+        key = self._cell_inspector_shape_key()
+        shapes = getattr(self._active_sdata, "shapes", None)
+        return key, (shapes[key] if key is not None and shapes is not None and key in shapes else None)
+
+    def _umap_selected_cells(self, state: CellUmapState, view: UmapView):
+        """``(cell id, highlight colour, centroid (y, x))`` for each selected cell."""
+        if state.paired:
+            selected = []
+            for index, (cell_id, geometry) in enumerate(
+                self._paired_selected_cells.get(view.dataset, [])
+            ):
+                try:
+                    centroid = geometry.centroid
+                    centroid_yx = (float(centroid.y), float(centroid.x))
+                except Exception:
+                    centroid_yx = None
+                color = CELL_HIGHLIGHT_COLORS[index % len(CELL_HIGHLIGHT_COLORS)]
+                selected.append((cell_id, color, centroid_yx))
+            return selected
+        return [
+            (entry.get("cell_id"), str(entry.get("color", "#ffffff")), entry.get("centroid_yx"))
+            for entry in self._selected_cells.get(view.dataset, [])
+        ]
+
+    def _refresh_umap_highlights(self):
+        """Ring every cell currently selected in the spatial view(s)."""
+        window = getattr(self, "_umap_window", None)
+        if window is None or not window.isVisible():
+            return
+        state = self._umap_state()
+        if state is None:
+            return
+        panel_keys = window.panel_keys()
+        for view in state.views.values():
+            key = self._umap_panel_key(state, view)
+            if key not in panel_keys:
+                continue
+            panel = window.panel(key)
+            embedding = view.embeddings.get(state.source)
+            if embedding is None or (self._umap_displayed_keys.get(key) or ())[:2] != (
+                view.dataset,
+                state.source,
+            ):
+                panel.set_highlights([])
+                continue
+            highlights = []
+            for cell_id, color, centroid_yx in self._umap_selected_cells(state, view):
+                row = self._umap_row_for_selection(state, view, embedding, cell_id, centroid_yx)
+                if row >= 0:
+                    highlights.append((row, color))
+            panel.set_highlights(highlights)
+
+    def _umap_row_for_selection(
+        self,
+        state: CellUmapState,
+        view: UmapView,
+        embedding: CellUmapEmbedding,
+        cell_id,
+        centroid_yx,
+    ) -> int:
+        """Embedding row of a spatially selected cell, or -1.
+
+        Selections come from the picking masks (normally ProSeg). When the UMAP
+        shows a clustering of those same masks the ids join directly; otherwise
+        the UMAP cell is the one whose mask contains the selected cell's centroid.
+        """
+        source_shape, source_gdf = self._umap_source_shapes(state, view)
+        pick_shape, _pick_gdf = self._umap_pick_shapes(state, view)
+        if pick_shape is not None and pick_shape == source_shape:
+            return embedding.row_for_id(cell_id)
+        cache_key = (state.source, str(cell_id))
+        if cache_key in view.row_cache:
+            return int(view.row_cache[cache_key])
+        row = -1
+        if centroid_yx is not None and source_gdf is not None:
+            try:
+                picked = pick_cell_at_point(
+                    source_gdf, float(centroid_yx[1]), float(centroid_yx[0])
+                )
+            except Exception as exc:
+                log.debug("UMAP selection lookup failed: %s", exc)
+                picked = None
+            if picked is not None:
+                row = embedding.row_for_id(picked[0])
+        view.row_cache[cache_key] = row
+        return row
+
+    @staticmethod
+    def _shape_for_cell_id(gdf, cell_id):
+        """Return ``(index label, geometry)`` for a mask id, or None."""
+        for key in (cell_id, str(cell_id)):
+            try:
+                loc = gdf.index.get_loc(key)
+            except Exception:
+                continue
+            if isinstance(loc, slice):
+                loc = loc.start
+            elif isinstance(loc, np.ndarray):
+                hits = np.flatnonzero(loc)
+                if hits.size == 0:
+                    continue
+                loc = int(hits[0])
+            return gdf.index[int(loc)], gdf.geometry.iloc[int(loc)]
+        return None
+
+    def _umap_cell_to_inspector_cell(self, state: CellUmapState, view: UmapView, cell_id: int):
+        """Map a UMAP cell to the picking-mask cell the spatial view selects."""
+        source_shape, source_gdf = self._umap_source_shapes(state, view)
+        if source_gdf is None:
+            return None, f"{source_shape or 'The source'} shapes are not in this dataset."
+        found = self._shape_for_cell_id(source_gdf, cell_id)
+        if found is None:
+            return None, f"Cell {cell_id} has no {source_shape} polygon."
+        pick_shape, pick_gdf = self._umap_pick_shapes(state, view)
+        if pick_shape is None or pick_shape == source_shape or pick_gdf is None:
+            return found, ""
+        point = found[1].representative_point()
+        picked = pick_cell_at_point(pick_gdf, float(point.x), float(point.y))
+        if picked is None:
+            return None, f"No {pick_shape} cell lies at {source_shape} cell {cell_id}."
+        return picked, ""
+
+    def _on_umap_point_clicked(self, panel_key: str, row: int):
+        """Select the clicked UMAP cell in its own store's spatial view."""
+        state = self._umap_state()
+        view = self._umap_view_for_panel(state, panel_key) if state is not None else None
+        embedding = view.embeddings.get(state.source) if view is not None else None
+        if embedding is None or not (0 <= int(row) < len(embedding)):
+            return
+        cell_id = int(embedding.cell_ids[int(row)])
+        gated = (
+            self._paired_pick_segmentation(view.dataset) is None
+            if state.paired
+            else not self._cell_inspector_pickable()
+        )
+        if gated:
+            self._set_status(
+                "Cell selection is paused while the cell-inspector segmentation "
+                "layer is hidden; show it to pick cells from the UMAP."
+            )
+            return
+        picked, reason = self._umap_cell_to_inspector_cell(state, view, cell_id)
+        if picked is None:
+            self._set_status(f"{view.dataset}: could not select UMAP cell {cell_id}. {reason}")
+            return
+        target_id, geometry = picked
+        view.row_cache[(state.source, str(target_id))] = int(row)
+        if state.paired:
+            self._add_paired_cell_selection(view.dataset, target_id, geometry)
+        else:
+            self._add_cell_selection(view.dataset, target_id, geometry)
+        self._refresh_umap_highlights()
+        widget = self._umap_widget
+        if widget is None or widget.centre_on_pick:
+            self._centre_view_on_geometry(geometry)
+
+    def _add_paired_cell_selection(self, platform: str, cell_id, geometry):
+        """Select one store's cell (a UMAP pick is specific to its modality)."""
+        normalized = normalize_cell_key(cell_id)
+        selections = self._paired_selected_cells.setdefault(platform, [])
+        if not any(normalize_cell_key(existing) == normalized for existing, _g in selections):
+            selections.append((cell_id, geometry))
+        self._replace_paired_selection_layer(platform)
+        self._remove_paired_anchor()
+        self._update_paired_cell_info_overlay()
+        self._set_status(f"Selected {platform} cell {cell_id} from its UMAP.")
+
+    def _centre_view_on_geometry(self, geometry):
+        """Pan (without zooming) so a selected cell is in the middle of the view."""
+        try:
+            centroid = geometry.centroid
+            camera = self.viewer.camera
+            center = list(camera.center)
+            center[-2:] = [float(centroid.y), float(centroid.x)]
+            camera.center = tuple(center)
+        except Exception as exc:
+            log.debug("Could not centre the view on the selected cell: %s", exc)
+
+    # -- UMAP region of interest (lasso) ------------------------------------
+    def set_umap_lasso_active(self, active: bool, *, tidy: bool = True):
+        """Arm (or cancel) drawing one region in the spatial view or a UMAP.
+
+        Arming does the one-off work up front -- mask centroids and, for a pair,
+        registering the mirrored outline layers (a grid re-layout) -- so the
+        drag itself stays smooth. Cancelling (``tidy``) restores the current
+        region's outline, or removes the unused layers.
+        """
+        state = self._umap_state()
+        active = bool(active) and state is not None
+        self._umap_lasso_armed = active
+        if self._umap_widget is not None:
+            self._umap_widget.set_lasso_active(active)
+        if active and (self._umap_window is None or not self._umap_window.isVisible()):
+            # The region's pie chart lives in the UMAP window.
+            self.set_umap_window_visible(True)
+        if self._umap_window is not None:
+            self._umap_window.set_lasso_mode(active)
+        if active:
+            for view in state.views.values():
+                self._source_centroids(state, view, state.source)
+            if state.paired:
+                self._ensure_paired_roi_outline_layers()
+        elif tidy and state is not None:
+            self._update_roi_spatial_outline(state)
+        self._set_spatial_pan_enabled(not active)
+        if active:
+            self._set_status(
+                "Draw a region of interest: hold the mouse button and drag around "
+                "cells in the spatial view or a UMAP, then release."
+            )
+
+    def _ensure_paired_roi_outline_layers(self):
+        """Register (empty) mirrored outline layers in both panes, in one layout pass."""
+        registry = self._paired_registry
+        if registry is None:
+            return
+        identities = [
+            LayerIdentity(platform, ROI_PAIRED_ROLE, ROI_PAIRED_ELEMENT, "outline")
+            for platform in ("MERSCOPE", "XENIUM")
+        ]
+        missing = [identity for identity in identities if registry.layer_for(identity) is None]
+        if not missing:
+            return
+        previous = self._active_layer()
+        width = ROI_OUTLINE_CANVAS_PX * (self._um_per_canvas_px() or 1.0)
+        with registry.deferred_order():
+            for identity in missing:
+                registry.register_layer(
+                    identity,
+                    napari.layers.Shapes(
+                        [],
+                        shape_type="path",
+                        name="region outline",
+                        edge_color=UMAP_ROI_COLOR,
+                        face_color="transparent",
+                        edge_width=width,
+                        opacity=1.0,
+                    ),
+                )
+            self._remove_paired_anchor()
+        self._restore_active_layer(previous)
+
+    def _set_spatial_pan_enabled(self, enabled: bool):
+        """Stop napari panning while a drag draws a lasso (and restore it after)."""
+        camera = getattr(self.viewer, "camera", None)
+        if camera is None:
+            return
+        if enabled:
+            # Hand control back to napari's own rule (the active layer's mode);
+            # when that cannot be read, panning must still come back.
+            active = self._active_layer()
+            enabled = bool(getattr(active, "mouse_pan", True)) if active is not None else True
+        try:
+            camera.mouse_pan = bool(enabled)
+        except Exception as exc:
+            log.debug("Could not toggle napari panning: %s", exc)
+
+    def _spatial_lasso_gesture(self, event):
+        """Generator driving one press-drag-release lasso in the spatial view.
+
+        World coordinates are shared by both panes of a pair (the aligned
+        MERSCOPE data is drawn in the Xenium frame), so the same outline is
+        drawn in, and selects cells from, both stores.
+        """
+        if getattr(event, "button", 1) not in (1, None):
+            return
+        start = self._event_world_xy(event)
+        if start is None:
+            return
+        # napari re-derives camera panning from the active layer, so re-assert
+        # it for every gesture.
+        self._set_spatial_pan_enabled(False)
+        points = [start]
+        last_px = self._event_canvas_position(event)
+        last_draw = 0.0
+        yield
+        while str(getattr(event, "type", "")) == "mouse_move":
+            xy = self._event_world_xy(event)
+            px = self._event_canvas_position(event)
+            moved = (
+                last_px is None
+                or px is None
+                or float(np.linalg.norm(px - last_px)) >= UMAP_LASSO_MIN_STEP_PX
+            )
+            if xy is not None and moved:
+                points.append(xy)
+                last_px = px
+                now = time.monotonic()
+                if now - last_draw >= 0.03 and len(points) >= 2:
+                    self._draw_roi_outline(np.asarray(points), closed=False)
+                    last_draw = now
+            yield
+        end = self._event_world_xy(event)
+        if end is not None:
+            points.append(end)
+        self._finish_lasso("spatial", np.asarray(points, dtype=float))
+
+    def _on_umap_lasso_completed(self, panel_key: str, polygon):
+        self._finish_lasso("umap", np.asarray(polygon, dtype=float), panel_key=panel_key)
+
+    def _finish_lasso(self, space: str, polygon: np.ndarray, panel_key: str | None = None):
+        """Close a drawn outline into the region of interest and show it.
+
+        A spatial outline selects cells in every store; a UMAP outline is
+        specific to the store whose embedding it was drawn on (UMAPs of
+        different modalities are not harmonised), so it clears the others.
+        """
+        state = self._umap_state()
+        if state is None:
+            return
+        polygon = np.asarray(polygon, dtype=float).reshape(-1, 2)
+        if polygon.shape[0] < 3 or float(np.ptp(polygon, axis=0).min()) <= 0:
+            self._update_roi_spatial_outline(state)  # drop any half-drawn path
+            self._set_status(
+                "That region was too small: hold the mouse button and drag around "
+                "the cells to outline them."
+            )
+            return
+        # One region per press of "Draw region of interest", so napari panning
+        # and UMAP dragging come straight back once the outline is closed.
+        self.set_umap_lasso_active(False, tidy=False)
+        if space == "umap":
+            target = self._umap_view_for_panel(state, panel_key or "")
+            targets = [target] if target is not None else []
+        else:
+            targets = list(state.views.values())
+        for view in state.views.values():
+            chosen = any(view is target for target in targets)
+            view.roi = (
+                UmapRoi(space=str(space), polygon=polygon, source=state.source)
+                if chosen
+                else None
+            )
+            self._assign_roi_cells(state, view)
+        if self._umap_widget is not None:
+            self._umap_widget.set_roi_available(True)
+        with self._paired_layer_batch():
+            self._update_roi_spatial_outline(state)
+            for view in state.views.values():
+                self._update_roi_cells_layer(state, view)
+        if self._umap_window is None or not self._umap_window.isVisible():
+            self.set_umap_window_visible(True)
+        else:
+            self._refresh_umap()
+        counts = [
+            f"{view.dataset + ' ' if state.paired else ''}{view.roi.rows.size:,}"
+            for view in state.views.values()
+            if view.roi is not None and view.roi.rows is not None
+        ]
+        if counts:
+            self._set_status(
+                f"Region of interest holds {' and '.join(counts)} "
+                f"{cell_type_source_label(state.source)} cells."
+            )
+
+    def clear_umap_roi(self):
+        """Remove the region of interest from every view."""
+        state = self._umap_state_obj
+        if state is not None:
+            for view in state.views.values():
+                view.roi = None
+        self._reset_umap_roi_views()
+        self._refresh_umap()
+
+    def _reset_umap_roi_views(self):
+        """Drop the region's spatial layers and disarm drawing (not the state)."""
+        was_armed = self._umap_lasso_armed
+        self._umap_lasso_armed = False
+        if was_armed:
+            self._set_spatial_pan_enabled(True)
+        if self._umap_window is not None:
+            self._umap_window.set_lasso_mode(False)
+            for panel in self._umap_window.panels().values():
+                panel.canvas.set_roi_polygon(None)
+                panel.set_roi_summary(None)
+        token = self._task_cancel_events.get("umap-roi")
+        if token is not None:
+            token.set()
+            self._finish_task_token("umap-roi", token)
+        self._roi_layer_generation += 1
+        self._roi_cells_layer_key = None
+        self._remove_roi_layers(outline=True, cells=True)
+        if self._umap_widget is not None:
+            self._umap_widget.set_lasso_active(False)
+            self._umap_widget.set_roi_available(False)
+
+    def _paired_layer_batch(self):
+        """Group paired registrations so the grid is re-laid out once."""
+        registry = self._paired_registry
+        return registry.deferred_order() if registry is not None else nullcontext()
+
+    @staticmethod
+    def _roi_slot(part: str) -> LayerSlotKey:
+        return LayerSlotKey(ROI_PAIRED_ROLE, ROI_PAIRED_ELEMENT, part)
+
+    def _remove_roi_layers(self, *, outline: bool, cells: bool):
+        """Remove region layers (standalone names, or a pair's annotation slots)."""
+        if self._paired_registry is not None:
+            with self._paired_layer_batch():
+                for part, wanted in (("outline", outline), ("cells", cells)):
+                    if wanted:
+                        self._remove_paired_slot(self._roi_slot(part))
+        if outline:
+            self._remove_layer_by_name(ROI_OUTLINE_LAYER)
+        if cells:
+            self._remove_layer_by_name(ROI_CELLS_LAYER)
+
+    def _roi_outline_layers(self) -> list:
+        registry = self._paired_registry
+        if registry is not None:
+            layers = [
+                registry.layer_for(LayerIdentity(platform, ROI_PAIRED_ROLE, ROI_PAIRED_ELEMENT, "outline"))
+                for platform in ("MERSCOPE", "XENIUM")
+            ]
+            return [layer for layer in layers if layer is not None]
+        layer = self._get_layer_by_name(ROI_OUTLINE_LAYER)
+        return [layer] if layer is not None else []
+
+    def _source_centroids(self, state: CellUmapState, view: UmapView, source: str):
+        """Cached ``(ids, x, y)`` mask centroids for a cell-type source's masks."""
+        shape_key, gdf = self._umap_source_shapes(state, view, source)
+        cached = view.centroids.get(shape_key)
+        if cached is not None:
+            return cached
+        empty = (np.empty(0, dtype=np.int64), np.empty(0), np.empty(0))
+        if gdf is None:
+            return empty
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")  # geographic-CRS centroid warnings
+            centroids = gdf.geometry.centroid
+        ids, valid = cell_ids_as_int64(np.asarray(gdf.index))
+        cached = (
+            ids[valid],
+            np.asarray(centroids.x, dtype=np.float64)[valid],
+            np.asarray(centroids.y, dtype=np.float64)[valid],
+        )
+        view.centroids[shape_key] = cached
+        return cached
+
+    def _assign_roi_cells(self, state: CellUmapState, view: UmapView) -> bool:
+        """Find the region's cells among the current source's embedding rows.
+
+        A spatial outline takes the cells whose mask centroid lies inside it; a
+        UMAP outline takes the embedding points inside it. Either way only cells
+        with a UMAP row are kept, so the UMAP and spatial views show the same set.
+        """
+        roi = view.roi
+        embedding = view.embeddings.get(state.source)
+        if roi is None or embedding is None:
+            return False
+        if roi.space == "umap":
+            rows = np.flatnonzero(points_in_polygon(embedding.coords, roi.polygon))
+        else:
+            ids, xs, ys = self._source_centroids(state, view, state.source)
+            inside = points_in_polygon(np.column_stack([xs, ys]), roi.polygon)
+            rows = embedding.rows_for_ids(ids[inside])
+            rows = np.unique(rows[rows >= 0])
+        roi.rows = rows.astype(np.int64, copy=False)
+        roi.cell_ids = np.asarray(embedding.cell_ids, dtype=np.int64)[roi.rows]
+        roi.source = state.source
+        return True
+
+    def _sync_roi_to_source(self, state: CellUmapState, view: UmapView):
+        """Keep a view's region consistent with the UMAP's (possibly new) source."""
+        roi = view.roi
+        if roi is None:
+            return
+        if roi.source != state.source and roi.space == "umap":
+            # A UMAP outline only means something on the embedding it was drawn on.
+            label = cell_type_source_label(roi.source)
+            view.roi = None
+            self._update_roi_cells_layer(state, view)
+            if self._umap_widget is not None and not any(
+                other.roi is not None for other in state.views.values()
+            ):
+                self._umap_widget.set_roi_available(False)
+            self._umap_status_note = (
+                f"Cleared the region of interest: it was drawn on the {label} UMAP."
+            )
+            return
+        if roi.rows is None or roi.source != state.source:
+            if self._assign_roi_cells(state, view):
+                self._update_roi_cells_layer(state, view)
+
+    def _draw_roi_outline(self, points_xy: np.ndarray, *, closed: bool):
+        """Draw (or redraw) the lasso outline; a pair draws it in both panes."""
+        points_xy = np.asarray(points_xy, dtype=float).reshape(-1, 2)
+        if points_xy.shape[0] < 2:
+            return
+        data = points_xy[:, ::-1]  # napari (y, x)
+        width = ROI_OUTLINE_CANVAS_PX * (self._um_per_canvas_px() or 1.0)
+        shape_type = "polygon" if closed and points_xy.shape[0] >= 3 else "path"
+        registry = self._paired_registry
+        try:
+            if registry is not None:
+                previous = self._active_layer()
+                added = False
+                with registry.deferred_order():
+                    for platform in ("MERSCOPE", "XENIUM"):
+                        identity = LayerIdentity(
+                            platform, ROI_PAIRED_ROLE, ROI_PAIRED_ELEMENT, "outline"
+                        )
+                        layer = registry.layer_for(identity)
+                        if layer is None:
+                            registry.register_layer(
+                                identity,
+                                napari.layers.Shapes(
+                                    [data],
+                                    shape_type=shape_type,
+                                    name="region outline",
+                                    edge_color=UMAP_ROI_COLOR,
+                                    face_color="transparent",
+                                    edge_width=width,
+                                    opacity=1.0,
+                                ),
+                            )
+                            added = True
+                        else:
+                            layer.data = []
+                            layer.add(
+                                [data],
+                                shape_type=shape_type,
+                                edge_width=width,
+                                edge_color=UMAP_ROI_COLOR,
+                                face_color="transparent",
+                            )
+                    if added:
+                        self._remove_paired_anchor()
+                if added:
+                    self._restore_active_layer(previous)
+                return
+            layer = self._get_layer_by_name(ROI_OUTLINE_LAYER)
+            if layer is None:
+                previous = self._active_layer()
+                self.viewer.add_shapes(
+                    [data],
+                    shape_type=shape_type,
+                    name=ROI_OUTLINE_LAYER,
+                    edge_color=UMAP_ROI_COLOR,
+                    face_color="transparent",
+                    edge_width=width,
+                    opacity=1.0,
+                )
+                self._restore_active_layer(previous)
+            else:
+                layer.data = []
+                layer.add(
+                    [data],
+                    shape_type=shape_type,
+                    edge_width=width,
+                    edge_color=UMAP_ROI_COLOR,
+                    face_color="transparent",
+                )
+        except Exception as exc:
+            log.debug("Could not draw the region outline: %s", exc)
+
+    def _update_roi_spatial_outline(self, state: CellUmapState | None):
+        roi = None
+        if state is not None:
+            roi = next(
+                (
+                    view.roi
+                    for view in state.views.values()
+                    if view.roi is not None and view.roi.space == "spatial"
+                ),
+                None,
+            )
+        if roi is None:
+            if self._umap_lasso_armed and self._paired_registry is not None:
+                # Keep the prepared mirrored layers while drawing is armed.
+                for layer in self._roi_outline_layers():
+                    layer.data = []
+                return
+            self._remove_roi_layers(outline=True, cells=False)
+            return
+        self._draw_roi_outline(roi.polygon, closed=True)
+
+    def _active_layer(self):
+        try:
+            return self.viewer.layers.selection.active
+        except Exception:
+            return None
+
+    def _restore_active_layer(self, layer):
+        """Undo napari selecting a helper layer we just added."""
+        if layer is None or layer not in list(self.viewer.layers):
+            return
+        try:
+            self.viewer.layers.selection.active = layer
+        except Exception:
+            pass
+        if self._umap_lasso_armed:
+            self._set_spatial_pan_enabled(False)
+
+    def _roi_color_dict(self, roi: UmapRoi) -> dict:
+        color = tuple(float(c) for c in rgba_array(UMAP_ROI_COLOR, alpha=1.0))
+        color_dict: dict = {0: (0.0, 0.0, 0.0, 0.0), None: (0.0, 0.0, 0.0, 0.0)}
+        for cell_id in np.asarray(roi.cell_ids if roi.cell_ids is not None else []).tolist():
+            color_dict[int(cell_id)] = color
+        return color_dict
+
+    def _update_roi_cells_layer(self, state: CellUmapState, view: UmapView):
+        """Outline the region's cells in the spatial view (one Labels layer)."""
+        if state.paired:
+            self._update_paired_roi_cells_layer(state, view)
+            return
+        roi = view.roi
+        if roi is None or roi.cell_ids is None or roi.cell_ids.size == 0:
+            self._roi_layer_generation += 1
+            self._roi_cells_layer_key = None
+            self._remove_layer_by_name(ROI_CELLS_LAYER)
+            return
+        key = (view.dataset, self._mask_shape_key_for_source(roi.source))
+        layer = self._get_layer_by_name(ROI_CELLS_LAYER)
+        if layer is not None and self._roi_cells_layer_key == key:
+            # Same masks: a new region only needs a new colormap.
+            self._roi_layer_generation += 1
+            self._recolor_roi_cells_layer(layer, roi)
+            return
+        # Different masks (or none yet): never leave the previous region's
+        # outlines showing while the new raster is prepared.
+        self._roi_cells_layer_key = None
+        self._remove_layer_by_name(ROI_CELLS_LAYER)
+        self._start_roi_cells_layer_build(state, roi.source, key)
+
+    def _update_paired_roi_cells_layer(self, state: CellUmapState, view: UmapView):
+        """Register (or recolour) one platform's region-cell outlines in the grid.
+
+        The materialized paired labels are read lazily and never built, so this
+        runs on the GUI thread like the paired cell-type fill.
+        """
+        registry = self._paired_registry
+        session = self._paired_session
+        if registry is None or session is None:
+            return
+        identity = LayerIdentity(view.dataset, ROI_PAIRED_ROLE, ROI_PAIRED_ELEMENT, "cells")
+        roi = view.roi
+        if roi is None or roi.cell_ids is None or roi.cell_ids.size == 0:
+            if registry.layer_for(identity) is not None:
+                registry.unload_layer(identity)
+            if not any(
+                registry.layer_for(identity.for_platform(platform)) is not None
+                for platform in ("MERSCOPE", "XENIUM")
+            ):
+                self._remove_paired_slot(self._roi_slot("cells"))
+            return
+        segmentation = self._paired_segmentation_for_cell_type(view.dataset, roi.source)
+        if segmentation is None:
+            self._set_status(f"{view.dataset}: no aligned masks for {roi.source}.")
+            return
+        layer = registry.layer_for(identity)
+        if layer is not None and (layer.metadata or {}).get(
+            "spatialdata_label_key"
+        ) == segmentation.label_key:
+            self._recolor_roi_cells_layer(layer, roi)
+            return
+        levels, label_key = self._paired_label_levels(view.dataset, segmentation, outline=False)
+        if not levels:
+            self._set_status(f"{view.dataset}: the region's masks have no label raster.")
+            return
+        layer = napari.layers.Labels(
+            levels if len(levels) > 1 else levels[0],
+            name="region cells",
+            affine=self._paired_napari_affine(session.contract),
+            cache=NAPARI_DASK_CACHE_ENABLED,
+            colormap=DirectLabelColormap(color_dict=self._roi_color_dict(roi)),
+            multiscale=len(levels) > 1,
+            opacity=1.0,
+            blending="translucent",
+            visible=True,
+            metadata={"spatialdata_label_key": label_key},
+        )
+        try:
+            layer.contour = ROI_CELL_CONTOUR_PX
+        except Exception as exc:
+            log.debug("Could not draw region cells as outlines: %s", exc)
+        previous = self._active_layer()
+        registry.register_layer(identity, layer)
+        self._remove_paired_anchor()
+        self._restore_active_layer(previous)
+        self._recolor_roi_cells_layer(layer, roi)
+
+        def recolor_if_current():
+            current = view.roi
+            if current is not None and registry.layer_for(identity) is layer:
+                self._recolor_roi_cells_layer(layer, current)
+
+        self._reapply_labels_colormap_after_first_slice(layer, recolor_if_current)
+
+    def _recolor_roi_cells_layer(self, layer, roi: UmapRoi):
+        try:
+            layer.colormap = DirectLabelColormap(color_dict=self._roi_color_dict(roi))
+            layer.refresh()
+        except Exception as exc:
+            log.debug("Could not recolour the region cells layer: %s", exc)
+        self._force_canvas_redraw()
+
+    def _start_roi_cells_layer_build(self, state: CellUmapState, source: str, key: tuple):
+        cancel_token = self._begin_task_token("umap-roi", key)
+        if cancel_token is None:
+            return  # already building this mask; it recolours on arrival
+        self._roi_layer_generation += 1
+        generation = self._roi_layer_generation
+        self._set_status(f"{state.dataset}: outlining the region's cells…")
+
+        def compute():
+            with self._store_io_slots:
+                self._raise_if_task_cancelled(cancel_token.is_set, state.dataset)
+                label_key = self._ensure_label_key_for_segmentation(
+                    source,
+                    cancel_check=cancel_token.is_set,
+                    expected_dataset=state.dataset,
+                )
+                label_levels, napari_affine = self._build_cellpose_label_display(
+                    label_key,
+                    cancel_check=cancel_token.is_set,
+                    expected_dataset=state.dataset,
+                )
+            return {
+                "label_key": label_key,
+                "label_levels": label_levels,
+                "napari_affine": napari_affine,
+            }
+
+        def apply(payload):
+            self._apply_roi_cells_layer(generation, state, key, payload, cancel_token)
+
+        def handle_error(exc):
+            self._finish_task_token("umap-roi", cancel_token)
+            if generation != self._roi_layer_generation or cancel_token.is_set():
+                return
+            message = exc[1] if isinstance(exc, tuple) and len(exc) > 1 else exc
+            self._set_status(f"{state.dataset}: could not outline the region's cells: {message}")
+            log.error("[%s] Region-of-interest outline failed: %s", state.dataset, message)
+
+        if thread_worker is None:
+            try:
+                payload = compute()
+            except Exception as exc:
+                handle_error(exc)
+                return
+            apply(payload)
+            return
+        worker = thread_worker(compute)()
+        worker.returned.connect(apply)
+        worker.errored.connect(handle_error)
+        self._umap_workers[("umap-roi",) + tuple(key)] = worker
+        worker.start()
+
+    def _apply_roi_cells_layer(
+        self,
+        generation: int,
+        state: CellUmapState,
+        key: tuple,
+        payload: dict,
+        token: Event,
+    ):
+        self._finish_task_token("umap-roi", token)
+        self._umap_workers.pop(("umap-roi",) + tuple(key), None)
+        roi = state.primary.roi
+        if (
+            token.is_set()
+            or self._umap_state_obj is not state
+            or roi is None
+            or roi.cell_ids is None
+            or roi.cell_ids.size == 0
+            or (state.dataset, self._mask_shape_key_for_source(roi.source)) != key
+        ):
+            return
+        label_levels = payload["label_levels"]
+        if not label_levels:
+            self._set_status(f"{state.dataset}: the region's masks have no 2D levels.")
+            return
+        self._remove_layer_by_name(ROI_CELLS_LAYER)
+        previous = self._active_layer()
+        layer = self.viewer.add_labels(
+            label_levels if len(label_levels) > 1 else label_levels[0],
+            name=ROI_CELLS_LAYER,
+            affine=payload["napari_affine"],
+            cache=NAPARI_DASK_CACHE_ENABLED,
+            colormap=DirectLabelColormap(color_dict=self._roi_color_dict(roi)),
+            multiscale=len(label_levels) > 1,
+            opacity=1.0,
+            blending="translucent",
+            visible=True,
+        )
+        try:
+            layer.contour = ROI_CELL_CONTOUR_PX
+        except Exception as exc:
+            log.debug("Could not draw region cells as outlines: %s", exc)
+        self._restore_active_layer(previous)
+        self._roi_cells_layer_key = key
+        self._recolor_roi_cells_layer(layer, roi)
+
+        def recolor_if_current():
+            current = state.primary.roi if self._umap_state_obj is state else None
+            if current is not None and self._get_layer_by_name(ROI_CELLS_LAYER) is layer:
+                self._recolor_roi_cells_layer(layer, current)
+
+        self._reapply_labels_colormap_after_first_slice(layer, recolor_if_current)
+        self._schedule_canvas_visibility_repair(state.dataset)
+        self._set_status(
+            f"{state.dataset}: outlined {roi.cell_ids.size:,} cells in the region of interest."
+        )
+
+    def _umap_roi_summary(
+        self,
+        state: CellUmapState,
+        view: UmapView,
+        embedding: CellUmapEmbedding,
+        colouring,
+    ):
+        """Cell-type make-up of a view's region for its panel's pie chart."""
+        roi = view.roi
+        if roi is None or roi.rows is None:
+            return None
+        kind = state.colour_by if state.colour_by in ("broad", "fine") else "broad"
+        labels = self._umap_labels(state, view, embedding, kind)
+        scheme = self._umap_scheme(state, view, kind)
+        note = ""
+        values = getattr(colouring, "values", None)
+        if values is not None and roi.rows.size:
+            region_values = np.asarray(values)[roi.rows]
+            finite = region_values[np.isfinite(region_values)]
+            all_finite = np.asarray(values)[np.isfinite(values)]
+            if finite.size and all_finite.size:
+                note = (
+                    f"Mean {colouring.title}: {float(finite.mean()):.4g} in the region "
+                    f"vs {float(all_finite.mean()):.4g} overall."
+                )
+        return summarise_roi_labels(
+            labels[roi.rows],
+            scheme.colors if scheme is not None else {},
+            level="Fine cell type" if kind == "fine" else "Broad cell type",
+            drawn_in=(
+                "the spatial view"
+                if roi.space == "spatial"
+                else (f"the {view.dataset} UMAP" if state.paired else "the UMAP")
+            ),
+            note=note,
+        )
 
     def close_gene_inspector(self, dataset_name: str):
         if self._paired_session is not None:
@@ -12494,10 +14217,20 @@ def main():
         set_opacity_callback=controller.set_cell_type_opacity,
         opacity=float(getattr(args, "shape_opacity", 0.95)),
     )
+    # The "UMAP" tab: opens the floating UMAP window and picks its colouring.
+    umap_widget = UmapControlWidget(
+        set_window_visible_callback=controller.set_umap_window_visible,
+        set_source_callback=controller.set_umap_source,
+        set_colour_callback=controller.set_umap_colour,
+        set_point_size_callback=controller.set_umap_point_size,
+        set_lasso_active_callback=controller.set_umap_lasso_active,
+        clear_roi_callback=controller.clear_umap_roi,
+    )
     panel = ViewerControlPanel(
         datasets=available_datasets,
         gene_inspector_widget=gene_inspector,
         cell_type_widget=cell_type_widget,
+        umap_widget=umap_widget,
         load_callback=controller.load_dataset,
         load_selected_labels_callback=controller.load_selected_labels,
         unload_selected_shapes_callback=controller.unload_selected_shapes,
@@ -12536,6 +14269,7 @@ def main():
     controller.set_cellpose_value_options_callback(panel.set_cellpose_value_options)
     controller.set_gene_inspector_widget(gene_inspector)
     controller.set_cell_type_widget(cell_type_widget)
+    controller.set_umap_widget(umap_widget)
     viewer_controls_dock = viewer.window.add_dock_widget(
         panel, area="right", name="Viewer Controls"
     )

@@ -20,7 +20,7 @@ blocks; stacked overlay and standalone modes expose real data layers only.
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Callable, Iterable, Mapping, MutableSequence
@@ -347,6 +347,8 @@ class PairedLayerRegistry:
         self._overlay_visibility: dict[LayerIdentity, bool] = {}
         self._sequence = 0
         self._syncing_visibility = False
+        self._order_hold = 0
+        self._order_pending = False
 
     # -- inspection -----------------------------------------------------
     @property
@@ -551,6 +553,23 @@ class PairedLayerRegistry:
         self._apply_order_only()
         return removed
 
+    @contextmanager
+    def deferred_order(self):
+        """Apply canonical order and grid layout once, after several changes.
+
+        Each registration otherwise re-orders the LayerList and re-strides the
+        live grid, which napari answers with a full grid re-layout. Grouping the
+        per-platform registrations of one logical slot makes that happen once.
+        """
+        self._order_hold += 1
+        try:
+            yield
+        finally:
+            self._order_hold -= 1
+            if self._order_hold == 0 and self._order_pending:
+                self._order_pending = False
+                self._apply_order_only()
+
     # -- mode and event coordination -----------------------------------
     def set_mode(self, mode: ViewMode | str) -> ViewMode:
         """Apply grid state, canonical order, and mode-specific visibility."""
@@ -720,6 +739,9 @@ class PairedLayerRegistry:
         self.layers.insert(destination, layer)
 
     def _apply_order_only(self) -> None:
+        if self._order_hold:
+            self._order_pending = True
+            return
         refresh_live_grid = (
             self.mode is ViewMode.SIDE_BY_SIDE and bool(self.grid.enabled)
         )
