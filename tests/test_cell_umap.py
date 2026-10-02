@@ -1208,3 +1208,45 @@ def test_unreadable_annotation_store_fails_closed(tmp_path):
     root.create_group("tables").create_group("table_MOSAIK_proseg_hybrid_clustering_squidpy")
     assert cell_type_levels(tmp_path / "broken.zarr", "proseg_hybrid") == {}
     assert load_cell_type_assignments(tmp_path / "broken.zarr", "proseg_hybrid") is None
+
+
+@pytest.mark.parametrize("suffix", ["mapfirst", "m8", "custom_run"])
+def test_named_map_first_run_supersedes_legacy_for_labels_and_umap(tmp_path, suffix):
+    from napari_compare_xenium_merscope.utils import (
+        clustering_table_key_for_segmentation, cell_type_levels, load_cell_type_assignments,
+    )
+    base = "table_MOSAIK_proseg_hybrid_clustering_squidpy"
+    legacy = pd.DataFrame({"instance_id": [1], "broad_class": ["Neurons"]}, index=["legacy"])
+    store = _write_clustering_table(tmp_path, base, legacy, np.array([[0., 0.]]))
+    atlas = pd.DataFrame({"instance_id": [7, 8], "ct_seaad_subclass_name": ["L2/3 IT", "Pvalb"]},
+                         index=["a", "b"])
+    key = base + "_" + suffix
+    _write_clustering_table(tmp_path, key, atlas, np.array([[1., 2.], [3., 4.]]))
+    assert clustering_table_key_for_segmentation(store, "proseg_hybrid") == key
+    assert "ct_seaad_subclass" in cell_type_levels(store, "proseg_hybrid")
+    assignments = load_cell_type_assignments(store, "proseg_hybrid")
+    embedding = load_cell_umap(store, "proseg_hybrid")
+    assert assignments.table_key == embedding.table_key == key
+    assert assignments.labels_for("ct_seaad_subclass").tolist() == ["L2/3 IT", "Pvalb"]
+    assert assignments.cell_ids.tolist() == embedding.cell_ids.tolist() == [7, 8]
+    assert embedding.coords.tolist() == [[1., 2.], [3., 4.]]
+    assert clustering_table_key_for_segmentation(store, "proseg") is None
+    assert clustering_table_key_for_segmentation(store, "proseg_mask") is None
+
+
+def test_map_first_run_preference_is_deterministic_and_ignores_non_annotation_variants(tmp_path):
+    from napari_compare_xenium_merscope.utils import clustering_table_key_for_segmentation
+    base = "table_MOSAIK_proseg_hybrid_clustering_squidpy"
+    atlas = pd.DataFrame({"instance_id": [7], "ct_final_name": ["Pvalb"]}, index=["a"])
+    legacy = pd.DataFrame({"instance_id": [1], "broad_class": ["Neurons"]}, index=["a"])
+    # The exact coexistence seen in P7513, deliberately created out of order.
+    store = _write_clustering_table(tmp_path, base + "_m8_state", atlas, np.array([[1., 2.]]))
+    _write_clustering_table(tmp_path, base + "_m8", atlas, np.array([[3., 4.]]))
+    _write_clustering_table(tmp_path, base, legacy, np.array([[0., 0.]]))
+    _write_clustering_table(tmp_path, base + "_mapfirst", legacy, np.array([[0., 0.]]))
+    assert clustering_table_key_for_segmentation(store, "proseg_hybrid") == base + "_m8"
+    _write_clustering_table(tmp_path, base + "_mapfirst", atlas, np.array([[5., 6.]]))
+    assert clustering_table_key_for_segmentation(store, "proseg_hybrid") == base + "_mapfirst"
+    # After MerXen's default switches, an annotated unsuffixed run wins.
+    _write_clustering_table(tmp_path, base, atlas, np.array([[7., 8.]]))
+    assert clustering_table_key_for_segmentation(store, "proseg_hybrid") == base

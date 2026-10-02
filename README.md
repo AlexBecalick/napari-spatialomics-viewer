@@ -472,8 +472,14 @@ embedding. Hovering a point shows its cell ID and its label or value.
 MerXen's reference-based annotation and `map_first` clustering outputs are
 supported in **Cell type labels** and **UMAP**, including the default
 `table_MOSAIK_proseg_hybrid_clustering_squidpy` table joined to
-`MOSAIK_proseg_hybrid` masks. Other segmentations can expose the same levels
-when their own clustering tables contain them.
+`MOSAIK_proseg_hybrid` masks. Named runs such as
+`table_MOSAIK_proseg_hybrid_clustering_squidpy_mapfirst` are also discovered.
+When several runs coexist, the viewer prefers an unsuffixed table with Allen
+annotation columns, then an annotated `_mapfirst` table, then other annotated
+suffixes in alphabetical order (for example `_m8` before `_m8_state`). Legacy
+unsuffixed tables remain the fallback. Labels and UMAP always use the same
+selected table; its name appears under the UMAP title. Other segmentations can
+expose the same levels when their own clustering tables contain them.
 
 Choose **ProSeg hybrid** under **Cell type source**, then a stored **Colour by**
 level. **Allen · final assignment** displays `ct_final_name`, the deepest
