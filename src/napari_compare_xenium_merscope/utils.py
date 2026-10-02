@@ -8,7 +8,7 @@ import json
 import logging
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from hashlib import blake2s
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
@@ -2503,7 +2503,7 @@ NEURON_BROAD_CLASS = "Neurons"
 _NEURON_SPLIT_LABELS = {"excitatory": "Excitatory neurons", "inhibitory": "Inhibitory neurons"}
 
 #: Instance-key candidates when a table omits ``uns['spatialdata_attrs']``.
-_INSTANCE_KEY_CANDIDATES = ("cell", "cell_id", "cells", "cell_ID", "EntityID", "label_id")
+_INSTANCE_KEY_CANDIDATES = ("instance_id", "cell", "cell_id", "cells", "cell_ID", "EntityID", "label_id")
 _MISSING_LABEL_TEXTS = {"", "nan", "none", "na", "<na>"}
 
 
@@ -2531,6 +2531,12 @@ class CellTypeSource:
 #: ``label`` is the button text. ``"proseg"`` is kept as the reseg key for
 #: backward compatibility (the historical name for this clustering).
 CELL_TYPE_SOURCES: tuple[CellTypeSource, ...] = (
+    CellTypeSource(
+        key="proseg_hybrid",
+        label="ProSeg hybrid",
+        clustering_tables=("table_MOSAIK_proseg_hybrid_clustering_squidpy",),
+        mask_shape_keys=("MOSAIK_proseg_hybrid",),
+    ),
     CellTypeSource(
         key="proseg",
         label="ProSeg · reseg (probabilistic)",
@@ -2571,10 +2577,10 @@ def cell_type_source(key: Any) -> CellTypeSource | None:
 class CellTypeAssignments:
     """Per-cell broad/fine cell-type labels joined to a segmentation mask.
 
-    ``cell_ids`` are the SpatialData instance-key values (matching the integer
-    pixel ids of the segmentation label mask); ``broad``/``fine`` are the
-    human-readable labels, same length and order as ``cell_ids``. Cells whose
-    label was missing are dropped, so unannotated mask ids stay transparent.
+    ``cell_ids`` are SpatialData instance-key values matching mask pixel IDs.
+    ``levels`` holds the available, row-aligned legacy and Allen labels; missing
+    labels remain None. ``broad``/``fine`` retain the cell inspector's summary.
+    Cells missing every label are dropped; unannotated mask IDs stay transparent.
     """
 
     segmentation: str
@@ -2584,9 +2590,17 @@ class CellTypeAssignments:
     broad: np.ndarray               # str (object)
     fine: np.ndarray                # str (object)
 
+    levels: dict[str, np.ndarray] = field(default_factory=dict)
+
     def labels_for(self, kind: str) -> np.ndarray:
-        """Return the per-cell labels for ``"broad"`` (default) or ``"fine"``."""
-        return self.fine if str(kind) == "fine" else self.broad
+        """Return labels at a stored level; absent levels remain unannotated."""
+        if self.levels:
+            return self.levels.get(str(kind), np.full(len(self.cell_ids), None, dtype=object))
+        if kind == "broad":
+            return self.broad
+        if kind == "fine":
+            return self.fine
+        return np.full(len(self.cell_ids), None, dtype=object)
 
 
 def clustering_table_key_for_segmentation(zarr_path: Any, segmentation: str) -> str | None:
@@ -2630,68 +2644,170 @@ def _resolve_instance_key(table) -> str:
     return ""
 
 
-def load_cell_type_assignments(zarr_path: Any, segmentation: str = "proseg") -> CellTypeAssignments | None:
-    """Load per-cell broad/fine cell-type labels for a segmentation from a store.
+# MerXen annotation/schema.py and clustering/map_first.py define these columns.
+# Keep resolved assignments distinct from the legacy branch/leaf clustering.
+CELL_TYPE_LEVEL_LABELS = {
+    "broad": "Broad cell type",
+    "fine": "Fine cell type",
+    "ct_final": "Allen · final assignment",
+    "ct_lineage": "Allen · lineage",
+    "ct_broad": "Allen · broad type",
+    "ct_class": "Allen · class",
+    "ct_nt": "Allen · neurotransmitter",
+    "ct_supercluster": "Allen · supercluster",
+    "ct_subclass": "Allen · subclass",
+    "ct_seaad_subclass": "SEA-AD · subclass",
+    "ct_cluster": "Allen · cluster (report only)",
+    "ct_supertype": "Allen · supertype (report only)",
+}
 
-    Reads the ``broad_class`` and ``hierarchical_cluster`` obs columns of the
-    segmentation's ``*_clustering_squidpy`` table and joins them to the mask via
-    the SpatialData instance key. Never raises -- a store without clustering
-    output (or without the expected columns) simply yields ``None``.
+
+def cell_id_to_int(value: Any) -> int | None:
+    """Return an exact integer cell id, or ``None`` when ``value`` is not one.
+
+    Unlike :func:`utils.normalize_cell_key` this never routes through ``float``,
+    so 19-digit MERSCOPE EntityIDs keep every digit.
     """
+    if value is None or isinstance(value, (bool, np.bool_)):
+        return None
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, (float, np.floating)):
+        as_float = float(value)
+        return int(as_float) if np.isfinite(as_float) and as_float.is_integer() else None
+    text = str(value).strip()
+    try:
+        return int(text)
+    except ValueError:
+        pass
+    try:
+        as_float = float(text)
+    except ValueError:
+        return None
+    return int(as_float) if np.isfinite(as_float) and as_float.is_integer() else None
+
+
+def cell_ids_as_int64(values: Iterable[Any]) -> tuple[np.ndarray, np.ndarray]:
+    """Convert cell ids to ``int64`` plus a validity mask, without float rounding."""
+    arr = np.asarray(values)
+    if arr.dtype.kind in "iu":
+        return arr.astype(np.int64, copy=False), np.ones(arr.shape[0], dtype=bool)
+    parsed = pd.to_numeric(pd.Series(arr, copy=False), errors="coerce")
+    if parsed.dtype.kind in "iu":
+        return parsed.to_numpy(dtype=np.int64), np.ones(arr.shape[0], dtype=bool)
+    ids = np.zeros(arr.shape[0], dtype=np.int64)
+    valid = np.zeros(arr.shape[0], dtype=bool)
+    for i, value in enumerate(arr.tolist()):
+        as_int = cell_id_to_int(value)
+        if as_int is not None:
+            ids[i] = as_int
+            valid[i] = True
+    return ids, valid
+
+
+def _clean_cell_labels(values) -> np.ndarray:
+    text = pd.Series(np.asarray(values), dtype=object).astype("string").str.strip()
+    text = text.mask(text.str.lower().isin(_MISSING_LABEL_TEXTS))
+    return text.to_numpy(dtype=object, na_value=None)
+
+
+def _read_cell_type_obs(zarr_path: Any, segmentation: str):
+    """Read annotation metadata only, without expression or neighbour matrices."""
     table_key = clustering_table_key_for_segmentation(zarr_path, segmentation)
     if table_key is None:
         return None
+    from anndata.io import read_elem
+    from types import SimpleNamespace
+
+    table = open_zarr_group_unconsolidated(zarr_path)[f"tables/{table_key}"]
+    obs_group = table["obs"]
+    columns = list(obs_group.attrs.get("column-order", []))
+    attrs = {}
+    if "uns" in table and "spatialdata_attrs" in table["uns"]:
+        attrs = dict(read_elem(table["uns"]["spatialdata_attrs"]))
+    instance_key = _resolve_instance_key(SimpleNamespace(
+        obs=SimpleNamespace(columns=columns), uns={"spatialdata_attrs": attrs}
+    ))
+    wanted = {CELL_TYPE_BROAD_CLASS_COL, CELL_TYPE_FINE_CLUSTER_COL,
+              CELL_TYPE_NEURON_SPLIT_COL, instance_key}
+    wanted.update(f"{key}_name" for key in CELL_TYPE_LEVEL_LABELS if key.startswith("ct_"))
+    index_key = str(obs_group.attrs.get("_index", "_index"))
+    obs = pd.DataFrame(index=np.asarray(read_elem(obs_group[index_key])))
+    for column in columns:
+        if column in wanted:
+            obs[column] = read_elem(obs_group[column])
+    return table_key, obs, instance_key
+
+
+def _cell_label_levels(obs) -> dict[str, np.ndarray]:
+    levels = {}
+    if CELL_TYPE_BROAD_CLASS_COL in obs:
+        broad = _clean_cell_labels(obs[CELL_TYPE_BROAD_CLASS_COL])
+        if CELL_TYPE_NEURON_SPLIT_COL in obs:
+            split = obs[CELL_TYPE_NEURON_SPLIT_COL].astype(str).str.lower().map(_NEURON_SPLIT_LABELS)
+            for i, label in enumerate(broad):
+                if label and label.lower() == NEURON_BROAD_CLASS.lower() and pd.notna(split.iloc[i]):
+                    broad[i] = split.iloc[i]
+        if any(value is not None for value in broad):
+            levels["broad"] = broad
+            fine = (_clean_cell_labels(obs[CELL_TYPE_FINE_CLUSTER_COL])
+                    if CELL_TYPE_FINE_CLUSTER_COL in obs else broad.copy())
+            levels["fine"] = np.array([
+                (f if f is not None else b) if b is not None else None
+                for b, f in zip(broad, fine)
+            ], dtype=object)
+    for kind in CELL_TYPE_LEVEL_LABELS:
+        column = f"{kind}_name"
+        if kind.startswith("ct_") and column in obs:
+            labels = _clean_cell_labels(obs[column])
+            if any(value is not None for value in labels):
+                levels[kind] = labels
+    return levels
+
+
+def cell_type_levels(zarr_path: Any, segmentation: str) -> dict[str, str]:
+    """List usable stored levels; missing, empty or unreadable data offers none."""
     try:
-        import anndata as ad
-
-        table = ad.read_zarr(str(Path(zarr_path) / "tables" / table_key))
+        result = _read_cell_type_obs(zarr_path, segmentation)
+        if result is None:
+            return {}
+        levels = _cell_label_levels(result[1])
+        return {key: CELL_TYPE_LEVEL_LABELS[key] for key in levels}
     except Exception:
+        log.debug("Cannot inspect cell-type levels for %s", segmentation, exc_info=True)
+        return {}
+
+
+def load_cell_type_assignments(zarr_path: Any, segmentation: str = "proseg") -> CellTypeAssignments | None:
+    """Load legacy and resolved Allen hierarchy labels joined by exact mask IDs.
+
+    Nullable levels stay missing at those cells; no finer assignment is inferred
+    from a coarser level. Stored candidate names retain their upstream meaning.
+    """
+    try:
+        result = _read_cell_type_obs(zarr_path, segmentation)
+        if result is None:
+            return None
+        table_key, obs, instance_key = result
+        levels = _cell_label_levels(obs)
+        if not levels:
+            return None
+        # Share the exact-integer join used by UMAP, including 19-digit IDs.
+        ids, valid = cell_ids_as_int64(obs[instance_key] if instance_key else obs.index)
+        valid &= np.logical_or.reduce([pd.notna(values) for values in levels.values()])
+        if not valid.any():
+            return None
+        levels = {key: values[valid] for key, values in levels.items()}
+        broad = levels.get("broad", levels.get("ct_broad", next(iter(levels.values()))))
+        fine = levels.get("fine", levels.get("ct_final", broad))
+        return CellTypeAssignments(
+            segmentation=str(segmentation), table_key=table_key,
+            instance_key=instance_key, cell_ids=ids[valid],
+            broad=broad, fine=fine, levels=levels,
+        )
+    except Exception:
+        log.debug("Cannot load cell-type assignments for %s", segmentation, exc_info=True)
         return None
-
-    obs = getattr(table, "obs", None)
-    if obs is None or CELL_TYPE_BROAD_CLASS_COL not in getattr(obs, "columns", []):
-        return None
-    instance_key = _resolve_instance_key(table)
-
-    broad = obs[CELL_TYPE_BROAD_CLASS_COL].astype(str).str.strip()
-    # Split the single "Neurons" broad class into excitatory / inhibitory
-    # categories where the neuron sub-split is recorded.
-    if CELL_TYPE_NEURON_SPLIT_COL in obs.columns:
-        split = obs[CELL_TYPE_NEURON_SPLIT_COL].astype(str).str.strip()
-        split_named = split.str.lower().map(_NEURON_SPLIT_LABELS)
-        is_neuron = broad.str.lower() == NEURON_BROAD_CLASS.lower()
-        broad = broad.mask(is_neuron & split_named.notna(), split_named)
-    if CELL_TYPE_FINE_CLUSTER_COL in obs.columns:
-        fine = obs[CELL_TYPE_FINE_CLUSTER_COL].astype(str).str.strip()
-    else:
-        fine = broad.copy()
-
-    if instance_key and instance_key in obs.columns:
-        ids = pd.to_numeric(obs[instance_key], errors="coerce")
-    else:
-        ids = pd.to_numeric(pd.Series(obs.index, index=obs.index), errors="coerce")
-
-    # Keep only rows with a real broad label and a valid integer mask id.
-    valid = ids.notna().to_numpy() & ~broad.str.lower().isin(_MISSING_LABEL_TEXTS).to_numpy()
-    if not valid.any():
-        return None
-    cell_ids = ids.to_numpy()[valid].astype(np.int64, copy=False)
-    broad_arr = broad.to_numpy()[valid]
-    fine_arr = fine.to_numpy()[valid]
-    # Fine labels can be missing even when broad is present; fall back to broad.
-    fine_missing = pd.Series(fine_arr).str.lower().isin(_MISSING_LABEL_TEXTS).to_numpy()
-    if fine_missing.any():
-        fine_arr = fine_arr.copy()
-        fine_arr[fine_missing] = broad_arr[fine_missing]
-
-    return CellTypeAssignments(
-        segmentation=str(segmentation),
-        table_key=str(table_key),
-        instance_key=str(instance_key),
-        cell_ids=cell_ids,
-        broad=broad_arr,
-        fine=fine_arr,
-    )
 
 
 @dataclass
@@ -2760,6 +2876,36 @@ def build_cell_type_color_schemes(
         groups=fine_groups,
     )
     return {"broad": broad_scheme, "fine": fine_scheme}
+
+
+def build_assignment_color_schemes(
+    assignments: Iterable[CellTypeAssignments],
+) -> dict[str, CellTypeColorScheme]:
+    """Build matching palettes over one or multiple datasets' stored levels."""
+    items = list(assignments)
+    if not items:
+        return {}
+    schemes = build_cell_type_color_schemes(
+        np.concatenate([item.broad for item in items]),
+        np.concatenate([item.fine for item in items]),
+    )
+    keys = set().union(*(
+        item.levels or {"broad": item.broad, "fine": item.fine} for item in items
+    ))
+    schemes = {key: scheme for key, scheme in schemes.items() if key in keys}
+    for key in CELL_TYPE_LEVEL_LABELS:
+        if key not in keys or key in ("broad", "fine"):
+            continue
+        labels = sorted({
+            str(label) for item in items for label in item.labels_for(key)
+            if label is not None and str(label).lower() not in _MISSING_LABEL_TEXTS
+        })
+        palette = gene_palette_rgba(len(labels), alpha=1.0)
+        schemes[key] = CellTypeColorScheme(
+            kind=key, colors=dict(zip(labels, palette)), order=labels,
+            groups=[(CELL_TYPE_LEVEL_LABELS[key], labels)] if labels else [],
+        )
+    return schemes
 
 
 def build_cell_type_color_dict(

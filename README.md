@@ -8,8 +8,8 @@ The viewer opens a single Napari window with a tabbed control panel (tabs across
 the top of the right-hand dock): **Gene inspector**, **Cell segmentation**,
 **Cell type labels**, **Per cell statistics**, **Draw tissue annotations**,
 **Images**, **Dataset loader**, and **UMAP**. With
-a supplied dataset it automatically loads all image channels, the Cellpose and
-ProSeg cell segmentations, and all transcripts (rendered as per-gene coloured
+a supplied dataset it automatically loads all image channels, the Cellpose, ProSeg and
+ProSeg hybrid cell segmentations, and all transcripts (rendered as per-gene coloured
 points). A busy progress bar with a stage label below the tabs shows what is
 loading (image pyramids, cell masks, transcripts, …).
 
@@ -175,10 +175,12 @@ then reopen both stores.
 
 ### Default startup and low-RAM flags
 
-In either workflow, the viewer loads all available image channels, the Cellpose
-and ProSeg segmentations (shown as lazy label outlines), and all transcripts as
-per-gene points by default. Per-cell statistic overlays are **not** loaded
-automatically and are unavailable in paired mode.
+In either workflow, the viewer loads all available image channels, the Cellpose,
+ProSeg and ProSeg hybrid segmentations (shown as lazy label outlines), and all
+transcripts as per-gene points by default. Per-cell statistic overlays are **not** loaded
+automatically and are unavailable in paired mode. Missing segmentations are
+skipped. Outline colours match between MERSCOPE and Xenium: **Cellpose green**,
+**ProSeg hybrid magenta**, and **ProSeg cyan**.
 
 On low-memory systems you can suppress the startup load of any layer type; each
 `--skip-*` flag only skips the *automatic* load — you can still load that layer
@@ -191,6 +193,7 @@ napari-compare-xenium-merscope \
   --skip-images \       # don't auto-load images (load from the Images tab)
   --skip-cellpose \     # don't auto-load the Cellpose mask
   --skip-proseg \       # don't auto-load the ProSeg mask
+  --skip-proseg-hybrid \ # don't auto-load the ProSeg hybrid mask
   --skip-transcripts    # don't auto-load transcripts (load from the Gene inspector tab)
 ```
 
@@ -436,10 +439,11 @@ Only that array and the cell-id column are read, so opening it takes about a
 second even for ~170k cells. The window can be closed and reopened at any time
 and stays above the viewer.
 
-- **Cell type source** picks which clustering's UMAP is shown (ProSeg reseg,
-  ProSeg in-mask, Cellpose, or the original segmentation). Only sources stored
-  in the dataset are offered.
-- **Colour by** offers **Broad cell type**, **Fine cell type**, or a
+- **Cell type source** picks which clustering's UMAP is shown (ProSeg hybrid,
+  ProSeg reseg, ProSeg in-mask, Cellpose, or the original segmentation). Only
+  sources with a stored UMAP are offered.
+- **Colour by** offers stored cell-type levels (including **Broad cell type**,
+  **Fine cell type** and the Allen hierarchy described below), or a
   **Per-cell statistic** (Channel / Statistic / Colormap, as on the Per cell
   statistics tab). Cell-type colours are identical to the **Cell type labels**
   masks. Statistics use the same 1st–99th percentile clipping as the spatial
@@ -462,6 +466,36 @@ and stays above the viewer.
 
 Scroll to zoom, drag to pan, and double-click (or **Reset view**) to fit the
 embedding. Hovering a point shows its cell ID and its label or value.
+
+### Allen / MAPMYCELLS cell-type hierarchy
+
+MerXen's reference-based annotation and `map_first` clustering outputs are
+supported in **Cell type labels** and **UMAP**, including the default
+`table_MOSAIK_proseg_hybrid_clustering_squidpy` table joined to
+`MOSAIK_proseg_hybrid` masks. Other segmentations can expose the same levels
+when their own clustering tables contain them.
+
+Choose **ProSeg hybrid** under **Cell type source**, then a stored **Colour by**
+level. **Allen · final assignment** displays `ct_final_name`, the deepest
+confident assignment selected by MerXen. Depending on species and output,
+additional choices include lineage, broad type, class, neurotransmitter,
+supercluster, subclass, SEA-AD subclass, and optional report-only cluster or
+supertype. These read their corresponding `ct_<level>_name` columns. Individual
+level names are displayed as stored, including candidates that MerXen may mark
+as low confidence; use **final assignment** for its resolved calls.
+
+Only levels with at least one non-missing label are offered. Missing cells stay
+transparent in the spatial fill and appear as **Unannotated** in UMAP; the
+viewer never substitutes a coarser label for a missing Allen level. Older stores
+retain their Broad/Fine choices. Stores without these annotations or a UMAP
+cannot select the corresponding new options.
+
+The selected level drives the spatial fill, UMAP colours, hover labels, type
+filters, and region-of-interest summaries. In paired mode the same type has the
+same colour in both platforms and both views. Spatial fills offer levels shared
+by both stores; paired UMAPs can show a level available in either store, with
+unannotated points in the other. Changing source or dataset removes unavailable
+choices and falls back to an available level.
 
 ### Regions of interest
 

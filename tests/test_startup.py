@@ -545,3 +545,28 @@ def test_left_panel_rotation_keeps_layers_registered_and_inputs_synchronised(qap
     adapter.rotation_spin.setValue(360.0)
     assert adapter.rotation_slider.value() == 36000
     assert np.allclose(image.affine.affine_matrix, np.eye(3), atol=1e-12)
+
+
+def test_default_masks_include_hybrid_without_confusing_it_with_proseg():
+    ctrl = object.__new__(V.ComparisonViewerController)
+    ctrl.args = types.SimpleNamespace()
+    ctrl._segmentation_keys = ["MOSAIK_proseg_hybrid", "MOSAIK_cellpose", "MOSAIK_proseg"]
+    assert ctrl._startup_segmentation_keys() == ["MOSAIK_cellpose", "MOSAIK_proseg", "MOSAIK_proseg_hybrid"]
+    ctrl._paired_session = types.SimpleNamespace(segmentation_keys=["proseg_hybrid", "proseg", "cellpose"])
+    assert ctrl._paired_startup_segmentation_keys() == ["cellpose", "proseg", "proseg_hybrid"]
+    ctrl.args.skip_proseg = True
+    assert ctrl._paired_startup_segmentation_keys() == ["cellpose", "proseg_hybrid"]
+    ctrl.args.skip_proseg_hybrid = True
+    assert ctrl._startup_segmentation_keys() == ["MOSAIK_cellpose"]
+    ctrl.args = types.SimpleNamespace()
+    ctrl._segmentation_keys = ["MOSAIK_proseg_hybrid"]
+    assert ctrl._startup_segmentation_keys() == ["MOSAIK_proseg_hybrid"]
+
+
+@pytest.mark.parametrize("method, colour", [
+    ("cellpose", (0, 1, 0, 1)), ("proseg_hybrid", (1, 0, 1, 1)), ("proseg", (0, 1, 1, 1)),
+])
+def test_segmentation_outline_colours_match_platforms(method, colour):
+    assert V.segmentation_color(f"MERSCOPE:MOSAIK_{method}_labels") == colour
+    assert V.segmentation_color(f"XENIUM:MOSAIK_{method}_labels") == colour
+    assert V.segmentation_color(method) == colour

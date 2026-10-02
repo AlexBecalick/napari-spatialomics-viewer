@@ -387,8 +387,9 @@ def _cell_type_controller_with_synthetic_store(qapp, monkeypatch):
         fine=np.array(["Neurons:0", "Neurons:1", "Astrocytes:0", "Astrocytes:0"]),
     )
     monkeypatch.setattr(
-        V, "clustering_table_key_for_segmentation",
-        lambda z, seg: assignments.table_key if seg == "proseg" else None,
+        V, "cell_type_levels",
+        lambda z, seg: {"broad": "Broad cell type", "fine": "Fine cell type"}
+        if seg == "proseg" else {},
     )
     monkeypatch.setattr(
         V, "load_cell_type_assignments",
