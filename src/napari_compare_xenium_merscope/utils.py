@@ -2515,8 +2515,8 @@ class CellTypeSource:
     clustering: ProSeg masks by the *reseg* (probabilistic-assignment) clustering
     or by a *proseg-mask* (in-mask transcript) clustering; the original instrument
     masks only by the *original* clustering. Each source pins the clustering
-    ``clustering_tables`` (first present in the store wins) to the ``mask_shape_keys``
-    it annotates (first present wins), so a request never joins a clustering's
+    ``clustering_tables`` (including their named map_first variants) to the
+    ``mask_shape_keys`` it annotates (first present wins), so a request never joins a clustering's
     instance ids against the wrong mask.
     """
 
@@ -2604,28 +2604,53 @@ class CellTypeAssignments:
 
 
 def clustering_table_key_for_segmentation(zarr_path: Any, segmentation: str) -> str | None:
-    """Return the ``*_clustering_squidpy`` table key for a cell-type source, if any.
+    """Resolve one source's annotation table, including named map_first runs.
 
-    ``segmentation`` is a :data:`CELL_TYPE_SOURCES` key (``"proseg"`` = reseg,
-    ``"proseg_mask"``, ``"cellpose"``, ``"original"``). Only that source's own
-    clustering tables are considered, so a request never falls back to a
-    different segmentation's table (which would join wrong ids). Returns ``None``
-    for an unknown source or when no matching table is stored.
+    MerXen can retain legacy tables beside ``_mapfirst`` or user-named runs
+    such as ``_m8``. Prefer an unsuffixed reference-annotated table, then the
+    conventional ``_mapfirst`` run, then other reference-annotated suffixes in
+    lexical order. Fall back to the source's original unsuffixed table when
+    no reference-annotated run exists. Both labels and UMAP use this resolver
+    so their rows always come from the same run.
+
+    Candidates must match a complete source-specific clustering-table prefix;
+    ProSeg, ProSeg hybrid and ProSeg in-mask tables never cross-match.
     """
     source = cell_type_source(segmentation)
     if source is None:
         return None
     try:
         root = open_zarr_group_unconsolidated(zarr_path)
+        if "tables" not in root:
+            return None
+        tables = root["tables"]
+        present = set(tables.group_keys())
+        annotated = []
+        for base_index, base in enumerate(source.clustering_tables):
+            for key in present:
+                if key != base and not key.startswith(base + "_"):
+                    continue
+                try:
+                    obs = tables[key]["obs"]
+                    columns = set(obs.attrs.get("column-order", []))
+                    # Check the stored fields, not just a suffix that could name
+                    # a legacy or incomplete run. Do not read expression data.
+                    has_labels = any(
+                        f"{level}_name" in columns and f"{level}_name" in obs
+                        for level in CELL_TYPE_LEVEL_LABELS
+                        if level.startswith("ct_")
+                    )
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if has_labels:
+                    rank = 0 if key == base else 1 if key == base + "_mapfirst" else 2
+                    annotated.append((rank, base_index, key))
+        if annotated:
+            return min(annotated)[2]
+        return next((key for key in source.clustering_tables if key in present), None)
     except Exception:
+        log.debug("Cannot resolve clustering table for %s", segmentation, exc_info=True)
         return None
-    if "tables" not in root:
-        return None
-    present = set(root["tables"].group_keys())
-    for key in source.clustering_tables:  # ordered; first present wins
-        if key in present:
-            return key
-    return None
 
 
 def _resolve_instance_key(table) -> str:
