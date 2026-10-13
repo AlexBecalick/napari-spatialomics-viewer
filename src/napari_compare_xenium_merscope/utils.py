@@ -1741,28 +1741,218 @@ def build_napari_affine_from_px_to_um(
     )
 
 
+MERSCOPE_TRANSFORM_CSV_NAME = "micron_to_mosaic_pixel_transform.csv"
+# The SpatialData MERSCOPE reader stores cell boundaries in microns with the
+# micron->mosaic-pixel affine as their ``global`` transformation, so the store
+# carries the same matrix as the CSV even when the CSV itself was not copied.
+MERSCOPE_TRANSFORM_SHAPES_KEY = "merscope_cell_boundaries"
+MERSCOPE_FALLBACK_UM_PER_PX = 0.108
+# Plausible MERSCOPE mosaic sampling in pixels per micron (nominal ~9.26, i.e.
+# 0.108 um/px). The range rejects an identity (1 px/um: boundaries already in
+# the micron frame) and nonsense matrices while tolerating other optics.
+MERSCOPE_PX_PER_UM_RANGE = (2.0, 50.0)
+# Mosaic pixels are square; a larger x/y scale ratio is not a micron->pixel map.
+MERSCOPE_MAX_PIXEL_ANISOTROPY = 1.05
+
+
+def merscope_transform_csv_candidates(zarr_path: str | Path) -> list[Path]:
+    """Places a micron_to_mosaic_pixel_transform.csv may sit for a MERSCOPE store."""
+    zarr_path = Path(zarr_path)
+    return [zarr_path / MERSCOPE_TRANSFORM_CSV_NAME, zarr_path.parent / MERSCOPE_TRANSFORM_CSV_NAME]
+
+
+def validate_micron_to_mosaic_matrix(matrix, *, source: str) -> np.ndarray:
+    """Return ``matrix`` as a 3x3 float affine, or raise ``ValueError``.
+
+    Accepts any orientation-preserving 2D affine (rotation and translation are
+    handled exactly by the inverse) whose scale is a plausible, square MERSCOPE
+    mosaic sampling.
+    """
+    try:
+        m = np.asarray(matrix, dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{source}: transform is not numeric ({exc})") from exc
+    if m.shape == (2, 3):
+        m = np.vstack([m, (0.0, 0.0, 1.0)])
+    if m.shape != (3, 3):
+        raise ValueError(f"{source}: expected a 3x3 2D affine, got shape {m.shape}")
+    if not np.isfinite(m).all():
+        raise ValueError(f"{source}: transform has non-finite entries")
+    if not np.allclose(m[2], (0.0, 0.0, 1.0), rtol=0.0, atol=1e-9):
+        raise ValueError(f"{source}: last row {m[2].tolist()} is not [0, 0, 1]; not a 2D affine")
+    linear = m[:2, :2]
+    det = float(np.linalg.det(linear))
+    if not det > 0.0:
+        raise ValueError(f"{source}: transform is singular or mirrored (det={det:.6g})")
+    scales = np.linalg.svd(linear, compute_uv=False)
+    lo, hi = MERSCOPE_PX_PER_UM_RANGE
+    if float(scales.min()) < lo or float(scales.max()) > hi:
+        raise ValueError(
+            f"{source}: scale {np.round(scales, 6).tolist()} px/um is outside the plausible "
+            f"MERSCOPE mosaic range [{lo}, {hi}] px/um (nominal ~9.26)"
+        )
+    if float(scales.max() / scales.min()) > MERSCOPE_MAX_PIXEL_ANISOTROPY:
+        raise ValueError(
+            f"{source}: x/y scales {np.round(scales, 6).tolist()} px/um are not square mosaic pixels"
+        )
+    return m
+
+
+def _read_json_mapping(path: Path) -> dict | None:
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _zarr_element_attributes(zarr_path: Path, group: str, key: str) -> dict | None:
+    """Return one element's zarr attributes from metadata only (no data reads).
+
+    Prefers the element's own ``zarr.json`` (v3) or ``.zattrs`` (v2) and falls
+    back to the root consolidated metadata.
+    """
+    element = zarr_path / group / key
+    own_v3 = _read_json_mapping(element / "zarr.json")
+    if own_v3 is not None and isinstance(own_v3.get("attributes"), dict):
+        return own_v3["attributes"]
+    own_v2 = _read_json_mapping(element / ".zattrs")
+    if own_v2 is not None:
+        return own_v2
+
+    root = _read_json_mapping(zarr_path / "zarr.json")
+    consolidated = root.get("consolidated_metadata") if root is not None else None
+    metadata = consolidated.get("metadata") if isinstance(consolidated, dict) else None
+    entry = metadata.get(f"{group}/{key}") if isinstance(metadata, dict) else None
+    if isinstance(entry, dict) and isinstance(entry.get("attributes"), dict):
+        return entry["attributes"]
+
+    zmetadata = _read_json_mapping(zarr_path / ".zmetadata")
+    metadata = zmetadata.get("metadata") if zmetadata is not None else None
+    entry = metadata.get(f"{group}/{key}/.zattrs") if isinstance(metadata, dict) else None
+    return entry if isinstance(entry, dict) else None
+
+
+def _global_xy_affine_from_ngff(transformations, *, source: str) -> np.ndarray | None:
+    """Return the x/y affine of the NGFF transformation into ``global``, if any."""
+    if not isinstance(transformations, list):
+        return None
+    for entry in transformations:
+        if not isinstance(entry, dict):
+            continue
+        output = entry.get("output")
+        name = output.get("name") if isinstance(output, dict) else output
+        if name != "global":
+            continue
+        try:
+            from spatialdata.transformations.ngff.ngff_transformations import NgffBaseTransformation
+            from spatialdata.transformations.transformations import BaseTransformation
+
+            transformation = BaseTransformation.from_ngff(NgffBaseTransformation.from_dict(dict(entry)))
+            matrix = transformation.to_affine_matrix(input_axes=("x", "y"), output_axes=("x", "y"))
+        except Exception as exc:
+            raise ValueError(f"{source}: could not read its 'global' transformation ({exc})") from exc
+        return np.asarray(matrix, dtype=float)
+    return None
+
+
+def read_merscope_micron_to_mosaic_from_zarr(
+    zarr_path: str | Path,
+    shapes_key: str = MERSCOPE_TRANSFORM_SHAPES_KEY,
+) -> np.ndarray | None:
+    """Return the store's micron->mosaic-pixel matrix from metadata alone.
+
+    Reads the ``global`` transformation of ``shapes/<shapes_key>`` without
+    loading geometries. Returns ``None`` when the element or its ``global``
+    transformation is absent; raises ``ValueError`` when it is present but is
+    not a plausible MERSCOPE micron->mosaic-pixel affine.
+    """
+    zarr_path = Path(zarr_path)
+    source = f"shapes/{shapes_key} in {zarr_path}"
+    attrs = _zarr_element_attributes(zarr_path, "shapes", shapes_key)
+    if attrs is None:
+        return None
+    matrix = _global_xy_affine_from_ngff(attrs.get("coordinateTransformations"), source=source)
+    if matrix is None:
+        return None
+    return validate_micron_to_mosaic_matrix(matrix, source=f"{source} 'global' transformation")
+
+
+def _resolve_merscope_micron_to_mosaic(
+    merscope_transform_path: str | Path | None,
+    zarr_path: str | Path | None,
+) -> np.ndarray | None:
+    """Pick the micron->mosaic matrix: CSV first, then the store's own transform."""
+    missing: list[str] = []
+    path = Path(merscope_transform_path) if merscope_transform_path else None
+    if path is not None and path.exists():
+        try:
+            matrix = validate_micron_to_mosaic_matrix(np.loadtxt(path), source=str(path))
+        except (OSError, ValueError) as exc:
+            log.warning("[MERSCOPE] Ignoring transform file %s (%s)", path, exc)
+            missing.append(f"{path} is not a usable micron->mosaic transform")
+        else:
+            log.info("[MERSCOPE] Placing images with the micron->mosaic transform from %s", path)
+            return matrix
+    elif path is not None:
+        missing.append(f"{path} does not exist")
+    elif zarr_path is not None:
+        missing.append(f"no {MERSCOPE_TRANSFORM_CSV_NAME} in or beside {zarr_path}")
+    else:
+        missing.append(f"no {MERSCOPE_TRANSFORM_CSV_NAME} given")
+
+    if zarr_path is not None:
+        source = f"shapes/{MERSCOPE_TRANSFORM_SHAPES_KEY} 'global' transformation in {zarr_path}"
+        try:
+            matrix = read_merscope_micron_to_mosaic_from_zarr(zarr_path)
+        except ValueError as exc:
+            missing.append(f"{source} is unusable ({exc})")
+        else:
+            if matrix is not None:
+                log.info(
+                    "[MERSCOPE] Placing images with the micron->mosaic transform from the %s",
+                    source,
+                )
+                return matrix
+            missing.append(f"no {source}")
+
+    log.warning(
+        "[MERSCOPE] No micron->mosaic transform found (%s); using fallback %s um/px isotropic "
+        "scale with no translation. Images will be offset from masks and transcripts unless "
+        "the mosaic origin is (0, 0) um.",
+        "; ".join(missing),
+        MERSCOPE_FALLBACK_UM_PER_PX,
+    )
+    return None
+
+
 def resolve_dataset_mask_affine(
     dataset_name: str,
     merscope_transform_path: str | Path | None = None,
     xenium_spec_path: str | Path | None = None,
+    *,
+    zarr_path: str | Path | None = None,
 ) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
-    """Resolve pixel->micron affine transform for a dataset."""
+    """Resolve pixel->micron affine transform for a dataset.
+
+    For MERSCOPE the micron->mosaic-pixel matrix comes from
+    ``merscope_transform_path`` when it exists, otherwise from the ``global``
+    transformation of ``shapes/merscope_cell_boundaries`` in ``zarr_path``;
+    its inverse (translation included) is returned. Only when neither is usable
+    does it fall back to a 0.108 um/px scale with no translation.
+    """
     ds = str(dataset_name).upper()
 
     if ds == "MERSCOPE":
-        path = Path(merscope_transform_path) if merscope_transform_path else None
-        if path is not None and path.exists():
-            matrix = np.loadtxt(path)
+        matrix = _resolve_merscope_micron_to_mosaic(merscope_transform_path, zarr_path)
+        if matrix is not None:
             inv = np.linalg.inv(matrix)
             return (
                 (float(inv[0, 0]), float(inv[0, 1]), float(inv[0, 2])),
                 (float(inv[1, 0]), float(inv[1, 1]), float(inv[1, 2])),
             )
-
-        log.warning(
-            "[MERSCOPE] Transform file missing; using fallback 0.108 um/px isotropic scale."
-        )
-        return (0.108, 0.0, 0.0), (0.0, 0.108, 0.0)
+        mpp = float(MERSCOPE_FALLBACK_UM_PER_PX)
+        return (mpp, 0.0, 0.0), (0.0, mpp, 0.0)
 
     if ds == "XENIUM":
         mpp = None
