@@ -29,6 +29,9 @@ release, that becomes a minor (or major) bump and you tag it.
 ## Cutting a release
 
 1. Bump `version` in [`pyproject.toml`](pyproject.toml) (e.g. `0.1.0` → `0.2.0`).
+   Add curated release notes at `docs/releases/<tag>.md` (for example,
+   `docs/releases/v0.3.0.md`) and include them in the release commit. The release
+   workflow reads this file into the release body and appends generated notes.
 2. Commit it:
    ```bash
    git add pyproject.toml

@@ -193,6 +193,7 @@ jobs:
     permissions:
       contents: write        # required to create the release and upload assets
     steps:
+      - uses: actions/checkout@v5
       - name: Download build artifacts
         uses: actions/download-artifact@v6
         with:
@@ -210,6 +211,7 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
+          body_path: docs/releases/${{ github.ref_name }}.md
           files: |
             dist-artifacts/**/*
             SHA256SUMS.txt
