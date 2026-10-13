@@ -481,7 +481,7 @@ def test_cell_type_state_is_scoped_to_store_path(qapp, monkeypatch):
     new = ctrl._cell_type_state("MERSCOPE")
 
     assert new is not old
-    assert new.store_path.endswith("/a/different/store.zarr")
+    assert Path(new.store_path) == ctrl.datasets["MERSCOPE"].zarr_path.resolve()
     assert new.assignments == {}
 
 
