@@ -571,9 +571,21 @@ so on large pairs), so the drawing itself stays smooth.
 
 ## Data Assumptions
 
-In standalone mode, MERSCOPE inputs may include
-`micron_to_mosaic_pixel_transform.csv` inside the zarr directory. If missing,
-the viewer falls back to `0.108 um/px`.
+In standalone mode, MERSCOPE images are placed in microns with the inverse of
+the micron-to-mosaic-pixel transform, taken from the first of:
+
+1. `--merscope-transform-path`, when that file exists;
+2. `micron_to_mosaic_pixel_transform.csv` inside the zarr directory, then beside
+   it (the zarr's parent folder);
+3. the `global` transformation of `shapes/merscope_cell_boundaries` in the zarr
+   (read from metadata only). The SpatialData MERSCOPE reader stores the same
+   matrix there, so MerXen's published stores need no CSV.
+
+The log names the source used. Only when none is usable does the viewer fall
+back to `0.108 um/px` with no translation, with a warning: images are then
+offset from masks and transcripts unless the mosaic origin is (0, 0) um.
+Viewer-built label caches rasterized under a transform that places them more
+than 1 um from the current one are rebuilt.
 
 In standalone mode, Xenium inputs may include `experiment.xenium` either inside
 the zarr directory or beside it. If missing, the viewer falls back to `0.2125

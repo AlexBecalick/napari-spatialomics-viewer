@@ -236,6 +236,7 @@ from .utils import (
     load_cellpose_quantification_values,
     make_layer_name,
     matching_layer_names,
+    merscope_transform_csv_candidates,
     pixel_window_global_bounds,
     query_geometries_for_bounds,
     read_object_annotation_geojson,
@@ -560,6 +561,11 @@ GENE_STATUS_SYMBOL_GLYPHS = {
 SYNTHETIC_IMAGE_PYRAMID_MIN_SIZE = 1024
 SYNTHETIC_IMAGE_PYRAMID_MAX_LEVELS = 10
 LABEL_CACHE_ATTR = "napari_compare_label_cache"
+# A viewer-built label raster is reused only while the current pixel->micron
+# transform places it within this distance of where it was rasterized. Larger
+# drift (e.g. a cache built with the old untranslated 0.108 um/px fallback on a
+# store whose mosaic origin is not (0, 0)) forces a rebuild.
+LABEL_CACHE_TRANSFORM_TOLERANCE_UM = 1.0
 # Raster layers use napari's bounded opportunistic RAM cache. At startup we
 # replace its thread-unsafe callback bookkeeping with ThreadSafeDaskCache so
 # concurrent layers retain hot chunks without Cache._posttask races.
@@ -5182,14 +5188,27 @@ class ComparisonViewerController:
             self.viewer.layers.remove(layer)
 
     def _resolve_optional_transform_paths(self, ds: str, cfg: DatasetConfig) -> tuple[Path | None, Path | None]:
-        """Resolve optional transform/spec paths from explicit args or common defaults."""
+        """Resolve optional transform/spec paths from explicit args or common defaults.
+
+        MERSCOPE: an existing explicit CSV wins, then a CSV inside the zarr, then
+        one beside it. ``None`` lets :func:`resolve_dataset_mask_affine` fall
+        back to the store's own ``merscope_cell_boundaries`` transform.
+        """
         merscope_transform_path = cfg.merscope_transform_path
         xenium_spec_path = cfg.xenium_spec_path
 
-        if ds == "MERSCOPE" and merscope_transform_path is None:
-            candidate = cfg.zarr_path / "micron_to_mosaic_pixel_transform.csv"
-            if candidate.exists():
-                merscope_transform_path = candidate
+        if ds == "MERSCOPE":
+            if merscope_transform_path is not None and not Path(merscope_transform_path).exists():
+                log.warning(
+                    "[MERSCOPE] Transform file %s does not exist; looking beside the zarr instead.",
+                    merscope_transform_path,
+                )
+                merscope_transform_path = None
+            if merscope_transform_path is None:
+                for candidate in merscope_transform_csv_candidates(cfg.zarr_path):
+                    if candidate.exists():
+                        merscope_transform_path = candidate
+                        break
 
         if ds == "XENIUM" and xenium_spec_path is None:
             candidates = [
@@ -5202,6 +5221,18 @@ class ComparisonViewerController:
                     break
 
         return merscope_transform_path, xenium_spec_path
+
+    def _resolve_dataset_pixel_transform(
+        self, ds: str, cfg: DatasetConfig
+    ) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+        """Pixel->micron transform used to place this dataset's images and labels."""
+        ms_tf_path, xe_spec_path = self._resolve_optional_transform_paths(ds, cfg)
+        return resolve_dataset_mask_affine(
+            ds,
+            merscope_transform_path=ms_tf_path,
+            xenium_spec_path=xe_spec_path,
+            zarr_path=cfg.zarr_path if ds == "MERSCOPE" else None,
+        )
 
     def _remove_layer_by_name(self, layer_name: str):
         """Remove a layer by exact name if present."""
@@ -5783,12 +5814,7 @@ class ComparisonViewerController:
         except Exception as exc:
             log.warning("[%s] Could not read images element (%s); continuing without images.", ds, exc)
             images_sdata = None
-        ms_tf_path, xe_spec_path = self._resolve_optional_transform_paths(ds, cfg)
-        x_transform, y_transform = resolve_dataset_mask_affine(
-            ds,
-            merscope_transform_path=ms_tf_path,
-            xenium_spec_path=xe_spec_path,
-        )
+        x_transform, y_transform = self._resolve_dataset_pixel_transform(ds, cfg)
         if self._segmentation_source() == "labels":
             segmentation_keys = sorted(
                 str(key) for key in sdata.labels.keys() if not is_derived_cache_key(str(key))
@@ -7457,7 +7483,68 @@ class ComparisonViewerController:
             # v2 rasterizes with true instance ids (v1 used positional id+1, which
             # mis-joined the cell-type overlay); force a rebuild of v1 caches.
             and attrs.get("version") == 2
+            and self._label_cache_matches_pixel_transform(label_key)
         )
+
+    def _label_cache_matches_pixel_transform(self, label_key: str) -> bool:
+        """Whether a cached label raster still lines up with the current transform.
+
+        Shapes are rasterized through the pixel->micron transform in force at
+        build time, and the raster is displayed through the current one
+        (:meth:`_label_display_affine`). When the two place the raster grid more
+        than ``LABEL_CACHE_TRANSFORM_TOLERANCE_UM`` apart, the cached masks would
+        be drawn away from their shapes, so the cache is stale. Only MERSCOPE
+        transforms changed source (CSV vs. the store's own transform vs. the
+        0.108 um/px fallback); Xenium caches and labels without a readable
+        ``global`` transformation are left to the existing checks.
+        """
+        sdata = self._active_sdata
+        if str(self.active_dataset or "").upper() != "MERSCOPE":
+            return True
+        if sdata is None or self._x_transform is None or self._y_transform is None:
+            return True
+        try:
+            label_elem = sdata.labels[label_key]
+            stored = self._napari_affine_from_element(label_elem)
+            height, width = (int(axis) for axis in get_scale0_dataarray(label_elem).shape[-2:])
+        except Exception:
+            return True
+        current = self._label_display_affine(label_elem)
+        corners = np.array(
+            [
+                [0.0, 0.0, max(height - 1, 0), max(height - 1, 0)],
+                [0.0, max(width - 1, 0), 0.0, max(width - 1, 0)],
+                [1.0, 1.0, 1.0, 1.0],
+            ]
+        )
+        drift_um = float(np.max(np.linalg.norm(((current - stored) @ corners)[:2], axis=0)))
+        if not np.isfinite(drift_um) or drift_um > LABEL_CACHE_TRANSFORM_TOLERANCE_UM:
+            log.info(
+                "[%s] Label cache %s was rasterized with a pixel->micron transform that "
+                "places it up to %.2f um from the current one; rebuilding it.",
+                self.active_dataset,
+                label_key,
+                drift_um,
+            )
+            return False
+        return True
+
+    def _derived_label_cache_matches_source(self, cache_key: str, label_key: str, sdata) -> bool:
+        """Whether a derived label cache was built from the current source raster.
+
+        Outline and pyramid caches copy their source label's transformation, so
+        a MERSCOPE source rebuilt under a different pixel->micron transform
+        (see :meth:`_label_cache_matches_pixel_transform`) leaves them with a
+        transformation that no longer matches.
+        """
+        if str(self.active_dataset or "").upper() != "MERSCOPE":
+            return True
+        try:
+            cache_affine = self._napari_affine_from_element(sdata.labels[cache_key])
+            source_affine = self._napari_affine_from_element(sdata.labels[label_key])
+        except Exception:
+            return True
+        return bool(np.allclose(cache_affine, source_affine, rtol=0.0, atol=1e-9))
 
     def _mark_label_cache_complete(self, label_key: str, shape_key: str, shape: tuple[int, int], chunks: tuple[int, int]):
         if self.active_dataset is None:
@@ -7713,6 +7800,7 @@ class ComparisonViewerController:
             and self._refresh_label_key_from_store(
                 cache_key, dataset_name=ds, target_sdata=sdata
             )
+            and self._derived_label_cache_matches_source(cache_key, label_key, sdata)
         ):
             return cache_key
 
@@ -8155,6 +8243,7 @@ class ComparisonViewerController:
             and self._refresh_label_key_from_store(
                 cache_key, dataset_name=ds, target_sdata=sdata
             )
+            and self._derived_label_cache_matches_source(cache_key, label_key, sdata)
         ):
             return self._label_pyramid_levels_from_element(sdata.labels[cache_key])
 
@@ -13951,7 +14040,10 @@ def parse_args() -> argparse.Namespace:
         "--merscope-transform-path",
         default=None,
         type=Path,
-        help="Optional MERSCOPE micron_to_mosaic_pixel_transform.csv path",
+        help=(
+            "Optional MERSCOPE micron_to_mosaic_pixel_transform.csv path. Default: the CSV in "
+            "or beside the zarr, else the zarr's merscope_cell_boundaries transform."
+        ),
     )
     parser.add_argument(
         "--xenium-spec-path",
