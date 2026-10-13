@@ -83,6 +83,9 @@ downloadable artifacts. It does not create a GitHub Release or publish the
 installers automatically. Native packages are built and smoke-tested on their
 target operating systems; PyInstaller is not a cross-compiler.
 
+Pushing a version tag such as `v0.3.0` builds these same installers and publishes
+a GitHub Release with checksums and release notes. See [RELEASING.md](RELEASING.md).
+
 For local package builds, first install the pinned build environment:
 
 ```bash
