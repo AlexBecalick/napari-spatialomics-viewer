@@ -3877,7 +3877,7 @@ class GeneLayerAggregateRow(QFrame):
 class NapariLeftPanelAdapter(QObject):
     """Apply the viewer-specific, non-destructive presentation of napari's left dock."""
 
-    def __init__(self, viewer):
+    def __init__(self, viewer, settings=None):
         qt_viewer = viewer.window._qt_viewer
         super().__init__(qt_viewer)
         self.viewer = viewer
@@ -3889,6 +3889,10 @@ class NapariLeftPanelAdapter(QObject):
         self._layer_base_affines = WeakKeyDictionary()
         self._layer_base_bounds = WeakKeyDictionary()
         self._rotation_angle = 0.0
+        self._rotation_settings = settings if settings is not None else QSettings(
+            "Napari Compare Xenium MERSCOPE", "Spatialomics Viewer"
+        )
+        self._rotation_settings_key = None
         self._layer_controls_expanded = True
         self._expanded_layer_controls_height = 260
         self._collapse_button = None
@@ -4037,12 +4041,51 @@ class NapariLeftPanelAdapter(QObject):
         layout.addWidget(label)
         layout.addWidget(self.rotation_slider, 1)
         layout.addWidget(self.rotation_spin)
+        self.rotation_save_button = QPushButton("Save", control)
+        self.rotation_save_button.setToolTip("Save this rotation for the next time this dataset is opened")
+        self.rotation_save_button.setEnabled(False)
+        self.rotation_save_button.clicked.connect(self.save_rotation)
+        layout.addWidget(self.rotation_save_button)
 
         self.rotation_slider.valueChanged.connect(self._on_rotation_slider_changed)
         self.rotation_spin.valueChanged.connect(self._on_rotation_spin_changed)
         self._register_layers_for_rotation()
         control.setEnabled(any(layer in self._layer_base_affines for layer in self.viewer.layers))
         return control
+
+    def set_rotation_dataset(self, paths):
+        """Restore the saved angle for a standalone store or an aligned pair."""
+        canonical = [str(Path(path).expanduser().resolve()) for path in paths]
+        identity = json.dumps(canonical, separators=(",", ":"))
+        self._rotation_settings_key = "dataset_rotations/" + hashlib.sha256(identity.encode()).hexdigest()
+        try:
+            angle = float(self._rotation_settings.value(self._rotation_settings_key, 0.0))
+            if not np.isfinite(angle) or not 0.0 <= angle <= 360.0:
+                angle = 0.0
+        except (TypeError, ValueError):
+            angle = 0.0
+        self.set_rotation_angle(angle)
+        self.rotation_save_button.setEnabled(True)
+
+    def save_rotation(self):
+        """Persist only the display angle, leaving the source store untouched."""
+        if self._rotation_settings_key is None:
+            return
+        self._rotation_settings.setValue(self._rotation_settings_key, self._rotation_angle)
+        self._rotation_settings.sync()
+        if self._rotation_settings.status() != QSettings.NoError:
+            self.viewer.status = "Could not save rotation: viewer settings are not writable."
+            return
+        self.viewer.status = f"Saved rotation: {self._rotation_angle:.2f}°"
+
+    def unrotate_world_xy(self, xy):
+        """Convert displayed world coordinates back to the source micron frame."""
+        origin = self._rotation_origin()
+        if origin is None:
+            return xy
+        inverse = self._world_rotation_matrix(2, -self._rotation_angle, origin)
+        yx = inverse @ np.asarray([xy[1], xy[0], 1.0])
+        return float(yx[1]), float(yx[0])
 
     def _on_rotation_slider_changed(self, value: int):
         angle = float(value) / 100.0
@@ -4061,6 +4104,13 @@ class NapariLeftPanelAdapter(QObject):
     def set_rotation_angle(self, angle: float):
         """Rotate every layer by ``angle`` degrees in their shared world space."""
         self._rotation_angle = min(360.0, max(0.0, float(angle)))
+        for widget, value in (
+            (self.rotation_spin, self._rotation_angle),
+            (self.rotation_slider, int(round(self._rotation_angle * 100))),
+        ):
+            blocked = widget.blockSignals(True)
+            widget.setValue(value)
+            widget.blockSignals(blocked)
         self._register_layers_for_rotation()
         self._apply_rotation_to_layers()
 
@@ -4086,6 +4136,11 @@ class NapariLeftPanelAdapter(QObject):
             self._layer_base_bounds[layer]
             for layer in self.viewer.layers
             if layer in self._layer_base_bounds
+            and getattr(layer, "name", "") not in (ROI_OUTLINE_LAYER, ROI_CELLS_LAYER)
+            and not (
+                (identity := layer_identity_from_layer(layer)) is not None
+                and identity.element_key == ROI_PAIRED_ELEMENT
+            )
         ]
         if not bounds:
             return None
@@ -5909,6 +5964,9 @@ class ComparisonViewerController:
         gc.collect()
         ds = session.dataset
         self.active_dataset = ds
+        left_panel = getattr(self, "_left_panel_adapter", None)
+        if left_panel is not None:
+            left_panel.set_rotation_dataset([self.datasets[ds].zarr_path])
         self._active_sdata = session.sdata
         self._active_images_sdata = session.images_sdata
         self._x_transform = session.x_transform
@@ -6611,6 +6669,9 @@ class ComparisonViewerController:
         self._paired_selected_cells = {"MERSCOPE": [], "XENIUM": []}
         left_panel = getattr(self, "_left_panel_adapter", None)
         if left_panel is not None:
+            left_panel.set_rotation_dataset([
+                session.configs[platform].zarr_path for platform in ("MERSCOPE", "XENIUM")
+            ])
             left_panel.set_paired_mode(True)
         self._paired_registry = PairedLayerRegistry(
             self.viewer,
@@ -13079,6 +13140,11 @@ class ComparisonViewerController:
         except Exception as exc:
             log.debug("Could not toggle napari panning: %s", exc)
 
+    def _lasso_dataset_xy(self, event):
+        xy = self._event_world_xy(event)
+        adapter = getattr(self, "_left_panel_adapter", None)
+        return adapter.unrotate_world_xy(xy) if xy is not None and adapter is not None else xy
+
     def _spatial_lasso_gesture(self, event):
         """Generator driving one press-drag-release lasso in the spatial view.
 
@@ -13088,7 +13154,7 @@ class ComparisonViewerController:
         """
         if getattr(event, "button", 1) not in (1, None):
             return
-        start = self._event_world_xy(event)
+        start = self._lasso_dataset_xy(event)
         if start is None:
             return
         # napari re-derives camera panning from the active layer, so re-assert
@@ -13099,7 +13165,7 @@ class ComparisonViewerController:
         last_draw = 0.0
         yield
         while str(getattr(event, "type", "")) == "mouse_move":
-            xy = self._event_world_xy(event)
+            xy = self._lasso_dataset_xy(event)
             px = self._event_canvas_position(event)
             moved = (
                 last_px is None
@@ -13114,7 +13180,7 @@ class ComparisonViewerController:
                     self._draw_roi_outline(np.asarray(points), closed=False)
                     last_draw = now
             yield
-        end = self._event_world_xy(event)
+        end = self._lasso_dataset_xy(event)
         if end is not None:
             points.append(end)
         self._finish_lasso("spatial", np.asarray(points, dtype=float))

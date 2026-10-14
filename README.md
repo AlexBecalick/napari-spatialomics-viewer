@@ -682,3 +682,13 @@ platform-prefixed columns such as `xenium_pial_boundary_geojson`,
 ```bash
 pytest
 ```
+
+### Saved dataset rotation
+
+Use the Rotation slider or angle field below the layer list to rotate the display.
+Click **Save** beside the angle to restore it the next time you open that dataset.
+Angles are stored in local viewer settings using the full dataset path; an aligned
+MERSCOPE/Xenium pair has its own shared saved angle. Moving a store to a new path
+starts with zero rotation. To clear a saved rotation, set the angle to 0° and save.
+Source images, coordinates, and Zarr stores are never modified. Region drawing
+follows the rotated display while selecting cells in their original coordinate frame.

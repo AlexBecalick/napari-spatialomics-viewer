@@ -467,7 +467,7 @@ def test_left_panel_adapter_collapses_controls_and_aggregates_gene_rows(qapp):
     assert not controls.isHidden()
 
 
-def test_left_panel_rotation_keeps_layers_registered_and_inputs_synchronised(qapp):
+def test_left_panel_rotation_keeps_layers_registered_and_inputs_synchronised(qapp, tmp_path):
     from napari._qt.containers.qt_layer_list import QtLayerList
     from napari.components import ViewerModel
     from qtpy.QtWidgets import QDockWidget, QHBoxLayout, QPushButton, QVBoxLayout, QWidget
@@ -528,7 +528,13 @@ def test_left_panel_rotation_keeps_layers_registered_and_inputs_synchronised(qap
             _qt_window=types.SimpleNamespace(resizeDocks=lambda *_args: None),
         ),
     )
-    adapter = V.NapariLeftPanelAdapter(viewer)
+    from qtpy.QtCore import QSettings
+    settings_path = str(tmp_path / "viewer.ini")
+    settings = QSettings(settings_path, QSettings.IniFormat)
+    adapter = V.NapariLeftPanelAdapter(viewer, settings=settings)
+    store = tmp_path / "data.zarr"
+    store.mkdir()
+    adapter.set_rotation_dataset([store])
 
     adapter.rotation_spin.setValue(90.0)
     expected_origin_rotation = np.asarray([1.0, 0.0])
@@ -545,6 +551,47 @@ def test_left_panel_rotation_keeps_layers_registered_and_inputs_synchronised(qap
     adapter.rotation_spin.setValue(360.0)
     assert adapter.rotation_slider.value() == 36000
     assert np.allclose(image.affine.affine_matrix, np.eye(3), atol=1e-12)
+
+
+    adapter.set_rotation_angle(37.25)
+    xy = (0.25, 0.75)
+    displayed_yx = image.data_to_world(xy[::-1])
+    assert adapter.unrotate_world_xy(displayed_yx[::-1]) == pytest.approx(xy)
+
+    # A wide ROI must not move the rotation pivot or the underlying image.
+    before = image.affine.affine_matrix.copy()
+    outline = model.add_shapes(
+        [np.array([[-100., -100.], [-100., 100.], [100., 100.]])],
+        shape_type="polygon", name=V.ROI_OUTLINE_LAYER,
+    )
+    assert np.allclose(image.affine.affine_matrix, before)
+    assert np.allclose(outline.data_to_world(xy[::-1]), displayed_yx)
+
+    adapter.rotation_save_button.click()
+    adapter.set_rotation_angle(12.0)  # an unsaved edit does not replace the saved angle
+    assert list(store.iterdir()) == []
+    adapter.set_rotation_dataset([tmp_path / "other.zarr"])
+    assert adapter.rotation_spin.value() == 0.0
+    # Fresh settings instance models a new app process.
+    adapter._rotation_settings = QSettings(settings_path, QSettings.IniFormat)
+    adapter.set_rotation_dataset([store])
+    assert adapter.rotation_spin.value() == 37.25
+    assert adapter.rotation_slider.value() == 3725
+    adapter.set_rotation_dataset([store, tmp_path / "paired.zarr"])
+    assert adapter.rotation_spin.value() == 0.0
+    adapter.set_rotation_angle(90.0)
+    adapter.save_rotation()
+    adapter.set_rotation_dataset([store])
+    assert adapter.rotation_spin.value() == 37.25
+    adapter.set_rotation_angle(0.0)
+    adapter.save_rotation()
+    adapter.set_rotation_dataset([store])
+    assert adapter.rotation_spin.value() == 0.0
+    for invalid in ("broken", "nan", -5.0, 400.0):
+        settings.setValue(adapter._rotation_settings_key, invalid)
+        settings.sync()
+        adapter.set_rotation_dataset([store])
+        assert adapter.rotation_spin.value() == 0.0
 
 
 def test_default_masks_include_hybrid_without_confusing_it_with_proseg():

@@ -632,7 +632,24 @@ def _drag(ctrl, points_xy):
         next(callback)
 
 
-def test_spatial_lasso_outlines_cells_and_summarises_them_in_the_umap(qapp, monkeypatch):
+def _rotated_drag(ctrl, angle):
+    origin = np.array([20., 30.])
+    adapter = types.SimpleNamespace(
+        _rotation_angle=angle,
+        _rotation_origin=lambda: origin,
+        _world_rotation_matrix=V.NapariLeftPanelAdapter._world_rotation_matrix,
+    )
+    adapter.unrotate_world_xy = lambda xy: V.NapariLeftPanelAdapter.unrotate_world_xy(adapter, xy)
+    ctrl._left_panel_adapter = adapter
+    source = np.array([(-2, -2), (12, -2), (12, 12), (-2, 12)])
+    transform = V.NapariLeftPanelAdapter._world_rotation_matrix(2, angle, origin)
+    displayed = (transform @ np.column_stack([source[:, ::-1], np.ones(4)]).T).T[:, :2][:, ::-1]
+    _drag(ctrl, displayed)
+    return source
+
+
+@pytest.mark.parametrize("angle", [0.0, 37.25, 90.0, 180.0])
+def test_spatial_lasso_outlines_cells_and_summarises_them_in_the_umap(qapp, monkeypatch, angle):
     ctrl, widget = _controller(qapp)
     built = _fake_label_display(ctrl, monkeypatch)
     window = _open_window(ctrl, widget)
@@ -641,8 +658,8 @@ def test_spatial_lasso_outlines_cells_and_summarises_them_in_the_umap(qapp, monk
     assert ctrl._umap_lasso_armed and window.canvas.lasso_mode
     assert ctrl.viewer.camera.mouse_pan is False  # dragging draws instead of panning
 
-    # Outline ProSeg cell 202 (the 0..10 square) with a freehand drag.
-    _drag(ctrl, [(-2, -2), (12, -2), (12, 12), (-2, 12)])
+    source = _rotated_drag(ctrl, angle)
+    assert np.allclose(ctrl._umap_state().roi.polygon[:4], source)
     state = ctrl._umap_state()
     assert state.roi.space == "spatial"
     assert state.roi.cell_ids.tolist() == [202] and state.roi.rows.tolist() == [1]
@@ -923,13 +940,14 @@ def test_paired_umap_window_stacks_merscope_above_xenium_in_one_palette(qapp, mo
     assert not stat_item.isEnabled()
 
 
-def test_paired_spatial_lasso_mirrors_the_outline_and_selects_each_store(qapp, monkeypatch):
+@pytest.mark.parametrize("angle", [0.0, 37.25, 90.0])
+def test_paired_spatial_lasso_mirrors_the_outline_and_selects_each_store(qapp, monkeypatch, angle):
     ctrl, widget, registry = _paired_controller(qapp, monkeypatch)
     window = _open_window(ctrl, widget)
     widget._lasso_button.click()
     assert window.panel("XENIUM").canvas.lasso_mode
 
-    _drag(ctrl, [(-2, -2), (12, -2), (12, 12), (-2, 12)])
+    _rotated_drag(ctrl, angle)
     state = ctrl._umap_state()
     assert state.views["MERSCOPE"].roi.cell_ids.tolist() == [202]
     assert state.views["XENIUM"].roi.cell_ids.tolist() == [11]
