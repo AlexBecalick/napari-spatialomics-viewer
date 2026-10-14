@@ -57,7 +57,6 @@ from packaging.version import InvalidVersion, Version
 from spatialdata.models import Image2DModel, Labels2DModel
 from spatialdata.models.pyramids_utils import dask_arrays_to_datatree
 from spatialdata.transformations import Affine
-from spatialdata.transformations import get_transformation
 from spatialdata.transformations import set_transformation
 
 try:
@@ -213,6 +212,7 @@ from .utils import (
     pick_cell_at_point,
     ranked_gene_counts,
     affine_matrix_from_px_to_um,
+    aligned_raster_transformation,
     build_binned_label_color_dict,
     build_cortical_depth_annotation_geojson,
     build_object_annotation_geojson,
@@ -237,10 +237,12 @@ from .utils import (
     make_layer_name,
     matching_layer_names,
     merscope_transform_csv_candidates,
+    napari_affine_from_transformation,
     pixel_window_global_bounds,
     query_geometries_for_bounds,
     read_object_annotation_geojson,
     rasterize_geometries_chunk,
+    raster_display_transformation,
     resolve_dataset_mask_affine,
     resolve_gene_column,
     snap_cortical_depth_boundaries_to_edge,
@@ -6917,7 +6919,7 @@ class ComparisonViewerController:
         if len(levels) == 0:
             return []
 
-        transform = get_transformation(image_elem, to_coordinate_system="global")
+        coordinate_system, transform = raster_display_transformation(image_elem)
         channels = channel_labels(base_cyx)
         base_dtype = getattr(base_cyx, "dtype", None)
         pyramid_tree = self._datatree_from_levels(
@@ -6926,6 +6928,7 @@ class ComparisonViewerController:
             channels=channels,
             transform=transform,
             dtype=base_dtype,
+            coordinate_system=coordinate_system,
         )
         Image2DModel.validate(pyramid_tree)
         if cancel_check is not None and cancel_check():
@@ -7091,12 +7094,19 @@ class ComparisonViewerController:
                     if "y" in base_image_cyx.coords
                     else None
                 )
-                affine = build_napari_affine_from_px_to_um(
-                    x_transform=x_transform,
-                    y_transform=y_transform,
-                    x_coords=x_coords,
-                    y_coords=y_coords,
-                )
+                aligned_transform = aligned_raster_transformation(sdata.images[image_key])
+                if aligned_transform is not None:
+                    # A MerXen aligned image sits on the Xenium pixel grid in the
+                    # alignment frame; the dataset's MERSCOPE pixel transform
+                    # would draw it at about half size.
+                    affine = napari_affine_from_transformation(aligned_transform)
+                else:
+                    affine = build_napari_affine_from_px_to_um(
+                        x_transform=x_transform,
+                        y_transform=y_transform,
+                        x_coords=x_coords,
+                        y_coords=y_coords,
+                    )
 
                 for chan_idx, chan_name in enumerate(labels):
                     if only_channels is not None and (image_key, str(chan_name)) not in only_channels:
@@ -7356,16 +7366,13 @@ class ComparisonViewerController:
         return levels
 
     def _napari_affine_from_element(self, elem) -> np.ndarray:
-        tf = get_transformation(elem, to_coordinate_system="global")
-        m = tf.to_affine_matrix(input_axes=("x", "y"), output_axes=("x", "y"))
-        return np.array(
-            [
-                [float(m[1, 1]), float(m[1, 0]), float(m[1, 2])],
-                [float(m[0, 1]), float(m[0, 0]), float(m[0, 2])],
-                [0.0, 0.0, 1.0],
-            ],
-            dtype=float,
-        )
+        """Napari affine of the raster's stored transformation.
+
+        ``global`` when present, otherwise the MerXen alignment frame of an
+        aligned raster (see :func:`raster_display_transformation`).
+        """
+        _coordinate_system, tf = raster_display_transformation(elem)
+        return napari_affine_from_transformation(tf)
 
     def _label_display_affine(self, label_elem) -> np.ndarray:
         """Napari affine for a label raster, kept consistent with the images.
@@ -7380,7 +7387,16 @@ class ComparisonViewerController:
         the top-left quadrant of the image. Rebuilding the affine from the
         resolved pixel_size and the label's own (pixel-index) coordinates fixes
         that and is a no-op for MERSCOPE, where the two already agree.
+
+        The exception is a MerXen aligned raster (``*_aligned_nonrigid_labels``
+        in a MERSCOPE store). It is resampled onto the Xenium pixel grid and
+        maps only to the alignment frame, so it is placed by that stored
+        transformation (Xenium pixel size), like the aligned shapes and
+        transcripts whose coordinates are already in that frame.
         """
+        aligned_transform = aligned_raster_transformation(label_elem)
+        if aligned_transform is not None:
+            return napari_affine_from_transformation(aligned_transform)
         if self._x_transform is None or self._y_transform is None:
             return self._napari_affine_from_element(label_elem)
         try:
@@ -7419,9 +7435,18 @@ class ComparisonViewerController:
         # density) sort first by their ``_`` prefix, so a plain
         # ``next(iter(...))`` would pick a downsampled cache and rasterize every
         # mask onto a too-small grid -- clipping all cells outside the top-left.
+        # Aligned images (MerXen ``*_aligned_nonrigid``) sit on the Xenium grid
+        # in another frame, so the dataset pixel transform does not place them.
+        real_image_keys = [
+            k for k in self._active_images_sdata.images.keys() if not is_derived_cache_key(k)
+        ]
         image_key = next(
-            (k for k in self._active_images_sdata.images.keys() if not is_derived_cache_key(k)),
-            None,
+            (
+                k
+                for k in real_image_keys
+                if aligned_raster_transformation(self._active_images_sdata.images[k]) is None
+            ),
+            real_image_keys[0] if real_image_keys else None,
         )
         if image_key is None:
             raise RuntimeError(
@@ -7557,7 +7582,9 @@ class ComparisonViewerController:
         be drawn away from their shapes, so the cache is stale. Only MERSCOPE
         transforms changed source (CSV vs. the store's own transform vs. the
         0.108 um/px fallback); Xenium caches and labels without a readable
-        ``global`` transformation are left to the existing checks.
+        transformation are left to the existing checks. A MerXen aligned label
+        raster is displayed through its own stored transformation, so it always
+        matches and is never rebuilt on the MERSCOPE grid.
         """
         sdata = self._active_sdata
         if str(self.active_dataset or "").upper() != "MERSCOPE":
@@ -7813,6 +7840,7 @@ class ComparisonViewerController:
         transform,
         channels: list[str] | None = None,
         dtype=None,
+        coordinate_system: str = "global",
     ):
         if da is None:
             raise RuntimeError("dask is required to build derived raster caches.")
@@ -7823,7 +7851,7 @@ class ComparisonViewerController:
                 arr = arr.astype(dtype)
             arrays.append(arr)
         tree = dask_arrays_to_datatree(arrays, dims=dims, channels=channels)
-        set_transformation(tree, {"global": transform}, set_all=True)
+        set_transformation(tree, {str(coordinate_system): transform}, set_all=True)
         return tree
 
     def _ensure_label_outline_cache(
@@ -7893,12 +7921,13 @@ class ComparisonViewerController:
         # every level for steadier latency in both directions.
         outline_levels = rechunk_raster_levels_for_display(outline_levels)
 
-        tf = get_transformation(label_elem, to_coordinate_system="global")
+        coordinate_system, tf = raster_display_transformation(label_elem)
         outline_tree = self._datatree_from_levels(
             outline_levels,
             dims=("y", "x"),
             transform=tf,
             dtype=np.uint8,
+            coordinate_system=coordinate_system,
         )
         Labels2DModel.validate(outline_tree)
         self._raise_if_task_cancelled(cancel_check, expected_dataset)
@@ -8323,12 +8352,13 @@ class ComparisonViewerController:
         if len(levels) == 0:
             return []
 
-        transform = get_transformation(label_elem, to_coordinate_system="global")
+        coordinate_system, transform = raster_display_transformation(label_elem)
         pyramid_tree = self._datatree_from_levels(
             levels,
             dims=("y", "x"),
             transform=transform,
             dtype=getattr(base, "dtype", None),
+            coordinate_system=coordinate_system,
         )
         Labels2DModel.validate(pyramid_tree)
         self._raise_if_task_cancelled(cancel_check, expected_dataset)
