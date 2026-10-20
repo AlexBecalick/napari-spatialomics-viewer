@@ -2936,7 +2936,7 @@ class CellTypeWidget(QWidget):
 
     Mirrors :class:`GeneInspectorWidget`: a grouped, ticked list (each cell type
     with a colour swatch, fine subtypes grouped under their broad class) plus a
-    Broad/Fine level toggle, a cell-type *source* selector (which clustering fills
+    cell-type level dropdown, a cell-type *source* dropdown (which clustering fills
     which masks -- ProSeg reseg/in-mask, Cellpose, or the original segmentation),
     and a mask opacity slider. Toggling a type shows/hides those cells; the
     controller recolours the labels layer.
@@ -2968,8 +2968,7 @@ class CellTypeWidget(QWidget):
         self._checkboxes: dict[str, QCheckBox] = {}
         self._items: dict[str, QListWidgetItem] = {}
         self._headers: list[tuple[QListWidgetItem, str, list[str]]] = []
-        # No level is active until the user clicks Broad or Fine (those buttons
-        # are the "colour the masks" trigger), so start with none checked.
+        # Selecting a level triggers mask colouring; start without a selection.
         self._kind = ""
         self._segmentation = "proseg"
         self._suppress = False
@@ -2982,46 +2981,22 @@ class CellTypeWidget(QWidget):
         self._status_label.setWordWrap(True)
         self.status_message.connect(self._status_label.setText)
 
-        self._close_button = QPushButton("Remove cell-type colouring")
-        self._close_button.clicked.connect(self._on_close)
-
-        # -- Cell-type source (which clustering fills which masks) ------------
-        # One button per CellTypeSource: ProSeg masks can be coloured by the reseg
-        # (probabilistic) or in-mask clustering; the original instrument masks by
-        # the original clustering; Cellpose by its own. Only sources whose
-        # clustering table is stored are shown (see set_segmentation_available).
+        # Compact selectors leave the remaining dock height for cell types.
         self._seg_label = QLabel("Cell type source")
-        self._seg_group = QButtonGroup(self)
-        self._seg_group.setExclusive(True)
-        self._seg_buttons: dict[str, QPushButton] = {}
+        self._seg_combo = QComboBox()
         for source in CELL_TYPE_SOURCES:
-            button = QPushButton(source.label)
-            button.setCheckable(True)
-            button.setCursor(Qt.PointingHandCursor)
-            button.setToolTip(source.label)
-            button.clicked.connect(lambda _checked=False, s=source.key: self._on_segmentation_clicked(s))
-            self._seg_group.addButton(button)
-            self._seg_buttons[source.key] = button
-        if self._segmentation in self._seg_buttons:
-            self._seg_buttons[self._segmentation].setChecked(True)
+            self._seg_combo.addItem(source.label, source.key)
+        self._seg_combo.setCurrentIndex(self._seg_combo.findData(self._segmentation))
+        self._seg_combo.activated.connect(
+            lambda index: self._on_segmentation_clicked(self._seg_combo.itemData(index))
+        )
 
-        # -- Broad vs fine cell-type level ------------------------------------
         self._level_label = QLabel("Colour by")
-        self._level_group = QButtonGroup(self)
-        self._level_group.setExclusive(True)
-        self._level_broad_btn = QPushButton("Broad cell type")
-        self._level_fine_btn = QPushButton("Fine cell type")
-        self._level_buttons = {"broad": self._level_broad_btn, "fine": self._level_fine_btn}
-        for key, label in CELL_TYPE_LEVEL_LABELS.items():
-            if key not in self._level_buttons:
-                self._level_buttons[key] = QPushButton(label)
-        # Exclusive, but allow starting with none checked until the user picks.
-        self._level_group.setExclusive(False)
-        for kind, button in self._level_buttons.items():
-            button.setCheckable(True)
-            button.setCursor(Qt.PointingHandCursor)
-            button.clicked.connect(lambda _checked=False, k=kind: self._on_kind_clicked(k))
-            self._level_group.addButton(button)
+        self._level_combo = QComboBox()
+        self._level_combo.setPlaceholderText("Choose cell type level…")
+        self._level_combo.activated.connect(
+            lambda index: self._on_kind_clicked(self._level_combo.itemData(index))
+        )
 
         # -- Mask opacity (0-100 % -> 0..1) -----------------------------------
         self._opacity_slider = QSlider(Qt.Horizontal)
@@ -3047,23 +3022,10 @@ class CellTypeWidget(QWidget):
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(6)
         root.addWidget(self._title)
-        root.addWidget(self._close_button)
         root.addWidget(self._seg_label)
-        seg_col = QVBoxLayout()
-        seg_col.setSpacing(2)
-        for button in self._seg_buttons.values():
-            seg_col.addWidget(button)
-        root.addLayout(seg_col)
+        root.addWidget(self._seg_combo)
         root.addWidget(self._level_label)
-        level_row = QHBoxLayout()
-        level_row.addWidget(self._level_broad_btn)
-        level_row.addWidget(self._level_fine_btn)
-        root.addLayout(level_row)
-        for key, button in self._level_buttons.items():
-            if key not in ("broad", "fine"):
-                root.addWidget(button)
-                button.setVisible(False)
-                button.setEnabled(False)
+        root.addWidget(self._level_combo)
         opacity_row = QHBoxLayout()
         opacity_row.addWidget(QLabel("Mask opacity"))
         opacity_row.addWidget(self._opacity_slider)
@@ -3099,39 +3061,30 @@ class CellTypeWidget(QWidget):
             self._dataset = None if dataset is None else str(dataset)
             self._kind = ""
             self._show_all_check.setCheckState(Qt.Unchecked)
-            for button in self._level_buttons.values():
-                button.blockSignals(True)
-                button.setChecked(False)
-                button.blockSignals(False)
+            self._level_combo.setCurrentIndex(-1)
         finally:
             self._suppress = False
 
     def set_segmentation_available(self, available: dict[str, bool]):
-        """Show a cell-type source button only when its clustering is stored.
-
-        Keeps the current selection if it is still available, else falls back to
-        the first available source. Unavailable sources are hidden, so the panel
-        only offers what the dataset actually contains.
-        """
+        """Offer stored sources, retaining the current selection when available."""
         if not available.get(self._segmentation, False):
             self._segmentation = next((s for s, ok in available.items() if ok), self._segmentation)
-        for seg, button in self._seg_buttons.items():
-            ok = bool(available.get(seg, False))
-            button.blockSignals(True)
-            button.setEnabled(ok)
-            button.setVisible(ok)
-            button.setChecked(seg == self._segmentation)
-            button.blockSignals(False)
+        self._seg_combo.clear()
+        for source in CELL_TYPE_SOURCES:
+            if available.get(source.key, False):
+                self._seg_combo.addItem(source.label, source.key)
+        self._seg_combo.setCurrentIndex(self._seg_combo.findData(self._segmentation))
+        self._seg_combo.setEnabled(self._seg_combo.count() > 0)
 
     def set_levels_available(self, levels: dict[str, str]):
-        """Hide levels absent from this source (or either member of a pair)."""
-        for key, button in self._level_buttons.items():
-            button.setVisible(key in levels)
-            button.setEnabled(key in levels)
-            if key not in levels:
-                button.setChecked(False)
+        """Offer levels present in this source (or either member of a pair)."""
+        self._level_combo.clear()
+        for key, label in levels.items():
+            self._level_combo.addItem(label, key)
         if self._kind not in levels:
             self._kind = ""
+        self._level_combo.setCurrentIndex(self._level_combo.findData(self._kind))
+        self._level_combo.setEnabled(self._level_combo.count() > 0)
 
     def clear(self):
         self._suppress = True
@@ -3172,14 +3125,8 @@ class CellTypeWidget(QWidget):
             self._kind = str(kind)
             self._segmentation = str(segmentation)
             self._set_opacity_widgets(float(opacity))
-            for seg, button in self._seg_buttons.items():
-                button.blockSignals(True)
-                button.setChecked(seg == self._segmentation)
-                button.blockSignals(False)
-            for k, button in self._level_buttons.items():
-                button.blockSignals(True)
-                button.setChecked(bool(self._kind) and k == self._kind)
-                button.blockSignals(False)
+            self._seg_combo.setCurrentIndex(self._seg_combo.findData(self._segmentation))
+            self._level_combo.setCurrentIndex(self._level_combo.findData(self._kind))
 
             pending_header: tuple | None = None
             header_types: list[str] = []
@@ -3286,12 +3233,7 @@ class CellTypeWidget(QWidget):
         self._set_segmentation_callback(self._dataset, str(seg))
 
     def _on_kind_clicked(self, kind: str):
-        # Enforce single selection (the group is non-exclusive so it can start
-        # with neither Broad nor Fine chosen).
-        for k, button in self._level_buttons.items():
-            button.blockSignals(True)
-            button.setChecked(k == kind)
-            button.blockSignals(False)
+        self._level_combo.setCurrentIndex(self._level_combo.findData(kind))
         if kind == self._kind:
             return
         self._kind = str(kind)

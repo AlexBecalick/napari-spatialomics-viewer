@@ -1196,13 +1196,41 @@ def test_cell_type_widget_hides_unavailable_hierarchy_levels(qapp):
         set_all_types_callback=callback, set_opacity_callback=callback,
     )
     widget.set_levels_available({"ct_final": "Allen · final assignment"})
-    assert widget._level_buttons["ct_final"].isEnabled()
-    assert not widget._level_buttons["ct_final"].isHidden()
-    assert widget._level_buttons["ct_supercluster"].isHidden()
-    assert not widget._level_buttons["ct_supercluster"].isEnabled()
+    assert widget._level_combo.findData("ct_final") == 0
+    assert widget._level_combo.findData("ct_supercluster") == -1
+    assert widget._level_combo.currentIndex() == -1
     widget.set_levels_available({"broad": "Broad cell type", "fine": "Fine cell type"})
-    assert widget._level_buttons["ct_final"].isHidden()
-    assert widget._level_buttons["broad"].isEnabled()
+    assert widget._level_combo.findData("ct_final") == -1
+    assert widget._level_combo.findData("broad") == 0
+
+
+def test_cell_type_dropdowns_dispatch_user_choices_only(qapp):
+    changes = []
+    callback = lambda *args: None
+    widget = V.CellTypeWidget(
+        close_callback=callback,
+        set_segmentation_callback=lambda *args: changes.append(("source", *args)),
+        set_kind_callback=lambda *args: changes.append(("level", *args)),
+        set_type_visible_callback=callback, set_types_visible_callback=callback,
+        set_all_types_callback=callback, set_opacity_callback=callback,
+    )
+    widget.set_dataset("MERSCOPE")
+    sources = [source.key for source in V.CELL_TYPE_SOURCES[:2]]
+    widget.set_segmentation_available(dict.fromkeys(sources, True))
+    widget.set_levels_available({"broad": "Broad cell type", "fine": "Fine cell type"})
+    assert changes == []
+    source_index = 1 - widget._seg_combo.currentIndex()
+    widget._seg_combo.setCurrentIndex(source_index)
+    widget._seg_combo.activated.emit(source_index)
+    widget._level_combo.setCurrentIndex(1)
+    widget._level_combo.activated.emit(1)
+    assert changes == [("source", "MERSCOPE", sources[source_index]), ("level", "MERSCOPE", "fine")]
+    widget.set_levels_available({"broad": "Broad cell type"})
+    assert widget._level_combo.currentIndex() == -1
+    widget.set_segmentation_available({sources[0]: True})
+    assert widget._seg_combo.count() == 1
+    assert widget._seg_combo.currentData() == sources[0]
+    assert len(changes) == 2
 
 
 def test_paired_hierarchy_missing_on_one_platform_stays_unannotated(qapp, monkeypatch):
