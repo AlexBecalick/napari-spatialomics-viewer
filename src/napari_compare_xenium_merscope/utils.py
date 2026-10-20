@@ -1767,6 +1767,72 @@ def build_napari_affine_from_px_to_um(
     )
 
 
+#: MerXen's name for the paired Xenium frame. MerXen's aligned rasters
+#: (``*_aligned_nonrigid`` images and labels in a MERSCOPE store) are resampled
+#: onto the Xenium pixel grid and map only to this frame, with the Xenium pixel
+#: size; they carry no ``global`` (MERSCOPE mosaic) transformation.
+MERXEN_ALIGNMENT_COORDINATE_SYSTEM = "merxen_xenium"
+
+
+def _element_transformations(element) -> dict[str, Any]:
+    from spatialdata.transformations import get_transformation
+
+    try:
+        transformations = get_transformation(element, get_all=True)
+    except Exception:
+        return {}
+    return dict(transformations) if isinstance(transformations, Mapping) else {}
+
+
+def raster_display_transformation(element) -> tuple[str, Any]:
+    """Return the (coordinate system, transformation) a raster is placed through.
+
+    Native rasters are placed through ``global``. A MerXen aligned raster has no
+    ``global`` entry, only its own transformation to the alignment frame, so it
+    is placed through that one.
+
+    Raises:
+        ValueError: If the element maps to neither frame.
+    """
+    transformations = _element_transformations(element)
+    for coordinate_system in ("global", MERXEN_ALIGNMENT_COORDINATE_SYSTEM):
+        if coordinate_system in transformations:
+            return coordinate_system, transformations[coordinate_system]
+    raise ValueError(
+        "Raster has no 'global' or "
+        f"{MERXEN_ALIGNMENT_COORDINATE_SYSTEM!r} transformation "
+        f"(found: {sorted(transformations)})."
+    )
+
+
+def aligned_raster_transformation(element):
+    """Return the raster's own alignment-frame transformation, if it lives only there.
+
+    ``None`` for every raster that maps to ``global``: those are placed with the
+    dataset's resolved pixel->micron transform.
+    """
+    transformations = _element_transformations(element)
+    if "global" in transformations:
+        return None
+    return transformations.get(MERXEN_ALIGNMENT_COORDINATE_SYSTEM)
+
+
+def napari_affine_from_transformation(transformation) -> np.ndarray:
+    """napari (row, col) -> (y, x) affine of a SpatialData raster transformation."""
+    m = np.asarray(
+        transformation.to_affine_matrix(input_axes=("x", "y"), output_axes=("x", "y")),
+        dtype=float,
+    )
+    return np.array(
+        [
+            [float(m[1, 1]), float(m[1, 0]), float(m[1, 2])],
+            [float(m[0, 1]), float(m[0, 0]), float(m[0, 2])],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=float,
+    )
+
+
 MERSCOPE_TRANSFORM_CSV_NAME = "micron_to_mosaic_pixel_transform.csv"
 # The SpatialData MERSCOPE reader stores cell boundaries in microns with the
 # micron->mosaic-pixel affine as their ``global`` transformation, so the store
