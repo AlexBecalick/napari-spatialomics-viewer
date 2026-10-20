@@ -50,6 +50,19 @@ warnings.filterwarnings(
     module="dask\\.dataframe",
 )
 
+
+def _ignore_macos_zarr_metadata_warning() -> None:
+    # Finder creates .DS_Store inside folders, including otherwise valid Zarr stores.
+    warnings.filterwarnings(
+        "ignore",
+        message=r"^Object at (?:.*/)?\.DS_Store is not recognized as a component of a Zarr hierarchy\.$",
+        category=UserWarning,
+        module=r"zarr\.core\.group",
+    )
+
+
+_ignore_macos_zarr_metadata_warning()
+
 import spatialdata as sd
 import zarr
 from napari.utils.colormaps import Colormap, DirectLabelColormap, ensure_colormap
@@ -219,6 +232,7 @@ from .utils import (
     build_gene_point_groups,
     build_napari_affine_from_px_to_um,
     cellpose_quantification_features,
+    cellpose_quantification_channel_labels,
     cellpose_quantification_table_available,
     cellpose_value_clip_range,
     channel_labels,
@@ -5198,7 +5212,7 @@ class ComparisonViewerController:
         if self._paired_session is not None:
             self._cellpose_value_options_callback([], [], False)
             return
-        if self.active_dataset is None or self.active_dataset != "MERSCOPE":
+        if self.active_dataset is None:
             self._cellpose_value_options_callback([], [], False)
             return
 
@@ -5217,7 +5231,7 @@ class ComparisonViewerController:
                 self._cellpose_value_options_callback([], [], False)
                 return
             features = cellpose_quantification_features(cfg.zarr_path)
-            channels = sorted({feature.channel for feature in features})
+            channels = sorted(set(cellpose_quantification_channel_labels(features)))
             statistic_order = ["min", "median", "mean", "max", "iqr"]
             statistics = sorted(
                 {feature.statistic for feature in features},
@@ -5891,9 +5905,9 @@ class ComparisonViewerController:
         cellpose_channels: list[str] = []
         cellpose_statistics: list[str] = []
         cellpose_available = False
-        if ds == "MERSCOPE" and cellpose_quantification_table_available(cfg.zarr_path):
+        if cellpose_quantification_table_available(cfg.zarr_path):
             features = cellpose_quantification_features(cfg.zarr_path)
-            cellpose_channels = sorted({feature.channel for feature in features})
+            cellpose_channels = sorted(set(cellpose_quantification_channel_labels(features)))
             order = ["min", "median", "mean", "max", "iqr"]
             cellpose_statistics = sorted(
                 {feature.statistic for feature in features},
@@ -8491,7 +8505,7 @@ class ComparisonViewerController:
             self._finish_task_token("cell-values", token)
         if (
             generation != self._cellpose_value_generation
-            or self.active_dataset != "MERSCOPE"
+            or self.active_dataset != payload.get("dataset")
             or (token is not None and token.is_set())
         ):
             return
@@ -8503,7 +8517,7 @@ class ComparisonViewerController:
         label_levels = payload["label_levels"]
         napari_affine = payload["napari_affine"]
         if not label_levels:
-            self._set_status(f"MERSCOPE Cellpose value overlay failed: labels[{label_key}] has no 2D levels.")
+            self._set_status(f"{self.active_dataset} Cellpose value overlay failed: labels[{label_key}] has no 2D levels.")
             return
         label_data = label_levels if len(label_levels) > 1 else label_levels[0]
 
@@ -8557,8 +8571,8 @@ class ComparisonViewerController:
             return
         self._cellpose_value_worker = None
         message = exc[1] if isinstance(exc, tuple) and len(exc) > 1 else exc
-        self._set_status(f"MERSCOPE Cellpose value overlay failed: {message}")
-        log.error("[MERSCOPE] Cellpose value overlay failed: %s", message)
+        self._set_status(f"{self.active_dataset} Cellpose value overlay failed: {message}")
+        log.error("[%s] Cellpose value overlay failed: %s", self.active_dataset, message)
 
     def load_cellpose_value_overlay(
         self,
@@ -8575,17 +8589,14 @@ class ComparisonViewerController:
         if not self._ensure_dataset_is_active(dataset_name):
             self._set_status(f"Could not activate dataset {dataset_name}.")
             return
-        if self.active_dataset != "MERSCOPE":
-            self._set_status("Cellpose value overlay is only enabled for MERSCOPE datasets.")
-            return
-
         cfg = self.datasets[self.active_dataset]
         if not cellpose_quantification_table_available(cfg.zarr_path):
             self._set_status(f"Missing {CELLPOSE_QUANTIFICATION_TABLE_KEY}; cannot load Cellpose value overlay.")
             return
 
+        ds = self.active_dataset
         task_key = (
-            "MERSCOPE",
+            ds,
             str(channel),
             str(statistic),
             str(colormap_name),
@@ -8596,7 +8607,7 @@ class ComparisonViewerController:
             return
         self._cellpose_value_generation += 1
         generation = self._cellpose_value_generation
-        self._set_status(f"MERSCOPE building Cellpose value overlay: {channel} {statistic}...")
+        self._set_status(f"{ds} building Cellpose value overlay: {channel} {statistic}...")
         self._sync_umap_from_statistic(channel, statistic, colormap_name)
 
         def compute():
@@ -8605,22 +8616,23 @@ class ComparisonViewerController:
             # the overlay pans/zooms without re-reading the full-resolution
             # labels. All off the GUI thread; layer creation happens on apply.
             with self._store_io_slots:
-                self._raise_if_task_cancelled(cancel_token.is_set, "MERSCOPE")
+                self._raise_if_task_cancelled(cancel_token.is_set, ds)
                 label_key = self._ensure_cellpose_label_key(
                     cancel_check=cancel_token.is_set,
-                    expected_dataset="MERSCOPE",
+                    expected_dataset=ds,
                 )
                 label_levels, napari_affine = self._build_cellpose_label_display(
                     label_key,
                     cancel_check=cancel_token.is_set,
-                    expected_dataset="MERSCOPE",
+                    expected_dataset=ds,
                 )
-                self._raise_if_task_cancelled(cancel_token.is_set, "MERSCOPE")
+                self._raise_if_task_cancelled(cancel_token.is_set, ds)
                 payload = self._compute_cellpose_value_payload(
                     cfg.zarr_path, channel, statistic, colormap_name
                 )
             return {
                 **payload,
+                "dataset": ds,
                 "label_key": label_key,
                 "label_levels": label_levels,
                 "napari_affine": napari_affine,

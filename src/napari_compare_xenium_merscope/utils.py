@@ -305,18 +305,44 @@ def cellpose_quantification_features(zarr_path: str | Path) -> list[CellposeQuan
     return _cellpose_quantification_features_from_table(_cellpose_quantification_table(root))
 
 
+def cellpose_quantification_channel_labels(
+    features: list[CellposeQuantificationFeature],
+) -> list[str]:
+    """Qualify channels shared by multiple images so selections stay unambiguous."""
+    sources: dict[str, set[str]] = {}
+    for feature in features:
+        sources.setdefault(feature.channel.casefold(), set()).add(feature.image_key)
+    return [
+        f"{feature.image_key}: {feature.channel}"
+        if len(sources[feature.channel.casefold()]) > 1 else feature.channel
+        for feature in features
+    ]
+
+
+def _resolve_cellpose_feature(
+    features: list[CellposeQuantificationFeature], channel: str, statistic: str
+) -> CellposeQuantificationFeature:
+    labels = cellpose_quantification_channel_labels(features)
+    matches = [
+        feature for feature, label in zip(features, labels, strict=True)
+        if (label.casefold() == str(channel).casefold()
+            or feature.channel.casefold() == str(channel).casefold())
+        and feature.statistic.casefold() == str(statistic).casefold()
+    ]
+    if len(matches) > 1:
+        raise ValueError(f"Ambiguous quantification channel {channel!r}; select an image-qualified channel.")
+    if not matches:
+        raise KeyError(f"No Cellpose quantification feature for channel={channel!r}, statistic={statistic!r}.")
+    return matches[0]
+
+
 def resolve_cellpose_quantification_feature(
     zarr_path: str | Path,
     channel: str,
     statistic: str,
 ) -> CellposeQuantificationFeature:
-    """Resolve a selected channel/statistic to a quantification table column."""
-    channel_key = str(channel).casefold()
-    statistic_key = str(statistic).casefold()
-    for feature in cellpose_quantification_features(zarr_path):
-        if feature.channel.casefold() == channel_key and feature.statistic.casefold() == statistic_key:
-            return feature
-    raise KeyError(f"No Cellpose quantification feature for channel={channel!r}, statistic={statistic!r}.")
+    """Resolve a channel (image-qualified when shared) and statistic."""
+    return _resolve_cellpose_feature(cellpose_quantification_features(zarr_path), channel, statistic)
 
 
 def load_cellpose_quantification_values(
@@ -327,15 +353,9 @@ def load_cellpose_quantification_values(
     """Load label ids and one selected Cellpose quantification column."""
     root = open_zarr_group_unconsolidated(zarr_path)
     table = _cellpose_quantification_table(root)
-    feature = None
-    channel_key = str(channel).casefold()
-    statistic_key = str(statistic).casefold()
-    for candidate in _cellpose_quantification_features_from_table(table):
-        if candidate.channel.casefold() == channel_key and candidate.statistic.casefold() == statistic_key:
-            feature = candidate
-            break
-    if feature is None:
-        raise KeyError(f"No Cellpose quantification feature for channel={channel!r}, statistic={statistic!r}.")
+    feature = _resolve_cellpose_feature(
+        _cellpose_quantification_features_from_table(table), channel, statistic
+    )
 
     label_ids = np.asarray(table["obs/label_id"][:], dtype=np.uint32)
     values = np.asarray(table["X"][:, feature.column_index], dtype=np.float32)
@@ -480,7 +500,13 @@ def _pretty_segmentation_key(key: str) -> str:
 def make_layer_name(dataset: str, layer_type: str, key: str, channel: str | None = None) -> str:
     """Build a standardized layer name for this viewer."""
     if str(layer_type) == "image":
-        return " | ".join(["Image", str(channel if channel is not None else key)])
+        label = str(channel if channel is not None else key)
+        if str(dataset).upper() == "XENIUM" and label == "DAPI":
+            label = {
+                "morphology_focus": "DAPI Xenium",
+                "post_xenium_if": "DAPI Post Xenium-IF",
+            }.get(str(key), label)
+        return " | ".join(["Image", label])
     friendly = _FRIENDLY_LAYER_TYPE_LABELS.get(str(layer_type))
     if friendly is not None:
         parts = [friendly, _pretty_segmentation_key(key)]
