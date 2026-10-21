@@ -617,3 +617,13 @@ def test_segmentation_outline_colours_match_platforms(method, colour):
     assert V.segmentation_color(f"MERSCOPE:MOSAIK_{method}_labels") == colour
     assert V.segmentation_color(f"XENIUM:MOSAIK_{method}_labels") == colour
     assert V.segmentation_color(method) == colour
+
+
+def test_spatialdata_explorer_button_opens_its_tab(qapp):
+    panel = _panel([])
+    button = next(button for button in panel._tab_group.buttons()
+                  if button.text() == "Zarr metadata")
+    button.click()
+    assert panel._tab_stack.currentWidget() is panel.spatialdata_explorer
+    assert button.isChecked()
+    panel.close()
