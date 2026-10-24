@@ -164,6 +164,10 @@ class TranscriptCacheRequest:
     cache_root: Path
     family_digest: str
     digest: str
+    assignment_source: str = "native"
+    analysis_id: str = ""
+    status_col: str | None = None
+    coordinate_points_key: str | None = None
 
     @classmethod
     def create(
@@ -179,6 +183,10 @@ class TranscriptCacheRequest:
         random_state: int = 42,
         build_cell_index: bool = False,
         cache_root: str | Path | None = None,
+        assignment_source: str = "native",
+        analysis_id: str = "",
+        status_col: str | None = None,
+        coordinate_points_key: str | None = None,
     ) -> "TranscriptCacheRequest | None":
         """Create a request for a readable local SpatialData points element.
 
@@ -216,6 +224,17 @@ class TranscriptCacheRequest:
         tree = _point_tree_fingerprint(points)
         if tree is None:
             return None
+        coordinate_tree = None
+        if coordinate_points_key is not None:
+            coordinate_key = Path(str(coordinate_points_key))
+            if coordinate_key.is_absolute() or ".." in coordinate_key.parts:
+                return None
+            coordinate_points = (dataset / "points" / coordinate_key).resolve()
+            if not _is_relative_to(coordinate_points, dataset) or not coordinate_points.is_dir():
+                return None
+            coordinate_tree = _point_tree_fingerprint(coordinate_points)
+            if coordinate_tree is None:
+                return None
         cap = None if max_points is None or int(max_points) <= 0 else int(max_points)
         family_identity = {
             "version": TRANSCRIPT_CACHE_VERSION,
@@ -234,7 +253,16 @@ class TranscriptCacheRequest:
                 "build_cell_index": bool(build_cell_index),
             },
         }
+        # Preserve existing native cache addresses; source generation options
+        # only distinguish the new assignment views that actually need them.
+        if str(assignment_source) != "native" or analysis_id or status_col is not None:
+            family_identity["assignment_source"] = str(assignment_source)
+            family_identity["analysis_id"] = str(analysis_id)
+            family_identity["columns"]["status"] = status_col
         identity = {**family_identity, "point_tree": tree}
+        if coordinate_tree is not None:
+            family_identity["coordinate_points_key"] = str(coordinate_points_key)
+            identity = {**family_identity, "point_tree": tree, "coordinate_point_tree": coordinate_tree}
         return cls(
             dataset_path=dataset,
             points_path=points,
@@ -250,6 +278,10 @@ class TranscriptCacheRequest:
             cache_root=root,
             family_digest=_digest(family_identity),
             digest=_digest(identity),
+            assignment_source=str(assignment_source),
+            analysis_id=str(analysis_id),
+            status_col=status_col,
+            coordinate_points_key=coordinate_points_key,
         )
 
     @property
@@ -566,6 +598,8 @@ def _restore_store(
         sampled=bool(raw.get("sampled", False)),
         source_gene_counts=source_counts,
         source_total_points=None if source_total_raw is None else int(source_total_raw),
+        source_status_counts=(None if raw.get("source_status_counts") is None else
+                              {str(k): int(v) for k, v in raw["source_status_counts"].items()}),
         gene_visuals=visuals,
         cell_transcript_index=cell_index,
     )
@@ -815,6 +849,7 @@ def save_transcript_cache(
             "source_total_points": (
                 None if store.source_total_points is None else int(store.source_total_points)
             ),
+            "source_status_counts": getattr(store, "source_status_counts", None),
             "gene_visuals": {
                 str(gene): _visual_payload(visuals[gene]) for gene in store.genes
             },
@@ -875,6 +910,10 @@ def make_transcript_cache_request(
     random_state: int = 42,
     build_cell_index: bool = False,
     cache_dir: str | Path | None = None,
+    assignment_source: str = "native",
+    analysis_id: str = "",
+    status_col: str | None = None,
+    coordinate_points_key: str | None = None,
 ) -> TranscriptCacheRequest | None:
     """Return the cache request corresponding to one viewer transcript build."""
     return TranscriptCacheRequest.create(
@@ -889,6 +928,10 @@ def make_transcript_cache_request(
         random_state=random_state,
         build_cell_index=build_cell_index,
         cache_root=cache_dir,
+        assignment_source=assignment_source,
+        analysis_id=analysis_id,
+        status_col=status_col,
+        coordinate_points_key=coordinate_points_key,
     )
 
 

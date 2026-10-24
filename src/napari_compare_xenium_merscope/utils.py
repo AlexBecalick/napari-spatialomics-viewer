@@ -9,6 +9,7 @@ import logging
 import os
 import re
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from hashlib import blake2s
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping
@@ -2806,6 +2807,8 @@ class CellTypeSource:
     label: str
     clustering_tables: tuple[str, ...]
     mask_shape_keys: tuple[str, ...]
+    method: str = "clustering"
+    segmentation: str | None = None
 
 
 #: Every cell-type source the viewer knows about, in display order. ``key`` is the
@@ -2846,6 +2849,24 @@ CELL_TYPE_SOURCES: tuple[CellTypeSource, ...] = (
         clustering_tables=("table_original_clustering_squidpy",),
         mask_shape_keys=("merscope_cell_boundaries", "cell_boundaries"),
     ),
+    *(
+        CellTypeSource(
+            key=f"pciseq_{branch}",
+            label=f"pciSeq · {label}",
+            clustering_tables=(),
+            mask_shape_keys=shapes,
+            method="pciseq",
+            segmentation=branch,
+        )
+        for branch, label, shapes in (
+            ("proseg_hybrid", "ProSeg hybrid", ("MOSAIK_proseg_hybrid",)),
+            ("proseg", "ProSeg", ("MOSAIK_proseg",)),
+            ("cellpose", "Cellpose", ("MOSAIK_cellpose",)),
+            ("original", "Original segmentation", (
+                "merscope_cell_boundaries", "xenium_cell_boundaries", "cell_boundaries",
+            )),
+        )
+    ),
 )
 _CELL_TYPE_SOURCE_BY_KEY = {source.key: source for source in CELL_TYPE_SOURCES}
 
@@ -2853,6 +2874,270 @@ _CELL_TYPE_SOURCE_BY_KEY = {source.key: source for source in CELL_TYPE_SOURCES}
 def cell_type_source(key: Any) -> CellTypeSource | None:
     """Return the :class:`CellTypeSource` for ``key`` (``None`` if unknown)."""
     return _CELL_TYPE_SOURCE_BY_KEY.get(str(key))
+
+
+def _table_region_matches(table, shape_key: str, instance_key: str) -> bool:
+    """Validate a table's declared shape/instance link without expression reads."""
+    from anndata.io import read_elem
+
+    attrs = read_elem(table["uns"]["spatialdata_attrs"])
+    region = attrs.get("region")
+    regions = [region] if isinstance(region, str) else list(region) if region is not None else []
+    return (
+        regions == [shape_key]
+        and attrs.get("instance_key") == instance_key
+        and instance_key in table["obs"]
+    )
+
+
+def _analysis_marker_matches(element, analysis_id: str, *, table: bool = False) -> bool:
+    """Reject a mixed generation while a registered source is being refreshed."""
+    marker_key = "merxen_pciseq_viewer"
+    if table:
+        from anndata.io import read_elem
+
+        marker = read_elem(element["uns"][marker_key])
+    else:
+        # SpatialData only restores standard feature/instance points attrs.
+        # Publication markers therefore live on the standard Zarr group itself.
+        marker = element.attrs.get(marker_key)
+    return isinstance(marker, Mapping) and marker.get("analysis_id") == analysis_id
+
+
+def analysis_source_metadata(zarr_path: Any, source_key: str) -> dict[str, Any] | None:
+    """Read a registered pciSeq source, failing closed on an unsafe mask join.
+
+    The registry must identify a native segmentation, existing points and a
+    table linked to exactly that segmentation. Only metadata is read; points,
+    polygons, expression and embeddings remain lazy.
+    """
+    source = cell_type_source(source_key)
+    if source is None or source.method != "pciseq":
+        return None
+    try:
+        root = open_zarr_group_unconsolidated(zarr_path)
+        schema = root.attrs.get("merxen_schema", {})
+        if not isinstance(schema, Mapping):
+            return None
+        registry = schema.get("analysis_sources", {})
+        segmentations = schema.get("segmentations", {})
+        if not isinstance(registry, Mapping) or not isinstance(segmentations, Mapping):
+            return None
+        entry = registry.get(str(source_key))
+        native = segmentations.get(source.segmentation)
+        if not isinstance(entry, Mapping) or not isinstance(native, Mapping):
+            return None
+        required = (
+            "shape", "table", "embedding_table", "points", "source_points",
+            "assignment_column", "background_column", "status_column",
+            "instance_key", "analysis_id",
+        )
+        if any(not isinstance(entry.get(key), str) or not entry[key] for key in required):
+            return None
+        if (
+            entry.get("method") != "pciseq"
+            or entry.get("segmentation") != source.segmentation
+            or entry["shape"] != native.get("shape")
+            or entry["source_points"] != native.get("points", schema.get("primary_points"))
+            or entry["points"] == entry["source_points"]
+            or entry["table"] == entry["embedding_table"]
+            or re.fullmatch(r"[0-9a-f]{64}", entry["analysis_id"]) is None
+        ):
+            return None
+        if (
+            entry["shape"] not in root["shapes"]
+            or entry["points"] not in root["points"]
+            or entry["source_points"] not in root["points"]
+            or entry["table"] not in root["tables"]
+        ):
+            return None
+        table = root["tables"][entry["table"]]
+        if (
+            "pciseq_cell_type" not in table["obs"]
+            or not _table_region_matches(table, entry["shape"], entry["instance_key"])
+            or not _analysis_marker_matches(table, entry["analysis_id"], table=True)
+            or not _analysis_marker_matches(root["points"][entry["points"]], entry["analysis_id"])
+        ):
+            return None
+        embedding_key = entry["embedding_table"]
+        if embedding_key in root["tables"]:
+            embedding_shape = entry.get("embedding_shape", entry["shape"])
+            registered_variant = any(
+                isinstance(variant, Mapping)
+                and variant.get("shape") == embedding_shape
+                and variant.get("coordinate_variant_of") == source.segmentation
+                for variant in segmentations.values()
+            )
+            legacy_variant = (
+                "embedding_shape" in entry
+                and embedding_shape == f"{entry['shape']}_aligned_nonrigid"
+            )
+            if (
+                not isinstance(embedding_shape, str)
+                or embedding_shape not in root["shapes"]
+                or not (embedding_shape == entry["shape"] or registered_variant or legacy_variant)
+            ):
+                return None
+            embedding = root["tables"][embedding_key]
+            if not (
+                _table_region_matches(embedding, embedding_shape, entry["instance_key"])
+                and _analysis_marker_matches(embedding, entry["analysis_id"], table=True)
+            ):
+                return None
+        return dict(entry)
+    except Exception:
+        log.debug("Cannot validate analysis source %s", source_key, exc_info=True)
+        return None
+
+
+def assignment_source_points(zarr_path: Any, source_key: str) -> dict[str, Any] | None:
+    """Return the validated points/assignment metadata for a pciSeq source."""
+    return analysis_source_metadata(zarr_path, source_key)
+
+
+def cell_type_shape_key_for_source(zarr_path: Any, source_key: str) -> str | None:
+    """Resolve a source's exact native shape key from its registry or candidates."""
+    source = cell_type_source(source_key)
+    if source is None:
+        return None
+    if source.method == "pciseq":
+        metadata = analysis_source_metadata(zarr_path, source_key)
+        return metadata["shape"] if metadata else None
+    try:
+        shapes = open_zarr_group_unconsolidated(zarr_path)["shapes"]
+        return next((key for key in source.mask_shape_keys if key in shapes), None)
+    except Exception:
+        return None
+
+
+def cell_type_table_key_for_source(
+    zarr_path: Any, source_key: str, *, embedding: bool = False,
+) -> str | None:
+    """Resolve annotations or the separate QC-retained embedding for a source."""
+    source = cell_type_source(source_key)
+    if source is not None and source.method == "pciseq":
+        metadata = analysis_source_metadata(zarr_path, source_key)
+        if metadata is None:
+            return None
+        key = metadata["embedding_table" if embedding else "table"]
+        root = open_zarr_group_unconsolidated(zarr_path)
+        return key if key in root["tables"] else None
+    return clustering_table_key_for_segmentation(zarr_path, source_key)
+
+
+def assignment_points_in_display_frame(
+    assignment_points,
+    display_points,
+    *,
+    assignment_gene_col: str | None = None,
+    display_gene_col: str | None = None,
+    transcript_id_col: str = "transcript_id",
+    assignment_col: str = "assignment",
+    background_col: str = "background",
+    status_col: str = "pciseq_assignment_status",
+    coordinate_cols: Iterable[str] | None = None,
+):
+    """Join pciSeq assignments onto exact-ID aligned display coordinates.
+
+    Both inputs must contain the same unique uint64 transcript ids and
+    gene names. Coordinates and gene spelling come only from ``display_points``;
+    assignments, background and model status come only from ``assignment_points``.
+    Native measured coordinates are never modified or approximately transformed.
+
+    Dask inputs remain lazy. Matching hash shuffles colocate every transcript id
+    before a partition-wise one-to-one outer join, so duplicate ids spanning
+    partitions, missing ids and conflicting genes fail when the renderer reads
+    the data. No full transcript table is collected into pandas.
+    """
+    assignment_gene_col = assignment_gene_col or resolve_gene_column(assignment_points)
+    display_gene_col = display_gene_col or resolve_gene_column(display_points)
+    coordinates = list(coordinate_cols) if coordinate_cols is not None else [
+        axis for axis in ("x", "y", "z") if axis in display_points.columns
+    ]
+    if not coordinates or assignment_gene_col is None or display_gene_col is None:
+        raise ValueError("Assignment/display points require coordinates and gene columns")
+    display_columns = [*coordinates, display_gene_col, transcript_id_col]
+    assignment_columns = [
+        transcript_id_col, assignment_gene_col, assignment_col, background_col, status_col,
+    ]
+    if not set(display_columns).issubset(display_points.columns):
+        raise ValueError("Display points lack coordinates, genes or transcript_id")
+    if not set(assignment_columns).issubset(assignment_points.columns):
+        raise ValueError("Assignment points lack exact transcript IDs or pciSeq fields")
+    internal_gene = "__viewer_assignment_gene"
+    internal_fields = {
+        assignment_col: "__viewer_assignment",
+        background_col: "__viewer_background",
+        status_col: "__viewer_status",
+    }
+    output_columns = [*display_columns, assignment_col, background_col, status_col]
+    if len(set(output_columns)) != len(output_columns):
+        raise ValueError("Display coordinate/gene columns overlap assignment columns")
+
+    def project(part, *, assignment):
+        columns = assignment_columns if assignment else display_columns
+        projected = part[columns].copy()
+        ids, valid = cell_ids_as_int64(projected[transcript_id_col])
+        if not valid.all() or (ids < 0).any():
+            raise ValueError("Display/assignment transcript_id must be exact uint64 integers")
+        projected[transcript_id_col] = ids.astype(np.uint64, copy=False)
+        gene_col = assignment_gene_col if assignment else display_gene_col
+        if projected[gene_col].isna().any():
+            raise ValueError("Display/assignment transcript genes cannot be missing")
+        if assignment:
+            projected = projected.rename(columns={assignment_gene_col: internal_gene, **internal_fields})
+        return projected
+
+    def join(display, assignments):
+        try:
+            joined = display.merge(
+                assignments, on=transcript_id_col, how="outer",
+                validate="one_to_one", indicator="__viewer_match",
+            )
+        except pd.errors.MergeError as error:
+            raise ValueError("Display/assignment points contain duplicate transcript IDs") from error
+        if not joined["__viewer_match"].eq("both").all():
+            raise ValueError("Display and assignment transcript IDs differ: missing transcripts")
+        if not np.array_equal(
+            joined[display_gene_col].astype(str).to_numpy(),
+            joined[internal_gene].astype(str).to_numpy(),
+        ):
+            raise ValueError("Display and assignment transcript IDs resolve to different genes")
+        return joined.rename(columns={value: key for key, value in internal_fields.items()})[output_columns]
+
+    if isinstance(assignment_points, pd.DataFrame) and isinstance(display_points, pd.DataFrame):
+        result = join(project(display_points, assignment=False), project(assignment_points, assignment=True))
+    else:
+        import dask.dataframe as dd
+
+        assignments = (
+            dd.from_pandas(assignment_points, npartitions=1, sort=False)
+            if isinstance(assignment_points, pd.DataFrame) else assignment_points
+        )
+        display = (
+            dd.from_pandas(display_points, npartitions=1, sort=False)
+            if isinstance(display_points, pd.DataFrame) else display_points
+        )
+        assignment_meta = project(assignments._meta, assignment=True)
+        display_meta = project(display._meta, assignment=False)
+        assignments = assignments.map_partitions(project, assignment=True, meta=assignment_meta)
+        display = display.map_partitions(project, assignment=False, meta=display_meta)
+        partitions = max(assignments.npartitions, display.npartitions)
+        shuffle = dict(
+            on=transcript_id_col, npartitions=partitions, shuffle_method="disk",
+            ignore_index=True, force=True,
+        )
+        assignments, display = assignments.shuffle(**shuffle), display.shuffle(**shuffle)
+        result = dd.map_partitions(
+            join, display, assignments, meta=join(display_meta, assignment_meta),
+            align_dataframes=False, clear_divisions=True,
+        )
+    # Plain Dask has no attrs; SpatialData installs a special accessor which
+    # must be updated in place rather than replaced by an ordinary dictionary.
+    result_attrs = getattr(result, "attrs", None)
+    if result_attrs is not None:
+        result_attrs.update(dict(getattr(display_points, "attrs", {})))
+    return result
 
 
 @dataclass
@@ -2868,11 +3153,15 @@ class CellTypeAssignments:
     segmentation: str
     table_key: str
     instance_key: str
-    cell_ids: np.ndarray            # int64
+    cell_ids: np.ndarray            # exact signed/unsigned integers
     broad: np.ndarray               # str (object)
     fine: np.ndarray                # str (object)
 
     levels: dict[str, np.ndarray] = field(default_factory=dict)
+    probabilities: np.ndarray | None = None
+    statuses: np.ndarray | None = None
+    shape_key: str | None = None
+    analysis_id: str | None = None
 
     def labels_for(self, kind: str) -> np.ndarray:
         """Return labels at a stored level; absent levels remain unannotated."""
@@ -2901,6 +3190,8 @@ def clustering_table_key_for_segmentation(zarr_path: Any, segmentation: str) -> 
     source = cell_type_source(segmentation)
     if source is None:
         return None
+    if source.method == "pciseq":
+        return cell_type_table_key_for_source(zarr_path, segmentation)
     try:
         root = open_zarr_group_unconsolidated(zarr_path)
         if "tables" not in root:
@@ -2966,14 +3257,15 @@ CELL_TYPE_LEVEL_LABELS = {
     "ct_seaad_subclass": "SEA-AD · subclass",
     "ct_cluster": "Allen · cluster (report only)",
     "ct_supertype": "Allen · supertype (report only)",
+    "pciseq": "pciSeq · cell type",
 }
 
 
 def cell_id_to_int(value: Any) -> int | None:
     """Return an exact integer cell id, or ``None`` when ``value`` is not one.
 
-    Unlike :func:`utils.normalize_cell_key` this never routes through ``float``,
-    so 19-digit MERSCOPE EntityIDs keep every digit.
+    Integer and decimal strings never pass through ``float``. Already-rounded
+    floating point ids beyond its exact integer range are rejected.
     """
     if value is None or isinstance(value, (bool, np.bool_)):
         return None
@@ -2981,35 +3273,40 @@ def cell_id_to_int(value: Any) -> int | None:
         return int(value)
     if isinstance(value, (float, np.floating)):
         as_float = float(value)
-        return int(as_float) if np.isfinite(as_float) and as_float.is_integer() else None
+        return int(as_float) if (
+            np.isfinite(as_float) and as_float.is_integer() and abs(as_float) <= 2**53
+        ) else None
     text = str(value).strip()
     try:
         return int(text)
     except ValueError:
         pass
     try:
-        as_float = float(text)
-    except ValueError:
+        decimal = Decimal(text)
+    except InvalidOperation:
         return None
-    return int(as_float) if np.isfinite(as_float) and as_float.is_integer() else None
+    return int(decimal) if decimal.is_finite() and decimal == decimal.to_integral_value() else None
 
 
 def cell_ids_as_int64(values: Iterable[Any]) -> tuple[np.ndarray, np.ndarray]:
-    """Convert cell ids to ``int64`` plus a validity mask, without float rounding."""
-    arr = np.asarray(values)
-    if arr.dtype.kind in "iu":
-        return arr.astype(np.int64, copy=False), np.ones(arr.shape[0], dtype=bool)
-    parsed = pd.to_numeric(pd.Series(arr, copy=False), errors="coerce")
-    if parsed.dtype.kind in "iu":
-        return parsed.to_numpy(dtype=np.int64), np.ones(arr.shape[0], dtype=bool)
-    ids = np.zeros(arr.shape[0], dtype=np.int64)
-    valid = np.zeros(arr.shape[0], dtype=bool)
-    for i, value in enumerate(arr.tolist()):
+    """Return exact integer ids and validity, preserving the full uint64 range.
+
+    The historical name is retained for callers. Small ids use int64; unsigned
+    ids above its maximum use uint64. A mixture of negative and large unsigned
+    ids uses Python integers rather than overflowing either numpy dtype.
+    """
+    arr = np.asarray(values, dtype=object)
+    parsed = [0] * len(arr)
+    valid = np.zeros(len(arr), dtype=bool)
+    low, high = np.iinfo(np.int64).min, np.iinfo(np.uint64).max
+    for i, value in enumerate(arr):
         as_int = cell_id_to_int(value)
-        if as_int is not None:
-            ids[i] = as_int
+        if as_int is not None and low <= as_int <= high:
+            parsed[i] = as_int
             valid[i] = True
-    return ids, valid
+    minimum, maximum = min(parsed, default=0), max(parsed, default=0)
+    dtype = np.int64 if maximum <= np.iinfo(np.int64).max else np.uint64 if minimum >= 0 else object
+    return np.asarray(parsed, dtype=dtype), valid
 
 
 def _clean_cell_labels(values) -> np.ndarray:
@@ -3020,7 +3317,13 @@ def _clean_cell_labels(values) -> np.ndarray:
 
 def _read_cell_type_obs(zarr_path: Any, segmentation: str):
     """Read annotation metadata only, without expression or neighbour matrices."""
-    table_key = clustering_table_key_for_segmentation(zarr_path, segmentation)
+    source = cell_type_source(segmentation)
+    metadata = None
+    if source is not None and source.method == "pciseq":
+        metadata = analysis_source_metadata(zarr_path, segmentation)
+        if metadata is None:
+            return None
+    table_key = metadata["table"] if metadata else clustering_table_key_for_segmentation(zarr_path, segmentation)
     if table_key is None:
         return None
     from anndata.io import read_elem
@@ -3038,16 +3341,32 @@ def _read_cell_type_obs(zarr_path: Any, segmentation: str):
     wanted = {CELL_TYPE_BROAD_CLASS_COL, CELL_TYPE_FINE_CLUSTER_COL,
               CELL_TYPE_NEURON_SPLIT_COL, instance_key}
     wanted.update(f"{key}_name" for key in CELL_TYPE_LEVEL_LABELS if key.startswith("ct_"))
+    if source is not None and source.method == "pciseq":
+        wanted = {instance_key, "pciseq_cell_type", "pciseq_probability", "pciseq_status"}
     index_key = str(obs_group.attrs.get("_index", "_index"))
     obs = pd.DataFrame(index=np.asarray(read_elem(obs_group[index_key])))
     for column in columns:
         if column in wanted:
             obs[column] = read_elem(obs_group[column])
-    return table_key, obs, instance_key
+    if metadata is not None:
+        current = analysis_source_metadata(zarr_path, segmentation)
+        if current is None or current["analysis_id"] != metadata["analysis_id"]:
+            return None
+    return table_key, obs, instance_key, metadata
 
 
 def _cell_label_levels(obs) -> dict[str, np.ndarray]:
     levels = {}
+    if "pciseq_cell_type" in obs:
+        # Reference class names are identities: strings such as 'NA' or 'None'
+        # can be legitimate custom classes, unlike legacy missing-label text.
+        labels = obs["pciseq_cell_type"].to_numpy(dtype=object, copy=True)
+        labels[pd.isna(labels) | (labels == "")] = None
+        if "pciseq_status" in obs:
+            labels[obs["pciseq_status"].eq("excluded_overlap").to_numpy()] = None
+        if any(value is not None for value in labels):
+            levels["pciseq"] = labels
+        return levels
     if CELL_TYPE_BROAD_CLASS_COL in obs:
         broad = _clean_cell_labels(obs[CELL_TYPE_BROAD_CLASS_COL])
         if CELL_TYPE_NEURON_SPLIT_COL in obs:
@@ -3095,7 +3414,7 @@ def load_cell_type_assignments(zarr_path: Any, segmentation: str = "proseg") -> 
         result = _read_cell_type_obs(zarr_path, segmentation)
         if result is None:
             return None
-        table_key, obs, instance_key = result
+        table_key, obs, instance_key, metadata = result
         levels = _cell_label_levels(obs)
         if not levels:
             return None
@@ -3111,6 +3430,13 @@ def load_cell_type_assignments(zarr_path: Any, segmentation: str = "proseg") -> 
             segmentation=str(segmentation), table_key=table_key,
             instance_key=instance_key, cell_ids=ids[valid],
             broad=broad, fine=fine, levels=levels,
+            probabilities=(
+                obs["pciseq_probability"].to_numpy(dtype=float)[valid]
+                if "pciseq_probability" in obs else None
+            ),
+            statuses=(obs["pciseq_status"].to_numpy()[valid] if "pciseq_status" in obs else None),
+            shape_key=metadata["shape"] if metadata else cell_type_shape_key_for_source(zarr_path, segmentation),
+            analysis_id=metadata["analysis_id"] if metadata else None,
         )
     except Exception:
         log.debug("Cannot load cell-type assignments for %s", segmentation, exc_info=True)
@@ -3205,7 +3531,10 @@ def build_assignment_color_schemes(
             continue
         labels = sorted({
             str(label) for item in items for label in item.labels_for(key)
-            if label is not None and str(label).lower() not in _MISSING_LABEL_TEXTS
+            if label is not None and (
+                str(label) != "" if key == "pciseq"
+                else str(label).lower() not in _MISSING_LABEL_TEXTS
+            )
         })
         palette = gene_palette_rgba(len(labels), alpha=1.0)
         schemes[key] = CellTypeColorScheme(
@@ -3308,6 +3637,8 @@ class GenePointStore:
     sampled: bool = False
     source_gene_counts: dict[str, int] | None = None
     source_total_points: int | None = None
+    #: Exact pre-sampling assignment status counts, including unmodelled spots.
+    source_status_counts: dict[str, int] | None = None
     #: The (colour, symbol) scheme the points were coloured with. Symbols are
     #: fixed at build time (they decide the layer grouping); only colours change
     #: when the inspector switches between the broad and fine cell-type schemes.
@@ -3385,6 +3716,7 @@ def _point_partition_arrays(
     gene_col: str,
     assignment_col: str | None,
     background_col: str | None,
+    status_col: str | None = None,
 ):
     """Return compact valid arrays for one transcript partition."""
     x_all = pdf[x_col].to_numpy(dtype=np.float32, copy=False)
@@ -3400,6 +3732,10 @@ def _point_partition_arrays(
         background_all = ~assignment_mask(pdf[assignment_col]).to_numpy(dtype=bool, copy=False)
     else:
         background_all = np.zeros(len(pdf), dtype=bool)
+    if status_col is not None:
+        # Rendering's unassigned group includes excluded transcripts. Their
+        # scientific background flag remains false in the original points.
+        background_all = background_all | (pdf[status_col].astype("string").fillna("unknown") != "assigned").to_numpy(dtype=bool)
 
     assignment_all = None
     assigned_all = None
@@ -3432,6 +3768,7 @@ def build_gene_point_groups(
     alpha: float = 1.0,
     build_cell_index: bool = False,
     cancel_check: Callable[[], bool] | None = None,
+    status_col: str | None = None,
 ) -> GenePointStore:
     """Read all transcripts into a symbol-grouped, gene-sorted point store.
 
@@ -3445,15 +3782,24 @@ def build_gene_point_groups(
         cols.append(background_col)
     if assignment_col is not None and assignment_col not in cols:
         cols.append(assignment_col)
+    if status_col is not None and status_col not in cols:
+        cols.append(status_col)
 
     # Pass 1 retains only small aggregate dictionaries.  In particular, it does
     # not keep a Python string object for every transcript and it lets us size
     # all output arrays exactly before the second streaming pass.
     source_gene_counts: dict[str, int] = {}
+    source_status_counts: dict[str, int] | None = {} if status_col else None
     cell_counts: dict[str, int] = {}
     total_source = 0
     for pdf in _iter_point_partitions(points_obj, cols):
         _check_transcript_cancelled(cancel_check)
+        if status_col is not None:
+            # Status totals describe the complete source, independent of the
+            # render cap and coordinate filtering used for the point layers.
+            for status, count in pdf[status_col].value_counts(dropna=False).items():
+                key = str(status) if pd.notna(status) else "unknown"
+                source_status_counts[key] = source_status_counts.get(key, 0) + int(count)
         arrays = _point_partition_arrays(
             pdf,
             x_col=x_col,
@@ -3461,6 +3807,7 @@ def build_gene_point_groups(
             gene_col=gene_col,
             assignment_col=assignment_col,
             background_col=background_col,
+            status_col=status_col,
         )
         if arrays is None:
             continue
@@ -3536,6 +3883,7 @@ def build_gene_point_groups(
             gene_col=gene_col,
             assignment_col=assignment_col,
             background_col=background_col,
+            status_col=status_col,
         )
         if arrays is None:
             continue
@@ -3728,6 +4076,7 @@ def build_gene_point_groups(
         sampled=sampled,
         source_gene_counts=source_gene_counts,
         source_total_points=total_source,
+        source_status_counts=source_status_counts,
         gene_visuals=dict(gene_visuals),
         cell_transcript_index=cell_index,
     )
@@ -3853,19 +4202,24 @@ def normalize_cell_key(value) -> str:
     both identify a cell, but one may store the id as an integer and the other as
     a string (``5`` vs ``"5"``). Normalising both through this function so an
     integer-valued float/str collapses to its plain integer text lets the two
-    line up regardless of dtype.
+    line up regardless of dtype. Integer and string ids keep every digit;
+    floating-point ids outside their exact integer range are rejected.
     """
-    if value is None:
+    if value is None or value is pd.NA:
         return ""
+    integer = cell_id_to_int(value)
+    if integer is not None:
+        return str(integer)
+    if isinstance(value, (int, np.integer, float, np.floating)):
+        return "" if not np.isfinite(value) or abs(value) > 2**53 else repr(float(value))
+    text = str(value).strip()
     try:
-        as_float = float(value)
-    except (TypeError, ValueError):
-        return str(value).strip()
-    if not np.isfinite(as_float):
+        decimal = Decimal(text)
+    except InvalidOperation:
+        return text
+    if not decimal.is_finite():
         return ""
-    if float(int(round(as_float))) == as_float:
-        return str(int(round(as_float)))
-    return repr(as_float)
+    return format(decimal.normalize(), "f")
 
 
 def pick_cell_at_point(gdf, x_um: float, y_um: float):

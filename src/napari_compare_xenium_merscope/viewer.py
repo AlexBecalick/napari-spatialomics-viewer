@@ -23,10 +23,11 @@ import sys
 import time
 import warnings
 from collections import OrderedDict
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event, RLock, Semaphore
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from weakref import WeakKeyDictionary, WeakSet
 
@@ -216,6 +217,9 @@ from .utils import (
     CELL_TYPE_LEVEL_LABELS,
     CELL_TYPE_SOURCES,
     cell_type_source,
+    assignment_source_points,
+    assignment_points_in_display_frame,
+    cell_type_shape_key_for_source,
     load_cell_type_assignments,
     resolve_cell_type_marker_reference,
     build_cell_transcript_index,
@@ -418,6 +422,8 @@ class GeneInspectorState:
     panel_genes: list[str] | None = None
     panel_gene_counts: dict[str, int] | None = None
     panel_control_genes: set[str] | None = None
+    assignment_source: str = "native"
+    analysis_id: str = ""
 
 
 @dataclass
@@ -465,6 +471,8 @@ class UmapView:
     dataset: str
     #: source -> CellUmapEmbedding (None means "looked up, no UMAP stored").
     embeddings: dict = field(default_factory=dict)
+    #: Analysis identity for each memoized source, independent of table names.
+    source_identities: dict = field(default_factory=dict)
     #: (source, kind, id(assignments)) -> per-row labels joined to the embedding.
     label_cache: dict = field(default_factory=dict)
     #: (source, cell id text) -> embedding row for cross-segmentation selections.
@@ -2499,6 +2507,7 @@ class GeneInspectorWidget(QWidget):
         hide_background: bool = False,
         show_controls: bool = False,
         colour_by_assignment: bool = False,
+        set_assignment_source_callback=None,
     ):
         super().__init__()
         self._close_callback = close_callback
@@ -2511,6 +2520,7 @@ class GeneInspectorWidget(QWidget):
         self._set_show_controls_callback = set_show_controls_callback
         self._set_ordering_callback = set_ordering_callback
         self._set_genes_visible_callback = set_genes_visible_callback
+        self._set_assignment_source_callback = set_assignment_source_callback
 
         self._dataset: str | None = None
         self._checkboxes: dict[str, QCheckBox] = {}
@@ -2531,6 +2541,11 @@ class GeneInspectorWidget(QWidget):
 
         self._close_button = QPushButton("Unload transcripts")
         self._close_button.clicked.connect(self._on_close)
+        self._assignment_combo = QComboBox()
+        self._assignment_combo.addItem("Native assignments", "native")
+        self._assignment_combo.currentIndexChanged.connect(self._on_assignment_source_changed)
+        self._assignment_summary = QLabel("")
+        self._assignment_summary.setWordWrap(True)
 
         self._spot_slider = QSlider(Qt.Horizontal)
         self._spot_slider.setRange(self._SPOT_SLIDER_MIN, self._SPOT_SLIDER_MAX)
@@ -2602,6 +2617,9 @@ class GeneInspectorWidget(QWidget):
         root.setSpacing(6)
         root.addWidget(self._title)
         root.addWidget(self._close_button)
+        root.addWidget(QLabel("Transcript assignment source"))
+        root.addWidget(self._assignment_combo)
+        root.addWidget(self._assignment_summary)
         spot_row = QHBoxLayout()
         spot_row.addWidget(QLabel("Spot size"))
         spot_row.addWidget(self._spot_slider)
@@ -2625,6 +2643,42 @@ class GeneInspectorWidget(QWidget):
         self.setMinimumWidth(240)
 
     # -- public API ---------------------------------------------------------
+    def set_assignment_sources(
+        self,
+        sources: dict[str, str],
+        selected: str,
+        summary: str = "",
+        *,
+        dataset: str | None = None,
+    ):
+        if dataset is not None:
+            self._dataset = dataset
+        self._assignment_combo.blockSignals(True)
+        try:
+            self._assignment_combo.clear()
+            for key, label in sources.items():
+                self._assignment_combo.addItem(label, key)
+            self._assignment_combo.setCurrentIndex(
+                max(0, self._assignment_combo.findData(selected))
+            )
+        finally:
+            self._assignment_combo.blockSignals(False)
+        self._assignment_summary.setText(summary)
+        self._assignment_summary.setToolTip(
+            "Not modelled transcripts were excluded from the pciSeq model; "
+            "they are distinct from modelled background. The unassigned display "
+            "controls include both groups."
+        )
+
+    def _on_assignment_source_changed(self, _index):
+        if (
+            self._dataset is not None
+            and self._set_assignment_source_callback is not None
+        ):
+            self._set_assignment_source_callback(
+                self._dataset, self._assignment_combo.currentData()
+            )
+
     def set_status(self, text: str):
         self.status_message.emit(str(text))
 
@@ -3369,6 +3423,12 @@ def _cell_summary_html(cell: dict) -> str:
         f"<b>Total transcripts:</b> {int(cell.get('total', 0)):,}",
         f"<b>Area:</b> {area_text}",
     ]
+    if cell.get("annotation_method") == "pciseq":
+        probability = cell.get("pciseq_probability")
+        if probability is not None and np.isfinite(probability):
+            lines.append(f"<b>pciSeq probability:</b> {probability:.1%}")
+        if cell.get("pciseq_status"):
+            lines.append(f"<b>pciSeq status:</b> {html.escape(str(cell['pciseq_status']))}")
     if cell.get("loading"):
         lines.append("<i>Loading transcript and image statistics…</i>")
         return "<br>".join(lines)
@@ -3446,7 +3506,8 @@ class _CellPanel(QWidget):
         title.setTextFormat(Qt.RichText)
         broad_text = str(cell.get("broad_cell_type", "Unannotated"))
         fine_text = str(cell.get("fine_cell_type", "Unannotated"))
-        broad = QLabel(f"Broad: {broad_text}")
+        is_pciseq = cell.get("annotation_method") == "pciseq"
+        broad = QLabel(f"{'pciSeq' if is_pciseq else 'Broad'}: {broad_text}")
         broad.setObjectName("BroadCellType")
         broad.setTextFormat(Qt.PlainText)
         broad.setStyleSheet(
@@ -3460,6 +3521,7 @@ class _CellPanel(QWidget):
             f"color: {_rgba_css_color(cell.get('fine_cell_type_rgba'))}; "
             "font-size: 22pt; font-weight: bold;"
         )
+        fine.setVisible(not is_pciseq)
         summary = QLabel(_cell_summary_html(cell))
         summary.setTextFormat(Qt.RichText)
         summary.setWordWrap(True)
@@ -4491,6 +4553,7 @@ class ComparisonViewerController:
         self._paired_registry: PairedLayerRegistry | None = None
         self._paired_registry_repair_pending = False
         self._dataset_sessions: OrderedDict[str, DatasetSession] = OrderedDict()
+        self._transcript_assignment_sources: dict[str, str] = {}
         self._dataset_load_generation = 0
         self._dataset_load_worker: object | None = None
         self._dataset_loading_key: tuple[str, bool] | None = None
@@ -8039,7 +8102,14 @@ class ComparisonViewerController:
         if len(self._active_sdata.points) == 0:
             raise RuntimeError("No points available in SpatialData.")
 
-        points_key = list(self._active_sdata.points.keys())[0]
+        ds = str(self.active_dataset).upper()
+        metadata = self._transcript_source_metadata(ds)
+        points_key = (str(metadata["points"]) if metadata is not None else
+                      "transcripts" if "transcripts" in self._active_sdata.points else
+                      next((str(key) for key in self._active_sdata.points
+                            if not str(key).startswith("transcripts_pciseq_")), ""))
+        if self._transcript_source_key(ds) != "native" and metadata is None:
+            raise KeyError(f"Selected transcript assignment source is unavailable for {ds}")
         return self._resolve_points_columns_for(self._active_sdata, points_key)
 
     @staticmethod
@@ -8692,17 +8762,144 @@ class ComparisonViewerController:
     def _gene_layer_name(self, ds: str, symbol: str) -> str:
         return f"Genes | {gene_marker_symbol_label(symbol)}"
 
+    def _transcript_source_key(self, dataset: str) -> str:
+        return getattr(self, "_transcript_assignment_sources", {}).get(
+            str(dataset).upper(), "native"
+        )
+
+    def _transcript_source_metadata(self, dataset: str, source: str | None = None):
+        key = self._transcript_source_key(dataset) if source is None else str(source)
+        if key == "native":
+            return None
+        cfg = getattr(self, "datasets", {}).get(str(dataset).upper())
+        path = getattr(cfg, "zarr_path", None)
+        metadata = assignment_source_points(path, key) if path is not None else None
+        return metadata
+
+    def _transcript_source_identity(self, dataset: str) -> tuple[str, str]:
+        key = self._transcript_source_key(dataset)
+        metadata = self._transcript_source_metadata(dataset)
+        return key, str(metadata.get("analysis_id", "")) if metadata else ""
+
+    def _transcript_payload_is_current(self, dataset: str, payload: dict) -> bool:
+        return (
+            str(payload.get("assignment_source", "native")),
+            str(payload.get("analysis_id", "")),
+        ) == self._transcript_source_identity(dataset)
+
+    def _publish_transcript_sources(self, state: GeneInspectorState | None = None):
+        widget = self._gene_inspector_widget
+        if widget is None or not hasattr(widget, "set_assignment_sources"):
+            return
+        paired = self._paired_session is not None
+        platforms = ("MERSCOPE", "XENIUM") if paired else (self.active_dataset,)
+        platforms = tuple(ds for ds in platforms if ds is not None)
+        options = {"native": "Native assignments"}
+        for source in CELL_TYPE_SOURCES:
+            if getattr(source, "method", "") != "pciseq":
+                continue
+            available = [
+                ds
+                for ds in platforms
+                if self._transcript_source_metadata(ds, source.key)
+            ]
+            if available:
+                suffix = (
+                    f" ({', '.join(available)} only)"
+                    if len(available) != len(platforms)
+                    else ""
+                )
+                options[source.key] = source.label + suffix
+        selected = self._transcript_source_key(platforms[0]) if platforms else "native"
+        summary = ""
+        if selected != "native":
+            if selected not in options:
+                source = cell_type_source(selected)
+                options[selected] = (
+                    f"{source.label if source else selected} (unavailable)"
+                )
+            missing = [
+                ds for ds in platforms if self._transcript_source_metadata(ds) is None
+            ]
+            if missing:
+                summary = f"Unavailable for {', '.join(missing)}; those transcripts and cell assignments are hidden."
+            states = (
+                getattr(self, "_gene_inspector_states", {}).values()
+                if paired
+                else (state,)
+            )
+            counts: dict[str, int] = {}
+            for item in states:
+                if (
+                    item is not None
+                    and getattr(item, "assignment_source", "native") == selected
+                ):
+                    for status, count in (
+                        getattr(item.store, "source_status_counts", None) or {}
+                    ).items():
+                        counts[status] = counts.get(status, 0) + int(count)
+            if counts:
+                summary += (" " if summary else "") + "; ".join(
+                    f"{counts.get(key, 0):,} {label}"
+                    for key, label in (
+                        ("assigned", "assigned"),
+                        ("background", "modelled background"),
+                        ("not_modelled", "not modelled"),
+                    )
+                )
+        widget.set_assignment_sources(
+            options,
+            selected,
+            summary,
+            dataset="PAIRED" if paired else self.active_dataset,
+        )
+
+    def set_transcript_assignment_source(self, dataset_name: str, source_key: str):
+        source_key = str(source_key)
+        paired = self._paired_session is not None
+        platforms = ("MERSCOPE", "XENIUM") if paired else (str(dataset_name).upper(),)
+        if source_key != "native" and not any(
+            self._transcript_source_metadata(ds, source_key) is not None
+            for ds in platforms
+        ):
+            self._set_status(
+                f"Transcript assignment source {source_key} is unavailable."
+            )
+            return False
+        if not hasattr(self, "_transcript_assignment_sources"):
+            self._transcript_assignment_sources = {}
+        for ds in platforms:
+            self._transcript_assignment_sources[ds] = source_key
+            session = self._dataset_sessions.get(ds)
+            if session is not None:
+                session.gene_payload = None
+        if paired:
+            self._teardown_paired_gene_inspector(clear_widget=False)
+            self._clear_paired_cell_selections()
+        else:
+            self._teardown_gene_inspector(platforms[0])
+        self._publish_transcript_sources()
+        self.open_gene_inspector("PAIRED" if paired else platforms[0])
+        return True
+
     def _resolve_gene_points_columns(self):
         points_key, points_obj, x_col, y_col, assignment_col = self._resolve_points_columns()
         gene_col = resolve_gene_column(points_obj)
         background_col = first_existing_col(points_obj, ["background"])
+        metadata = self._transcript_source_metadata(self.active_dataset)
+        if metadata:
+            assignment_col = str(metadata["assignment_column"])
+            background_col = str(metadata["background_column"])
         return points_key, points_obj, x_col, y_col, assignment_col, gene_col, background_col
 
     def _paired_gene_build_input(self, platform: str):
         session = self._paired_session
         if session is None:
             raise RuntimeError("No paired dataset is loaded.")
-        points_key = session.contract.profile(platform).points_key
+        metadata = self._transcript_source_metadata(platform)
+        if self._transcript_source_key(platform) != "native" and metadata is None:
+            raise KeyError(f"Selected transcript assignment source is unavailable for {platform}")
+        points_key = str(metadata["points"]) if metadata else session.contract.profile(platform).points_key
         points_key, points_obj, x_col, y_col, assignment_col = (
             self._resolve_points_columns_for(session.sdata[platform], points_key)
         )
@@ -8710,6 +8907,9 @@ class ComparisonViewerController:
         if gene_col is None:
             raise KeyError(f"{platform} points[{points_key}] has no gene column")
         background_col = first_existing_col(points_obj, ["background"])
+        if metadata:
+            assignment_col = str(metadata["assignment_column"])
+            background_col = str(metadata["background_column"])
         return (
             points_key,
             points_obj,
@@ -8720,16 +8920,69 @@ class ComparisonViewerController:
             background_col,
         )
 
+    def _paired_assignment_display_input(self, platform: str, metadata: dict | None):
+        session = self._paired_session
+        if session is None or metadata is None:
+            return None
+        display_key = session.contract.profile(platform).points_key
+        if str(metadata["source_points"]) == str(display_key):
+            return None
+        key, points, x_col, y_col, _assignment = self._resolve_points_columns_for(
+            session.sdata[platform], display_key
+        )
+        gene_col = resolve_gene_column(points)
+        if gene_col is None:
+            raise KeyError(f"{platform} aligned points[{key}] has no gene column")
+        if "transcript_id" not in points.columns:
+            raise KeyError(
+                f"{platform} aligned points[{key}] has no exact transcript_id for pciSeq assignments"
+            )
+        return key, points, x_col, y_col, gene_col
+
+    @staticmethod
+    @contextmanager
+    def _assignment_display_spool(points):
+        """Reuse one bounded exact-ID join across both transcript passes."""
+        if isinstance(points, pd.DataFrame):
+            yield points
+            return
+        import dask.dataframe as dd
+
+        # A lazy shuffled graph would otherwise be recomputed for each output
+        # partition in each streaming pass. Spool its narrow columns once,
+        # outside the sample, without retaining all transcripts in memory.
+        with TemporaryDirectory(prefix="napari-assignment-display-") as scratch:
+            parquet = Path(scratch) / "points"
+            with dask.config.set({"temporary-directory": scratch}):
+                points.to_parquet(
+                    str(parquet),
+                    write_index=False,
+                    compute_kwargs={"scheduler": "synchronous"},
+                )
+            yield dd.read_parquet(str(parquet))
+
     def _open_paired_gene_inspector(self):
         session = self._paired_session
         if session is None:
             return False
         self._teardown_paired_gene_inspector(clear_widget=False)
+        self._publish_transcript_sources()
+        identities = {ds: self._transcript_source_identity(ds) for ds in ("MERSCOPE", "XENIUM")}
+        metadata = {ds: self._transcript_source_metadata(ds) for ds in identities}
+        try:
+            inputs = {ds: self._paired_gene_build_input(ds) for ds in identities
+                      if identities[ds][0] == "native" or metadata[ds] is not None}
+            display_inputs = {ds: self._paired_assignment_display_input(ds, metadata[ds]) for ds in inputs}
+        except (KeyError, ValueError) as exc:
+            self._set_status(f"Paired transcript load failed: {exc}")
+            return False
         self._gene_build_generation += 1
         generation = self._gene_build_generation
         task_key = (
             "PAIRED",
             session.contract.pair_id,
+            tuple((ds, *identity) for ds, identity in identities.items()),
+            tuple((ds, value[0] if value else None) for ds, value in display_inputs.items()),
             int(getattr(self.args, "gene_max_render_points", DEFAULT_GENE_MAX_RENDER_POINTS)),
             int(getattr(self.args, "random_state", 42)),
         )
@@ -8752,6 +9005,8 @@ class ComparisonViewerController:
                 for offset, platform in enumerate(("MERSCOPE", "XENIUM")):
                     if cancel_token.is_set():
                         raise RuntimeError("Paired transcript build cancelled")
+                    if platform not in inputs:
+                        continue
                     (
                         points_key,
                         points_obj,
@@ -8760,7 +9015,15 @@ class ComparisonViewerController:
                         assignment_col,
                         gene_col,
                         background_col,
-                    ) = self._paired_gene_build_input(platform)
+                    ) = inputs[platform]
+                    source_key, analysis_id = identities[platform]
+                    status_col = (metadata[platform] or {}).get("status_column")
+                    display = display_inputs[platform]
+                    assignment_gene_col = gene_col
+                    if display is not None:
+                        display_points_key, display_points, x_col, y_col, gene_col = display
+                    else:
+                        display_points_key = None
                     resolution = None
 
                     def resolve_reference(genes, ds=platform):
@@ -8783,6 +9046,10 @@ class ComparisonViewerController:
                         max_points=max_points if max_points > 0 else None,
                         random_state=seed,
                         build_cell_index=assignment_col is not None,
+                        assignment_source=source_key,
+                        analysis_id=analysis_id,
+                        status_col=status_col,
+                        coordinate_points_key=display_points_key,
                     )
                     payload = (
                         load_transcript_payload(
@@ -8793,19 +9060,37 @@ class ComparisonViewerController:
                         else None
                     )
                     if payload is None:
-                        store = build_gene_point_groups(
-                            points_obj,
-                            x_col=x_col,
-                            y_col=y_col,
-                            gene_col=gene_col,
-                            assignment_col=assignment_col,
-                            background_col=background_col,
-                            reference_resolver=resolve_reference,
-                            max_points=max_points if max_points > 0 else None,
-                            random_state=seed,
-                            build_cell_index=assignment_col is not None,
-                            cancel_check=cancel_token.is_set,
-                        )
+                        if display is not None:
+                            # Join only after a cache miss, on the background
+                            # worker. Row order and image affines are never used
+                            # to transfer assignments to registered coordinates.
+                            points_obj = assignment_points_in_display_frame(
+                                points_obj, display_points,
+                                assignment_gene_col=assignment_gene_col,
+                                display_gene_col=gene_col,
+                                assignment_col=assignment_col,
+                                background_col=background_col,
+                                status_col=status_col,
+                                coordinate_cols=(x_col, y_col),
+                            )
+                        spool = self._assignment_display_spool(points_obj) if display is not None else nullcontext(points_obj)
+                        with spool as render_points:
+                            if cancel_token.is_set():
+                                raise RuntimeError("Paired transcript build cancelled")
+                            store = build_gene_point_groups(
+                                render_points,
+                                x_col=x_col,
+                                y_col=y_col,
+                                gene_col=gene_col,
+                                assignment_col=assignment_col,
+                                background_col=background_col,
+                                reference_resolver=resolve_reference,
+                                max_points=max_points if max_points > 0 else None,
+                                random_state=seed,
+                                build_cell_index=assignment_col is not None,
+                                cancel_check=cancel_token.is_set,
+                                status_col=status_col,
+                            )
                         payload = {
                             "points_key": points_key,
                             "store": store,
@@ -8824,6 +9109,10 @@ class ComparisonViewerController:
                                 cancel_check=cancel_token.is_set,
                             )
                     payload["build_seconds"] = time.time() - started
+                    payload["assignment_source"] = source_key
+                    payload["analysis_id"] = analysis_id
+                    payload["paired_source_identities"] = identities
+                    payload["display_points_key"] = display_points_key
                     payloads[platform] = payload
             return pair_id, payloads
 
@@ -8883,6 +9172,8 @@ class ComparisonViewerController:
         state = GeneInspectorState(
             dataset=platform,
             points_key=str(payload["points_key"]),
+            assignment_source=str(payload.get("assignment_source", "native")),
+            analysis_id=str(payload.get("analysis_id", "")),
             store=store,
             gene_visuals=store.gene_visuals or coarse_scheme.visuals,
             layer_names=[],
@@ -9109,6 +9400,13 @@ class ComparisonViewerController:
             or session is None
             or session.contract.pair_id != pair_id
             or (token is not None and token.is_set())
+            or any(not self._transcript_payload_is_current(ds, payload) for ds, payload in payloads.items())
+            or any(tuple(identity) != self._transcript_source_identity(ds)
+                   for payload in payloads.values()
+                   for ds, identity in payload.get("paired_source_identities", {}).items())
+            or any(payload.get("display_points_key") is not None
+                   and payload["display_points_key"] != session.contract.profile(ds).points_key
+                   for ds, payload in payloads.items())
         ):
             return
         self._gene_build_worker = None
@@ -9130,7 +9428,8 @@ class ComparisonViewerController:
             self._gene_inspector_states[platform] = state
             paired_states.append(state)
             if store.cell_transcript_index is not None:
-                self._cell_transcript_index[platform] = store.cell_transcript_index
+                self._cache_cell_transcript_index(platform, store.cell_transcript_index,
+                                                  (state.assignment_source, state.analysis_id))
             total_points += int(store.total_points)
 
         self._harmonize_paired_gene_states(paired_states)
@@ -9203,6 +9502,7 @@ class ComparisonViewerController:
         self._task_keys.pop("transcripts", None)
         self._gene_build_generation += 1
         self._gene_build_worker = None
+        self._invalidate_cell_inspection(None)
         for platform in ("MERSCOPE", "XENIUM"):
             state = self._gene_inspector_states.pop(platform, None)
             if state is not None and state.rebuild_timer is not None:
@@ -9223,7 +9523,9 @@ class ComparisonViewerController:
             return
         ds = str(dataset_name).upper()
         session = self._dataset_sessions.get(ds)
-        if reuse_cached and session is not None and session.gene_payload is not None:
+        self._publish_transcript_sources()
+        if (reuse_cached and session is not None and session.gene_payload is not None
+                and self._transcript_payload_is_current(ds, session.gene_payload)):
             self._teardown_gene_inspector(ds)
             self._gene_build_generation += 1
             generation = self._gene_build_generation
@@ -9244,6 +9546,7 @@ class ComparisonViewerController:
 
         # Tear down any prior gene inspector layers before rebuilding.
         self._teardown_gene_inspector(ds)
+        self._publish_transcript_sources()
         gc.collect()
 
         self._gene_build_generation += 1
@@ -9252,7 +9555,10 @@ class ComparisonViewerController:
         random_state = int(getattr(self.args, "random_state", 42))
         cfg = self.datasets.get(ds)
         zarr_path = getattr(cfg, "zarr_path", None)
-        task_key = (ds, str(points_key), max_points, random_state)
+        source_key, analysis_id = self._transcript_source_identity(ds)
+        metadata = self._transcript_source_metadata(ds)
+        status_col = (metadata or {}).get("status_column")
+        task_key = (ds, str(points_key), source_key, analysis_id, max_points, random_state)
         cancel_token = self._begin_task_token("transcripts", task_key)
         if cancel_token is None:
             self._set_status(f"{ds}: transcript build is already running.")
@@ -9287,6 +9593,9 @@ class ComparisonViewerController:
                     max_points=max_points if max_points > 0 else None,
                     random_state=random_state,
                     build_cell_index=assignment_col is not None,
+                    assignment_source=source_key,
+                    analysis_id=analysis_id,
+                    status_col=status_col,
                 )
                 payload = (
                     load_transcript_payload(
@@ -9309,6 +9618,7 @@ class ComparisonViewerController:
                         random_state=random_state,
                         build_cell_index=assignment_col is not None,
                         cancel_check=cancel_token.is_set,
+                        status_col=status_col,
                     )
                     payload = {
                         "points_key": points_key,
@@ -9326,6 +9636,8 @@ class ComparisonViewerController:
                             cancel_check=cancel_token.is_set,
                         )
             payload["build_seconds"] = time.time() - t0
+            payload["assignment_source"] = source_key
+            payload["analysis_id"] = analysis_id
             return payload
 
         if thread_worker is None:
@@ -9359,6 +9671,7 @@ class ComparisonViewerController:
         if (
             generation != self._gene_build_generation
             or self.active_dataset != ds
+            or not self._transcript_payload_is_current(ds, payload)
             or (token is not None and token.is_set())
         ):
             return
@@ -9401,6 +9714,8 @@ class ComparisonViewerController:
         state = GeneInspectorState(
             dataset=ds,
             points_key=points_key,
+            assignment_source=str(payload.get("assignment_source", "native")),
+            analysis_id=str(payload.get("analysis_id", "")),
             store=store,
             gene_visuals=gene_visuals,
             layer_names=[],
@@ -9437,7 +9752,8 @@ class ComparisonViewerController:
         # exact per-cell index produced by the same background streaming pass.
         self._invalidate_cell_inspection(ds)
         if store.cell_transcript_index is not None:
-            self._cell_transcript_index[ds] = store.cell_transcript_index
+            self._cache_cell_transcript_index(ds, store.cell_transcript_index,
+                                              (state.assignment_source, state.analysis_id))
 
         # Create each layer already populated with its enabled genes' points +
         # per-point colours + symbol. Building populated (vs. empty then growing)
@@ -9806,14 +10122,21 @@ class ComparisonViewerController:
         if session is None or registry is None:
             return None
         profile = session.contract.profile(platform)
-        candidates = sorted(
-            profile.segmentations,
-            key=lambda segmentation: (
-                "proseg" not in segmentation.logical_key.lower(),
-                "cellpose" not in segmentation.logical_key.lower(),
-                segmentation.logical_key,
-            ),
-        )
+        assignment_source = self._transcript_source_key(platform)
+        if assignment_source != "native":
+            selected = self._paired_segmentation_for_cell_type(platform, assignment_source)
+            if selected is None:
+                return None
+            candidates = [selected]
+        else:
+            candidates = sorted(
+                profile.segmentations,
+                key=lambda segmentation: (
+                    "proseg" not in segmentation.logical_key.lower(),
+                    "cellpose" not in segmentation.logical_key.lower(),
+                    segmentation.logical_key,
+                ),
+            )
         loaded_regular_layers = []
         for segmentation in candidates:
             layer = registry.layer_for(
@@ -9846,7 +10169,9 @@ class ComparisonViewerController:
                     platform,
                     source_key,
                 )
-                if segmentation is not None:
+                if segmentation is not None and (
+                    assignment_source == "native" or segmentation.logical_key == candidates[0].logical_key
+                ):
                     return segmentation
         # Match standalone picking semantics: if no mask layer was loaded at
         # all, the stored vector geometry can still be inspected.  A deliberately
@@ -10079,6 +10404,10 @@ class ComparisonViewerController:
         """Resolve the segmentation GeoDataFrame to hit-test, preferring ProSeg."""
         if self._active_sdata is None:
             return None
+        ds = getattr(self, "active_dataset", None)
+        if ds is not None and self._transcript_source_key(ds) != "native":
+            metadata = self._transcript_source_metadata(ds)
+            return str(metadata["shape"]) if metadata is not None else None
         try:
             shape_keys = [str(k) for k in self._active_sdata.shapes.keys()]
         except Exception:
@@ -10176,7 +10505,8 @@ class ComparisonViewerController:
             segmentation = self._paired_pick_segmentation(state.dataset)
             if segmentation is None:
                 return None
-            candidates = [state.segmentation]
+            selected = self._transcript_source_key(state.dataset)
+            candidates = ([selected] if selected != "native" else []) + [state.segmentation]
             candidates.extend(
                 source.key
                 for source in CELL_TYPE_SOURCES
@@ -10198,7 +10528,8 @@ class ComparisonViewerController:
             return None
         session = self._dataset_sessions.get(state.dataset)
         available = dict(session.cell_type_available) if session is not None else {}
-        candidates = [state.segmentation]
+        selected = self._transcript_source_key(state.dataset)
+        candidates = ([selected] if selected != "native" else []) + [state.segmentation]
         candidates.extend(
             source.key
             for source in CELL_TYPE_SOURCES
@@ -10206,7 +10537,11 @@ class ComparisonViewerController:
         )
         for key in candidates:
             source = cell_type_source(key)
-            if source is None or shape_key not in source.mask_shape_keys:
+            if source is None:
+                continue
+            metadata = self._transcript_source_metadata(state.dataset, key) if getattr(source, "method", "") == "pciseq" else None
+            shapes = (str(metadata["shape"]),) if metadata is not None else source.mask_shape_keys
+            if shape_key not in shapes:
                 continue
             if available.get(key) is False and state.assignments.get(key) is None:
                 continue
@@ -10234,37 +10569,50 @@ class ComparisonViewerController:
         segmentation = self._cell_inspector_annotation_source(state)
         if segmentation is None:
             return self._unannotated_cell_type_fields()
-        if load and segmentation not in state.assignments:
+        if load:
             self._load_cell_type_data(state, segmentation)
         assignments = state.assignments.get(segmentation)
         schemes = state.schemes.get(segmentation)
         if assignments is None or schemes is None:
             return self._unannotated_cell_type_fields()
+        if getattr(cell_type_source(segmentation), "method", "") == "pciseq":
+            metadata = self._transcript_source_metadata(ds, segmentation)
+            if metadata is None or getattr(assignments, "analysis_id", "") != metadata["analysis_id"]:
+                return self._unannotated_cell_type_fields()
 
         lookup = state.annotation_lookup.get(segmentation)
         if lookup is None:
             lookup = {
-                normalize_cell_key(cid): (str(broad), str(fine))
-                for cid, broad, fine in zip(
+                normalize_cell_key(cid): (str(broad), str(fine), row)
+                for row, (cid, broad, fine) in enumerate(zip(
                     np.asarray(assignments.cell_ids).tolist(),
                     np.asarray(assignments.broad).tolist(),
                     np.asarray(assignments.fine).tolist(),
-                )
+                ))
             }
             state.annotation_lookup[segmentation] = lookup
         labels = lookup.get(normalize_cell_key(cell_id))
         if labels is None:
             return self._unannotated_cell_type_fields()
-        broad, fine = labels
+        broad, fine = labels[:2]
         neutral = (0.6, 0.64, 0.7, 1.0)
-        broad_scheme = schemes.get("broad", schemes.get("ct_broad"))
-        fine_scheme = schemes.get("fine", schemes.get("ct_final"))
-        return {
+        broad_scheme = schemes.get("broad", schemes.get("ct_broad", schemes.get("pciseq")))
+        fine_scheme = schemes.get("fine", schemes.get("ct_final", schemes.get("pciseq")))
+        result = {
             "broad_cell_type": broad if broad != "None" else "Unannotated",
             "fine_cell_type": fine if fine != "None" else "Unannotated",
             "broad_cell_type_rgba": broad_scheme.colors.get(broad, neutral) if broad_scheme else neutral,
             "fine_cell_type_rgba": fine_scheme.colors.get(fine, neutral) if fine_scheme else neutral,
         }
+        if getattr(cell_type_source(segmentation), "method", "") == "pciseq":
+            result["annotation_method"] = "pciseq"
+            row = labels[2] if len(labels) > 2 else None
+            if row is not None:
+                probabilities = getattr(assignments, "probabilities", None)
+                statuses = getattr(assignments, "statuses", None)
+                result["pciseq_probability"] = float(probabilities[row]) if probabilities is not None else None
+                result["pciseq_status"] = str(statuses[row]) if statuses is not None else None
+        return result
 
     def _refresh_cell_selection_annotations(self, dataset_name: str):
         """Refresh existing inspector panels after background annotation load."""
@@ -10290,10 +10638,22 @@ class ComparisonViewerController:
         return CellTranscriptIndex.empty()
 
     def _get_cell_transcript_index(self, ds: str) -> CellTranscriptIndex:
-        """Return the already-prepared index without doing GUI-thread I/O."""
+        """Return an index only for the selected assignment generation."""
         key = str(ds).upper()
+        saved = getattr(self, "_cell_transcript_index_sources", {}).get(key, ("native", ""))
+        identity = self._transcript_source_identity(key)
+        if saved != identity or (identity[0] != "native" and not identity[1]):
+            return self._empty_cell_transcript_index()
         cached = self._cell_transcript_index.get(key)
         return cached if cached is not None else self._empty_cell_transcript_index()
+
+    def _cache_cell_transcript_index(self, ds: str, index: CellTranscriptIndex,
+                                   identity: tuple[str, str] | None = None):
+        key = str(ds).upper()
+        self._cell_transcript_index[key] = index
+        if not hasattr(self, "_cell_transcript_index_sources"):
+            self._cell_transcript_index_sources = {}
+        self._cell_transcript_index_sources[key] = identity if identity is not None else self._transcript_source_identity(key)
 
     def _invalidate_cell_inspection(self, ds: str | None = None):
         """Drop cached cell index(es) and clear highlighted cells."""
@@ -10306,11 +10666,13 @@ class ComparisonViewerController:
         self._cell_inspection_workers.clear()
         if ds is None:
             self._cell_transcript_index.clear()
+            self._cell_transcript_index_sources = {}
             self._cell_intensity_cache.clear()
             self._clear_all_cell_selections()
             return
         ds_key = str(ds).upper()
         self._cell_transcript_index.pop(ds_key, None)
+        getattr(self, "_cell_transcript_index_sources", {}).pop(ds_key, None)
         self._cell_intensity_cache = {
             key: value for key, value in self._cell_intensity_cache.items() if key[0] != ds_key
         }
@@ -10442,8 +10804,7 @@ class ComparisonViewerController:
 
     def _cell_index_build_inputs(self):
         try:
-            _pk, points_obj, x_col, y_col, assignment_col = self._resolve_points_columns()
-            gene_col = resolve_gene_column(points_obj)
+            _pk, points_obj, x_col, y_col, assignment_col, gene_col, _bg = self._resolve_gene_points_columns()
         except Exception:
             return None
         if gene_col is None or assignment_col is None:
@@ -10453,11 +10814,13 @@ class ComparisonViewerController:
     def _start_cell_selection_build(self, ds: str, cell_id, geometry, color: str):
         ds_key = str(ds).upper()
         norm = normalize_cell_key(cell_id)
-        worker_key = (ds_key, norm)
+        worker_key = (ds_key, norm, *self._transcript_source_identity(ds_key))
         if worker_key in self._cell_inspection_workers:
             return
         generation = self._cell_inspection_generation
         index = self._cell_transcript_index.get(ds_key)
+        if getattr(self, "_cell_transcript_index_sources", {}).get(ds_key, ("native", "")) != self._transcript_source_identity(ds_key):
+            index = None
         index_inputs = None if index is not None else self._cell_index_build_inputs()
         state = self._gene_inspector_states.get(ds_key)
         visuals = dict(state.gene_visuals) if state is not None else None
@@ -10517,10 +10880,12 @@ class ComparisonViewerController:
         index: CellTranscriptIndex,
     ):
         self._cell_inspection_workers.pop(worker_key, None)
-        ds, norm = worker_key
+        ds, norm = worker_key[:2]
         if generation != self._cell_inspection_generation or self.active_dataset != ds:
             return
-        self._cell_transcript_index.setdefault(ds, index)
+        if len(worker_key) > 2 and tuple(worker_key[2:]) != self._transcript_source_identity(ds):
+            return
+        self._cache_cell_transcript_index(ds, index, tuple(worker_key[2:]) if len(worker_key) > 2 else None)
         entries = self._selected_cells.get(ds, [])
         for entry in entries:
             if normalize_cell_key(entry.get("cell_id")) == norm:
@@ -11034,6 +11399,7 @@ class ComparisonViewerController:
         if widget is None:
             return
         store = state.store
+        self._publish_transcript_sources(state)
         layout, labels = self._gene_ordering_layout(state)
         widget.set_ordering_available(
             state.broad_ordering_available,
@@ -11241,6 +11607,10 @@ class ComparisonViewerController:
         keys; the first present in the store wins. Falls back to the historical
         ``MOSAIK_<source>`` name for unknown sources.
         """
+        cfg = getattr(self, "datasets", {}).get(getattr(self, "active_dataset", None))
+        exact = cell_type_shape_key_for_source(getattr(cfg, "zarr_path", None), source_key)
+        if exact:
+            return exact
         source = cell_type_source(source_key)
         candidates = source.mask_shape_keys if source is not None else (f"MOSAIK_{source_key}",)
         shapes = self._active_sdata.shapes if self._active_sdata is not None else {}
@@ -11258,7 +11628,14 @@ class ComparisonViewerController:
         """
         seg = str(segmentation)
         if seg in state.assignments:
-            return state.assignments[seg] is not None
+            source = cell_type_source(seg)
+            if getattr(source, "method", "") != "pciseq":
+                return state.assignments[seg] is not None
+            metadata = self._transcript_source_metadata(state.dataset, seg)
+            cached = state.assignments[seg]
+            if metadata is not None and cached is not None and getattr(cached, "analysis_id", "") == metadata["analysis_id"]:
+                return True
+            state.assignments.pop(seg, None)
         cfg = self.datasets.get(state.dataset)
         zarr_path = getattr(cfg, "zarr_path", None)
         assignments = load_cell_type_assignments(zarr_path, seg) if zarr_path is not None else None
@@ -11283,12 +11660,12 @@ class ComparisonViewerController:
             kind: set(scheme.order) for kind, scheme in schemes.items()
         }
         state.annotation_lookup[seg] = {
-            normalize_cell_key(cid): (str(broad), str(fine))
-            for cid, broad, fine in zip(
+            normalize_cell_key(cid): (str(broad), str(fine), row)
+            for row, (cid, broad, fine) in enumerate(zip(
                 np.asarray(assignments.cell_ids).tolist(),
                 np.asarray(assignments.broad).tolist(),
                 np.asarray(assignments.fine).tolist(),
-            )
+            ))
         }
         return True
 
@@ -11305,7 +11682,10 @@ class ComparisonViewerController:
         zarr_path = getattr(cfg, "zarr_path", None)
         if zarr_path is None:
             return
-        key = (state.dataset, str(segmentation))
+        source = cell_type_source(segmentation)
+        metadata = self._transcript_source_metadata(state.dataset, segmentation) if getattr(source, "method", "") == "pciseq" else None
+        analysis_id = (metadata or {}).get("analysis_id", "")
+        key = (state.dataset, state.store_path, str(segmentation), analysis_id)
         if key in self._cell_annotation_workers:
             return
 
@@ -11316,7 +11696,10 @@ class ComparisonViewerController:
         def apply(assignments):
             self._cell_annotation_workers.pop(key, None)
             current = self._cell_type_states.get(state.dataset)
-            if current is None:
+            if current is not state:
+                return
+            latest = self._transcript_source_metadata(state.dataset, segmentation) if getattr(source, "method", "") == "pciseq" else None
+            if analysis_id != (latest or {}).get("analysis_id", ""):
                 return
             self._cache_cell_type_data(current, segmentation, assignments)
             self._refresh_cell_selection_annotations(state.dataset)
@@ -11387,12 +11770,16 @@ class ComparisonViewerController:
             return None
         platform = str(platform).upper()
         profile = session.contract.profile(platform)
-        candidate_shapes = set(source.mask_shape_keys)
+        metadata = self._transcript_source_metadata(platform, source_key) if getattr(source, "method", "") == "pciseq" else None
+        if getattr(source, "method", "") == "pciseq" and metadata is None:
+            return None
+        native_shapes = (str(metadata["shape"]),) if metadata is not None else source.mask_shape_keys
+        candidate_shapes = set(native_shapes)
         if platform == "MERSCOPE":
             shape_mapping = session.contract.mappings.get("shapes", {})
             candidate_shapes = {
                 str(shape_mapping[shape_key])
-                for shape_key in source.mask_shape_keys
+                for shape_key in native_shapes
                 if shape_key in shape_mapping
             }
         for segmentation in profile.segmentations:
@@ -11402,9 +11789,12 @@ class ComparisonViewerController:
             ):
                 return segmentation
 
+        if metadata is not None:
+            return None
+
         # Schema branch names are stable in most stores, so retain a precise
         # logical-key fallback for sources whose historical mask name differs.
-        logical_candidates = {str(source.key)}
+        logical_candidates = {str(metadata["segmentation"]) if metadata is not None else str(source.key)}
         if source.key == "proseg_mask":
             logical_candidates.add("proseg")
         return next(
@@ -11597,13 +11987,14 @@ class ComparisonViewerController:
                 is not None
             )
         )
-        if len(available) != len(states):
+        if not available or (len(available) != len(states) and getattr(cell_type_source(states[0].segmentation), "method", "") != "pciseq"):
             self._clear_paired_cell_type_layers()
             self._set_status(
                 f"Both datasets need matching labels and cell-type annotations "
                 f"for {segmentation}."
             )
             return
+        self._synchronize_paired_cell_type_schemes(available)
         self._publish_cell_type_levels()
         if available[0].kind:
             self._apply_paired_cell_type_layers(available)
@@ -11623,7 +12014,7 @@ class ComparisonViewerController:
                 is not None
             ):
                 available.append(state)
-        if len(available) != len(states):
+        if not available or (len(available) != len(states) and getattr(cell_type_source(states[0].segmentation), "method", "") != "pciseq"):
             self._clear_paired_cell_type_layers()
             self._set_status(
                 "Both paired datasets need a matching materialized mask and "
@@ -11654,6 +12045,12 @@ class ComparisonViewerController:
             )
             return
         state = self._cell_type_state(dataset_name)
+        self._cell_type_generation += 1
+        token = self._task_cancel_events.get("cell-types")
+        if token is not None:
+            token.set()
+        self._remove_layers_by_prefix(layer_name_prefix(state.dataset, "cell_types"))
+        state.layer_name = None
         state.segmentation = str(segmentation)
         if not self._load_cell_type_data(state, state.segmentation):
             self._set_status(
@@ -11948,7 +12345,9 @@ class ComparisonViewerController:
         """Build (off the GUI thread) and draw the filled cell-type Labels layer."""
         seg = state.segmentation
         kind = state.kind or "broad"
-        task_key = (state.dataset, seg, kind)
+        metadata = self._transcript_source_metadata(state.dataset, seg) if getattr(cell_type_source(seg), "method", "") == "pciseq" else None
+        analysis_id = (metadata or {}).get("analysis_id", "")
+        task_key = (state.dataset, seg, kind, analysis_id)
         cancel_token = self._begin_task_token("cell-types", task_key)
         if cancel_token is None:
             self._set_status(f"{state.dataset}: that cell-type overlay is already being prepared.")
@@ -11970,7 +12369,8 @@ class ComparisonViewerController:
                     cancel_check=cancel_token.is_set,
                     expected_dataset=state.dataset,
                 )
-            return {"label_key": label_key, "label_levels": label_levels, "napari_affine": napari_affine}
+            return {"label_key": label_key, "label_levels": label_levels, "napari_affine": napari_affine,
+                    "source_key": seg, "analysis_id": analysis_id}
 
         if thread_worker is None:
             try:
@@ -12007,9 +12407,14 @@ class ComparisonViewerController:
         if (
             generation != self._cell_type_generation
             or self.active_dataset != state.dataset
+            or payload.get("source_key", state.segmentation) != state.segmentation
             or (token is not None and token.is_set())
         ):
             return
+        if getattr(cell_type_source(state.segmentation), "method", "") == "pciseq":
+            metadata = self._transcript_source_metadata(state.dataset, state.segmentation)
+            if metadata is None or payload.get("analysis_id", "") != metadata["analysis_id"]:
+                return
         self._cell_type_worker = None
         if self._active_sdata is None:
             return
@@ -12092,6 +12497,13 @@ class ComparisonViewerController:
     def _source_levels(self, dataset: str, source: str) -> dict[str, str]:
         state = self._cell_type_state(dataset)
         assignments = state.assignments.get(source)
+        if getattr(cell_type_source(source), "method", "") == "pciseq":
+            metadata = self._transcript_source_metadata(dataset, source)
+            if metadata is None:
+                return {}
+            if assignments is None or getattr(assignments, "analysis_id", "") != metadata["analysis_id"]:
+                assignments = None
+                state.available_levels.pop(source, None)
         if assignments is not None:
             keys = assignments.levels or {"broad": None, "fine": None}
             return {key: CELL_TYPE_LEVEL_LABELS[key] for key in keys}
@@ -12108,7 +12520,10 @@ class ComparisonViewerController:
         levels = dict(self._source_levels(states[0].dataset, states[0].segmentation))
         for state in states[1:]:
             other = self._source_levels(state.dataset, state.segmentation)
-            levels = {key: label for key, label in levels.items() if key in other}
+            if getattr(cell_type_source(state.segmentation), "method", "") == "pciseq":
+                levels.update(other)
+            else:
+                levels = {key: label for key, label in levels.items() if key in other}
         for state in states:
             if state.kind and state.kind not in levels:
                 state.kind = next(iter(levels), "")
@@ -12147,7 +12562,7 @@ class ComparisonViewerController:
                 for platform in ("MERSCOPE", "XENIUM")
             }
             available = {
-                source.key: all(
+                source.key: (any if getattr(source, "method", "") == "pciseq" else all)(
                     available_by_platform[platform][source.key]
                     for platform in ("MERSCOPE", "XENIUM")
                 )
@@ -12171,11 +12586,11 @@ class ComparisonViewerController:
             self._publish_cell_type_levels()
             if any(available.values()):
                 widget.set_status(
-                    "Choose a stored cell-type level to colour both paired datasets."
+                    "Choose a stored cell-type level to colour the available paired dataset masks."
                 )
             else:
                 widget.set_status(
-                    "No cell-type annotation source is shared by both datasets."
+                    "No cell-type annotation sources are available for this pair."
                 )
             return
         session = self._dataset_sessions.get(self.active_dataset)
@@ -12552,6 +12967,19 @@ class ComparisonViewerController:
         )
         source = state.source
         label = cell_type_source_label(source)
+        if getattr(cell_type_source(source), "method", "") == "pciseq":
+            for view in state.views.values():
+                identity = (self._transcript_source_metadata(view.dataset, source) or {}).get("analysis_id", "")
+                if view.source_identities.get(source) != identity:
+                    view.embeddings.pop(source, None)
+                    view.label_cache.clear()
+                    view.row_cache.clear()
+                    view.roi = None
+                    annotations = self._cell_type_state(view.dataset)
+                    cached = annotations.assignments.get(source)
+                    if cached is None or getattr(cached, "analysis_id", "") != identity:
+                        annotations.assignments.pop(source, None)
+                    view.source_identities[source] = identity
         needs: dict[str, tuple[bool, bool]] = {}
         for name, view in state.views.items():
             if not view.available_sources.get(source, False):
@@ -12642,10 +13070,13 @@ class ComparisonViewerController:
         stat_key: tuple[str, str] | None,
     ):
         """Load missing embeddings/assignments (per view) and a statistic column."""
+        identities = {name: (self._transcript_source_metadata(name, source) or {}).get("analysis_id", "")
+                      for name in state.views} if getattr(cell_type_source(source), "method", "") == "pciseq" else {}
         load_key = (
             state.dataset,
             state.store_path,
             source,
+            tuple(sorted(identities.items())),
             tuple(sorted(needs.items())),
             stat_key,
         )
@@ -12660,7 +13091,7 @@ class ComparisonViewerController:
             self._umap_widget.set_status(f"Loading the {cell_type_source_label(source)} UMAP…")
 
         def compute():
-            result: dict[str, object] = {"views": {}}
+            result: dict[str, object] = {"views": {}, "source_identities": identities}
             with self._store_io_slots:
                 for name, (need_embedding, need_assignments) in needs.items():
                     zarr_path = paths.get(name)
@@ -12721,6 +13152,10 @@ class ComparisonViewerController:
     ):
         if self._umap_state_obj is not state:
             return  # the dataset changed while this was loading
+        for name, identity in result.get("source_identities", {}).items():
+            latest = (self._transcript_source_metadata(name, source) or {}).get("analysis_id", "")
+            if identity != latest:
+                return
         for name, entry in dict(result.get("views", {})).items():
             view = state.views.get(name)
             if view is None:
@@ -13330,7 +13765,7 @@ class ComparisonViewerController:
             rows = embedding.rows_for_ids(ids[inside])
             rows = np.unique(rows[rows >= 0])
         roi.rows = rows.astype(np.int64, copy=False)
-        roi.cell_ids = np.asarray(embedding.cell_ids, dtype=np.int64)[roi.rows]
+        roi.cell_ids = np.asarray(embedding.cell_ids)[roi.rows]
         roi.source = state.source
         return True
 
@@ -14430,6 +14865,7 @@ def main():
         set_show_controls_callback=controller.set_gene_show_controls,
         set_hide_assigned_callback=controller.set_gene_hide_assigned,
         set_colour_by_assignment_callback=controller.set_gene_colour_by_assignment,
+        set_assignment_source_callback=controller.set_transcript_assignment_source,
         set_ordering_callback=controller.set_gene_ordering,
         set_genes_visible_callback=controller.set_genes_visible,
         spot_size=args.gene_spot_size,

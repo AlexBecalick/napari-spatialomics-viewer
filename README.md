@@ -319,6 +319,47 @@ By default the cache is stored in the platform user-cache directory: under
 `NAPARI_COMPARE_TRANSCRIPT_CACHE_DIR` to use another external directory. Delete
 that directory to force all transcript caches to be rebuilt.
 
+### pciSeq assignments from MerXen
+
+MerXen's pciSeq finalization publishes separately selectable cell-type and
+transcript-assignment sources. Choose a **pciSeq** source for the segmentation
+used in the fit; the original clustering and native transcript assignments stay
+available. A paired session can display a pciSeq source on just the platform
+where it exists, with the other side marked unavailable.
+
+pciSeq cell labels use the all-cell annotation table, including cells excluded
+by clustering QC. Its UMAP uses the original clustered subset: a spatially
+labelled cell can have no embedding point. The model's **Zero** expression class
+is retained as a distinct label, while cells excluded from fitting have no
+inferred type. These results are estimates, not independent validation of the
+reference labels.
+
+Transcript assignments join the original measured positions by exact transcript
+IDs and canonical mask IDs. The viewer never displays the raster-frame
+coordinates from pciSeq's CSV export. Source selection switches the transcript
+store, its per-cell lookup, and the matching segmentation together. The cache
+includes the selected source and analysis identity, so switching assignment
+methods cannot restore an index belonging to another result. The assignment
+summary distinguishes modelled background from transcripts that were not
+modelled, such as genes absent from the reference.
+
+For the moving platform in a paired session, the viewer joins those assignments
+onto the store's materialized aligned transcript positions by transcript ID.
+This preserves nonrigid alignment without changing the native pciSeq points.
+Missing, duplicate, or gene-conflicting IDs are rejected rather than joined to
+another transcript.
+
+For an older completed MerXen run, publish its exports once with:
+
+```bash
+merxen publish-pciseq-viewer --config pciseq_config.json --results-dir pciseq_results
+```
+
+The viewer reads these results from the SpatialData store and does not require
+pciSeq or the reference expression matrix in its own environment.
+
+### Transcript controls
+
 Genes are grouped by marker shape into at most 14 napari Points layers, so per-gene
 toggles stay fast even with hundreds of genes. Each layer keeps fixed point
 buffers and toggles update a per-point visibility mask, avoiding large array and
