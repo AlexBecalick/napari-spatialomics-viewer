@@ -51,12 +51,13 @@ from qtpy.QtWidgets import (
 
 from .utils import (
     CELL_TYPE_SOURCES,
-    cell_id_to_int,
+    analysis_source_metadata,
+    cell_id_to_int as cell_id_to_int,
     cell_ids_as_int64,
     _resolve_instance_key,
     cell_type_source,
     cellpose_value_clip_range,
-    clustering_table_key_for_segmentation,
+    cell_type_table_key_for_source,
     open_zarr_group_unconsolidated,
 )
 
@@ -97,7 +98,7 @@ UMAP_LASSO_MIN_STEP_PX = 2.0
 
 def _unique_id_index(ids: np.ndarray) -> tuple[pd.Index, np.ndarray]:
     """Return a unique ``pd.Index`` over ``ids`` and the rows it keeps (first wins)."""
-    ids = np.asarray(ids, dtype=np.int64)
+    ids = np.asarray(ids)
     duplicated = pd.Index(ids).duplicated(keep="first")
     keep = np.flatnonzero(~duplicated)
     return pd.Index(ids[keep]), keep
@@ -108,7 +109,7 @@ class CellUmapEmbedding:
     """One clustering table's UMAP, row-aligned with its mask cell ids.
 
     ``segmentation`` is the :data:`utils.CELL_TYPE_SOURCES` key it was read for;
-    ``cell_ids`` are unique ``int64`` instance-key values (the mask pixel ids);
+    ``cell_ids`` are unique exact integer instance-key values (the mask pixel ids);
     ``coords`` is ``(N, 2)`` ``float32`` UMAP-1 / UMAP-2.
     """
 
@@ -125,7 +126,7 @@ class CellUmapEmbedding:
     def rows_for_ids(self, ids: Iterable[Any]) -> np.ndarray:
         """Return each id's row, or ``-1`` where that cell has no embedding."""
         if self._index is None:
-            self._index = pd.Index(np.asarray(self.cell_ids, dtype=np.int64))
+            self._index = pd.Index(np.asarray(self.cell_ids))
         wanted, valid = cell_ids_as_int64(list(ids) if not isinstance(ids, np.ndarray) else ids)
         rows = np.full(wanted.shape[0], -1, dtype=np.int64)
         if valid.any():
@@ -147,7 +148,7 @@ def _read_elem():
 def cell_umap_available(zarr_path: Any, segmentation: str) -> bool:
     """Check for a stored two-dimensional embedding without loading its data."""
     try:
-        key = clustering_table_key_for_segmentation(zarr_path, segmentation)
+        key = cell_type_table_key_for_source(zarr_path, segmentation, embedding=True)
         if key is None:
             return False
         array = open_zarr_group_unconsolidated(zarr_path)[f"tables/{key}/obsm/{UMAP_OBSM_KEY}"]
@@ -171,7 +172,13 @@ def load_cell_umap(
     """
     if zarr_path is None:
         return None
-    table_key = clustering_table_key_for_segmentation(zarr_path, segmentation)
+    source = cell_type_source(segmentation)
+    metadata = None
+    if source is not None and source.method == "pciseq":
+        metadata = analysis_source_metadata(zarr_path, segmentation)
+        if metadata is None:
+            return None
+    table_key = cell_type_table_key_for_source(zarr_path, segmentation, embedding=True)
     if table_key is None:
         return None
     try:
@@ -221,11 +228,15 @@ def load_cell_umap(
         rows = rows[keep]
         if rows.size == 0:
             return None
+        if metadata is not None:
+            current = analysis_source_metadata(zarr_path, segmentation)
+            if current is None or current["analysis_id"] != metadata["analysis_id"]:
+                return None
         return CellUmapEmbedding(
             segmentation=str(segmentation),
             table_key=str(table_key),
             instance_key=str(instance_key),
-            cell_ids=ids[rows].astype(np.int64, copy=False),
+            cell_ids=ids[rows],
             coords=coords[rows],
         )
     except Exception as exc:
@@ -1291,7 +1302,7 @@ class UmapPanel(QWidget):
 
     def set_embedding(self, cell_ids, coords) -> None:
         """Show a new embedding (resets zoom); colours follow via set_colouring."""
-        self._cell_ids = np.asarray(cell_ids, dtype=np.int64)
+        self._cell_ids = np.asarray(cell_ids)
         self._colouring = None
         self._canvas.set_message("")
         self._canvas.set_embedding(coords)

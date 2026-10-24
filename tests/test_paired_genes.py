@@ -260,3 +260,16 @@ def test_paired_platform_only_gene_toggle_updates_union_state_and_local_store():
     assert rebuilt == [
         ("MERSCOPE", merscope.store.gene_offsets["M_ONLY"][0])
     ]
+
+
+def test_pciseq_excluded_points_are_unassigned_in_display_but_not_biological_background():
+    frame = pd.DataFrame(dict(x=[1.,2.,3.],y=[4.,5.,6.],gene=["A"]*3,
+        assignment=pd.array([7,None,None],dtype="UInt64"), background=[False,True,False],
+        status=["assigned","background","not_modelled"]))
+    store = build_gene_point_groups(frame,"x","y","gene",assignment_col="assignment",
+                                   background_col="background",status_col="status")
+    _group, start, assigned_end, end = store.gene_offsets["A"]
+    assert assigned_end-start == 1
+    assert end-assigned_end == 2
+    assert frame.background.tolist() == [False,True,False]
+    assert store.source_status_counts == {"assigned":1,"background":1,"not_modelled":1}

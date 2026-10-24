@@ -373,3 +373,54 @@ def test_default_cache_directory_honours_external_environment_override(tmp_path,
     configured = tmp_path / "custom-cache"
     monkeypatch.setenv("NAPARI_COMPARE_TRANSCRIPT_CACHE_DIR", str(configured))
     assert default_transcript_cache_dir() == configured.resolve()
+
+
+def test_assignment_source_analysis_and_status_are_part_of_cache_identity(tmp_path):
+    dataset, _ = _source_store(tmp_path)
+    native = _request(dataset, tmp_path / "cache")
+    source = _request(dataset, tmp_path / "cache", assignment_source="pciseq_proseg_hybrid", analysis_id="a"*64)
+    rebuilt = _request(dataset, tmp_path / "cache", assignment_source="pciseq_proseg_hybrid", analysis_id="b"*64)
+    statuses = _request(dataset, tmp_path / "cache", assignment_source="pciseq_proseg_hybrid", analysis_id="a"*64, status_col="pciseq_assignment_status")
+    assert len({request.digest for request in (native, source, rebuilt, statuses)}) == 4
+    assert len({request.family_digest for request in (native, source, rebuilt, statuses)}) == 4
+
+
+def test_cache_preserves_exact_unsampled_pciseq_status_counts(tmp_path):
+    dataset, _ = _source_store(tmp_path)
+    request = _request(dataset, tmp_path / "cache", assignment_source="pciseq_proseg_hybrid",
+                       analysis_id="a"*64, status_col="pciseq_assignment_status", max_points=2)
+    frame = pd.DataFrame(dict(x=[1.,2.,3.,4.], y=[5.,6.,7.,8.], gene=["A"]*4,
+                              assignment=pd.array([9,None,None,None],dtype="UInt64"),
+                              background=[False,True,False,False],
+                              pciseq_assignment_status=["assigned","background","not_modelled","not_modelled"]))
+    store = build_gene_point_groups(frame,"x","y","gene",assignment_col="assignment",
+        background_col="background",status_col="pciseq_assignment_status",max_points=2,
+        build_cell_index=True, reference=REFERENCE)
+    resolution=MarkerReferenceResolution(reference=REFERENCE)
+    assert save_transcript_cache(request, store, resolution)
+    restored=load_transcript_cache(request,lambda _:resolution)
+    assert restored is not None
+    assert restored.store.total_points == 2
+    assert restored.store.source_status_counts == {"assigned":1,"background":1,"not_modelled":2}
+    assert len(restored.store.cell_transcript_index.transcripts_for(9)[1]) == 1
+
+
+def test_aligned_assignment_cache_fingerprints_both_points_trees(tmp_path):
+    dataset, native_part = _source_store(tmp_path)
+    aligned = dataset / "points" / "transcripts_aligned"
+    aligned.mkdir()
+    aligned_part = aligned / "part.0.parquet"
+    aligned_part.write_bytes(b"aligned coordinates")
+    options = dict(assignment_source="pciseq_proseg", analysis_id="a"*64,
+                   coordinate_points_key="transcripts_aligned")
+    first = _request(dataset, tmp_path / "cache", **options)
+    aligned_part.write_bytes(b"different aligned coordinates")
+    after_alignment = _request(dataset, tmp_path / "cache", **options)
+    assert first.digest != after_alignment.digest
+    assert first.family_digest == after_alignment.family_digest
+    native_part.write_bytes(b"new assignments")
+    after_assignments = _request(dataset, tmp_path / "cache", **options)
+    assert after_assignments.digest != after_alignment.digest
+    assert after_assignments.coordinate_points_key == "transcripts_aligned"
+    assert TranscriptCacheRequest.create(dataset,"transcripts","x","y","gene",
+        cache_root=tmp_path / "cache", coordinate_points_key="../transcripts") is None
