@@ -7,7 +7,7 @@ pre-aligned pair.
 The viewer opens a single Napari window with a tabbed control panel (tabs across
 the top of the right-hand dock): **Gene inspector**, **Cell segmentation**,
 **Cell type labels**, **Per cell statistics**, **Draw tissue annotations**,
-**Images**, **Dataset loader**, and **UMAP**. With
+**Images**, **Dataset loader**, **UMAP**, and **Zarr metadata**. With
 a supplied dataset it automatically loads all image channels, the Cellpose, ProSeg and
 ProSeg hybrid cell segmentations, and all transcripts (rendered as per-gene coloured
 points). A busy progress bar with a stage label below the tabs shows what is
@@ -474,6 +474,22 @@ canvas. It remains hidden on the empty launch screen. Its length is fixed at
 about a quarter of the canvas width; as you zoom, the **bar stays the same size**
 and only its **label** changes to show how many microns it currently spans (large
 bold white text with a black outline).
+
+## Zarr metadata
+
+The **Zarr metadata** button at the top of the right-hand controls opens a
+read-only text tree of the active SpatialData object. Expand or collapse branches
+to inspect images, labels, points, shapes, tables, and attributes, including table
+`obs`, `var`, and nested `uns` entries. Elements omitted from the viewer's loaded
+object are browsed directly from the backing Zarr store, with their stored encoding
+and attributes visible. Lazy transcript frames show their column types.
+
+Images, matrices, and table columns show shape, data type, and other available
+metadata only; the explorer never renders images or reads array values. Long
+collections are paged in groups of 100; expand **Show more…** to continue. Reads run in the background as branches open. **Collapse all** folds the
+tree, and **Refresh** rebuilds it from the current object and store. In paired
+mode, MERSCOPE and XENIUM appear one below the other, with independent expansion
+and collapse in either layout.
 
 ## UMAP view
 

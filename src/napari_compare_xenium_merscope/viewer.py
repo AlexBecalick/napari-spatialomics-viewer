@@ -153,6 +153,7 @@ try:
 except Exception:  # pragma: no cover - depends on the installed napari runtime
     thread_worker = None
 
+from .spatialdata_explorer import SpatialDataExplorerWidget
 from .dask_cache import install_thread_safe_napari_dask_cache
 from .cell_umap import (
     UMAP_LASSO_MIN_STEP_PX,
@@ -1223,8 +1224,8 @@ class ViewerControlPanel(QWidget):
     """Right-dock control panel: tabbed controls with a shared progress bar.
 
     Tabs (a wrapping button bar across the top): Gene inspector, Cell segmentation, Cell type labels,
-    Per cell statistics, Draw tissue annotations, Images, Dataset, UMAP. A busy progress bar plus a
-    stage label sit below the tabs and stay visible whatever tab is selected.
+    Per cell statistics, Draw tissue annotations, Images, Dataset, UMAP, and Zarr metadata.
+    A busy progress bar plus a stage label sit below the tabs and stay visible whatever tab is selected.
     """
 
     # Thread-safe status/progress updates: heavy work runs in napari
@@ -1272,6 +1273,7 @@ class ViewerControlPanel(QWidget):
         self._gene_inspector_widget = gene_inspector_widget
         self._cell_type_widget = cell_type_widget
         self._umap_widget = umap_widget
+        self.spatialdata_explorer = SpatialDataExplorerWidget()
         self._load_callback = load_callback
         self._load_selected_labels_callback = load_selected_labels_callback
         self._unload_selected_shapes_callback = unload_selected_shapes_callback
@@ -1472,6 +1474,7 @@ class ViewerControlPanel(QWidget):
             ("Images", self._build_images_tab),
             ("Dataset loader", self._build_dataset_tab),
             ("UMAP", self._build_umap_tab),
+            ("Zarr metadata", lambda: self.spatialdata_explorer),
         )
         for title, builder in tabs:
             self._add_tab(title, builder())
@@ -4593,6 +4596,7 @@ class ComparisonViewerController:
         self._cell_annotation_workers: dict[tuple[str, str], object] = {}
         # Floating UMAP view (see cell_umap.py): tab controls, window, state.
         self._umap_widget = None
+        self._spatialdata_explorer = None
         self._umap_window: UmapWindow | None = None
         self._umap_state_obj: CellUmapState | None = None
         self._umap_workers: dict[tuple, object] = {}
@@ -4656,6 +4660,25 @@ class ComparisonViewerController:
     def set_umap_widget(self, widget):
         self._umap_widget = widget
         self._publish_umap_options()
+
+    def set_spatialdata_explorer(self, widget):
+        self._spatialdata_explorer = widget
+        self._publish_spatialdata_explorer()
+
+    def _publish_spatialdata_explorer(self):
+        widget = getattr(self, "_spatialdata_explorer", None)
+        if widget is None:
+            return
+        stores = []
+        if self._paired_session is not None:
+            for name in ("MERSCOPE", "XENIUM"):
+                stores.append((name, self.datasets[name].zarr_path,
+                               self._paired_session.sdata[name], None))
+        elif self.active_dataset is not None and self._active_sdata is not None:
+            name = self.active_dataset
+            stores.append((name, self.datasets[name].zarr_path,
+                           self._active_sdata, self._active_images_sdata))
+        widget.set_stores(stores)
 
     def set_viewer_controls_dock(self, dock):
         """Keep the right dock used for the startup canvas-layout repair."""
@@ -6005,6 +6028,7 @@ class ComparisonViewerController:
         self._publish_cellpose_value_options()
         self._publish_cell_type_options()
         self._publish_umap_options()
+        self._publish_spatialdata_explorer()
         self._update_scale_bar_visibility()
         self._end_progress("dataset")
         elapsed = time.time() - started_at
@@ -6716,6 +6740,7 @@ class ComparisonViewerController:
         self._publish_cellpose_value_options()
         self._publish_cell_type_options()
         self._publish_umap_options()
+        self._publish_spatialdata_explorer()
         if not bool(getattr(self.args, "skip_images", False)):
             self._load_paired_image_slots()
         self._load_paired_segmentations(self._paired_startup_segmentation_keys())
@@ -6798,6 +6823,7 @@ class ComparisonViewerController:
         self.active_dataset = None
         self._active_sdata = None
         self._active_images_sdata = None
+        self._publish_spatialdata_explorer()
         self._dataset_sessions.clear()
         # MERSCOPE/XENIUM are presentation names, not store identities. Keeping
         # these states would join the newly opened masks to the previous store's
@@ -14937,6 +14963,7 @@ def main():
     controller.set_gene_inspector_widget(gene_inspector)
     controller.set_cell_type_widget(cell_type_widget)
     controller.set_umap_widget(umap_widget)
+    controller.set_spatialdata_explorer(panel.spatialdata_explorer)
     viewer_controls_dock = viewer.window.add_dock_widget(
         panel, area="right", name="Viewer Controls"
     )
