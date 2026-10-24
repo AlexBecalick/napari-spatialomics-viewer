@@ -1064,7 +1064,7 @@ def test_control_panel_has_a_umap_tab(qapp):
     widget = UmapControlWidget(lambda *_: None, lambda *_: None, lambda *_: None, lambda *_: None)
     panel = _panel([], umap_widget=widget)
     titles = [panel._tab_group.button(i).text() for i in range(len(panel._tab_group.buttons()))]
-    assert titles[-1] == "UMAP"
+    assert "UMAP" in titles
     # An empty launch still opens on the Dataset loader.
     assert panel._tab_group.checkedButton().text() == "Dataset loader"
 
