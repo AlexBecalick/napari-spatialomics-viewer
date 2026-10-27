@@ -774,6 +774,35 @@ def test_crop_draw_by_drag_and_undo(loaded, viewer, widget, host):
     assert not loaded.has_unsaved_changes()
 
 
+def test_moving_crop_under_rotated_mirrored_coarse(loaded, viewer, widget, host):
+    widget.rotation_set.emit(178.5)
+    widget.flip_horizontal.emit()
+    widget.offset_set.emit(12.5, -7.5)
+    loaded.flush_pending_updates()
+    widget.crop_draw_requested.emit("moving")
+    layer = viewer.layers["Moving | DAPI"]
+    # corners given in MOVING pixels; the layer's affine puts them at the rotated world positions
+    start_xy, end_xy = (100.2, 50.7), (600.6, 700.1)
+    assert gesture(
+        loaded,
+        world_of(layer, *start_xy),
+        end_rc=world_of(layer, *end_xy),
+        drag_px=50,
+    )
+    assert loaded.state.crops["moving"] == CropRect(100, 51, 602, 701)  # moving pixels
+    crop_layer = viewer.layers["Moving crop"]
+    assert layer_affine(crop_layer) == pytest.approx(layer_affine(layer), abs=1e-12)
+    assert np.asarray(crop_layer.data[0]) == pytest.approx(
+        crop_rectangle_rc(CropRect(100, 51, 602, 701))
+    )
+    # the drawn rectangle's world corners sit on the image corners they were dragged between
+    world = np.array([crop_layer.data_to_world(v) for v in np.asarray(crop_layer.data[0])])
+    expected = np.array([layer.data_to_world((y, x)) for x, y in (start_xy, end_xy)])
+    for corner in expected:  # within the integer snapping of the corners (0.2 px here)
+        assert np.min(np.linalg.norm(world - corner, axis=1)) < 0.5
+    assert loaded.display_mode == "both"
+
+
 def test_crop_draw_too_small_stays_armed(loaded, viewer, widget, host):
     widget.crop_draw_requested.emit("moving")
     layer = viewer.layers["Moving | DAPI"]
@@ -987,6 +1016,50 @@ def test_local_draft_with_bad_revision_is_discarded(prepared_store, tmp_path):
     assert ctrl.load_store(prepared_store)
     assert any(s.startswith("The local draft could not be read") for s in host.statuses)
     assert ctrl.state.pairs == []
+    assert read_local_draft(prepared_store, app_dir) is None
+
+
+def test_malformed_stored_labelling_never_costs_the_draft(prepared_store, tmp_path):
+    app_dir = tmp_path / "appdata"
+    pairs = [
+        {"id": i + 1, "reference_xy_px": list(ref), "moving_xy_px": list(mov)}
+        for i, (ref, mov) in enumerate(grid_pairs(5))
+    ]
+    write_local_draft(
+        prepared_store,
+        app_dir,
+        stores.labelling_payload(pairs=pairs, revision=1, updated_at="2099-01-01T00:00:00Z"),
+    )
+    stored = stores.labelling_payload(pairs=pairs[:1], revision=2)
+    del stored["coarse"]["offset_um"]  # malformed STORED labelling
+    stores.write_root_attr(prepared_store, LABELLING_ATTR, stored)
+
+    # "Restore": the draft comes back
+    _v, host, _w, ctrl = make_env(app_dir)
+
+    def ask(title, text, buttons, *, default):
+        ctrl.dialogs.asked.append((title, text, tuple(buttons)))
+        return "Start fresh" if "Start fresh" in buttons else "Restore"
+
+    ctrl._ask = ask
+    assert ctrl.load_store(prepared_store)
+    assert [t for t, *_ in ctrl.dialogs.asked] == [
+        "Landmarks do not match these images",
+        "Restore local draft?",
+    ]
+    assert [p.id for p in ctrl.state.pairs] == [1, 2, 3, 4, 5]
+    assert ctrl.state.revision == 2 and ctrl.has_unsaved_changes()
+    assert not any("could not be read" in s for s in host.statuses)
+
+    # "Discard" is the user's explicit choice; only then is the draft deleted
+    _v2, _h2, _w2, ctrl2 = make_env(app_dir)
+
+    def ask2(title, text, buttons, *, default):
+        return "Start fresh" if "Start fresh" in buttons else "Discard"
+
+    ctrl2._ask = ask2
+    assert ctrl2.load_store(prepared_store)
+    assert ctrl2.state.pairs == []
     assert read_local_draft(prepared_store, app_dir) is None
 
 
@@ -1306,6 +1379,22 @@ def test_second_save_while_running_is_refused(prepared_store, tmp_path):
     assert ctrl._saving is False and ctrl.state.revision == 1
 
 
+def test_save_draft_choice_refused_while_an_async_save_runs(prepared_store, tmp_path):
+    v, host, widget, ctrl = make_env(tmp_path / "app", deferred=True, answer="Save draft")
+    assert ctrl.load_store(prepared_store)
+    host.run_pending()
+    click_pair(ctrl, v, *grid_pairs(1)[0])
+    widget.save_requested.emit()
+    assert ctrl._saving is True
+    assert ctrl.confirm_discard_unsaved() is False  # the "Save draft" choice
+    assert host.statuses[-1] == "A save is already running."
+    assert ctrl.dialogs.warned == []
+    assert [t for t, *_ in ctrl.dialogs.asked] == ["Unsaved landmarks"]  # no "Store changed"
+    host.run_pending()
+    assert ctrl._saving is False and ctrl.state.revision == 1
+    assert ctrl.dialogs.warned == []
+
+
 def test_adopt_fit_sets_coarse_from_robust_fit(loaded, viewer, widget, host):
     widget.adopt_fit.emit()
     assert host.statuses[-1] == "Add at least 3 enabled pairs first."
@@ -1361,6 +1450,61 @@ def test_set_widget_twice_disconnects_old(loaded, host):
     new.rotate_by.emit(7.0)
     assert loaded.state.coarse.rotation_deg == 7.0
     assert new.display_mode() == "both"
+
+
+def test_replacing_a_session_stops_the_old_timers(
+    loaded, viewer, widget, host, prepared_template, tmp_path
+):
+    store_b = tmp_path / "B_prepared.zarr"
+    shutil.copytree(prepared_template, store_b)
+    click_pair(loaded, viewer, *grid_pairs(1)[0])
+    first = loaded.session.path
+    assert loaded._draft_timer is not None and loaded._draft_timer.isActive()
+    assert loaded.load_store(store_b)  # no prompt here; VW3 asks first
+    assert loaded.session.path == store_b
+    for timer in (loaded._draft_timer, loaded._affine_timer):
+        assert timer is None or not timer.isActive()
+    assert read_local_draft(first, host.app_data_dir()) is not None  # A's draft was written
+    assert read_local_draft(store_b, host.app_data_dir()) is None  # ... and B has none
+
+
+def test_failed_apply_before_teardown_keeps_the_old_session(
+    loaded, viewer, host, monkeypatch, prepared_template, tmp_path
+):
+    store_b = tmp_path / "B_prepared.zarr"
+    shutil.copytree(prepared_template, store_b)
+    click_pair(loaded, viewer, *grid_pairs(1)[0])
+    old = loaded.session
+    left = host.left
+
+    def boom(*args, **kwargs):
+        raise OSError("disk gone")
+
+    monkeypatch.setattr(loaded, "_decide_draft", boom)
+    write_local_draft(
+        store_b,
+        host.app_data_dir(),
+        stores.labelling_payload(
+            pairs=[{"id": 1, "reference_xy_px": [200.0, 300.0], "moving_xy_px": [210.0, 310.0]}],
+            updated_at="2099-01-01T00:00:00Z",
+        ),
+    )
+    assert loaded.load_store(store_b)
+    assert loaded.session is old and host.left == left  # nothing was torn down
+    assert "Could not load registration store" in host.statuses[-1]
+    assert [layer.name for layer in viewer.layers].count("Reference | DAPI") == 1
+    assert ("end", "registration", None) in host.progress
+
+
+def test_set_widget_reads_the_auto_switch_checkbox(host):
+    widget = ManualRegistrationWidget()
+    widget._auto_switch_check.setChecked(False)
+    assert widget.auto_switch() is False
+    controller = ManualRegistrationController(host)
+    controller.set_widget(widget)
+    assert controller._auto_switch is False
+    widget._auto_switch_check.setChecked(True)
+    assert controller._auto_switch is True
 
 
 def test_reload_over_active_session_keeps_clean_state(loaded, viewer, widget, host, prepared_store):

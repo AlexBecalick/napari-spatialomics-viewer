@@ -457,9 +457,18 @@ def build_result_store(
     *,
     landmarks: Sequence[dict[str, Any]] | None = None,
     crop: dict[str, int] = RESULT_CROP,
-    **kw: Any,
+    preset: str = "serial_section",
+    run_label: str | None = None,
+    reference_shape_yx: tuple[int, int] = REFERENCE_SHAPE_YX,
+    moving_shape_yx: tuple[int, int] = MOVING_SHAPE_YX,
+    reference_channels: Sequence[str] = REFERENCE_CHANNELS,
+    moving_channels: Sequence[str] = MOVING_CHANNELS,
 ) -> Path:
-    """Write a synthetic result store (cropped reference + registered moving, result attrs)."""
+    """Write a synthetic result store (cropped reference + registered moving, result attrs).
+
+    ``preset``/``run_label`` reach both ``STORE_ATTR`` and ``RESULT_ATTR``; the shapes and channels
+    drive the images and ``STORE_ATTR`` alike. Other keywords are rejected (``TypeError``).
+    """
     from spatialdata.transformations import Affine
 
     path = Path(path)
@@ -470,19 +479,35 @@ def build_result_store(
         input_axes=("x", "y"),
         output_axes=("x", "y"),
     )
-    reference_full = synthetic_image(REFERENCE_SHAPE_YX, len(REFERENCE_CHANNELS), seed=11)
+    reference_full = synthetic_image(reference_shape_yx, len(reference_channels), seed=11)
     reference = _image_model(
         reference_full[:, crop["y0"] : crop["y1"], crop["x0"] : crop["x1"]],
-        REFERENCE_CHANNELS,
+        reference_channels,
         transformation,
     )
     registered = _image_model(
-        synthetic_image(cropped, len(MOVING_CHANNELS), seed=37), MOVING_CHANNELS, transformation
+        synthetic_image(cropped, len(moving_channels), seed=37), moving_channels, transformation
     )
     _write_images(path, {"reference": reference, "moving_registered": registered})
-    write_root_attr(path, STORE_ATTR, result_store_attr(crop=crop, **kw))
+    write_root_attr(
+        path,
+        STORE_ATTR,
+        result_store_attr(
+            crop=crop,
+            preset=preset,
+            run_label=run_label,
+            reference_shape_yx=reference_shape_yx,
+            moving_shape_yx=moving_shape_yx,
+            reference_channels=reference_channels,
+            moving_channels=moving_channels,
+        ),
+    )
     rows = default_result_landmarks() if landmarks is None else list(landmarks)
-    write_root_attr(path, RESULT_ATTR, result_attr(landmarks=rows, crop=crop))
+    write_root_attr(
+        path,
+        RESULT_ATTR,
+        result_attr(landmarks=rows, crop=crop, preset=preset, run_label=run_label),
+    )
     return path
 
 
