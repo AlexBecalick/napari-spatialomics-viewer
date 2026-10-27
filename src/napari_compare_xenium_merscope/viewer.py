@@ -23,7 +23,8 @@ import sys
 import time
 import warnings
 from collections import OrderedDict
-from contextlib import contextmanager, nullcontext
+from collections.abc import Mapping
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event, RLock, Semaphore
@@ -93,6 +94,7 @@ try:
         QRectF,
         QSettings,
         QSize,
+        QStandardPaths,
         Qt,
         QTimer,
         Signal,
@@ -153,6 +155,15 @@ try:
 except Exception:  # pragma: no cover - depends on the installed napari runtime
     thread_worker = None
 
+from .manual_registration_controller import REGISTRATION_DATASET, ManualRegistrationController
+from .manual_registration_model import LAYER_METADATA_KEY, STORE_ATTR
+from .manual_registration_store import (
+    StoreBusyError,
+    read_root_attrs,
+    read_store_descriptor,
+    store_write_lock,
+)
+from .manual_registration_widget import ManualRegistrationWidget
 from .spatialdata_explorer import SpatialDataExplorerWidget
 from .dask_cache import install_thread_safe_napari_dask_cache
 from .cell_umap import (
@@ -556,6 +567,15 @@ class UmapRoi:
 DEFAULT_GENE_SPOT_SIZE = 0.5
 MAX_RECENT_DATASETS = 10
 RECENT_DATASETS_SETTINGS_KEY = "dataset_loader/recent_datasets"
+REGISTRATION_RECENT_KIND = "registration"
+REGISTRATION_APP_DIR_NAME = "napari-compare-xenium-merscope"
+REGISTRATION_CACHE_LOCK_TIMEOUT_S = 30.0
+REGISTRATION_PROGRESS_KEY = "registration"
+REGISTRATION_IMAGES_STATUS = (
+    "Channels of a registration session are in the layer list; show or hide them there."
+)
+#: a started save is never cancelled: it must report its result so the controller can clear its save state
+_UNCANCELLED_REGISTRATION_KEYS = frozenset({"registration_save"})
 GENE_HIGHLIGHT_SPOT_SIZE = 2.0
 GENE_SPOT_SIZE_MIN = 0.1
 GENE_SPOT_SIZE_MAX = 5.0
@@ -672,6 +692,10 @@ INSPECT_CLICK_DRAG_THRESHOLD_PX = 4.0
 CELL_INSPECTOR_SHAPE_PREFERENCE = ("proseg", "cellpose", "cell")
 
 
+class _RegistrationTaskCancelled(RuntimeError):
+    """Raised inside a registration worker whose task was superseded or cancelled."""
+
+
 def startup_selection(segmentation_source: str) -> tuple[str, ...]:
     """Return the SpatialData element types to read when a dataset opens.
 
@@ -771,6 +795,12 @@ def configure_napari_async_slicing(enabled: bool = True) -> bool:
     except Exception as exc:
         log.warning("Could not configure napari asynchronous slicing (%s)", exc)
         return False
+
+
+def is_registration_layer(layer) -> bool:
+    """True for layers owned by the manual-registration controller."""
+    metadata = getattr(layer, "metadata", None)
+    return isinstance(metadata, Mapping) and LAYER_METADATA_KEY in metadata
 
 
 def stable_layer_color(key: str, alpha: float = 1.0) -> tuple[float, float, float, float]:
@@ -1224,7 +1254,8 @@ class ViewerControlPanel(QWidget):
     """Right-dock control panel: tabbed controls with a shared progress bar.
 
     Tabs (a wrapping button bar across the top): Gene inspector, Cell segmentation, Cell type labels,
-    Per cell statistics, Draw tissue annotations, Images, Dataset, UMAP, and Zarr metadata.
+    Per cell statistics, Draw tissue annotations, Images, Dataset, UMAP, Zarr metadata, and
+    Manual registration.
     A busy progress bar plus a stage label sit below the tabs and stay visible whatever tab is selected.
     """
 
@@ -1268,11 +1299,17 @@ class ViewerControlPanel(QWidget):
         settings: QSettings | None = None,
         switch_paired_view_callback=None,
         umap_widget=None,
+        load_registration_callback=None,
+        registration_widget=None,
     ):
         super().__init__()
         self._gene_inspector_widget = gene_inspector_widget
         self._cell_type_widget = cell_type_widget
         self._umap_widget = umap_widget
+        self._load_registration_callback = load_registration_callback
+        self._registration_widget = registration_widget
+        self._registration_active = False
+        self._registration_tab_index: int | None = None
         self.spatialdata_explorer = SpatialDataExplorerWidget()
         self._load_callback = load_callback
         self._load_selected_labels_callback = load_selected_labels_callback
@@ -1351,6 +1388,13 @@ class ViewerControlPanel(QWidget):
         self._load_standalone_merscope_button.clicked.connect(self._on_load_standalone_merscope)
         self._load_standalone_xenium_button = QPushButton("Load new standalone Xenium dataset")
         self._load_standalone_xenium_button.clicked.connect(self._on_load_standalone_xenium)
+        self._load_registration_button = QPushButton("Load image data")
+        self._load_registration_button.setToolTip(
+            "Open a MerXen manual-registration store: <id>_prepared.zarr to place landmarks, "
+            "or <run_id>_registered.zarr to inspect a registration result."
+        )
+        self._load_registration_button.setEnabled(load_registration_callback is not None)
+        self._load_registration_button.clicked.connect(self._on_load_registration)
         self._recent_dataset_list = QListWidget()
         self._recent_dataset_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self._recent_dataset_list.setMaximumHeight(220)
@@ -1475,10 +1519,12 @@ class ViewerControlPanel(QWidget):
             ("Dataset loader", self._build_dataset_tab),
             ("UMAP", self._build_umap_tab),
             ("Zarr metadata", lambda: self.spatialdata_explorer),
+            ("Manual registration", self._build_registration_tab),
         )
         for title, builder in tabs:
             self._add_tab(title, builder())
         tab_titles = [title for title, _builder in tabs]
+        self._registration_tab_index = tab_titles.index("Manual registration")
         initial_tab_index = 0 if datasets else tab_titles.index("Dataset loader")
         initial_tab_button = self._tab_group.button(initial_tab_index)
         if initial_tab_button is not None:
@@ -1664,9 +1710,30 @@ class ViewerControlPanel(QWidget):
         layout.addWidget(self._switch_side_by_side_button)
         layout.addWidget(self._switch_stacked_overlay_button)
         layout.addSpacing(10)
+        layout.addWidget(QLabel("Manual Registration"))
+        layout.addWidget(self._load_registration_button)
+        layout.addSpacing(10)
         layout.addWidget(QLabel("Recently viewed"))
         layout.addWidget(self._recent_dataset_list)
         layout.addWidget(self._open_recent_dataset_button)
+        layout.addStretch(1)
+        return self._scrollable(layout)
+
+    def _build_registration_tab(self) -> QWidget:
+        layout = QVBoxLayout()
+        layout.setContentsMargins(6, 6, 6, 6)
+        layout.setSpacing(6)
+        self._registration_hint = QLabel(
+            "No manual-registration store is open. Use Dataset loader ▸ Manual Registration "
+            "▸ Load image data."
+        )
+        self._registration_hint.setWordWrap(True)
+        layout.addWidget(self._registration_hint)
+        if self._registration_widget is not None:
+            self._registration_widget.setEnabled(False)
+            layout.addWidget(self._registration_widget, stretch=1)
+        else:
+            layout.addWidget(QLabel("Manual registration is unavailable in this build."))
         layout.addStretch(1)
         return self._scrollable(layout)
 
@@ -1876,6 +1943,16 @@ class ViewerControlPanel(QWidget):
                 if len(cleaned) >= MAX_RECENT_DATASETS:
                     break
                 continue
+            if str(entry.get("kind", "")).lower() == REGISTRATION_RECENT_KIND:
+                path = str(entry.get("path", "")).strip()
+                identity = (REGISTRATION_RECENT_KIND, path)
+                if not path or identity in seen:
+                    continue
+                seen.add(identity)
+                cleaned.append({"kind": REGISTRATION_RECENT_KIND, "path": path})
+                if len(cleaned) >= MAX_RECENT_DATASETS:
+                    break
+                continue
             platform = str(entry.get("platform", "")).upper()
             path = str(entry.get("path", "")).strip()
             identity = ("standalone", path)
@@ -1903,6 +1980,11 @@ class ViewerControlPanel(QWidget):
             )
             xenium = ViewerControlPanel._recent_path_label(Path(entry["xenium_path"]))
             return f"PAIRED ({mode.value}) — {merscope} + {xenium}"
+        if entry.get("kind") == REGISTRATION_RECENT_KIND:
+            return (
+                "MANUAL REGISTRATION — "
+                f"{ViewerControlPanel._recent_path_label(Path(entry['path']))}"
+            )
         return (
             f"{entry['platform']} — "
             f"{ViewerControlPanel._recent_path_label(Path(entry['path']))}"
@@ -1931,6 +2013,8 @@ class ViewerControlPanel(QWidget):
                     f"MERSCOPE: {entry['merscope_path']}\n"
                     f"Xenium: {entry['xenium_path']}"
                 )
+            elif entry.get("kind") == REGISTRATION_RECENT_KIND:
+                item.setToolTip(f"Manual registration store: {entry['path']}")
             else:
                 item.setToolTip(entry["path"])
             self._recent_dataset_list.addItem(item)
@@ -1990,10 +2074,89 @@ class ViewerControlPanel(QWidget):
         self.record_recent_pair(merscope_path, xenium_path, view_mode)
         self.dataset_open_requested.emit()
 
+    def set_registration_mode(self, active: bool) -> None:
+        """Enable the registration tab; disable single-dataset tools while a store is open."""
+        active = bool(active)
+        self._registration_active = active
+        single_dataset_tools = (
+            self._create_annotations_button,
+            self._new_piece_button,
+            self._apply_piece_button,
+            self._snap_side_edges_button,
+            self._validate_annotations_button,
+            self._export_annotations_button,
+            self._create_object_annotations_button,
+            self._validate_object_annotations_button,
+            self._export_object_annotations_button,
+            self._load_object_annotations_button,
+        )
+        dataset_tools = (
+            self._cellpose_channel_combo,
+            self._cellpose_statistic_combo,
+            self._cellpose_colormap_combo,
+            self._load_cellpose_values_button,
+            self._remove_cellpose_values_button,
+            self._load_transcripts_button,
+            self._unload_transcripts_button,
+            self._load_selected_labels_button,
+            self._unload_selected_shapes_button,
+        )
+        if active:
+            self._dataset_combo.setEnabled(False)
+            self._reload_button.setEnabled(False)
+            for widget in single_dataset_tools + dataset_tools:
+                widget.setEnabled(False)
+            self._load_registration_button.setEnabled(self._load_registration_callback is not None)
+        else:
+            # Restores the dataset combo, Reload and annotation tools for standalone viewing.
+            self.set_paired_view_mode(None)
+            for widget in (
+                self._load_transcripts_button,
+                self._unload_transcripts_button,
+                self._load_selected_labels_button,
+                self._unload_selected_shapes_button,
+            ):
+                widget.setEnabled(True)
+        if self._registration_widget is not None:
+            self._registration_widget.setEnabled(active)
+        hint = getattr(self, "_registration_hint", None)
+        if hint is not None:
+            hint.setVisible(not active)
+
+    def select_registration_tab(self) -> None:
+        index = self._registration_tab_index
+        if index is None:
+            return
+        button = self._tab_group.button(index)
+        if button is not None:
+            button.setChecked(True)
+        self._tab_stack.setCurrentIndex(index)
+
+    def record_recent_registration(self, path) -> None:
+        """Move a successfully opened registration store to the top of recents."""
+        normalized = str(Path(path).expanduser().absolute())
+        entry = {"kind": REGISTRATION_RECENT_KIND, "path": normalized}
+        self._recent_datasets = [
+            existing for existing in self._recent_datasets if existing.get("path") != normalized
+        ]
+        self._recent_datasets.insert(0, entry)
+        del self._recent_datasets[MAX_RECENT_DATASETS:]
+        self._write_recent_datasets()
+        self._refresh_recent_dataset_list()
+
+    def registration_dataset_loaded(self, path) -> None:
+        """Finalize UI state only after the controller installed the registration session."""
+        self.record_recent_registration(path)
+        self.dataset_open_requested.emit()
+
     def _recent_browse_directory(self) -> str:
         if not self._recent_datasets:
             return ""
         recent = self._recent_datasets[0]
+        if recent.get("kind") == REGISTRATION_RECENT_KIND:
+            # Browse the folder that holds the store.
+            candidate = Path(recent["path"]).parent
+            return str(candidate) if candidate.exists() else ""
         path = Path(
             recent.get("merscope_path")
             if recent.get("kind") == "paired"
@@ -2042,6 +2205,23 @@ class ViewerControlPanel(QWidget):
             # paired_dataset_loaded only after a successful atomic install.
             self.paired_dataset_loaded(merscope_path, xenium_path, mode)
 
+    def _on_load_registration(self):
+        if self._load_registration_callback is None:
+            self.set_status("Manual registration is unavailable in this build.")
+            return
+        path = self._browse_zarr(
+            "Select a manual-registration store (<id>_prepared.zarr or <run_id>_registered.zarr)"
+        )
+        if not path:
+            return
+        result = self._load_registration_callback(path)
+        if result is False:
+            return
+        if result is True:
+            # Synchronous embedders/tests acknowledge immediately; the controller returns
+            # None while the load runs and calls registration_dataset_loaded after the install.
+            self.registration_dataset_loaded(path)
+
     def _on_switch_paired_view(self, mode: ViewMode | str):
         mode = ViewMode.coerce(mode)
         if self._switch_paired_view_callback is None:
@@ -2058,7 +2238,7 @@ class ViewerControlPanel(QWidget):
         if not path:
             return
         result = self._load_standalone_callback("MERSCOPE", path)
-        if result is False:
+        if result is False or result is None:
             return
         self.record_recent_dataset("MERSCOPE", path)
         self.dataset_open_requested.emit()
@@ -2070,7 +2250,7 @@ class ViewerControlPanel(QWidget):
         if not path:
             return
         result = self._load_standalone_callback("XENIUM", path)
-        if result is False:
+        if result is False or result is None:
             return
         self.record_recent_dataset("XENIUM", path)
         self.dataset_open_requested.emit()
@@ -2104,10 +2284,20 @@ class ViewerControlPanel(QWidget):
                     entry["merscope_path"], entry["xenium_path"], mode
                 )
             return
+        if entry.get("kind") == REGISTRATION_RECENT_KIND:
+            if self._load_registration_callback is None:
+                self.set_status("Manual registration is unavailable in this build.")
+                return
+            result = self._load_registration_callback(str(entry["path"]))
+            if result is False:
+                return
+            if result is True:
+                self.registration_dataset_loaded(entry["path"])
+            return
         platform = str(entry["platform"])
         path = str(entry["path"])
         result = self._load_standalone_callback(platform, path)
-        if result is False:
+        if result is False or result is None:
             return
         self.record_recent_dataset(platform, path)
         self.dataset_open_requested.emit()
@@ -3672,6 +3862,22 @@ class _WidgetResizeRelay(QObject):
         return False
 
 
+class RegistrationCloseGuard(QObject):
+    """Ask before closing the window while a registration session has unsaved changes."""
+
+    def __init__(self, controller, parent: QObject):
+        super().__init__(parent)
+        self._controller = controller
+
+    def eventFilter(self, obj, event):  # noqa: N802 (Qt override)
+        if event.type() == QEvent.Close:
+            confirm = getattr(self._controller, "confirm_close_registration", None)
+            if confirm is not None and not confirm():
+                event.ignore()
+                return True
+        return False
+
+
 class ScaleBarOverlay(QWidget):
     """Bottom-right canvas overlay: a fixed-length bar labelled with the micron
     distance it currently spans.
@@ -3920,6 +4126,7 @@ class NapariLeftPanelAdapter(QObject):
         self._expanded_layer_controls_height = 260
         self._collapse_button = None
         self._paired_mode = False
+        self._registration_mode = False
 
         # Remove layer creation shortcuts. Deletion remains available for
         # standalone sessions and is guarded while a paired grid is active.
@@ -4010,30 +4217,53 @@ class NapariLeftPanelAdapter(QObject):
         self._apply_rotation_to_layers()
         self._schedule_gene_refresh()
 
-    def set_paired_mode(self, enabled: bool) -> None:
-        """Guard paired grid membership while preserving visibility toggles."""
-        enabled = bool(enabled)
-        self._paired_mode = enabled
+    def _apply_layer_list_guards(self) -> None:
+        """Guard the layer list while a paired grid or a registration session is active."""
+        guarded = self._paired_mode or self._registration_mode
         if self._delete_button is not None:
             self._delete_button.setEnabled(
-                False if enabled else self._delete_button_was_enabled
+                False if guarded else self._delete_button_was_enabled
             )
-            self._delete_button.setToolTip(
-                "Unload paired layers from the Viewer Controls panel."
-                if enabled
-                else self._delete_button_tooltip
-            )
+            if self._registration_mode:
+                tooltip = (
+                    "Registration layers belong to the session; "
+                    "open another dataset to unload them."
+                )
+            elif self._paired_mode:
+                tooltip = "Unload paired layers from the Viewer Controls panel."
+            else:
+                tooltip = self._delete_button_tooltip
+            self._delete_button.setToolTip(tooltip)
         self._layer_view.setDragDropMode(
-            QAbstractItemView.NoDragDrop
-            if enabled
-            else self._default_drag_drop_mode
+            QAbstractItemView.NoDragDrop if guarded else self._default_drag_drop_mode
         )
         self._layer_view.setEditTriggers(
-            QAbstractItemView.NoEditTriggers
-            if enabled
-            else self._default_edit_triggers
+            QAbstractItemView.NoEditTriggers if guarded else self._default_edit_triggers
         )
+
+    def set_paired_mode(self, enabled: bool) -> None:
+        """Guard paired grid membership while preserving visibility toggles."""
+        self._paired_mode = bool(enabled)
+        self._apply_layer_list_guards()
         self._refresh_gene_presentation()
+
+    def set_registration_mode(self, active: bool) -> None:
+        """Force display rotation to 0 and guard the layer list during a registration session."""
+        self._registration_mode = bool(active)
+        if self._registration_mode:
+            self.set_rotation_angle(0.0)
+            self._rotation_settings_key = None
+            self.rotation_save_button.setEnabled(False)
+            self.rotation_control.setToolTip(
+                "Display rotation is off during manual registration; "
+                "use the Coarse alignment controls."
+            )
+        else:
+            self.rotation_control.setToolTip(
+                "Rotate all dataset layers together around their shared centre"
+            )
+        self._apply_layer_list_guards()
+        self._update_rotation_control_enabled()
 
     def _build_rotation_control(self, parent) -> QWidget:
         control = QWidget(parent)
@@ -4139,6 +4369,10 @@ class NapariLeftPanelAdapter(QObject):
 
     def _register_layers_for_rotation(self):
         for layer in self.viewer.layers:
+            if is_registration_layer(layer):
+                self._layer_base_affines.pop(layer, None)
+                self._layer_base_bounds.pop(layer, None)
+                continue
             if layer in self._layer_base_affines or int(getattr(layer, "ndim", 0)) < 2:
                 continue
             affine = getattr(layer, "affine", None)
@@ -4159,6 +4393,7 @@ class NapariLeftPanelAdapter(QObject):
             self._layer_base_bounds[layer]
             for layer in self.viewer.layers
             if layer in self._layer_base_bounds
+            and not is_registration_layer(layer)
             and getattr(layer, "name", "") not in (ROI_OUTLINE_LAYER, ROI_CELLS_LAYER)
             and not (
                 (identity := layer_identity_from_layer(layer)) is not None
@@ -4195,7 +4430,7 @@ class NapariLeftPanelAdapter(QObject):
             return
         for layer in self.viewer.layers:
             base = self._layer_base_affines.get(layer)
-            if base is None:
+            if base is None or is_registration_layer(layer):
                 continue
             ndim = int(base.shape[0] - 1)
             rotation = self._world_rotation_matrix(ndim, self._rotation_angle, origin)
@@ -4209,7 +4444,9 @@ class NapariLeftPanelAdapter(QObject):
         self._update_rotation_control_enabled()
 
     def _update_rotation_control_enabled(self):
-        enabled = any(layer in self._layer_base_affines for layer in self.viewer.layers)
+        enabled = (not self._registration_mode) and any(
+            layer in self._layer_base_affines for layer in self.viewer.layers
+        )
         if hasattr(self, "rotation_control"):
             self.rotation_control.setEnabled(enabled)
 
@@ -4642,8 +4879,42 @@ class ComparisonViewerController:
                     emitter.connect(self._on_paired_layer_list_changed)
         except Exception:
             log.debug("Could not install paired layer-list guards", exc_info=True)
+        self._registration_dataset_loaded_callback = None
+        self._registration_mode_callback = None
+        self._registration_tab_callback = None
+        self._registration_widget = None
+        self._registration_workers: dict[str, object] = {}
+        self._registration_worker_tokens: dict[str, Event] = {}
+        self._registration_progress_keys: set[str] = set()
+        #: staging dataset key -> store path, used while a registration store is read on a worker
+        self._registration_store_paths: dict[str, Path] = {}
+        self._registration = ManualRegistrationController(self)
         self._install_gene_pick_callback()
         self._install_cell_hover_status()
+
+    # -- Manual registration plumbing (private accessors; tests build controllers with __new__) --
+    def _registration_controller(self):
+        return getattr(self, "_registration", None)
+
+    def _registration_active(self) -> bool:
+        registration = self._registration_controller()
+        return registration is not None and bool(registration.is_active())
+
+    def _deactivate_registration(self) -> None:
+        registration = self._registration_controller()
+        if registration is not None:
+            registration.deactivate()
+
+    def _confirm_leave_registration(self) -> bool:
+        """Ask before replacing a registration session that has unsaved changes."""
+        registration = self._registration_controller()
+        if registration is None or not registration.is_active():
+            return True
+        return bool(registration.confirm_discard_unsaved())
+
+    def confirm_close_registration(self) -> bool:
+        """Used by the window-close guard."""
+        return self._confirm_leave_registration()
 
     def set_status_callback(self, fn):
         self._status_callback = fn
@@ -4752,6 +5023,8 @@ class ComparisonViewerController:
     def _cell_aware_status_from_cursor(self):
         """Return napari status with world coordinates and hovered-cell data."""
         original = getattr(self, "_napari_status_calculator", None)
+        if self._registration_active():
+            return original() if original is not None else None
         if self.active_dataset is None or self._active_sdata is None:
             return original() if original is not None else None
         if not bool(getattr(self.viewer, "mouse_over_canvas", True)):
@@ -5088,6 +5361,19 @@ class ComparisonViewerController:
     def set_paired_dataset_loaded_callback(self, fn):
         self._paired_dataset_loaded_callback = fn
 
+    def set_registration_widget(self, widget):
+        self._registration_widget = widget
+        self._registration.set_widget(widget)
+
+    def set_registration_dataset_loaded_callback(self, fn):
+        self._registration_dataset_loaded_callback = fn
+
+    def set_registration_mode_callback(self, fn):
+        self._registration_mode_callback = fn
+
+    def set_registration_tab_callback(self, fn):
+        self._registration_tab_callback = fn
+
     def set_cellpose_value_options_callback(self, fn):
         self._cellpose_value_options_callback = fn
 
@@ -5108,8 +5394,12 @@ class ComparisonViewerController:
 
     def _reset_progress(self):
         """Clear all loading stages (e.g. when switching datasets)."""
-        for key in ("dataset", "images", "masks", "transcripts"):
+        keys = ["dataset", "images", "masks", "transcripts", REGISTRATION_PROGRESS_KEY]
+        keys.extend(sorted(getattr(self, "_registration_progress_keys", ())))
+        for key in dict.fromkeys(keys):
             self._end_progress(key)
+        if hasattr(self, "_registration_progress_keys"):
+            self._registration_progress_keys.clear()
 
     def _begin_task_token(self, kind: str, key: tuple) -> Event | None:
         """Return a fresh cooperative-cancellation token, or None for a duplicate."""
@@ -5133,6 +5423,14 @@ class ComparisonViewerController:
 
     def _cancel_background_tasks(self) -> None:
         """Cooperatively cancel every dataset-bound build before activation."""
+        self._cancel_dataset_background_tasks()
+        registration = self._registration_controller()
+        if registration is not None:
+            registration.cancel_background()
+        self._cancel_registration_workers()
+
+    def _cancel_dataset_background_tasks(self) -> None:
+        """Cancel the dataset-bound builders (not the registration controller's own work)."""
         for token in list(self._task_cancel_events.values()):
             token.set()
         self._task_cancel_events.clear()
@@ -5875,7 +6173,20 @@ class ComparisonViewerController:
             self.load_selected_labels(ds, mask_keys)
 
         if not bool(getattr(self.args, "skip_transcripts", False)):
-            self.open_gene_inspector(ds, reuse_cached=True)
+            if self._active_store_has_points():
+                self.open_gene_inspector(ds, reuse_cached=True)
+            else:
+                log.info("[%s] Store has no points element; skipping transcript autoload.", ds)
+                # The assignment-source list must not keep the previous dataset's entries.
+                self._publish_transcript_sources()
+                self._set_status(f"{ds} has no transcripts; images and masks only.")
+
+    def _active_store_has_points(self) -> bool:
+        try:
+            points = getattr(self._active_sdata, "points", None)
+            return points is not None and len(points) > 0
+        except Exception:
+            return True  # unknown: keep the previous behaviour
 
     @staticmethod
     def _enumerate_image_channels_for(images_sdata) -> list[tuple[str, str]]:
@@ -5998,6 +6309,7 @@ class ComparisonViewerController:
         self._dataset_load_worker = None
         self._dataset_loading_key = None
         self._cancel_background_tasks()
+        self._deactivate_registration()
         # A controller-level standalone activation can occur while a pair is
         # visible (for example through an integration calling load_dataset
         # directly).  Tear down the grid registry only once the replacement
@@ -6056,6 +6368,14 @@ class ComparisonViewerController:
 
     def load_dataset(self, dataset_name: str, force: bool = False):
         ds = str(dataset_name).upper()
+        if ds == REGISTRATION_DATASET:
+            if self.active_dataset == ds and not force and self._registration_active():
+                return True
+            cfg = self.datasets.get(ds)
+            if cfg is None:
+                self._set_status(f"Unknown dataset: {dataset_name}")
+                return False
+            return self.load_registration_store(cfg.zarr_path) is not False
         if ds not in self.datasets:
             self._set_status(f"Unknown dataset: {dataset_name}")
             return False
@@ -6699,6 +7019,7 @@ class ComparisonViewerController:
         self._dataset_load_worker = None
         self._dataset_loading_key = None
         self._cancel_background_tasks()
+        self._deactivate_registration()
         if self._paired_registry is not None:
             self._paired_registry.grid.enabled = False
         self._paired_registry = None
@@ -6818,6 +7139,7 @@ class ComparisonViewerController:
         self._dataset_load_cancel.set()
         self._dataset_loading_key = None
         self._cancel_background_tasks()
+        self._deactivate_registration()
         self._deactivate_paired_view()
         self._clear_layers()
         self.active_dataset = None
@@ -6857,6 +7179,9 @@ class ComparisonViewerController:
         except Exception as exc:
             self._set_status(f"Could not open paired dataset: {exc}")
             log.exception("Failed to open paired dataset")
+            return False
+        if not self._confirm_leave_registration():
+            self._set_status("Kept the current registration session (unsaved changes).")
             return False
         self._cancel_background_tasks()
         self._reset_progress()
@@ -6914,11 +7239,343 @@ class ComparisonViewerController:
             self._set_status(f"Could not open {platform} dataset: {exc}")
             log.exception("Failed to open standalone %s dataset", platform)
             return False
+        try:
+            root_attrs = read_root_attrs(path)
+        except Exception:
+            root_attrs = {}
+        if isinstance(root_attrs, dict) and STORE_ATTR in root_attrs:
+            self._set_status(
+                f"{path.name} is a manual-registration store; "
+                "opening it in the Manual registration tab."
+            )
+            return self.load_registration_store(path)
+        if not self._confirm_leave_registration():
+            self._set_status("Kept the current registration session (unsaved changes).")
+            return False
         return self._replace_datasets(datasets, initial=platform)
+
+    # -- Manual registration host --------------------------------------------------------------
+    def load_registration_store(self, path):
+        """Open a MerXen manual-registration store (prepared or result) in the registration tab.
+
+        Returns ``None`` when the load started (the loaded callback fires on success) and
+        ``False`` when it was refused or failed before starting. Never ``True``.
+        """
+        try:
+            path = Path(path).expanduser()
+            if not path.exists():
+                raise FileNotFoundError(f"Manual registration store not found: {path}")
+            validate_spatialdata_store_compatibility(path)
+            # Refuse anything that is not a registration store before the confirmation and
+            # before any pending load or builder is cancelled: a refused request is a no-op.
+            read_store_descriptor(path)
+        except Exception as exc:
+            self._set_status(f"Could not open manual registration store: {exc}")
+            log.warning("Could not open manual registration store %s: %s", path, exc)
+            return False
+        if not self._confirm_leave_registration():
+            self._set_status("Kept the current registration session (unsaved changes).")
+            return False
+        # A newer request supersedes a pending standalone/paired load.
+        self._dataset_load_generation += 1
+        self._dataset_load_cancel.set()
+        self._dataset_load_cancel = Event()
+        self._dataset_load_worker = None
+        self._dataset_loading_key = None
+        self._cancel_background_tasks()
+        self._reset_progress()
+        started = self._registration.load_store(path)
+        return None if started else False
+
+    def set_status(self, text: str) -> None:
+        self._set_status(str(text))
+
+    def begin_progress(self, key: str, text: str) -> None:
+        self._registration_progress_keys.add(str(key))
+        self._begin_progress(str(key), str(text))
+
+    def end_progress(self, key: str) -> None:
+        self._registration_progress_keys.discard(str(key))
+        self._end_progress(str(key))
+
+    def run_worker(self, compute, on_done, on_error, *, key: str) -> None:
+        """Run ``compute`` on a thread worker under the store-IO semaphore.
+
+        Callbacks run on the GUI thread; a superseded or cancelled task never calls back; the
+        task runs synchronously when ``thread_worker`` is unavailable.
+        """
+        key = str(key)
+        previous = self._registration_worker_tokens.get(key)
+        if previous is not None:
+            previous.set()  # supersede the same-key task
+        token = Event()
+        self._registration_worker_tokens[key] = token
+
+        def guarded():
+            with self._store_io_slots:
+                if token.is_set():
+                    raise _RegistrationTaskCancelled(f"{key} cancelled")
+                return compute()
+
+        def current() -> bool:
+            return (not token.is_set()) and self._registration_worker_tokens.get(key) is token
+
+        def finish():
+            if self._registration_worker_tokens.get(key) is token:
+                self._registration_worker_tokens.pop(key, None)
+                self._registration_workers.pop(key, None)
+
+        def done(result):
+            if not current():
+                return
+            finish()
+            on_done(result)
+
+        def failed(exc):
+            if not current():
+                return
+            finish()
+            if isinstance(exc, tuple) and len(exc) > 1:  # napari may deliver (type, value, tb)
+                exc = exc[1]
+            on_error(exc if isinstance(exc, BaseException) else RuntimeError(str(exc)))
+
+        if thread_worker is None:
+            try:
+                result = guarded()
+            except BaseException as exc:  # noqa: BLE001 - reported through on_error
+                failed(exc)
+                return
+            done(result)
+            return
+        worker = thread_worker(guarded)()
+        worker.returned.connect(done)
+        worker.errored.connect(failed)
+        self._registration_workers[key] = worker
+        worker.start()
+
+    def _cancel_registration_workers(self) -> None:
+        # A started save is never cancelled: it must report its result so the registration
+        # controller can clear its save state (it ignores a stale callback itself).
+        tokens = getattr(self, "_registration_worker_tokens", {})
+        workers = getattr(self, "_registration_workers", {})
+        for key in [k for k in tokens if k not in _UNCANCELLED_REGISTRATION_KEYS]:
+            tokens.pop(key).set()
+        for key in [k for k in workers if k not in _UNCANCELLED_REGISTRATION_KEYS]:
+            worker = workers.pop(key)
+            try:
+                worker.quit()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _registration_staging_key(store_path: Path) -> str:
+        digest = hashlib.sha1(
+            str(Path(store_path).expanduser().absolute()).encode("utf-8")
+        ).hexdigest()
+        return f"{REGISTRATION_DATASET}@{digest[:12].upper()}"  # upper-case: callers .upper() ds
+
+    def _dataset_store_path(self, dataset_name: str) -> Path:
+        key = str(dataset_name).upper()
+        cfg = getattr(self, "datasets", {}).get(key)
+        if cfg is not None:
+            return Path(cfg.zarr_path)
+        staged = getattr(self, "_registration_store_paths", {}).get(key)
+        if staged is not None:
+            return staged
+        raise KeyError(key)
+
+    def display_levels(self, image_key: str, sdata, *, cancel_check=None) -> list[object]:
+        """(c, y, x) DataArrays, level 0 first: stored pyramid, or s0 + the ds cache (built if missing)."""
+        store_path = getattr(sdata, "path", None)
+        if store_path is None:
+            raise RuntimeError(
+                f"Cannot read display levels for images/{image_key}: "
+                "the SpatialData object has no store path."
+            )
+        store_path = Path(store_path)
+        staging = self._registration_staging_key(store_path)
+        self._registration_store_paths[staging] = store_path
+        elem = sdata.images[image_key]
+        # The cache build writes into the store, so it runs under MerXen's write lock; a stored
+        # pyramid or a cache that is reused as it is needs no lock and never writes.
+        needs_build = len(image_scale_dataarrays(elem)) == 1 and not (
+            self._image_pyramid_cache_reusable(image_key, sdata, dataset_name=staging)
+        )
+        build_cache = True
+        with ExitStack() as stack:
+            if needs_build:
+                try:
+                    stack.enter_context(
+                        store_write_lock(store_path, timeout_s=REGISTRATION_CACHE_LOCK_TIMEOUT_S)
+                    )
+                except StoreBusyError:
+                    log.warning(
+                        "Registration store is busy; images/%s uses a runtime overview pyramid.",
+                        image_key,
+                    )
+                    self._set_status(
+                        "The registration store is busy; "
+                        "showing images without the cached overview pyramid."
+                    )
+                    build_cache = False
+                except OSError as exc:  # the lock file cannot be opened: a read-only location
+                    log.warning(
+                        "Registration store is not writable (%s); images/%s uses a runtime "
+                        "overview pyramid.",
+                        exc,
+                        image_key,
+                    )
+                    self._set_status(
+                        "The registration store is not writable; "
+                        "showing images without the cached overview pyramid."
+                    )
+                    build_cache = False
+            levels, source = self._display_scale_levels_for_image(
+                image_key,
+                sdata,
+                build_cache=build_cache,
+                dataset_name=staging,
+                target_sdata=sdata,
+                cancel_check=cancel_check,
+            )
+        if cancel_check is not None and bool(cancel_check()):
+            raise RuntimeError("Background task cancelled")
+        if source == "single":
+            levels = complete_image_pyramid_for_display(levels)  # always multiscale for > 1024 px
+        return [ensure_cyx(cyx) for _name, cyx in levels]
+
+    def enter_registration_session(self, path, sdata) -> None:
+        """Tear down the other views and install the registration dataset (GUI thread)."""
+        path = Path(path)
+        # 1. Supersede any pending standalone/paired load and stop dataset-bound builders.
+        self._dataset_load_generation += 1
+        self._dataset_load_cancel.set()
+        self._dataset_load_cancel = Event()
+        self._dataset_load_worker = None
+        self._dataset_loading_key = None
+        # Not _cancel_background_tasks: it would cancel the registration load being applied.
+        self._cancel_dataset_background_tasks()
+        if self._umap_lasso_armed:
+            self.set_umap_lasso_active(False)
+        # 2. Tear down the previous view.
+        if self._paired_session is not None:
+            self._deactivate_paired_view()
+        self._clear_layers()
+        gc.collect()
+        # 3. Install the registration dataset.
+        self.datasets = {REGISTRATION_DATASET: DatasetConfig(name=REGISTRATION_DATASET, zarr_path=path)}
+        self._dataset_sessions.clear()
+        self._cell_type_states.clear()
+        self.active_dataset = REGISTRATION_DATASET
+        self._active_sdata = sdata
+        self._active_images_sdata = sdata
+        self._x_transform = None
+        self._y_transform = None
+        self._segmentation_keys = []
+        self._image_keys = []
+        self._image_channels = []
+        grid = getattr(self.viewer, "grid", None)
+        if grid is not None:
+            grid.enabled = False
+        left = getattr(self, "_left_panel_adapter", None)
+        if left is not None:
+            left.set_registration_mode(True)
+        if self._datasets_changed_callback is not None:
+            self._datasets_changed_callback([REGISTRATION_DATASET], REGISTRATION_DATASET)
+        self._publish_shape_keys()
+        self._publish_loaded_segmentation_keys()
+        self._publish_image_entries()
+        self._publish_loaded_image_entries()
+        self._publish_cellpose_value_options()
+        self._publish_cell_type_options()
+        self._publish_umap_options()
+        self._publish_transcript_sources()
+        self._publish_spatialdata_explorer()
+        if self._registration_mode_callback is not None:
+            self._registration_mode_callback(True)
+        self._update_scale_bar_visibility()
+
+    def registration_session_ready(self, path, kind: str) -> None:
+        """The registration layers are built (GUI thread)."""
+        path = Path(path)
+        log.info("Registration session ready (%s): %s", kind, path.name)
+        self._publish_spatialdata_explorer()
+        try:
+            self.viewer.reset_view()
+        except Exception:
+            pass
+        if self._registration_tab_callback is not None:
+            self._registration_tab_callback()
+        self._end_progress("dataset")
+        self._end_progress(REGISTRATION_PROGRESS_KEY)
+        if self._registration_dataset_loaded_callback is not None:
+            try:
+                self._registration_dataset_loaded_callback(path)
+            except Exception:
+                log.exception("Failed to publish successful registration store load")
+        self._schedule_canvas_visibility_repair(REGISTRATION_DATASET)
+
+    def leave_registration_session(self) -> None:
+        """The registration session ended (GUI thread; called by the registration controller)."""
+        left = getattr(self, "_left_panel_adapter", None)
+        if left is not None:
+            left.set_registration_mode(False)
+        if self._registration_mode_callback is not None:
+            self._registration_mode_callback(False)
+        for key in list(self._registration_progress_keys):
+            self._end_progress(key)
+        self._registration_progress_keys.clear()
+        self.datasets.pop(REGISTRATION_DATASET, None)
+        if self.active_dataset == REGISTRATION_DATASET:
+            self.active_dataset = None
+            self._active_sdata = None
+            self._active_images_sdata = None
+            self._publish_spatialdata_explorer()
+            self._update_scale_bar_visibility()
+        if not self.datasets and self._datasets_changed_callback is not None:
+            self._datasets_changed_callback([], None)
+
+    def app_data_dir(self) -> Path:
+        location = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
+        base = Path(location) if location else Path.home() / ".local" / "share"
+        path = base / REGISTRATION_APP_DIR_NAME
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
     def _pyramid_levels_from_element(self, elem) -> list[object]:
         """Return the (c, y, x) DataArrays of a stored image element, coarsest last."""
         return [ensure_cyx(cyx) for _name, cyx in image_scale_dataarrays(elem)]
+
+    def _image_pyramid_cache_spec(self, image_key: str) -> tuple[str, dict[str, object]]:
+        """Cache element key and expected marker attributes of an image's overview pyramid."""
+        step = max(2, int(self.args.image_pyramid_downsample))
+        cache_key = derived_image_pyramid_cache_key(image_key, step)
+        expected: dict[str, object] = {
+            "kind": "image_pyramid",
+            "source_image_key": str(image_key),
+            "downsample": int(step),
+            "min_size": int(SYNTHETIC_IMAGE_PYRAMID_MIN_SIZE),
+        }
+        return cache_key, expected
+
+    def _image_pyramid_cache_is_complete(self, image_key: str, *, dataset_name: str) -> bool:
+        cache_key, expected = self._image_pyramid_cache_spec(image_key)
+        return self._derived_cache_complete(
+            "images", cache_key, expected, dataset_name=dataset_name
+        )
+
+    def _image_pyramid_cache_reusable(self, image_key: str, sdata, *, dataset_name: str) -> bool:
+        """True when the stored overview cache is complete and readable: no write is needed.
+
+        This is the exact condition under which :meth:`_ensure_image_pyramid_cache` reuses the
+        cache instead of rebuilding it; it adopts the stored cache element into ``sdata``.
+        """
+        if not self._image_pyramid_cache_is_complete(image_key, dataset_name=dataset_name):
+            return False
+        cache_key, _expected = self._image_pyramid_cache_spec(image_key)
+        return self._refresh_image_key_from_store(
+            cache_key, dataset_name=dataset_name, target_sdata=sdata
+        )
 
     def _ensure_image_pyramid_cache(
         self,
@@ -6945,18 +7602,8 @@ class ComparisonViewerController:
             return []
 
         step = max(2, int(self.args.image_pyramid_downsample))
-        cache_key = derived_image_pyramid_cache_key(image_key, step)
-        expected = {
-            "kind": "image_pyramid",
-            "source_image_key": str(image_key),
-            "downsample": int(step),
-            "min_size": int(SYNTHETIC_IMAGE_PYRAMID_MIN_SIZE),
-        }
-        if (
-            not bool(getattr(self.args, "overwrite_derived_caches", False))
-            and self._derived_cache_complete("images", cache_key, expected, dataset_name=ds)
-            and self._refresh_image_key_from_store(cache_key, dataset_name=ds, target_sdata=sdata)
-        ):
+        cache_key, expected = self._image_pyramid_cache_spec(image_key)
+        if self._image_pyramid_cache_reusable(image_key, sdata, dataset_name=ds):
             return self._pyramid_levels_from_element(sdata.images[cache_key])
 
         base_cyx = ensure_cyx(get_scale0_dataarray(image_elem))
@@ -7009,7 +7656,14 @@ class ComparisonViewerController:
         return self._pyramid_levels_from_element(sdata.images[cache_key])
 
     def _display_scale_levels_for_image(
-        self, image_key: str, sdata, *, build_cache: bool = True
+        self,
+        image_key: str,
+        sdata,
+        *,
+        build_cache: bool = True,
+        dataset_name: str | None = None,
+        target_sdata=None,
+        cancel_check=None,
     ) -> tuple[list[tuple[str, object]], str]:
         """Return (scale_levels, source) for display: stored pyramid, or base plus
         a materialized coarse pyramid for single-scale images."""
@@ -7024,11 +7678,17 @@ class ComparisonViewerController:
 
         if da is not None and build_cache:
             try:
-                coarse = self._ensure_image_pyramid_cache(image_key, elem)
+                coarse = self._ensure_image_pyramid_cache(
+                    image_key,
+                    elem,
+                    dataset_name=dataset_name,
+                    target_sdata=target_sdata,
+                    cancel_check=cancel_check,
+                )
             except Exception as exc:
                 log.warning(
                     "[%s] Image pyramid cache build failed for %s (%s); using synthetic fallback.",
-                    self.active_dataset,
+                    dataset_name or self.active_dataset,
                     image_key,
                     exc,
                 )
@@ -7235,15 +7895,13 @@ class ComparisonViewerController:
         ds = str(dataset_name or self.active_dataset or "").upper()
         if not ds:
             return None
-        cfg = self.datasets[ds]
-        return sd.read_zarr(str(cfg.zarr_path), selection=("labels",))
+        return sd.read_zarr(str(self._dataset_store_path(ds)), selection=("labels",))
 
     def _read_images_from_store(self, dataset_name: str | None = None):
         ds = str(dataset_name or self.active_dataset or "").upper()
         if not ds:
             return None
-        cfg = self.datasets[ds]
-        return sd.read_zarr(str(cfg.zarr_path), selection=("images",))
+        return sd.read_zarr(str(self._dataset_store_path(ds)), selection=("images",))
 
     def _read_shapes_from_store(self):
         if self.active_dataset is None:
@@ -7281,8 +7939,7 @@ class ComparisonViewerController:
         ds = str(dataset_name or self.active_dataset or "").upper()
         if not ds:
             return None
-        cfg = self.datasets[ds]
-        return cfg.zarr_path / str(element_type) / str(key)
+        return self._dataset_store_path(ds) / str(element_type) / str(key)
 
     def _remove_label_from_parent_metadata(
         self, label_key: str, dataset_name: str | None = None
@@ -10090,6 +10747,14 @@ class ComparisonViewerController:
             # instead of panning or picking (in either pane of a pair).
             yield from self._spatial_lasso_gesture(event)
             return
+        registration = self._registration_controller()
+        if registration is not None:
+            gesture = registration.mouse_gesture(event)
+            if gesture is not None:
+                yield from gesture
+                return
+            if registration.is_active():
+                return  # plain pan; no transcript/cell picking on registration images
         pick_event = self._snapshot_pick_event(event)
         press_position = self._event_canvas_position(event)
         dragged = False
@@ -14230,6 +14895,9 @@ class ComparisonViewerController:
             self._gene_inspector_widget.clear()
 
     def load_selected_image(self, dataset_name: str, image_channels):
+        if self._registration_active():
+            self._set_status(REGISTRATION_IMAGES_STATUS)
+            return None
         entries = [(str(k), str(c)) for k, c in image_channels]
         if not entries:
             self._set_status("No image channel selected.")
@@ -14237,6 +14905,9 @@ class ComparisonViewerController:
         self.load_images_on_demand(dataset_name, image_channels=entries)
 
     def unload_selected_images(self, dataset_name: str, image_channels):
+        if self._registration_active():
+            self._set_status(REGISTRATION_IMAGES_STATUS)
+            return None
         if self._paired_session is not None and self._paired_registry is not None:
             removed = 0
             for slot_key, _channel in [
@@ -14266,6 +14937,9 @@ class ComparisonViewerController:
         self._set_status(f"{ds} removed {removed} image channel layer(s).")
 
     def load_images_on_demand(self, dataset_name: str, image_channels=None):
+        if self._registration_active():
+            self._set_status(REGISTRATION_IMAGES_STATUS)
+            return None
         if self._paired_session is not None:
             slot_keys = (
                 None
@@ -14579,6 +15253,15 @@ def parse_args() -> argparse.Namespace:
             "this option, --initial-dataset retains the standalone behavior."
         ),
     )
+    parser.add_argument(
+        "--registration-store",
+        default=None,
+        type=Path,
+        help=(
+            "Open a MerXen manual-registration store (<id>_prepared.zarr or "
+            "<run_id>_registered.zarr) in the Manual registration tab at startup."
+        ),
+    )
 
     parser.add_argument(
         "--segmentation-source",
@@ -14762,6 +15445,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--package-smoke-test-no-opengl", action="store_true", help=argparse.SUPPRESS)
 
     args = parser.parse_args()
+    if args.registration_store is not None and (
+        args.merscope_zarr is not None or args.xenium_zarr is not None
+    ):
+        parser.error("--registration-store cannot be combined with --merscope-zarr or --xenium-zarr.")
     if args.label_chunk_size <= 0:
         parser.error("--label-chunk-size must be positive.")
     if args.label_contour_width < 0:
@@ -14806,10 +15493,14 @@ def run_package_smoke_test_without_opengl() -> None:
         load_paired_callback=callback,
         load_standalone_callback=callback,
         switch_paired_view_callback=callback,
+        load_registration_callback=callback,
+        registration_widget=ManualRegistrationWidget(),
         initial_dataset=None,
     )
     if panel._tab_stack.currentIndex() != 6:
         raise RuntimeError("The empty viewer did not select the Dataset loader tab.")
+    if panel._tab_stack.count() != 10:
+        raise RuntimeError("The control panel is missing the Manual registration tab.")
     panel.close()
     app.processEvents()
 
@@ -14825,6 +15516,10 @@ def main():
         raise FileNotFoundError(f"MERSCOPE zarr path not found: {args.merscope_zarr}")
     if args.xenium_zarr is not None and not args.xenium_zarr.exists():
         raise FileNotFoundError(f"Xenium zarr path not found: {args.xenium_zarr}")
+    if args.registration_store is not None and not args.registration_store.exists():
+        raise FileNotFoundError(
+            f"Manual registration store not found: {args.registration_store}"
+        )
 
     datasets: dict[str, DatasetConfig] = {}
     if args.merscope_zarr is not None:
@@ -14919,6 +15614,8 @@ def main():
         set_lasso_active_callback=controller.set_umap_lasso_active,
         clear_roi_callback=controller.clear_umap_roi,
     )
+    # The "Manual registration" tab: landmark registration of two images.
+    registration_widget = ManualRegistrationWidget()
     panel = ViewerControlPanel(
         datasets=available_datasets,
         gene_inspector_widget=gene_inspector,
@@ -14949,6 +15646,8 @@ def main():
         switch_paired_view_callback=controller.switch_paired_view,
         initial_dataset=initial_dataset,
         expand_layer_controls_callback=left_panel.expand_layer_controls,
+        load_registration_callback=controller.load_registration_store,
+        registration_widget=registration_widget,
     )
     controller.set_status_callback(panel.set_status)
     controller.set_progress_callback(panel.set_progress)
@@ -14960,6 +15659,10 @@ def main():
     controller.set_paired_view_mode_callback(panel.set_paired_view_mode)
     controller.set_paired_dataset_loaded_callback(panel.paired_dataset_loaded)
     controller.set_cellpose_value_options_callback(panel.set_cellpose_value_options)
+    controller.set_registration_widget(registration_widget)
+    controller.set_registration_dataset_loaded_callback(panel.registration_dataset_loaded)
+    controller.set_registration_mode_callback(panel.set_registration_mode)
+    controller.set_registration_tab_callback(panel.select_registration_tab)
     controller.set_gene_inspector_widget(gene_inspector)
     controller.set_cell_type_widget(cell_type_widget)
     controller.set_umap_widget(umap_widget)
@@ -14973,12 +15676,17 @@ def main():
     welcome_overlay = DatasetWelcomeOverlay(
         viewer,
         panel._load_paired_button,
-        start_visible=not bool(datasets),
+        start_visible=not bool(datasets) and args.registration_store is None,
     )
     panel.dataset_open_requested.connect(welcome_overlay.dismiss)
     # Keep the Qt helpers alive with the controller for the lifetime of the app.
     controller._left_panel_adapter = left_panel
     controller._dataset_welcome_overlay = welcome_overlay
+    qt_window = getattr(viewer.window, "_qt_window", None)
+    if qt_window is not None:
+        registration_close_guard = RegistrationCloseGuard(controller, qt_window)
+        qt_window.installEventFilter(registration_close_guard)
+        controller._registration_close_guard = registration_close_guard  # keep alive
 
     controller.install_canvas_overlays()
     if initial_pair:
@@ -14992,6 +15700,8 @@ def main():
         if loaded:
             for dataset_name, config in datasets.items():
                 panel.record_recent_dataset(dataset_name, config.zarr_path)
+    elif args.registration_store is not None:
+        controller.load_registration_store(args.registration_store)
     else:
         panel.set_status("No dataset loaded. Choose a dataset from the Dataset loader tab.")
     if args.package_smoke_test:
