@@ -7,7 +7,10 @@ pre-aligned pair.
 The viewer opens a single Napari window with a tabbed control panel (tabs across
 the top of the right-hand dock): **Gene inspector**, **Cell segmentation**,
 **Cell type labels**, **Per cell statistics**, **Draw tissue annotations**,
-**Images**, **Dataset loader**, **UMAP**, and **Zarr metadata**. With
+**Images**, **Dataset loader**, **UMAP**, **Zarr metadata**, and **Manual registration**.
+A MerXen manual-registration store opens in its own session for placing landmark
+pairs or inspecting a registration result (see
+[docs/manual_registration_guide.md](docs/manual_registration_guide.md)). With
 a supplied dataset it automatically loads all image channels, the Cellpose, ProSeg and
 ProSeg hybrid cell segmentations, and all transcripts (rendered as per-gene coloured
 points). A busy progress bar with a stage label below the tabs shows what is
@@ -138,6 +141,16 @@ napari-compare-xenium-merscope --merscope-zarr /path/to/merscope.zarr
 napari-compare-xenium-merscope --xenium-zarr /path/to/xenium.zarr
 ```
 
+Open a MerXen manual-registration store (to place landmarks or inspect a result)
+with:
+
+```bash
+napari-compare-xenium-merscope --registration-store /path/to/<id>_prepared.zarr
+```
+
+`--registration-store` cannot be combined with `--merscope-zarr` or
+`--xenium-zarr`.
+
 ### Paired viewing
 
 The **Dataset loader** offers two explicit choices: **Load new paired dataset
@@ -233,8 +246,18 @@ dock so every full name stays readable.
   overlay** (browse for a MERSCOPE store then a Xenium store), or **Load new
   standalone MERSCOPE / Xenium dataset** (browse for a single store). While a
   pair is active, use the two **Switch to... view** buttons to change layouts.
-  Each browser expects the store's `spatialdata.zarr` folder. **Recently viewed**
+  Each browser expects the store's `spatialdata.zarr` folder. **Manual
+  Registration ▸ Load image data** opens a MerXen `<id>_prepared.zarr` or
+  `<run_id>_registered.zarr`; picking such a store with a standalone loader opens
+  it here too. **Recently viewed**
   lists up to ten logical entries and persists between launches.
+- **Manual registration** — the landmark-registration controls: display modes and
+  Flick, crops, coarse alignment, landmarks with live residuals, **Save draft** and
+  **Finish labelling**. A result store (`<run_id>_registered.zarr`) is read-only and
+  shows the registered image, landmark overlays and the residual table. See
+  [docs/manual_registration_guide.md](docs/manual_registration_guide.md). In a
+  registration session the dataset switcher, Reload, segmentation, transcript,
+  per-cell statistic and annotation tools are disabled.
 - **UMAP** — **Open UMAP window** shows the stored UMAP of the cells in an
   optional floating window, with **Cell type source**, **Colour by**, and point
   size controls, plus **Draw region of interest** for lassoing cells in either
@@ -246,7 +269,7 @@ controls** starts collapsed and can be expanded or collapsed with the arrow in
 its title. The create-points, create-shapes, create-labels, console, 2D/3D,
 axis, and grid buttons are hidden. Delete remains available in standalone mode
 but is disabled while a paired grid is active; use the shared unload controls
-instead. **Reset view to original state** remains available in both modes.
+instead. Delete is also disabled during a manual-registration session. **Reset view to original state** remains available in both modes.
 
 In standalone mode, segmentations display as memory-efficient label outlines.
 If a matching label element is already present in the SpatialData store, it is
@@ -655,6 +678,19 @@ infer equivalent elements: it requires the exact common coordinate system,
 fixed grid, and materialized artifact mappings declared by a valid MerXen v2
 pair.
 
+### Manual-registration stores
+
+A manual-registration store is image-only SpatialData written by MerXen. The viewer
+recognises it only by the root attribute `merxen_manual_registration_store`. The viewer
+writes only the root attribute `merxen_manual_registration` (landmarks, crops and coarse
+alignment), under the lock file `<store>.merxen-write.lock`; it keeps a backup of every
+previous payload in `<store>.landmark-history/` and an unsaved-work draft in the user's
+application-data folder. It may add the private overview pyramid
+`images/_napari_compare_imgpyr__<key>__ds4` when MerXen did not; it never modifies image
+pixels. Coordinates in the attribute are full-resolution pixel coordinates of each original
+image (an integer is a pixel centre); matrices map moving to reference (the Xenium Explorer
+convention). Image-only stores without points skip the transcript autoload.
+
 ## Cortical-depth annotations for MerXen
 
 For a complete step-by-step workflow, see
@@ -747,5 +783,7 @@ Click **Save** beside the angle to restore it the next time you open that datase
 Angles are stored in local viewer settings using the full dataset path; an aligned
 MERSCOPE/Xenium pair has its own shared saved angle. Moving a store to a new path
 starts with zero rotation. To clear a saved rotation, set the angle to 0° and save.
+Rotation is set to 0° and disabled while a manual-registration session is open;
+registration layers are never rotated by this control.
 Source images, coordinates, and Zarr stores are never modified. Region drawing
 follows the rotated display while selecting cells in their original coordinate frame.
