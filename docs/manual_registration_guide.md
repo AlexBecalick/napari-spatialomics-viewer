@@ -96,7 +96,7 @@ names the preset, the refinement and flow status, and the tissue correlation per
 | **F** | Flick between the reference and the moving image |
 | **Shift+F** (hold) | Peek at the other image while the keys are held |
 | **Ctrl+Z** | Undo (cancels a half-placed pair first) |
-| **Escape** | Cancel a half-placed pair or an armed crop drawing |
+| **Escape** | Cancel a half-placed pair or an armed crop drawing; otherwise it leaves Landmark mode |
 | Left click | Place a landmark point (in Landmark mode) |
 | Drag | Pan |
 

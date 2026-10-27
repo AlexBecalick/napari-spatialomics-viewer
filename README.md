@@ -686,7 +686,8 @@ writes only the root attribute `merxen_manual_registration` (landmarks, crops an
 alignment), under the lock file `<store>.merxen-write.lock`; it keeps a backup of every
 previous payload in `<store>.landmark-history/` and an unsaved-work draft in the user's
 application-data folder. It may add the private overview pyramid
-`images/_napari_compare_imgpyr__<key>__ds4` when MerXen did not; it never modifies image
+`images/_napari_compare_imgpyr__<key>__ds4` when MerXen did not, under the same lock (a busy
+or read-only store is shown with a runtime pyramid instead); it never modifies image
 pixels. Coordinates in the attribute are full-resolution pixel coordinates of each original
 image (an integer is a pixel centre); matrices map moving to reference (the Xenium Explorer
 convention). Image-only stores without points skip the transcript autoload.
