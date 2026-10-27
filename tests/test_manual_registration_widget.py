@@ -7,6 +7,7 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
+from qtpy.QtCore import QItemSelectionModel
 
 from napari_compare_xenium_merscope.manual_registration_model import (
     CoarseState,
@@ -289,6 +290,14 @@ def test_enable_logic(widget):
     assert w._delete_button.isEnabled()
     w.set_rows(make_rows())  # the selection is kept by id
     assert w._selected_ids() == [5]
+    w._table.selectRow(0)
+    w._table.selectionModel().select(
+        w._table.model().index(2, 0), QItemSelectionModel.Select | QItemSelectionModel.Rows
+    )
+    assert w._selected_ids() == [3, 9]
+    w.set_rows(make_rows())  # a multi-row selection survives too
+    assert w._selected_ids() == [3, 9]
+    w._table.selectRow(1)
     w.set_rows([make_rows()[0]])
     assert not w._delete_button.isEnabled()
 
@@ -402,3 +411,17 @@ def test_table_content(widget):
         "100 µm",
         "1000 µm",
     ]
+
+
+def test_rotation_spin_arrows_cross_180(qapp):
+    w = ManualRegistrationWidget()
+    rec = Recorder(w)
+    w.set_coarse(CoarseState(180.0, False, (0.0, 0.0)))
+    w.set_coarse_enabled(True)
+    rec.pop()
+    w._rotation_spin.stepBy(1)
+    assert rec.pop() == [("rotation_set", (-179.0,))]
+    w._rotation_spin.setValue(-179.0)
+    rec.pop()
+    w._rotation_spin.stepBy(-1)
+    assert rec.pop() == [("rotation_set", (180.0,))]

@@ -12,7 +12,7 @@ import math
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 
-from qtpy.QtCore import Qt, Signal
+from qtpy.QtCore import QItemSelectionModel, Qt, Signal
 from qtpy.QtGui import QBrush, QColor
 from qtpy.QtWidgets import (
     QAbstractItemView,
@@ -47,6 +47,7 @@ from .manual_registration_model import (
     FitSummary,
     ResidualRow,
     snap_crop,
+    wrap_deg,
 )
 
 SIGNAL_NAMES: tuple[str, ...] = (
@@ -116,6 +117,18 @@ def _flags(row: ResidualRow, *, off_text: str) -> str:
     if not row.enabled:
         parts.append(off_text)
     return " ".join(parts)
+
+
+class _AngleSpinBox(QDoubleSpinBox):
+    """Angle spin box whose arrows wrap through +-180 degrees.
+
+    The built-in wrapping jumps from 180 straight back to the range minimum, which the controller
+    wraps to 180 again, so the arrows could never cross +-180. Stepping through ``wrap_deg``
+    lands on the equivalent angle instead.
+    """
+
+    def stepBy(self, steps: int) -> None:  # noqa: N802 - Qt override
+        self.setValue(wrap_deg(self.value() + steps * self.singleStep()))
 
 
 class ManualRegistrationWidget(QWidget):
@@ -286,7 +299,7 @@ class ManualRegistrationWidget(QWidget):
         lay = QVBoxLayout(self._coarse_box)
 
         lay.addWidget(QLabel("Rotation (counter-clockwise on screen)"))
-        self._rotation_spin = QDoubleSpinBox()
+        self._rotation_spin = _AngleSpinBox()
         self._rotation_spin.setRange(-180.0, 180.0)
         self._rotation_spin.setWrapping(True)
         self._rotation_spin.setDecimals(2)
@@ -701,7 +714,11 @@ class ManualRegistrationWidget(QWidget):
             table.clearSelection()
             for r, row in enumerate(rows):
                 if row.id in selected:
-                    table.selectRow(r)
+                    # selectRow would clear the earlier rows under ExtendedSelection
+                    table.selectionModel().select(
+                        table.model().index(r, 0),
+                        QItemSelectionModel.Select | QItemSelectionModel.Rows,
+                    )
         finally:
             table.blockSignals(False)
         self._update_delete_enabled()

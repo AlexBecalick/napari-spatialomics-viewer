@@ -324,7 +324,7 @@ def read_local_draft(store: Path, base_dir: Path) -> dict[str, Any] | None:
         text = target.read_text(encoding="utf-8")
     except FileNotFoundError:
         return None
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         log.warning("could not read the local draft %s: %s", target.name, exc)
         return None
     try:
