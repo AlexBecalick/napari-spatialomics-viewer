@@ -24,7 +24,7 @@ import time
 import warnings
 from collections import OrderedDict
 from collections.abc import Mapping
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event, RLock, Semaphore
@@ -157,7 +157,12 @@ except Exception:  # pragma: no cover - depends on the installed napari runtime
 
 from .manual_registration_controller import REGISTRATION_DATASET, ManualRegistrationController
 from .manual_registration_model import LAYER_METADATA_KEY, STORE_ATTR
-from .manual_registration_store import StoreBusyError, read_root_attrs, store_write_lock
+from .manual_registration_store import (
+    StoreBusyError,
+    read_root_attrs,
+    read_store_descriptor,
+    store_write_lock,
+)
 from .manual_registration_widget import ManualRegistrationWidget
 from .spatialdata_explorer import SpatialDataExplorerWidget
 from .dask_cache import install_thread_safe_napari_dask_cache
@@ -561,6 +566,7 @@ class UmapRoi:
 
 DEFAULT_GENE_SPOT_SIZE = 0.5
 MAX_RECENT_DATASETS = 10
+RECENT_DATASETS_SETTINGS_KEY = "dataset_loader/recent_datasets"
 REGISTRATION_RECENT_KIND = "registration"
 REGISTRATION_APP_DIR_NAME = "napari-compare-xenium-merscope"
 REGISTRATION_CACHE_LOCK_TIMEOUT_S = 30.0
@@ -570,11 +576,6 @@ REGISTRATION_IMAGES_STATUS = (
 )
 #: a started save is never cancelled: it must report its result so the controller can clear its save state
 _UNCANCELLED_REGISTRATION_KEYS = frozenset({"registration_save"})
-
-
-class _RegistrationTaskCancelled(RuntimeError):
-    """Raised inside a registration worker whose task was superseded or cancelled."""
-RECENT_DATASETS_SETTINGS_KEY = "dataset_loader/recent_datasets"
 GENE_HIGHLIGHT_SPOT_SIZE = 2.0
 GENE_SPOT_SIZE_MIN = 0.1
 GENE_SPOT_SIZE_MAX = 5.0
@@ -689,6 +690,10 @@ INSPECT_CLICK_DRAG_THRESHOLD_PX = 4.0
 #: Cell masks whose GeoDataFrames are preferred targets for a mask click, most
 #: specific first. ProSeg is the primary target named in the feature request.
 CELL_INSPECTOR_SHAPE_PREFERENCE = ("proseg", "cellpose", "cell")
+
+
+class _RegistrationTaskCancelled(RuntimeError):
+    """Raised inside a registration worker whose task was superseded or cancelled."""
 
 
 def startup_selection(segmentation_source: str) -> tuple[str, ...]:
@@ -6172,6 +6177,8 @@ class ComparisonViewerController:
                 self.open_gene_inspector(ds, reuse_cached=True)
             else:
                 log.info("[%s] Store has no points element; skipping transcript autoload.", ds)
+                # The assignment-source list must not keep the previous dataset's entries.
+                self._publish_transcript_sources()
                 self._set_status(f"{ds} has no transcripts; images and masks only.")
 
     def _active_store_has_points(self) -> bool:
@@ -7259,6 +7266,9 @@ class ComparisonViewerController:
             if not path.exists():
                 raise FileNotFoundError(f"Manual registration store not found: {path}")
             validate_spatialdata_store_compatibility(path)
+            # Refuse anything that is not a registration store before the confirmation and
+            # before any pending load or builder is cancelled: a refused request is a no-op.
+            read_store_descriptor(path)
         except Exception as exc:
             self._set_status(f"Could not open manual registration store: {exc}")
             log.warning("Could not open manual registration store %s: %s", path, exc)
@@ -7386,33 +7396,47 @@ class ComparisonViewerController:
         staging = self._registration_staging_key(store_path)
         self._registration_store_paths[staging] = store_path
         elem = sdata.images[image_key]
-        needs_build = len(
-            image_scale_dataarrays(elem)
-        ) == 1 and not self._image_pyramid_cache_is_complete(image_key, dataset_name=staging)
-        try:
-            guard = (
-                store_write_lock(store_path, timeout_s=REGISTRATION_CACHE_LOCK_TIMEOUT_S)
-                if needs_build
-                else nullcontext()
-            )
-            with guard:
-                levels, source = self._display_scale_levels_for_image(
-                    image_key,
-                    sdata,
-                    build_cache=True,
-                    dataset_name=staging,
-                    target_sdata=sdata,
-                    cancel_check=cancel_check,
-                )
-        except StoreBusyError:
-            log.warning(
-                "Registration store is busy; images/%s uses a runtime overview pyramid.", image_key
-            )
-            self._set_status(
-                "The registration store is busy; showing images without the cached overview pyramid."
-            )
+        # The cache build writes into the store, so it runs under MerXen's write lock; a stored
+        # pyramid or a cache that is reused as it is needs no lock and never writes.
+        needs_build = len(image_scale_dataarrays(elem)) == 1 and not (
+            self._image_pyramid_cache_reusable(image_key, sdata, dataset_name=staging)
+        )
+        build_cache = True
+        with ExitStack() as stack:
+            if needs_build:
+                try:
+                    stack.enter_context(
+                        store_write_lock(store_path, timeout_s=REGISTRATION_CACHE_LOCK_TIMEOUT_S)
+                    )
+                except StoreBusyError:
+                    log.warning(
+                        "Registration store is busy; images/%s uses a runtime overview pyramid.",
+                        image_key,
+                    )
+                    self._set_status(
+                        "The registration store is busy; "
+                        "showing images without the cached overview pyramid."
+                    )
+                    build_cache = False
+                except OSError as exc:  # the lock file cannot be opened: a read-only location
+                    log.warning(
+                        "Registration store is not writable (%s); images/%s uses a runtime "
+                        "overview pyramid.",
+                        exc,
+                        image_key,
+                    )
+                    self._set_status(
+                        "The registration store is not writable; "
+                        "showing images without the cached overview pyramid."
+                    )
+                    build_cache = False
             levels, source = self._display_scale_levels_for_image(
-                image_key, sdata, build_cache=False
+                image_key,
+                sdata,
+                build_cache=build_cache,
+                dataset_name=staging,
+                target_sdata=sdata,
+                cancel_check=cancel_check,
             )
         if cancel_check is not None and bool(cancel_check()):
             raise RuntimeError("Background task cancelled")
@@ -7465,6 +7489,7 @@ class ComparisonViewerController:
         self._publish_cellpose_value_options()
         self._publish_cell_type_options()
         self._publish_umap_options()
+        self._publish_transcript_sources()
         self._publish_spatialdata_explorer()
         if self._registration_mode_callback is not None:
             self._registration_mode_callback(True)
@@ -7539,6 +7564,19 @@ class ComparisonViewerController:
             "images", cache_key, expected, dataset_name=dataset_name
         )
 
+    def _image_pyramid_cache_reusable(self, image_key: str, sdata, *, dataset_name: str) -> bool:
+        """True when the stored overview cache is complete and readable: no write is needed.
+
+        This is the exact condition under which :meth:`_ensure_image_pyramid_cache` reuses the
+        cache instead of rebuilding it; it adopts the stored cache element into ``sdata``.
+        """
+        if not self._image_pyramid_cache_is_complete(image_key, dataset_name=dataset_name):
+            return False
+        cache_key, _expected = self._image_pyramid_cache_spec(image_key)
+        return self._refresh_image_key_from_store(
+            cache_key, dataset_name=dataset_name, target_sdata=sdata
+        )
+
     def _ensure_image_pyramid_cache(
         self,
         image_key: str,
@@ -7565,11 +7603,7 @@ class ComparisonViewerController:
 
         step = max(2, int(self.args.image_pyramid_downsample))
         cache_key, expected = self._image_pyramid_cache_spec(image_key)
-        if (
-            not bool(getattr(self.args, "overwrite_derived_caches", False))
-            and self._derived_cache_complete("images", cache_key, expected, dataset_name=ds)
-            and self._refresh_image_key_from_store(cache_key, dataset_name=ds, target_sdata=sdata)
-        ):
+        if self._image_pyramid_cache_reusable(image_key, sdata, dataset_name=ds):
             return self._pyramid_levels_from_element(sdata.images[cache_key])
 
         base_cyx = ensure_cyx(get_scale0_dataarray(image_elem))

@@ -14,6 +14,7 @@ import time
 import types
 from contextlib import contextmanager
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -262,22 +263,11 @@ def _fake_thread_worker(created):
 def _registration_store_dir(root: Path, attrs: bool = True) -> Path:
     store = root / "x_prepared.zarr"
     store.mkdir(parents=True)
-    attributes = (
-        {
-            "merxen_manual_registration_store": {
-                "schema": "merxen.manual_registration.store",
-                "schema_version": 1,
-                "kind": "prepared",
-            }
-        }
-        if attrs
-        else {}
-    )
+    attributes = {V.STORE_ATTR: stores.prepared_store_attr()} if attrs else {}
     (store / "zarr.json").write_text(
         json.dumps({"zarr_format": 3, "node_type": "group", "attributes": attributes})
     )
     return store
-
 
 
 def _gesture(registration, world_rc):
@@ -315,6 +305,26 @@ def _statuses(ctrl):
     out: list[str] = []
     ctrl.set_status_callback(out.append)
     return out
+
+
+def _gene_widget_with_stale_source():
+    """A Gene inspector that still lists the pciSeq source of a previously shown dataset."""
+    noop = lambda *args, **kwargs: None  # noqa: E731
+    widget = V.GeneInspectorWidget(
+        noop, noop, noop, noop, noop, noop, set_assignment_source_callback=noop
+    )
+    widget.set_assignment_sources(
+        {"native": "Native assignments", "pciseq": "pciSeq (previous dataset)"},
+        "pciseq",
+        "previous dataset summary",
+        dataset="XENIUM",
+    )
+    return widget
+
+
+def _assignment_sources(widget) -> list[str]:
+    combo = widget._assignment_combo
+    return [combo.itemText(index) for index in range(combo.count())]
 
 
 # ---------------------------------------------------------------------------------------------
@@ -510,9 +520,7 @@ def test_open_recent_registration_without_callback_sets_status(qapp, tmp_path):
 
 
 def test_standalone_loader_ignores_pending_result(qapp, tmp_path, monkeypatch):
-    panel = _panel(
-        [], settings=_settings(tmp_path), load_standalone_callback=lambda *_a: None
-    )
+    panel = _panel([], settings=_settings(tmp_path), load_standalone_callback=lambda *_a: None)
     monkeypatch.setattr(panel, "_browse_zarr", lambda _title: str(tmp_path / "s.zarr"))
     panel._load_standalone_merscope_button.click()
     panel._load_standalone_xenium_button.click()
@@ -543,6 +551,30 @@ def test_standalone_load_redirects_registration_store(qapp, tmp_path, monkeypatc
     monkeypatch.setattr(ctrl, "_replace_datasets", lambda *_a, **_k: True)
     assert ctrl.load_standalone_dataset("MERSCOPE", plain) is True
     assert recorded == [store]
+
+
+def test_standalone_load_keeps_unsaved_registration_session(qapp, tmp_path, monkeypatch):
+    plain = _registration_store_dir(tmp_path, attrs=False)
+    ctrl = _controller()
+    fake = _FakeRegistration(active=True, confirm=False)
+    ctrl._registration = fake
+    statuses = _statuses(ctrl)
+    replaced = []
+
+    def replace(*args, **kwargs):
+        replaced.append(args)
+        raise AssertionError("declining the discard must not replace the datasets")
+
+    monkeypatch.setattr(ctrl, "_replace_datasets", replace)
+    assert ctrl.load_standalone_dataset("XENIUM", plain) is False
+    assert replaced == []
+    assert fake.calls == ["confirm"]
+    assert statuses[-1] == "Kept the current registration session (unsaved changes)."
+
+    # Accepting the discard goes on to replace the datasets.
+    fake.confirm = True
+    monkeypatch.setattr(ctrl, "_replace_datasets", lambda *_a, **_k: True)
+    assert ctrl.load_standalone_dataset("XENIUM", plain) is True
 
 
 def test_load_dataset_routes_registration_name(qapp, tmp_path, monkeypatch):
@@ -589,6 +621,63 @@ def test_load_registration_store_confirms_supersedes_and_delegates(qapp, tmp_pat
     statuses = _statuses(ctrl)
     assert ctrl.load_registration_store(tmp_path / "missing.zarr") is False
     assert statuses[-1].startswith("Could not open manual registration store")
+
+
+def test_refused_registration_request_leaves_pending_loads_alone(qapp, tmp_path, monkeypatch):
+    """A request that is refused (not a store, missing, declined) must not cancel anything."""
+    monkeypatch.setattr(V, "validate_spatialdata_store_compatibility", lambda _p: None)
+    store = _registration_store_dir(tmp_path / "with")
+    plain = _registration_store_dir(tmp_path / "without", attrs=False)
+    ctrl = _controller()
+    fake = _FakeRegistration(active=True, confirm=True)
+    ctrl._registration = fake
+    statuses = _statuses(ctrl)
+    progress: list[tuple] = []
+    ctrl.set_progress_callback(lambda *args: progress.append(args))
+    pending_load = ctrl._dataset_load_cancel
+    sentinel_worker, sentinel_key = object(), "XENIUM"
+    ctrl._dataset_load_worker, ctrl._dataset_loading_key = sentinel_worker, sentinel_key
+    generation = ctrl._dataset_load_generation
+    token = ctrl._registration_worker_tokens["registration_load"] = Event()
+
+    def untouched():
+        assert ctrl._dataset_load_generation == generation
+        assert ctrl._dataset_load_cancel is pending_load and not pending_load.is_set()
+        assert ctrl._dataset_load_worker is sentinel_worker
+        assert ctrl._dataset_loading_key == sentinel_key
+        assert not token.is_set()
+        assert fake.calls == [] and progress == []
+
+    # A plain SpatialData folder (no store attribute), then a missing one.
+    assert ctrl.load_registration_store(plain) is False
+    assert statuses[-1].startswith("Could not open manual registration store")
+    untouched()
+    assert ctrl.load_registration_store(tmp_path / "missing.zarr") is False
+    untouched()
+
+    # A store whose descriptor is malformed is refused the same way.
+    (store / "zarr.json").write_text(
+        json.dumps(
+            {
+                "zarr_format": 3,
+                "node_type": "group",
+                "attributes": {V.STORE_ATTR: {"schema": "merxen.manual_registration.store"}},
+            }
+        )
+    )
+    assert ctrl.load_registration_store(store) is False
+    untouched()
+
+    # Declining to discard unsaved work only asks; nothing is cancelled.
+    good = _registration_store_dir(tmp_path / "good")
+    fake.confirm = False
+    assert ctrl.load_registration_store(good) is False
+    assert fake.calls == ["confirm"]
+    assert statuses[-1] == "Kept the current registration session (unsaved changes)."
+    fake.calls.clear()
+    assert ctrl._dataset_load_generation == generation
+    assert ctrl._dataset_load_cancel is pending_load and not pending_load.is_set()
+    assert ctrl._dataset_load_worker is sentinel_worker and not token.is_set()
 
 
 # ---------------------------------------------------------------------------------------------
@@ -867,11 +956,17 @@ def test_startup_autoload_skips_transcripts_without_points(qapp, monkeypatch):
         ctrl, "open_gene_inspector", lambda *args, **kwargs: calls.append((args, kwargs))
     )
     statuses = _statuses(ctrl)
+    widget = _gene_widget_with_stale_source()
+    ctrl.set_gene_inspector_widget(widget)
+    ctrl.active_dataset = "X"
 
     ctrl._active_sdata = SimpleNamespace(points={})
     ctrl._start_startup_autoload("X")
     assert calls == []
     assert statuses[-1] == "X has no transcripts; images and masks only."
+    # The previous dataset's pciSeq source and summary are gone.
+    assert _assignment_sources(widget) == ["Native assignments"]
+    assert widget._assignment_summary.text() == ""
 
     ctrl._active_sdata = SimpleNamespace(points={"transcripts": object()})
     ctrl._start_startup_autoload("X")
@@ -932,12 +1027,16 @@ def test_close_guard_blocks_close_when_discard_declined(qapp):
 
     window = QWidget()
     window.show()
-    guard = V.RegistrationCloseGuard(SimpleNamespace(confirm_close_registration=lambda: False), window)
+    guard = V.RegistrationCloseGuard(
+        SimpleNamespace(confirm_close_registration=lambda: False), window
+    )
     window.installEventFilter(guard)
     assert window.close() is False
     assert window.isVisible()
     window.removeEventFilter(guard)
-    allowing = V.RegistrationCloseGuard(SimpleNamespace(confirm_close_registration=lambda: True), window)
+    allowing = V.RegistrationCloseGuard(
+        SimpleNamespace(confirm_close_registration=lambda: True), window
+    )
     window.installEventFilter(allowing)
     assert window.close() is True
 
@@ -1013,6 +1112,106 @@ def test_display_levels_builds_cache_into_registration_store(qapp, tmp_path, mon
     )
 
 
+def test_display_levels_falls_back_when_the_lock_file_cannot_be_opened(qapp, tmp_path, monkeypatch):
+    import spatialdata as sd
+
+    store = _write_large_store(tmp_path / "x_prepared.zarr")
+
+    @contextmanager
+    def unwritable(*_a, **_k):
+        raise PermissionError(13, "Permission denied")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(V, "store_write_lock", unwritable)
+    ctrl = _controller()
+    statuses = _statuses(ctrl)
+    levels = ctrl.display_levels("reference", sd.read_zarr(store), cancel_check=None)
+    assert levels[0].shape == (2, 2100, 2100)
+    assert len(levels) >= 2
+    assert not (store / "images" / "_napari_compare_imgpyr__reference__ds4").exists()
+    assert statuses[-1] == (
+        "The registration store is not writable; showing images without the cached overview "
+        "pyramid."
+    )
+
+
+def test_display_levels_on_a_read_only_store_without_a_cache(qapp, tmp_path):
+    import spatialdata as sd
+
+    shared = tmp_path / "shared_results"
+    shared.mkdir()
+    store = _write_large_store(shared / "x_registered.zarr")
+    sdata = sd.read_zarr(store)
+
+    def set_writable(writable: bool) -> None:
+        for dirpath, dirnames, filenames in os.walk(shared, topdown=False):
+            for name in filenames:
+                (Path(dirpath) / name).chmod(0o644 if writable else 0o444)
+            for name in dirnames:
+                (Path(dirpath) / name).chmod(0o755 if writable else 0o555)
+        shared.chmod(0o755 if writable else 0o555)
+
+    set_writable(False)
+    try:
+        if os.access(shared, os.W_OK):
+            pytest.skip("file permissions are not enforced for this user")
+        ctrl = _controller()
+        statuses = _statuses(ctrl)
+        levels = ctrl.display_levels("reference", sdata, cancel_check=None)
+        assert levels[0].shape == (2, 2100, 2100)
+        assert len(levels) >= 2
+        assert "not writable" in statuses[-1]
+        assert not (store / "images" / "_napari_compare_imgpyr__reference__ds4").exists()
+        assert not list(shared.glob("*.lock"))
+    finally:
+        set_writable(True)
+
+
+def test_display_levels_takes_the_store_lock_for_every_write(qapp, tmp_path, monkeypatch):
+    import spatialdata as sd
+
+    store = _write_large_store(tmp_path / "x_prepared.zarr")
+    locks: list[Path] = []
+    held = {"now": False}
+    writes: list[bool] = []
+    real_lock = V.store_write_lock
+    real_write = sd.SpatialData.write_element
+
+    @contextmanager
+    def spy(path, **kwargs):
+        locks.append(Path(path))
+        with real_lock(path, **kwargs):
+            held["now"] = True
+            try:
+                yield
+            finally:
+                held["now"] = False
+
+    def write_element(self, *args, **kwargs):
+        writes.append(held["now"])
+        return real_write(self, *args, **kwargs)
+
+    monkeypatch.setattr(V, "store_write_lock", spy)
+    monkeypatch.setattr(sd.SpatialData, "write_element", write_element)
+    ctrl = _controller()
+
+    # Nothing cached: the cache is built under the lock.
+    assert len(ctrl.display_levels("reference", sd.read_zarr(store), cancel_check=None)) >= 2
+    assert locks == [store] and writes == [True]
+
+    # A complete, readable cache is reused: no lock and no write.
+    locks.clear()
+    writes.clear()
+    assert len(ctrl.display_levels("reference", sd.read_zarr(store), cancel_check=None)) >= 2
+    assert locks == [] and writes == []
+
+    # A complete marker whose element cannot be read back would be rebuilt: that write is
+    # still under the lock.
+    monkeypatch.setattr(ctrl, "_read_images_from_store", lambda *_a, **_k: None)
+    assert len(ctrl.display_levels("reference", sd.read_zarr(store), cancel_check=None)) >= 2
+    assert locks == [store] and writes == [True]
+
+
 def test_display_levels_requires_a_store_path(qapp):
     with pytest.raises(RuntimeError, match="no store path"):
         _controller().display_levels("reference", SimpleNamespace(path=None), cancel_check=None)
@@ -1029,9 +1228,12 @@ def test_enter_ready_leave_registration_session(qapp, tmp_path):
     ctrl.set_registration_tab_callback(lambda: tabs.append(True))
     ctrl.set_registration_dataset_loaded_callback(loaded.append)
     ctrl.set_datasets_changed_callback(lambda names, initial: changed.append((names, initial)))
+    left_panel: list[bool] = []
+    ctrl._left_panel_adapter = SimpleNamespace(set_registration_mode=left_panel.append)
     old_generation = ctrl._dataset_load_generation
 
     ctrl.enter_registration_session(store, sdata)
+    assert left_panel == [True]
     assert ctrl.active_dataset == V.REGISTRATION_DATASET
     assert list(ctrl.datasets) == [V.REGISTRATION_DATASET]
     assert ctrl.datasets[V.REGISTRATION_DATASET].zarr_path == store
@@ -1046,9 +1248,42 @@ def test_enter_ready_leave_registration_session(qapp, tmp_path):
 
     ctrl.leave_registration_session()
     assert modes == [True, False]
+    assert left_panel == [True, False]
     assert ctrl.active_dataset is None
     assert V.REGISTRATION_DATASET not in ctrl.datasets
     assert changed[-1] == ([], None)
+
+
+def test_enter_registration_session_tears_down_the_paired_view(qapp, tmp_path):
+    import spatialdata as sd
+
+    store = stores.build_prepared_store(tmp_path / "x_prepared.zarr")
+    ctrl = _controller()
+    order: list[str] = []
+    ctrl._paired_session = object()
+
+    def deactivate_paired():
+        order.append("deactivate_paired")
+        ctrl._paired_session = None
+
+    ctrl._deactivate_paired_view = deactivate_paired
+    ctrl._clear_layers = lambda: order.append("clear_layers")
+    ctrl.enter_registration_session(store, sd.read_zarr(store))
+    assert order == ["deactivate_paired", "clear_layers"]
+    assert ctrl.active_dataset == V.REGISTRATION_DATASET
+
+
+def test_enter_registration_session_resets_the_assignment_sources(qapp, tmp_path):
+    import spatialdata as sd
+
+    store = stores.build_prepared_store(tmp_path / "x_prepared.zarr")
+    ctrl = _controller()
+    widget = _gene_widget_with_stale_source()
+    ctrl.set_gene_inspector_widget(widget)
+    ctrl.enter_registration_session(store, sd.read_zarr(store))
+    assert _assignment_sources(widget) == ["Native assignments"]
+    assert widget._assignment_summary.text() == ""
+    assert widget.dataset == V.REGISTRATION_DATASET
 
 
 def test_save_survives_loading_another_store(qapp, tmp_path, monkeypatch):
