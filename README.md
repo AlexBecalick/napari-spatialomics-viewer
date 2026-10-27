@@ -428,7 +428,7 @@ and coverage. Partially mapped biological genes appear under **Unclassified**,
 separately from control/codeword probes.
 
 The catalogue contains portable JSON and CSV references for the P-series
-MERSCOPE and Xenium panels, NMV2P35-18, ag7, and the Vizgen 815-gene mouse-brain
+MERSCOPE and Xenium panels, the HM3 and MS1 panels, and the Vizgen 815-gene mouse-brain
 panel. Rebuild the portable files with `scripts/build_marker_reference_catalog.py`
 and inject one into one or more SpatialData stores with
 `scripts/inject_marker_reference.py`. Set
