@@ -792,6 +792,11 @@ def test_labelling_repairs_and_warnings():
     s = labelling_from_attrs(tampered, d)
     assert any("content_sha256" in w for w in s.load_warnings)
 
+    no_crops = {k: v for k, v in EXAMPLE_LABELLING.items() if k != "crops"}
+    s = labelling_from_attrs(no_crops, d)  # a missing crops block loads, it does not raise
+    assert s.crops == {"reference": None, "moving": None}
+    assert any("content_sha256" in w for w in s.load_warnings)
+
     outside = copy.deepcopy(EXAMPLE_LABELLING)
     outside["landmarks"]["pairs"][1]["moving_xy_px"] = [1e9, 5.0]
     s = labelling_from_attrs(outside, d)

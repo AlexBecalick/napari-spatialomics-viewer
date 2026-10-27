@@ -631,7 +631,7 @@ class ManualRegistrationController:
             signal.connect(slot)
             self._widget_connections.append((signal, slot))
         try:
-            self._auto_switch = bool(widget.auto_switch)
+            self._auto_switch = bool(widget.auto_switch())
         except Exception:  # noqa: BLE001
             self._auto_switch = True
         if self._session is not None:
@@ -679,7 +679,7 @@ class ManualRegistrationController:
         except Exception as exc:  # noqa: BLE001 (a broken session must not leave a half view)
             log.exception("manual registration: applying %s failed", session.path.name)
             self._host.end_progress("registration")
-            if self._session is not None:
+            if self._session is session:  # only a half-built NEW session is torn down
                 self._teardown_session(call_host=True)
             self._host.set_status(f"Could not load registration store {session.path.name}: {exc}")
 
@@ -827,6 +827,7 @@ class ManualRegistrationController:
             if session.draft is not None:
                 self._decide_draft(session)
         if self._session is not None:
+            self.flush_pending_updates()  # the old session's pending draft/affine run on IT
             self._teardown_session(call_host=False)
         self._saving = False
         if self._widget is not None:
@@ -906,20 +907,25 @@ class ManualRegistrationController:
         app_dir = self._host.app_data_dir()
         path = session.path
         draft = session.draft
+        assert draft is not None
+        stored = session.descriptor.labelling
         try:
-            assert draft is not None
-            stored = session.descriptor.labelling
-            same = stored is not None and labelling_content_sha256(
-                draft
-            ) == labelling_content_sha256(stored)
-            newer = stored is None or str(draft.get("updated_at", "")) > str(
-                stored.get("updated_at", "")
-            )
+            draft_sha = labelling_content_sha256(draft)
         except (KeyError, TypeError, ValueError, AttributeError) as exc:
             self._discard_bad_draft(
                 session, f"The local draft could not be read ({exc}); discarded."
             )
             return
+        # A malformed STORED labelling must never cost the user the draft (their only copy of
+        # that work): treat it as different from the draft and older, so Restore is offered.
+        same = False
+        newer = True
+        if stored is not None:
+            try:
+                same = draft_sha == labelling_content_sha256(stored)
+                newer = str(draft.get("updated_at", "")) > str(stored.get("updated_at", ""))
+            except (KeyError, TypeError, ValueError, AttributeError):
+                same, newer = False, True
         if same or not newer:
             clear_local_draft(path, app_dir)
             return
@@ -2288,6 +2294,9 @@ class ManualRegistrationController:
         """Save on the GUI thread (a single small attrs write); ``False`` after an error dialog."""
         session = self._session
         assert session is not None and session.state is not None
+        if self._saving:
+            self._host.set_status("A save is already running.")
+            return False
         payload = self._build_payload(status)
         try:
             written = save_labelling(
@@ -2397,6 +2406,10 @@ class ManualRegistrationController:
 
     def _teardown_session(self, *, call_host: bool) -> None:
         viewer = self._viewer
+        for name in ("_affine_timer", "_draft_timer"):
+            timer = getattr(self, name)
+            if timer is not None:
+                timer.stop()
         try:
             viewer.camera.events.zoom.disconnect(self._on_zoom)
         except (TypeError, ValueError, RuntimeError):
