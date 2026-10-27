@@ -1289,7 +1289,11 @@ def labelling_from_attrs(payload: Mapping[str, Any], descriptor: StoreDescriptor
         else:
             warnings.append(f"ignored an invalid outlier_floor_um {raw_floor!r}")
 
-    if payload.get("content_sha256") != labelling_content_sha256(payload):
+    try:
+        digest_matches = payload.get("content_sha256") == labelling_content_sha256(payload)
+    except (KeyError, TypeError):  # e.g. no 'crops' block: the stored digest cannot match
+        digest_matches = False
+    if not digest_matches:
         warnings.append(
             "content_sha256 does not match the stored landmarks (edited outside the viewer?)"
         )

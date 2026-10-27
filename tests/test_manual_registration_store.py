@@ -378,6 +378,8 @@ def test_draft_rejections(tmp_path):
     good = json.loads(target.read_text(encoding="utf-8"))
     target.write_text("{corrupt", encoding="utf-8")
     assert read_local_draft(store, base) is None
+    target.write_bytes(b"\xff\xfe\x80not utf-8")  # damaged bytes must not raise
+    assert read_local_draft(store, base) is None
     for patch in ({"draft_format": 2}, {"payload": [1]}, {"store_path": "elsewhere"}):
         target.write_text(json.dumps({**good, **patch}), encoding="utf-8")
         assert read_local_draft(store, base) is None
