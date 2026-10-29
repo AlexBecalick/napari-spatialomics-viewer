@@ -154,6 +154,17 @@ except Exception:  # pragma: no cover - depends on the installed napari runtime
     thread_worker = None
 
 from .spatialdata_explorer import SpatialDataExplorerWidget
+from .cell_groups import (
+    CELL_GROUP_SHAPE_KEY,
+    CellGroup,
+    CellGroupWidget,
+    cell_group_layer_name,
+    cell_group_table,
+    cellpose_statistics_for_labels,
+    next_cell_group_color,
+    next_cell_group_name,
+    read_cell_groups_csv,
+)
 from .dask_cache import install_thread_safe_napari_dask_cache
 from .cell_umap import (
     UMAP_LASSO_MIN_STEP_PX,
@@ -1224,7 +1235,7 @@ class ViewerControlPanel(QWidget):
     """Right-dock control panel: tabbed controls with a shared progress bar.
 
     Tabs (a wrapping button bar across the top): Gene inspector, Cell segmentation, Cell type labels,
-    Per cell statistics, Draw tissue annotations, Images, Dataset, UMAP, and Zarr metadata.
+    Per cell statistics, Draw tissue annotations, Images, Dataset, UMAP, Cell groups, and Zarr metadata.
     A busy progress bar plus a stage label sit below the tabs and stay visible whatever tab is selected.
     """
 
@@ -1268,11 +1279,13 @@ class ViewerControlPanel(QWidget):
         settings: QSettings | None = None,
         switch_paired_view_callback=None,
         umap_widget=None,
+        cell_group_widget=None,
     ):
         super().__init__()
         self._gene_inspector_widget = gene_inspector_widget
         self._cell_type_widget = cell_type_widget
         self._umap_widget = umap_widget
+        self._cell_group_widget = cell_group_widget
         self.spatialdata_explorer = SpatialDataExplorerWidget()
         self._load_callback = load_callback
         self._load_selected_labels_callback = load_selected_labels_callback
@@ -1474,6 +1487,7 @@ class ViewerControlPanel(QWidget):
             ("Images", self._build_images_tab),
             ("Dataset loader", self._build_dataset_tab),
             ("UMAP", self._build_umap_tab),
+            ("Cell groups", self._build_cell_groups_tab),
             ("Zarr metadata", lambda: self.spatialdata_explorer),
         )
         for title, builder in tabs:
@@ -1575,6 +1589,11 @@ class ViewerControlPanel(QWidget):
             layout.addWidget(QLabel("UMAP view unavailable."))
         layout.addStretch(1)
         return self._scrollable(layout)
+
+    def _build_cell_groups_tab(self) -> QWidget:
+        if self._cell_group_widget is not None:
+            return self._cell_group_widget
+        return QLabel("Cell groups unavailable.")
 
     def _build_segmentation_tab(self) -> QWidget:
         layout = QVBoxLayout()
@@ -4606,6 +4625,12 @@ class ComparisonViewerController:
         self._umap_refresh_pending = False
         self._umap_point_radius = 1.0
         self._umap_lasso_armed = False
+        # Hand-curated Cellpose cell groups, kept per store path so switching
+        # datasets and back restores them.
+        self._cell_group_widget = None
+        self._cell_groups_by_store: dict[str, list[CellGroup]] = {}
+        self._active_cell_group_by_store: dict[str, str | None] = {}
+        self._cell_group_picking = False
         self._roi_layer_generation = 0
         self._roi_cells_layer_key: tuple | None = None
         #: One-shot explanation appended to the UMAP tab's next status line.
@@ -4660,6 +4685,10 @@ class ComparisonViewerController:
     def set_umap_widget(self, widget):
         self._umap_widget = widget
         self._publish_umap_options()
+
+    def set_cell_group_widget(self, widget):
+        self._cell_group_widget = widget
+        self._publish_cell_groups()
 
     def set_spatialdata_explorer(self, widget):
         self._spatialdata_explorer = widget
@@ -6029,6 +6058,7 @@ class ComparisonViewerController:
         self._publish_cell_type_options()
         self._publish_umap_options()
         self._publish_spatialdata_explorer()
+        self._publish_cell_groups()
         self._update_scale_bar_visibility()
         self._end_progress("dataset")
         elapsed = time.time() - started_at
@@ -6741,6 +6771,7 @@ class ComparisonViewerController:
         self._publish_cell_type_options()
         self._publish_umap_options()
         self._publish_spatialdata_explorer()
+        self._publish_cell_groups()
         if not bool(getattr(self.args, "skip_images", False)):
             self._load_paired_image_slots()
         self._load_paired_segmentations(self._paired_startup_segmentation_keys())
@@ -10117,6 +10148,10 @@ class ComparisonViewerController:
             return
         if self.active_dataset is None:
             return
+        if self._cell_group_picking:
+            # "Pick cells for group" replaces inspection until it is turned off.
+            self._toggle_cell_group_cell_at(event)
+            return
         ds = self.active_dataset
         state = self._gene_inspector_states.get(str(ds).upper())
 
@@ -10410,6 +10445,361 @@ class ComparisonViewerController:
             for state in states:
                 if state.highlighted_genes:
                     self._clear_highlighted_genes(state)
+
+    # -- Cell groups: click Cellpose masks into named, exportable groups ----
+    def _cell_group_store_key(self) -> str | None:
+        """Store path owning the current groups (standalone datasets only)."""
+        if self._paired_session is not None or self.active_dataset is None:
+            return None
+        cfg = self.datasets.get(self.active_dataset)
+        return str(cfg.zarr_path) if cfg is not None else None
+
+    def _cell_groups(self) -> list[CellGroup]:
+        key = self._cell_group_store_key()
+        return self._cell_groups_by_store.setdefault(key, []) if key is not None else []
+
+    def _cell_group(self, name) -> CellGroup | None:
+        return next((group for group in self._cell_groups() if group.name == name), None)
+
+    def _active_cell_group(self) -> CellGroup | None:
+        key = self._cell_group_store_key()
+        return self._cell_group(self._active_cell_group_by_store.get(key)) if key is not None else None
+
+    def _publish_cell_groups(self):
+        """Enable the Cell groups tab for a standalone store and redraw its groups."""
+        widget = self._cell_group_widget
+        if self._cell_group_store_key() is None:
+            self._cell_group_picking = False
+            if widget is not None:
+                widget.set_available(
+                    False,
+                    "Cell groups are available for standalone datasets only."
+                    if self._paired_session is not None
+                    else "Load a standalone dataset to group cells.",
+                )
+            return
+        # Dataset activation clears every layer; restore this store's outlines.
+        for group in self._cell_groups():
+            self._redraw_cell_group_layer(group)
+        if widget is not None:
+            widget.set_available(True)
+        self._publish_cell_group_list()
+
+    def _publish_cell_group_list(self):
+        widget = self._cell_group_widget
+        if widget is None:
+            return
+        active = self._active_cell_group()
+        widget.set_groups(
+            [(group.name, group.color, len(group.cells)) for group in self._cell_groups()],
+            active.name if active is not None else None,
+        )
+        widget.set_picking(self._cell_group_picking)
+
+    def _cell_group_shapes(self):
+        """The Cellpose GeoDataFrame, read from the store if not yet loaded."""
+        sdata = self._active_sdata
+        if sdata is None or self._cell_group_store_key() is None:
+            return None
+        if CELL_GROUP_SHAPE_KEY not in sdata.shapes:
+            try:
+                stored = self._read_shapes_from_store()
+            except Exception as exc:
+                log.warning("[%s] Could not read Cellpose shapes: %s", self.active_dataset, exc)
+                return None
+            if stored is None or CELL_GROUP_SHAPE_KEY not in stored.shapes:
+                return None
+            sdata.shapes[CELL_GROUP_SHAPE_KEY] = stored.shapes[CELL_GROUP_SHAPE_KEY]
+        return sdata.shapes[CELL_GROUP_SHAPE_KEY]
+
+    def set_cell_group_picking(self, active: bool):
+        """Arm (or stop) click-to-group; while armed clicks do not inspect cells."""
+        active = bool(active) and self._cell_group_store_key() is not None
+        if active and self._cell_group_shapes() is None:
+            self._set_status(
+                f"{self.active_dataset} has no {CELL_GROUP_SHAPE_KEY} segmentation; cannot group cells."
+            )
+            active = False
+        if active and self._umap_lasso_armed:
+            self.set_umap_lasso_active(False)
+        if active and self._active_cell_group() is None:
+            self.add_cell_group()
+        self._cell_group_picking = active
+        if self._cell_group_widget is not None:
+            self._cell_group_widget.set_picking(active)
+        group = self._active_cell_group()
+        if active and group is not None:
+            self._set_status(
+                f"Click Cellpose masks to add them to '{group.name}'; click a grouped cell again to remove it."
+            )
+        elif not active:
+            self._set_status("Stopped picking cells for groups.")
+
+    def add_cell_group(self, name: str | None = None) -> str | None:
+        """Create a group (``Group N`` by default) and make it the active one."""
+        key = self._cell_group_store_key()
+        if key is None:
+            return None
+        groups = self._cell_groups()
+        name = str(name or "").strip() or next_cell_group_name(group.name for group in groups)
+        if self._cell_group(name) is not None:
+            self._set_status(f"A cell group named '{name}' already exists.")
+            return None
+        groups.append(CellGroup(name=name, color=next_cell_group_color(groups)))
+        self._active_cell_group_by_store[key] = name
+        self._publish_cell_group_list()
+        self._set_status(f"Created cell group '{name}'.")
+        return name
+
+    def rename_cell_group(self, old: str, new: str) -> bool:
+        group = self._cell_group(old)
+        new = str(new).strip()
+        if group is None or not new or new == old:
+            return False
+        if self._cell_group(new) is not None:
+            self._set_status(f"A cell group named '{new}' already exists.")
+            self._publish_cell_group_list()
+            return False
+        layer = self._get_layer_by_name(cell_group_layer_name(old))
+        group.name = new
+        if layer is not None:
+            layer.name = cell_group_layer_name(new)
+        key = self._cell_group_store_key()
+        if self._active_cell_group_by_store.get(key) == old:
+            self._active_cell_group_by_store[key] = new
+        self._publish_cell_group_list()
+        self._set_status(f"Renamed cell group '{old}' to '{new}'.")
+        return True
+
+    def delete_cell_group(self, name: str) -> bool:
+        group = self._cell_group(name)
+        if group is None:
+            return False
+        groups = self._cell_groups()
+        self._remove_layer_by_name(cell_group_layer_name(name))
+        groups.remove(group)
+        key = self._cell_group_store_key()
+        if self._active_cell_group_by_store.get(key) == name:
+            self._active_cell_group_by_store[key] = groups[-1].name if groups else None
+        if not groups:
+            self._cell_group_picking = False
+        self._publish_cell_group_list()
+        self._set_status(f"Deleted cell group '{name}'.")
+        return True
+
+    def clear_cell_group(self, name: str) -> bool:
+        group = self._cell_group(name)
+        if group is None:
+            return False
+        group.cells.clear()
+        group.path_owners = []
+        self._remove_layer_by_name(cell_group_layer_name(name))
+        self._publish_cell_group_list()
+        self._set_status(f"Cleared every cell from group '{name}'.")
+        return True
+
+    def set_active_cell_group(self, name: str):
+        key = self._cell_group_store_key()
+        if key is None or self._cell_group(name) is None:
+            return
+        self._active_cell_group_by_store[key] = name
+        if self._cell_group_picking:
+            self._set_status(f"Clicked cells now go to '{name}'.")
+
+    def _toggle_cell_group_cell_at(self, event):
+        if self._active_cell_group() is None:
+            return
+        gdf = self._cell_group_shapes()
+        # Cells live in the source frame; undo any display rotation first.
+        xy = self._lasso_dataset_xy(event)
+        if gdf is None or xy is None:
+            return
+        try:
+            picked = pick_cell_at_point(gdf, xy[0], xy[1])
+        except Exception as exc:
+            log.debug("Cell group pick failed: %s", exc)
+            picked = None
+        if picked is None:
+            self._set_status("No Cellpose cell under the click.")
+            return
+        label_id = cell_id_to_int(picked[0])
+        if label_id is None:
+            self._set_status(f"Cellpose cell id {picked[0]!r} is not an integer label; cannot group it.")
+            return
+        self.toggle_cell_group_cell(label_id, picked[1])
+
+    def toggle_cell_group_cell(self, label_id: int, geometry):
+        """Add a cell to the active group, or remove it if already there.
+
+        Groups overlap freely: membership of other groups is left untouched.
+        """
+        group = self._active_cell_group()
+        if group is None:
+            return
+        label_id = int(label_id)
+        if label_id in group.cells:
+            self._remove_cell_group_cells(group, [label_id])
+            message = f"Removed Cellpose cell {label_id} from '{group.name}'"
+        else:
+            group.cells[label_id] = geometry
+            self._append_cell_group_paths(group, label_id, geometry)
+            message = f"Added Cellpose cell {label_id} to '{group.name}'"
+            others = [
+                other.name for other in self._cell_groups()
+                if other is not group and label_id in other.cells
+            ]
+            if others:
+                message += " (also in " + ", ".join(f"'{name}'" for name in others) + ")"
+        self._publish_cell_group_list()
+        self._set_status(f"{message}: {len(group.cells)} cell(s).")
+
+    def _redraw_cell_group_layer(self, group: CellGroup):
+        """Rebuild a group's outline layer from its cells, keeping its visibility."""
+        name = cell_group_layer_name(group.name)
+        old = self._get_layer_by_name(name)
+        visible = bool(getattr(old, "visible", True)) if old is not None else True
+        self._remove_layer_by_name(name)
+        group.path_owners = []
+        paths: list[np.ndarray] = []
+        for label_id, geometry in group.cells.items():
+            cell_paths = self._polygon_to_napari_paths(geometry)
+            paths.extend(cell_paths)
+            group.path_owners.extend([label_id] * len(cell_paths))
+        if not paths:
+            return None
+        return self.viewer.add_shapes(
+            paths,
+            shape_type="polygon",
+            name=name,
+            edge_color=group.color,
+            face_color="transparent",
+            edge_width=self._mask_highlight_edge_width(),
+            opacity=1.0,
+            visible=visible,
+        )
+
+    def _cell_group_layer_in_sync(self, group: CellGroup):
+        """The group's layer if it still mirrors ``path_owners`` (else None)."""
+        layer = self._get_layer_by_name(cell_group_layer_name(group.name))
+        if layer is None or len(layer.data) != len(group.path_owners):
+            return None
+        return layer
+
+    def _append_cell_group_paths(self, group: CellGroup, label_id: int, geometry):
+        layer = self._cell_group_layer_in_sync(group)
+        if layer is None:
+            # First cell, or the layer was deleted/edited in napari.
+            self._redraw_cell_group_layer(group)
+            return
+        paths = self._polygon_to_napari_paths(geometry)
+        if not paths:
+            return
+        layer.add_polygons(
+            paths,
+            edge_color=group.color,
+            face_color="transparent",
+            edge_width=self._mask_highlight_edge_width(),
+        )
+        group.path_owners.extend([label_id] * len(paths))
+
+    def _remove_cell_group_cells(self, group: CellGroup, label_ids):
+        ids = {int(label_id) for label_id in label_ids}
+        for label_id in ids:
+            group.cells.pop(label_id, None)
+        layer = self._cell_group_layer_in_sync(group)
+        if layer is None or not group.cells:
+            self._redraw_cell_group_layer(group)
+            return
+        indices = {i for i, owner in enumerate(group.path_owners) if owner in ids}
+        if not indices:
+            return
+        layer.selected_data = indices
+        layer.remove_selected()
+        group.path_owners = [owner for owner in group.path_owners if owner not in ids]
+
+    def export_cell_groups(self, path) -> pd.DataFrame | None:
+        """Write one CSV row per grouped cell with its stored Cellpose statistics."""
+        groups = [group for group in self._cell_groups() if group.cells]
+        if not groups:
+            self._set_status("No grouped cells to export.")
+            return None
+        cfg = self.datasets[self.active_dataset]
+        label_ids = list(dict.fromkeys(label_id for group in groups for label_id in group.cells))
+        statistics = None
+        note = ""
+        if cellpose_quantification_table_available(cfg.zarr_path):
+            try:
+                statistics = cellpose_statistics_for_labels(cfg.zarr_path, label_ids)
+            except Exception as exc:
+                log.warning("[%s] Could not read Cellpose statistics: %s", self.active_dataset, exc)
+                note = f" Statistics unavailable: {exc}"
+        else:
+            note = f" No {CELLPOSE_QUANTIFICATION_TABLE_KEY} in this store; exported ids and geometry only."
+        if statistics is not None:
+            unmatched = int(statistics.isna().all(axis=1).sum())
+            if unmatched:
+                note = f" {unmatched} cell(s) have no row in {CELLPOSE_QUANTIFICATION_TABLE_KEY}."
+        table = cell_group_table(
+            groups,
+            dataset=self.active_dataset,
+            store=str(cfg.zarr_path),
+            statistics=statistics,
+        )
+        try:
+            table.to_csv(path, index=False)
+        except OSError as exc:
+            self._set_status(f"Could not write {path}: {exc}")
+            return None
+        self._set_status(
+            f"Exported {len(table)} cell(s) in {len(groups)} group(s) to {path}.{note}"
+        )
+        return table
+
+    def load_cell_groups(self, path) -> int:
+        """Merge groups from an exported CSV into this store's groups."""
+        if self._cell_group_store_key() is None:
+            return 0
+        try:
+            loaded = read_cell_groups_csv(path)
+        except Exception as exc:
+            self._set_status(f"Could not load cell groups from {path}: {exc}")
+            return 0
+        gdf = self._cell_group_shapes()
+        if gdf is None:
+            self._set_status(
+                f"{self.active_dataset} has no {CELL_GROUP_SHAPE_KEY} segmentation; cannot load cell groups."
+            )
+            return 0
+        numeric_ids = pd.to_numeric(pd.Series(np.asarray(gdf.index)), errors="coerce")
+        position_of_id = pd.Series(np.arange(len(gdf)), index=numeric_ids.to_numpy())
+        position_of_id = position_of_id[position_of_id.index.notna()]
+        position_of_id = position_of_id[~position_of_id.index.duplicated()]
+        geometries = gdf.geometry
+        groups = self._cell_groups()
+        added = missing = 0
+        for name, label_ids in loaded:
+            group = self._cell_group(name)
+            if group is None:
+                group = CellGroup(name=name, color=next_cell_group_color(groups))
+                groups.append(group)
+            for label_id in label_ids:
+                position = position_of_id.get(label_id)
+                if position is None:
+                    missing += 1
+                    continue
+                group.cells[label_id] = geometries.iloc[int(position)]
+                added += 1
+        for group in groups:
+            self._redraw_cell_group_layer(group)
+        key = self._cell_group_store_key()
+        if loaded and self._active_cell_group() is None:
+            self._active_cell_group_by_store[key] = loaded[0][0]
+        self._publish_cell_group_list()
+        message = f"Loaded {added} cell(s) into {len(loaded)} group(s) from {Path(path).name}."
+        if missing:
+            message += f" {missing} label id(s) are not {CELL_GROUP_SHAPE_KEY} cells in this store."
+        self._set_status(message)
+        return added
 
     # -- Cell inspector: click a mask to summarise its cell -----------------
     def _event_world_xy(self, event) -> tuple[float, float] | None:
@@ -13517,6 +13907,8 @@ class ComparisonViewerController:
         """
         state = self._umap_state()
         active = bool(active) and state is not None
+        if active and self._cell_group_picking:
+            self.set_cell_group_picking(False)
         self._umap_lasso_armed = active
         if self._umap_widget is not None:
             self._umap_widget.set_lasso_active(active)
@@ -14919,11 +15311,23 @@ def main():
         set_lasso_active_callback=controller.set_umap_lasso_active,
         clear_roi_callback=controller.clear_umap_roi,
     )
+    # The "Cell groups" tab: click Cellpose masks into named, exportable groups.
+    cell_group_widget = CellGroupWidget(
+        set_picking_callback=controller.set_cell_group_picking,
+        new_group_callback=controller.add_cell_group,
+        rename_group_callback=controller.rename_cell_group,
+        delete_group_callback=controller.delete_cell_group,
+        clear_group_callback=controller.clear_cell_group,
+        set_active_group_callback=controller.set_active_cell_group,
+        export_callback=controller.export_cell_groups,
+        load_callback=controller.load_cell_groups,
+    )
     panel = ViewerControlPanel(
         datasets=available_datasets,
         gene_inspector_widget=gene_inspector,
         cell_type_widget=cell_type_widget,
         umap_widget=umap_widget,
+        cell_group_widget=cell_group_widget,
         load_callback=controller.load_dataset,
         load_selected_labels_callback=controller.load_selected_labels,
         unload_selected_shapes_callback=controller.unload_selected_shapes,
@@ -14963,6 +15367,7 @@ def main():
     controller.set_gene_inspector_widget(gene_inspector)
     controller.set_cell_type_widget(cell_type_widget)
     controller.set_umap_widget(umap_widget)
+    controller.set_cell_group_widget(cell_group_widget)
     controller.set_spatialdata_explorer(panel.spatialdata_explorer)
     viewer_controls_dock = viewer.window.add_dock_widget(
         panel, area="right", name="Viewer Controls"

@@ -7,7 +7,7 @@ pre-aligned pair.
 The viewer opens a single Napari window with a tabbed control panel (tabs across
 the top of the right-hand dock): **Gene inspector**, **Cell segmentation**,
 **Cell type labels**, **Per cell statistics**, **Draw tissue annotations**,
-**Images**, **Dataset loader**, **UMAP**, and **Zarr metadata**. With
+**Images**, **Dataset loader**, **UMAP**, **Cell groups**, and **Zarr metadata**. With
 a supplied dataset it automatically loads all image channels, the Cellpose, ProSeg and
 ProSeg hybrid cell segmentations, and all transcripts (rendered as per-gene coloured
 points). A busy progress bar with a stage label below the tabs shows what is
@@ -240,6 +240,9 @@ dock so every full name stays readable.
   size controls, plus **Draw region of interest** for lassoing cells in either
   view (see [UMAP view](#umap-view)). With a pair active it shows both
   platforms' UMAPs, one above the other.
+- **Cell groups** — click Cellpose masks into named groups of cells that share
+  a feature you recognise, then export them with their per-channel statistics
+  (see [Cell groups](#cell-groups)). Standalone mode only.
 
 The left dock is simplified for the spatial-transcriptomics workflow. **Layer
 controls** starts collapsed and can be expanded or collapsed with the arrow in
@@ -625,6 +628,52 @@ The region layers are registered with the paired layout as
 follow side-by-side/stacked switching like every other paired layer. Clicking
 **Draw region of interest** does the one-off preparation up front (a second or
 so on large pairs), so the drawing itself stays smooth.
+
+## Cell groups
+
+The **Cell groups** tab builds hand-curated groups of cells, for example cells
+with a swollen soma or a bright inclusion, and exports them as a table. Groups
+use the **Cellpose** masks (`shapes/MOSAIK_cellpose`), the segmentation the
+stored per-cell image statistics are measured on.
+
+1. Click **Pick cells for group**. A group named `Group 1` is created if none
+   exists. While picking is on, a click in the spatial view toggles the Cellpose
+   cell under the cursor in the selected group instead of opening the Cell
+   inspector. Click the button again to return to normal inspection.
+2. **New group** adds another group; select a group in the list to send
+   clicks to it. Each group is outlined in its own colour in a
+   `Cell group | <name>` layer, which can be hidden from the layer list.
+3. Clicking a grouped cell again removes it from the selected group only. A
+   cell can belong to several groups; the status line lists the other groups
+   it is already in. Where groups overlap, their outlines coincide and the
+   upper layer hides the lower one, so toggle a group's layer to see the
+   other. **Rename** (or double-click), **Clear cells**, and **Delete group**
+   manage the selected group.
+4. **Export groups to CSV…** writes one row per cell and group, so a cell in
+   two groups appears twice with identical statistics:
+
+   | column | content |
+   |---|---|
+   | `group` | group name |
+   | `dataset`, `store` | `MERSCOPE`/`XENIUM` and the full store path |
+   | `segmentation` | `MOSAIK_cellpose` |
+   | `label_id` | Cellpose mask id (the label raster value and `obs/label_id` of the quantification table) |
+   | `centroid_x_um`, `centroid_y_um`, `area_um2` | from the mask polygon, in the store's micron frame |
+   | `<channel>__<statistic>` | every statistic in `table_MOSAIK_cellpose_image_quantification` (for MerXen: min, median, mean, max, iqr per channel) |
+
+   Channels that occur in more than one image are prefixed with the image key,
+   such as `post_xenium_if__DAPI__mean`. Statistics are read from the stored
+   table, not recomputed from the images. Without that table the export
+   keeps the identity and geometry columns only. Cells without a table row
+   have empty statistic cells, and the status line reports how many there were.
+
+Groups stay in memory for each store while the viewer is open, so switching
+to another dataset and back restores them. To keep them between sessions,
+export them and use **Load groups from CSV…** later. Loading merges the file
+into the current groups by name, and reports label ids that are not Cellpose
+cells of the open store. Clicks follow the display rotation, so the selected
+cell is the one under the cursor when the view is rotated. Grouping is
+unavailable in paired mode.
 
 ## Data Assumptions
 
