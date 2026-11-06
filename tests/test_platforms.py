@@ -235,6 +235,36 @@ def test_atera_override_wins(tmp_path):
     assert _mpp(resolve_dataset_mask_affine("ATERA", zarr_path=store)) == (0.25, 0.25)
 
 
+def test_atera_missing_explicit_spec_falls_back_to_store_sidecar(tmp_path, caplog):
+    store = atera_stores.build_atera_latest_store(
+        tmp_path, pixel_size=PS, with_override=True, override_pixel_size=0.25, with_index=False
+    )
+    missing = store / "nope.spatial"
+    with caplog.at_level(logging.WARNING):
+        affine = resolve_dataset_mask_affine("ATERA", spec_path=missing, zarr_path=store)
+    assert _mpp(affine) == (0.25, 0.25)
+    assert str(missing) in caplog.text and "missing" in caplog.text
+    assert "No experiment.spatial found" not in caplog.text
+
+    unreadable = tmp_path / "bad.spatial"
+    unreadable.write_text("not json")
+    caplog.clear()
+    with caplog.at_level(logging.WARNING):
+        affine = resolve_dataset_mask_affine("ATERA", spec_path=unreadable, zarr_path=store)
+    assert _mpp(affine) == (0.25, 0.25)
+    assert str(unreadable) in caplog.text and "unreadable" in caplog.text
+
+
+def test_atera_missing_explicit_spec_without_store_sidecar_warns(atera_store, tmp_path, caplog):
+    store = _copy_store(atera_store, tmp_path)
+    (store / "atera" / "experiment.spatial").unlink()
+    missing = tmp_path / "typo.spatial"
+    with caplog.at_level(logging.WARNING):
+        affine = resolve_dataset_mask_affine("ATERA", spec_path=missing, zarr_path=store)
+    assert _mpp(affine) == (PS, PS)
+    assert str(missing) in caplog.text and "merxen_atera" in caplog.text
+
+
 def test_atera_root_attr_and_shapes_fallbacks(atera_store, tmp_path, caplog):
     store = _copy_store(atera_store, tmp_path)
     (store / "atera" / "experiment.spatial").unlink()

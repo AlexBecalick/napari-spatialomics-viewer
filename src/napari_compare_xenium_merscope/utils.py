@@ -2118,12 +2118,23 @@ def _resolve_spec_file_um_per_px(
 ) -> float:
     spec = platform_spec(ds)
     path = Path(spec_path) if spec_path else None
-    if path is None and zarr_path is not None and spec.name == "ATERA":
-        path = find_spec_path(zarr_path, spec.name)
     mpp = read_spec_file_pixel_size(path, platform=spec.name) if path is not None else None
     if mpp is not None:
         log.info("[%s] Pixel size %s um from %s", spec.name, mpp, path)
         return mpp
+    if spec.name == "ATERA" and path is not None:
+        log.warning(
+            "[ATERA] Explicit spec file %s is %s; looking for the store's own sidecar.",
+            path,
+            "unreadable or has no usable pixel_size" if path.is_file() else "missing",
+        )
+    if spec.name == "ATERA" and zarr_path is not None:
+        found = find_spec_path(zarr_path, spec.name)
+        if found is not None and found != path:
+            mpp = read_spec_file_pixel_size(found, platform=spec.name)
+            if mpp is not None:
+                log.info("[%s] Pixel size %s um from %s", spec.name, mpp, found)
+                return mpp
 
     if spec.name != "ATERA":
         mpp = float(spec.fallback_um_per_px)
