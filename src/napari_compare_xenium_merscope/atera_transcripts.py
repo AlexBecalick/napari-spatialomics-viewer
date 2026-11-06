@@ -78,6 +78,8 @@ INT16_CODE_LIMIT = 32767
 #: Refuse a code-range map with more runs than this (a file that is not sorted
 #: by feature would otherwise blow it up); reads then use string statistics.
 MAX_CODE_MAP_RUNS = 50_000_000
+#: Window reads plan per-gene runs only for at most this many genes.
+WINDOW_PLAN_MAX_CODES = 256
 
 _PART_RE = re.compile(r"(\d+)")
 
@@ -1490,8 +1492,18 @@ class AteraTranscriptEngine:
         positions = self.files_in_window(bounds_um)
         rect = tuple(float(v) for v in bounds_um) if clip else None
         wanted = None if codes is None else sorted({int(c) for c in codes})
-        plan = None if wanted is None else self.plan_gene_reads(wanted, self.code_map)
-        code_filter = None if wanted is None else np.asarray(wanted, dtype=np.int64)
+        # Few genes: read only their runs.  Many (e.g. every real gene for the
+        # all-transcript view): planning thousands of runs costs more than
+        # decoding the window's row groups and filtering by a code table.
+        plan = (
+            None
+            if wanted is None or len(wanted) > WINDOW_PLAN_MAX_CODES
+            else self.plan_gene_reads(wanted, self.code_map)
+        )
+        code_filter = None
+        if wanted is not None:
+            code_filter = np.zeros(len(index.vocabulary) + 1, dtype=bool)
+            code_filter[np.asarray(wanted, dtype=np.int64)] = True
         has_assignment = all(_column_index(m, ASSIGNMENT_COLUMN) is not None for m in index.metadata)
         read_columns = [X_COLUMN, Y_COLUMN, GENE_COLUMN] + ([ASSIGNMENT_COLUMN] if has_assignment else [])
         if plan is not None:
@@ -1515,9 +1527,11 @@ class AteraTranscriptEngine:
                     if not n:
                         continue
                     codes_piece = index.global_codes(position, piece.column(GENE_COLUMN))
-                    keep = codes_piece >= 0
-                    if runs is None and code_filter is not None:
-                        keep &= np.isin(codes_piece, code_filter)
+                    if code_filter is not None and runs is None:
+                        # -1 (null) indexes the table's trailing False.
+                        keep = code_filter[codes_piece]
+                    else:
+                        keep = codes_piece >= 0
                     if rect is not None:
                         xs = piece.column(X_COLUMN).to_numpy()
                         ys = piece.column(Y_COLUMN).to_numpy()

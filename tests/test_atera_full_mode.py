@@ -243,3 +243,16 @@ def test_gene_point_store_from_rows_lists_every_observed_feature(atera_store):
         rows = frame[frame.gene == gene]
         assert bg1 - fg0 == len(rows)
         assert fg1 - fg0 == int((~rows.bg).sum())
+
+
+def test_window_rows_for_many_genes_filter_by_a_code_table(atera_store, monkeypatch):
+    engine = _engine(atera_store)
+    total = engine.index.n_rows
+    threshold = T.sample_threshold(total // 3, total)
+    codes = list(range(0, len(engine.index.vocabulary), 2))
+    planned = engine.read_window_rows((-1e9, -1e9, 1e9, 1e9), codes, exclude_below=threshold)
+    monkeypatch.setattr(T, "WINDOW_PLAN_MAX_CODES", 1)
+    tabled = engine.read_window_rows((-1e9, -1e9, 1e9, 1e9), codes, exclude_below=threshold)
+    key = lambda rows: sorted(zip(rows["x"].tolist(), rows["y"].tolist(), rows["code"].astype(int).tolist()))  # noqa: E731
+    assert key(planned) == key(tabled)
+    assert set(tabled["code"].astype(int).tolist()) <= set(codes)

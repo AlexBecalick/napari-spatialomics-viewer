@@ -395,6 +395,10 @@ def test_burst_of_camera_events_gives_one_read_in_flight(qapp, atera_store, monk
         ctrl.viewer.camera.events.center()
     assert len(started) == 1
     assert ctx.view_runner.pending is not None
+    # A view the latest request already covers adds nothing while it runs.
+    pending = ctx.view_runner.pending
+    ctrl.viewer.camera.events.zoom()
+    assert ctx.view_runner.pending is pending and len(started) == 1
     # A dataset switch cancels both lazy kinds.
     ctrl._cancel_dataset_background_tasks()
     assert ctx.view_runner.pending is None
@@ -467,10 +471,12 @@ def test_lazy_mode_density_overview_and_batched_gene_reads(qapp, atera_store, mo
     ctrl.set_gene_visible("ATERA", gene, True)
     ctrl._atera_flush_gene_reads("ATERA")
     assert len(reads) == 1
-    # The lazy viewport shows other genes, not the loaded ones.
+    # The lazy viewport shows the other genes under the overview, never the
+    # ticked or loaded ones (they have their own full-resolution layers).
     ctrl.set_gene_overview("ATERA", True)
-    if ctx.viewport_cache is not None:
-        assert not np.isin(ctx.viewport_codes, [ctx.overview.vocabulary.index(g) for g in wanted]).any()
+    assert ctx.viewport_cache is not None and len(ctx.viewport_codes) > 0
+    assert not np.isin(ctx.viewport_codes, [ctx.overview.vocabulary.index(g) for g in wanted]).any()
+    assert not np.isin(ctx.viewport_codes, [ctx.overview.vocabulary.index(g) for g in state.store.control_genes]).any()
 
 
 def test_teardown_removes_atera_layers_and_stops_reads(qapp, atera_store, monkeypatch):

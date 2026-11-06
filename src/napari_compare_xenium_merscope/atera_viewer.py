@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import gc
 import logging
+from contextlib import ExitStack
 import math
 import time
 from dataclasses import dataclass, field
@@ -293,6 +294,10 @@ class AteraTranscriptContext:
     viewport_codes: np.ndarray = field(default_factory=lambda: np.zeros(0, dtype=np.int32))
     camera_callback: Any = None
     last_hint: str = ""
+    #: The latest viewport request submitted (in flight or pending).
+    view_request: dict | None = None
+    #: _atera_render_key of what the viewport layer currently shows.
+    rendered_key: tuple | None = None
 
     @property
     def complete(self) -> bool:
@@ -333,6 +338,13 @@ def _rows_count(rows: dict) -> int:
 # ---------------------------------------------------------------------------
 # Controller mixin
 # ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Cancelled:
+    """A worker result standing for a cancelled read (no traceback printed)."""
+
+    exc: BaseException
 
 
 def _thread_worker():
@@ -638,6 +650,7 @@ class AteraTranscriptMixin:
         ctx.viewport_cache = None
         ctx.viewport_codes = np.zeros(0, dtype=np.int32)
         ctx.last_hint = ""
+        ctx.view_request = None
         if ctx.mode == ATERA_MODE_LAZY:
             ctx.loaded = {}
         ctx.gene_runner = LatestWinsRunner(
@@ -684,9 +697,10 @@ class AteraTranscriptMixin:
 
     def _atera_add_viewport_layer(self, state) -> None:
         self._remove_layer_by_name(ATERA_VIEWPORT_LAYER)
+        # An empty layer takes one RGBA colour (napari rejects a (0, 4) array).
         self._create_gene_points_layer(
             ATERA_VIEWPORT_LAYER, "disc", state.spot_size,
-            np.zeros((0, 2), dtype=np.float32), np.zeros((0, 4), dtype=np.float32),
+            np.zeros((0, 2), dtype=np.float32), np.ones(4, dtype=np.float32),
         )
 
     def _atera_order_layers(self, state) -> None:
@@ -754,6 +768,7 @@ class AteraTranscriptMixin:
                         pass
         ctx.camera_callback = None
         ctx.viewport_cache = None
+        ctx.view_request = None
         widget = getattr(self, "_gene_inspector_widget", None)
         if widget is not None and hasattr(widget, "set_atera_controls"):
             widget.set_atera_controls(False)
@@ -766,6 +781,7 @@ class AteraTranscriptMixin:
             for runner in (ctx.gene_runner, ctx.view_runner):
                 if runner is not None:
                     runner.cancel()
+            ctx.view_request = None
 
     def _atera_publish_controls(self, state) -> None:
         widget = getattr(self, "_gene_inspector_widget", None)
@@ -988,15 +1004,20 @@ class AteraTranscriptMixin:
         return visible_bounds(getattr(camera, "center", None), getattr(camera, "zoom", 0.0), canvas)
 
     def _atera_display_codes(self, state) -> np.ndarray:
-        """Global codes the viewport must show: ticked genes, plus every real
-        gene under the overview; in lazy mode minus the fully loaded genes."""
+        """Global codes the viewport must show.
+
+        Full mode: the ticked genes, plus every real gene under the overview
+        (the rows the sample left out).  Lazy mode: only the overview genes
+        that are neither ticked nor loaded - ticked genes arrive at full
+        resolution through their own per-gene read.
+        """
         ctx = state.atera
         vocab_codes = {name: i for i, name in enumerate(ctx.overview.vocabulary)}
-        names = set(state.enabled_genes)
+        names = set() if ctx.mode == ATERA_MODE_LAZY else set(state.enabled_genes)
         if getattr(state, "overview_visible", False):
             names |= {g for g in state.store.genes if g not in state.store.control_genes}
         if ctx.mode == ATERA_MODE_LAZY:
-            names -= set(ctx.loaded)
+            names -= set(ctx.loaded) | set(state.enabled_genes)
         codes = sorted(vocab_codes[n] for n in names if n in vocab_codes)
         return np.asarray(codes, dtype=np.int64)
 
@@ -1020,7 +1041,9 @@ class AteraTranscriptMixin:
             and code_set <= cache["codes"]
             and bounds_contain(cache["bounds"], bounds)
         ):
-            self._atera_render_viewport(state)
+            # A pan inside the cached window: the layer already holds these rows.
+            if ctx.rendered_key != self._atera_render_key(state):
+                self._atera_render_viewport(state)
             return
         padded = pad_bounds(bounds, ATERA_VIEWPORT_PAD_FRACTION)
         estimate = estimate_window_rows(ctx.overview, padded, codes, exclude)
@@ -1036,7 +1059,17 @@ class AteraTranscriptMixin:
             ctx.last_hint = hint
             return
         ctx.last_hint = ""
-        ctx.view_runner.submit({"bounds": padded, "codes": code_set, "exclude": exclude})
+        last = ctx.view_request
+        if (
+            ctx.view_runner.busy
+            and last is not None
+            and last["exclude"] == exclude
+            and code_set <= last["codes"]
+            and bounds_contain(last["bounds"], bounds)
+        ):
+            return  # the read in flight already covers this view
+        ctx.view_request = {"bounds": padded, "codes": code_set, "exclude": exclude}
+        ctx.view_runner.submit(ctx.view_request)
 
     def _atera_start_view_read(self, ds: str, request: dict, generation: int, cancel: Event) -> None:
         state = self._gene_inspector_states.get(str(ds).upper())
@@ -1046,12 +1079,15 @@ class AteraTranscriptMixin:
         cap = int(ctx.viewport_cap)
 
         def compute():
+            t0 = time.perf_counter()
             rows = ctx.engine.read_window_rows(
                 request["bounds"], sorted(request["codes"]), cancel, exclude_below=request["exclude"]
             )
             if rows is None:
                 return None
-            return cap_rows_by_key(rows, cap)
+            rows = cap_rows_by_key(rows, cap)
+            log.debug("[%s] Viewport read: %d rows in %.2fs", ds, len(rows["x"]), time.perf_counter() - t0)
+            return rows
 
         def done(rows, gen=generation):
             self._atera_view_read_done(ds, ctx, gen, request, rows)
@@ -1085,6 +1121,18 @@ class AteraTranscriptMixin:
             else:
                 table[i] = (0.7, 0.7, 0.7, 1.0)
         return table
+
+    def _atera_render_key(self, state) -> tuple:
+        """What the viewport layer's content depends on (besides the cached rows)."""
+        ctx = state.atera
+        allocator = getattr(state, "slot_allocator", None)
+        return (
+            id(ctx.viewport_cache),
+            tuple(int(c) for c in self._atera_display_codes(state)),
+            bool(state.hide_assigned), bool(state.hide_background), bool(state.colour_by_assignment),
+            float(state.spot_size), tuple(state.highlighted_genes or ()), state.color_kind,
+            tuple(getattr(allocator, "genes", ()) or ()),
+        )
 
     def _atera_render_viewport(self, state) -> None:
         """Push the cached window rows that are displayable now into the viewport layer."""
@@ -1132,35 +1180,43 @@ class AteraTranscriptMixin:
                 if hot and np.isin(point_codes, hot).any():
                     sizes = np.where(np.isin(point_codes, hot), GENE_HIGHLIGHT_SPOT_SIZE, state.spot_size).astype(np.float32)
         ctx.viewport_codes = point_codes
+        ctx.rendered_key = self._atera_render_key(state)
+        t0 = time.perf_counter()
         self._atera_set_viewport_data(layer, coords, colors, sizes)
+        log.debug("[%s] Viewport layer: %d points in %.2fs", state.dataset, len(coords), time.perf_counter() - t0)
 
     def _atera_set_viewport_data(self, layer, coords, colors, sizes) -> None:
-        """Replace the persistent viewport layer's points in one update."""
-        events = getattr(layer, "events", None)
-        blocker = getattr(events, "blocker_all", None) if events is not None else None
-        try:
-            if callable(blocker) and len(coords) and len(getattr(layer, "data", ())):
-                # Resize without per-event recolouring; colours are set right after.
-                with blocker():
-                    layer.data = coords
-            else:
-                layer.data = coords
-        except Exception:
+        """Replace the persistent viewport layer's points with one vispy upload.
+
+        Every per-point change (data, colours, size, shown) would otherwise
+        re-upload the whole vertex buffer.  The layer's and its colour
+        managers' events are blocked while the arrays are swapped (the view
+        slice is recomputed synchronously, since asynchronous slicing would
+        leave it indexing the old points), then one refresh draws the result.
+        """
+        blockers = []
+        for owner in (layer, getattr(layer, "_face", None), getattr(layer, "_border", None)):
+            events = getattr(owner, "events", None)
+            blocker = getattr(events, "blocker_all", None) if events is not None else None
+            if callable(blocker):
+                blockers.append(blocker())
+        with ExitStack() as stack:
+            for blocker in blockers:
+                stack.enter_context(blocker)
             layer.data = coords
-        if len(coords):
-            self._set_gene_layer_colors(layer, colors, "disc")
-        try:
-            layer.symbol = "disc"
-        except Exception:
-            pass
-        try:
-            layer.size = sizes
-        except Exception:
-            pass
-        try:
-            layer.shown = np.ones(len(coords), dtype=bool)
-        except Exception:
-            pass
+            reslice = getattr(layer, "set_view_slice", None)
+            if callable(reslice):
+                try:
+                    reslice()
+                except Exception as exc:  # pragma: no cover - napari internals
+                    log.debug("Viewport re-slice failed: %s", exc)
+            if len(coords):
+                self._set_gene_layer_colors(layer, colors, "disc")
+            for name, value in (("symbol", "disc"), ("size", sizes), ("shown", np.ones(len(coords), dtype=bool))):
+                try:
+                    setattr(layer, name, value)
+                except Exception:
+                    pass
         refresh = getattr(layer, "refresh", None)
         if callable(refresh):
             try:
@@ -1183,17 +1239,31 @@ class AteraTranscriptMixin:
     # -- worker plumbing --------------------------------------------------
 
     def _atera_run(self, compute, done, failed) -> None:
+        """Run ``compute`` off the Qt thread; a cancelled read reports quietly."""
+
+        def guarded():
+            try:
+                return compute()
+            except TranscriptBuildCancelled as exc:
+                return _Cancelled(exc)
+
+        def returned(result):
+            if isinstance(result, _Cancelled):
+                failed(result.exc)
+            else:
+                done(result)
+
         factory = _thread_worker()
         if factory is None:
             try:
-                result = compute()
+                result = guarded()
             except Exception as exc:
                 failed(exc)
                 return
-            done(result)
+            returned(result)
             return
-        worker = factory(compute)()
-        worker.returned.connect(done)
+        worker = factory(guarded)()
+        worker.returned.connect(returned)
         worker.errored.connect(failed)
         keep = getattr(self, "_atera_workers", None)
         if keep is None:
