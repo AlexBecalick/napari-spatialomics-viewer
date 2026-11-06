@@ -469,10 +469,16 @@ def test_standalone_relabel_notice_survives_the_startup_autoload(qapp, atera_sto
     def forbidden(*_a, **_k):
         raise AssertionError("the startup autoload must not open the eager gene inspector for ATERA")
 
+    atera_opens = []
     monkeypatch.setattr(ctrl, "open_gene_inspector", forbidden)
+    monkeypatch.setattr(
+        ctrl, "_open_atera_gene_inspector", lambda ds, **kw: atera_opens.append((ds, kw))
+    )
     assert not bool(getattr(ctrl.args, "skip_transcripts", False))
     assert ctrl.load_standalone_dataset("XENIUM", atera_store) is True
     assert autoloads == ["ATERA"]
+    # The Atera engine load starts quietly (progress bar only), so the notice stays.
+    assert atera_opens == [("ATERA", {"reuse_cached": True, "announce": False})]
     notice = "Detected Atera store; opening as ATERA."
     assert statuses[-1].startswith(notice)
     assert "ATERA metadata loaded" in statuses[-1]
@@ -598,21 +604,30 @@ def test_paired_backstops_still_reject_atera():
 # ---------------------------------------------------------------------------
 
 
-def test_open_gene_inspector_on_atera_builds_nothing(qapp, atera_store, monkeypatch):
-    ctrl = _controller()
+def test_open_gene_inspector_on_atera_never_uses_the_eager_build(qapp, atera_store, monkeypatch, tmp_path):
+    """M7 lifted the M2 gate: ATERA loads through the engine, never the eager path."""
+    monkeypatch.setenv("NAPARI_COMPARE_TRANSCRIPT_CACHE_DIR", str(tmp_path / "cache"))
+    monkeypatch.setattr(V, "thread_worker", None)
+    ctrl = _controller(gene_max_render_points=None, atera_transcript_mode="full")
+    ctrl.viewer.add_points = lambda data, **kw: ctrl.viewer.layers.append(
+        SimpleNamespace(data=data, **{k: v for k, v in kw.items() if k != "data"})
+    ) or ctrl.viewer.layers[-1]
     ctrl.datasets = {"ATERA": ctrl._build_dataset_config("ATERA", atera_store)}
     statuses = _statuses(ctrl)
 
     def forbidden(*_a, **_k):
-        raise AssertionError("ATERA must not build eager transcripts or read the marker table")
+        raise AssertionError("ATERA must not build eager transcripts")
 
     monkeypatch.setattr(ctrl, "_ensure_dataset_is_active", lambda _ds: True)
+    ctrl.active_dataset = "ATERA"
     monkeypatch.setattr(ctrl, "_resolve_gene_points_columns", forbidden)
     monkeypatch.setattr(V, "build_gene_point_groups", forbidden)
-    monkeypatch.setattr(V, "resolve_cell_type_marker_reference", forbidden)
     monkeypatch.setattr(V, "make_transcript_cache_request", forbidden)
-    assert ctrl.open_gene_inspector("ATERA") is None
-    assert statuses[-1] == "Atera transcripts: lazy engine not available yet"
+    ctrl.open_gene_inspector("ATERA")
+    state = ctrl._gene_inspector_states["ATERA"]
+    assert state.atera is not None and state.atera.mode == "full"
+    assert state.store.total_points > 0
+    assert not any("lazy engine not available" in text for text in statuses)
     assert ctrl._uses_lazy_cell_queries("ATERA")
     assert not ctrl._uses_lazy_cell_queries("MERSCOPE")
     assert not ctrl._uses_lazy_cell_queries("TEST")

@@ -165,6 +165,14 @@ except Exception:  # pragma: no cover - depends on the installed napari runtime
     thread_worker = None
 
 from .manual_registration_controller import REGISTRATION_DATASET, ManualRegistrationController
+from .atera_viewer import (
+    ATERA_MODE_FULL,
+    ATERA_MODE_LAZY,
+    ATERA_TRANSCRIPT_MODES,
+    DEFAULT_ATERA_TRANSCRIPT_MODE,
+    DEFAULT_ATERA_VIEWPORT_MAX_POINTS,
+    AteraTranscriptMixin,
+)
 from .manual_registration_model import LAYER_METADATA_KEY, STORE_ATTR
 from .platforms import (
     ATERA,
@@ -552,6 +560,8 @@ class GeneInspectorState:
     #: Selection mode's "All-transcript overview": every real gene drawn in its
     #: scheme colour regardless of the selection.
     overview_visible: bool = False
+    #: Atera lazy-engine context (atera_viewer.AteraTranscriptContext), else None.
+    atera: object | None = None
 
 
 @dataclass
@@ -3433,8 +3443,12 @@ class GeneInspectorWidget(QWidget):
         colour_by_assignment: bool = False,
         set_assignment_source_callback=None,
         set_overview_callback=None,
+        reload_atera_callback=None,
+        set_atera_viewport_cap_callback=None,
     ):
         super().__init__()
+        self._reload_atera_callback = reload_atera_callback
+        self._set_atera_viewport_cap_callback = set_atera_viewport_cap_callback
         self._close_callback = close_callback
         self._set_gene_visible_callback = set_gene_visible_callback
         self._set_all_genes_callback = set_all_genes_callback
@@ -3558,6 +3572,8 @@ class GeneInspectorWidget(QWidget):
         root.setSpacing(6)
         root.addWidget(self._title)
         root.addWidget(self._close_button)
+        self._build_atera_controls()
+        root.addWidget(self._atera_box)
         root.addWidget(QLabel("Transcript assignment source"))
         root.addWidget(self._assignment_combo)
         root.addWidget(self._assignment_summary)
@@ -3584,6 +3600,131 @@ class GeneInspectorWidget(QWidget):
         root.addWidget(self._status_label)
         self.setLayout(root)
         self.setMinimumWidth(240)
+
+    # -- Atera transcript controls -------------------------------------------
+    _ATERA_MODE_LABELS = {
+        ATERA_MODE_FULL: "Whole-slide sample (all genes)",
+        ATERA_MODE_LAZY: "Lazy (density + ticked genes)",
+    }
+
+    def _build_atera_controls(self) -> None:
+        """Mode, point budget and viewport cap for Atera stores (hidden otherwise)."""
+        self._atera_box = QWidget()
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        self._atera_mode_combo = QComboBox()
+        for mode, label in self._ATERA_MODE_LABELS.items():
+            self._atera_mode_combo.addItem(label, mode)
+        self._atera_budget_spin = QDoubleSpinBox()
+        self._atera_budget_spin.setDecimals(1)
+        self._atera_budget_spin.setRange(0.0, 100000.0)
+        self._atera_budget_spin.setSingleStep(10.0)
+        self._atera_budget_spin.setSuffix(" M points")
+        self._atera_budget_spin.setSpecialValueText("Auto")
+        self._atera_budget_spin.setKeyboardTracking(False)
+        self._atera_budget_spin.setToolTip(
+            "Whole-slide sample size in millions of transcripts. Auto = half the RAM over the "
+            "measured bytes per point; a value at or above the store total loads every transcript. "
+            "The memory guard clamps any budget. Applied by Reload."
+        )
+        self._atera_viewport_spin = QDoubleSpinBox()
+        self._atera_viewport_spin.setDecimals(1)
+        self._atera_viewport_spin.setRange(0.1, 100000.0)
+        self._atera_viewport_spin.setSingleStep(5.0)
+        self._atera_viewport_spin.setSuffix(" M points")
+        self._atera_viewport_spin.setKeyboardTracking(False)
+        self._atera_viewport_spin.setValue(DEFAULT_ATERA_VIEWPORT_MAX_POINTS / 1e6)
+        self._atera_viewport_spin.setToolTip(
+            "Cap on the transcripts streamed for the visible field at full density (applies at once)."
+        )
+        self._atera_viewport_spin.valueChanged.connect(self._on_atera_viewport_changed)
+        self._atera_reload_button = QPushButton("Reload transcripts")
+        self._atera_reload_button.clicked.connect(self._on_atera_reload_clicked)
+        self._atera_note = QLabel("")
+        self._atera_note.setWordWrap(True)
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Atera transcripts"))
+        mode_row.addWidget(self._atera_mode_combo, 1)
+        budget_row = QHBoxLayout()
+        budget_row.addWidget(QLabel("Point budget"))
+        budget_row.addWidget(self._atera_budget_spin, 1)
+        budget_row.addWidget(self._atera_reload_button)
+        viewport_row = QHBoxLayout()
+        viewport_row.addWidget(QLabel("Viewport cap"))
+        viewport_row.addWidget(self._atera_viewport_spin, 1)
+        layout.addLayout(mode_row)
+        layout.addLayout(budget_row)
+        layout.addLayout(viewport_row)
+        layout.addWidget(self._atera_note)
+        self._atera_box.setLayout(layout)
+        self._atera_box.setVisible(False)
+        self._atera_dataset: str | None = None
+
+    def set_atera_controls(
+        self,
+        visible: bool,
+        *,
+        dataset: str | None = None,
+        mode: str = ATERA_MODE_FULL,
+        budget: int | None = None,
+        auto_budget: int = 0,
+        total: int = 0,
+        loaded: int = 0,
+        viewport_cap: int = DEFAULT_ATERA_VIEWPORT_MAX_POINTS,
+        note: str = "",
+    ) -> None:
+        """Show (with values) or hide the Atera transcript controls."""
+        self._atera_box.setVisible(bool(visible))
+        if not visible:
+            self._atera_dataset = None
+            return
+        self._atera_dataset = dataset
+        for widget in (self._atera_mode_combo, self._atera_budget_spin, self._atera_viewport_spin):
+            widget.blockSignals(True)
+        try:
+            index = self._atera_mode_combo.findData(mode)
+            self._atera_mode_combo.setCurrentIndex(max(0, index))
+            self._atera_budget_spin.setMaximum(max(100000.0, total / 1e6 + 1.0))
+            if budget is None:
+                self._atera_budget_spin.setValue(0.0)
+            elif int(budget) <= 0:
+                self._atera_budget_spin.setValue(round(total / 1e6 + 0.05, 1))
+            else:
+                self._atera_budget_spin.setValue(round(int(budget) / 1e6, 1))
+            self._atera_budget_spin.setSpecialValueText(f"Auto ({auto_budget / 1e6:,.1f} M)")
+            self._atera_viewport_spin.setValue(max(0.1, viewport_cap / 1e6))
+        finally:
+            for widget in (self._atera_mode_combo, self._atera_budget_spin, self._atera_viewport_spin):
+                widget.blockSignals(False)
+        loaded_text = (
+            f"{loaded / 1e6:,.1f} M of {total / 1e6:,.1f} M transcripts as points."
+            if mode == ATERA_MODE_FULL
+            else f"{total / 1e6:,.1f} M transcripts; density overview plus ticked genes."
+        )
+        self._atera_note.setText(f"{loaded_text} {note}".strip())
+
+    def atera_requested_budget(self) -> int | None:
+        """The budget the spin box asks for (``None`` = Auto)."""
+        value = float(self._atera_budget_spin.value())
+        if value <= 0.0:
+            return None
+        return int(round(value * 1e6))
+
+    def _on_atera_reload_clicked(self) -> None:
+        if self._reload_atera_callback is None or self._atera_dataset is None:
+            return
+        self._reload_atera_callback(
+            self._atera_dataset,
+            str(self._atera_mode_combo.currentData()),
+            self.atera_requested_budget(),
+            int(round(float(self._atera_viewport_spin.value()) * 1e6)),
+        )
+
+    def _on_atera_viewport_changed(self, value: float) -> None:
+        if self._set_atera_viewport_cap_callback is None or self._atera_dataset is None:
+            return
+        self._set_atera_viewport_cap_callback(self._atera_dataset, int(round(float(value) * 1e6)))
 
     # -- public API ---------------------------------------------------------
     def set_assignment_sources(
@@ -3648,6 +3789,7 @@ class GeneInspectorWidget(QWidget):
             self._dataset = None
             self._apply_mode_widgets(GENE_PANEL_MODE_FULL)
             self._show_all_check.setCheckState(Qt.Unchecked)
+            self.set_atera_controls(False)
         finally:
             self._suppress = False
 
@@ -5787,7 +5929,7 @@ class DatasetWelcomeOverlay(QWidget):
         painter.end()
 
 
-class ComparisonViewerController:
+class ComparisonViewerController(AteraTranscriptMixin):
     """Coordinate loading/clearing napari layers for each dataset."""
 
     def __init__(self, viewer: napari.Viewer, datasets: dict[str, DatasetConfig], args):
@@ -6497,6 +6639,8 @@ class ComparisonViewerController:
 
     def _cancel_dataset_background_tasks(self) -> None:
         """Cancel the dataset-bound builders (not the registration controller's own work)."""
+        # Lazy Atera reads (per-gene and viewport kinds) stop and drop results.
+        self._atera_cancel_all()
         for token in list(self._task_cancel_events.values()):
             token.set()
         self._task_cancel_events.clear()
@@ -7307,12 +7451,10 @@ class ComparisonViewerController:
 
         if not bool(getattr(self.args, "skip_transcripts", False)):
             if self._uses_lazy_cell_queries(ds):
-                # No eager transcript build for lazy (Atera) stores. Log only: a
-                # status here would overwrite the 'metadata loaded' status and
-                # with it any one-shot detection notice it carries. An explicit
-                # open_gene_inspector request still reports the gate.
-                log.info("[%s] Lazy transcript store; skipping the eager transcript autoload.", ds)
-                self._publish_transcript_sources()
+                # Atera: the engine loads in the background. Quietly (progress
+                # bar only), so the 'metadata loaded' status and any one-shot
+                # detection notice it carries stay visible.
+                self._open_atera_gene_inspector(ds, reuse_cached=True, announce=False)
             elif self._active_store_has_points():
                 self.open_gene_inspector(ds, reuse_cached=True)
             else:
@@ -10794,6 +10936,14 @@ class ComparisonViewerController:
     def _gene_layer_name(self, ds: str, symbol: str) -> str:
         return f"Genes | {gene_marker_symbol_label(symbol)}"
 
+    def _gene_max_render_points(self) -> int:
+        """The Xenium/MERSCOPE render cap (``--gene-max-render-points``; unset = default).
+
+        ATERA reads the flag itself: unset there means the AUTO budget.
+        """
+        value = getattr(self.args, "gene_max_render_points", None)
+        return int(DEFAULT_GENE_MAX_RENDER_POINTS if value is None else value)
+
     def _transcript_source_key(self, dataset: str) -> str:
         return getattr(self, "_transcript_assignment_sources", {}).get(
             str(dataset).upper(), "native"
@@ -11020,7 +11170,7 @@ class ComparisonViewerController:
             session.contract.pair_id,
             tuple((ds, *identity) for ds, identity in identities.items()),
             tuple((ds, value[0] if value else None) for ds, value in display_inputs.items()),
-            int(getattr(self.args, "gene_max_render_points", DEFAULT_GENE_MAX_RENDER_POINTS)),
+            self._gene_max_render_points(),
             int(getattr(self.args, "random_state", 42)),
         )
         cancel_token = self._begin_task_token("transcripts", task_key)
@@ -11030,9 +11180,7 @@ class ComparisonViewerController:
         self._begin_progress(
             "transcripts", "Loading aligned transcripts for both datasets…"
         )
-        max_points = int(
-            getattr(self.args, "gene_max_render_points", DEFAULT_GENE_MAX_RENDER_POINTS)
-        )
+        max_points = self._gene_max_render_points()
         random_state = int(getattr(self.args, "random_state", 42))
         pair_id = session.contract.pair_id
 
@@ -11601,16 +11749,10 @@ class ComparisonViewerController:
             return
         ds = str(dataset_name).upper()
         if self._uses_lazy_cell_queries(ds):
-            # The eager build would stream every transcript row of an Atera store
-            # (~1.4e9) and the marker-reference lookup would read the whole table X.
-            # M7's lazy store must take its control set from the points' is_gene
-            # column via utils.control_genes_from_is_gene (as build_gene_point_groups
-            # does with is_gene_col), not from the name rule alone.
-            self._set_status(
-                f"{platform_display_name(self._config_platform(ds, self.datasets.get(ds)))} "
-                "transcripts: lazy engine not available yet"
-            )
-            return
+            # Never the eager build (it would stream ~1.4e9 rows twice): the
+            # Atera engine streams once into a nested hash sample ("full") or
+            # serves a density overview plus per-gene reads ("lazy").
+            return self._open_atera_gene_inspector(ds, reuse_cached=reuse_cached)
         session = self._dataset_sessions.get(ds)
         self._publish_transcript_sources()
         if (reuse_cached and session is not None and session.gene_payload is not None
@@ -11640,7 +11782,7 @@ class ComparisonViewerController:
 
         self._gene_build_generation += 1
         generation = self._gene_build_generation
-        max_points = int(getattr(self.args, "gene_max_render_points", DEFAULT_GENE_MAX_RENDER_POINTS))
+        max_points = self._gene_max_render_points()
         random_state = int(getattr(self.args, "random_state", 42))
         cfg = self.datasets.get(ds)
         zarr_path = getattr(cfg, "zarr_path", None)
@@ -11772,7 +11914,8 @@ class ComparisonViewerController:
             session.gene_payload = dict(payload)
             session.last_used = time.monotonic()
         points_key = str(payload["points_key"])
-        if store.total_points == 0 or not store.genes:
+        atera = payload.get("atera")
+        if (store.total_points == 0 and atera is None) or not store.genes:
             self._set_status(f"{ds} inspect genes: no transcripts found.")
             return
 
@@ -11873,6 +12016,9 @@ class ComparisonViewerController:
         # first. Layers added later by napari sit on top, so without this the
         # slow-to-build transcripts would land at the top.
         self._move_gene_layers_to_bottom(state)
+        if atera is not None:
+            state.atera = atera
+            self._atera_install(state)
 
         if self._gene_inspector_widget is not None:
             self._populate_gene_inspector(state)
@@ -11883,7 +12029,9 @@ class ComparisonViewerController:
                 pass
 
         source_total = int(store.source_total_points if store.source_total_points is not None else store.total_points)
-        if bool(payload.get("cache_hit")):
+        if atera is not None:
+            self._set_status(self._atera_status_text(state, payload))
+        elif bool(payload.get("cache_hit")):
             self._set_status(
                 f"{ds} transcripts restored from persistent cache in "
                 f"{float(payload.get('build_seconds', 0.0)):.1f}s. "
@@ -13630,6 +13778,11 @@ class ComparisonViewerController:
     def _pick_gene_from_event(self, state: GeneInspectorState, event) -> str | None:
         if state.group_display_ranges is None:
             return None
+        if getattr(state, "atera", None) is not None:
+            # The viewport layer sits above the gene groups.
+            gene = self._atera_pick_viewport_gene(state, event)
+            if gene is not None:
+                return gene
         # Later layers are visually on top, so query in reverse display order.
         for gi in reversed(range(len(state.layer_names))):
             layer = self._get_layer_by_name(state.layer_names[gi])
@@ -13706,6 +13859,8 @@ class ComparisonViewerController:
         if entry is not None:
             self._apply_gene_group_sizes(state, {int(entry[0])})
         self._set_gene_highlight_status(state)
+        if getattr(state, "atera", None) is not None:
+            self._atera_render_viewport(state)
 
     def _clear_highlighted_genes(self, state: GeneInspectorState):
         if not state.highlighted_genes:
@@ -13718,6 +13873,8 @@ class ComparisonViewerController:
         state.highlighted_genes = []
         self._apply_gene_group_sizes(state, groups)
         self._set_gene_highlight_status(state)
+        if getattr(state, "atera", None) is not None:
+            self._atera_render_viewport(state)
 
     def _discard_highlighted_genes(self, state: GeneInspectorState, genes: set[str]):
         if not state.highlighted_genes:
@@ -13733,6 +13890,8 @@ class ComparisonViewerController:
         state.highlighted_genes = [gene for gene in state.highlighted_genes if gene not in removed]
         self._apply_gene_group_sizes(state, groups)
         self._set_gene_highlight_status(state)
+        if getattr(state, "atera", None) is not None:
+            self._atera_render_viewport(state)
 
     def _apply_gene_group_sizes(self, state: GeneInspectorState, group_indices: set[int]):
         if state.group_display_ranges is None:
@@ -14028,6 +14187,7 @@ class ComparisonViewerController:
             else:
                 state.ordering = "alphabetical"
         self._populate_gene_inspector(states[0])
+        self._atera_display_changed(dataset_name)
 
     def _selection_overflow_refused(self, states, genes) -> bool:
         """Refuse (once, for every state) a tick that would exceed a slot cap.
@@ -14068,6 +14228,7 @@ class ComparisonViewerController:
             if entry is None:
                 continue
             self._schedule_gene_group_rebuild(state, entry[0])
+        self._atera_selection_changed(dataset_name)
 
     def set_genes_visible(self, dataset_name: str, genes: list[str], on: bool):
         """Show/hide a batch of genes at once (used by group-heading clicks)."""
@@ -14102,6 +14263,7 @@ class ComparisonViewerController:
             if not on:
                 self._discard_highlighted_genes(state, {str(g) for g in genes})
             self._rebuild_gene_group_layers(state, group_indices=groups)
+        self._atera_selection_changed(dataset_name)
 
     def set_all_genes_visible(self, dataset_name: str, on: bool):
         for state in self._gene_states_for_control(dataset_name):
@@ -14137,6 +14299,7 @@ class ComparisonViewerController:
                 state.enabled_genes = set()
                 self._clear_highlighted_genes(state)
             self._rebuild_gene_group_layers(state, group_indices=None)
+        self._atera_selection_changed(dataset_name)
 
     def set_gene_overview(self, dataset_name: str, on: bool):
         """Selection mode's "All-transcript overview" switch.
@@ -14154,6 +14317,7 @@ class ComparisonViewerController:
         widget = self._gene_inspector_widget
         if widget is not None and hasattr(widget, "set_overview_checked"):
             widget.set_overview_checked(any(getattr(state, "overview_visible", False) for state in states))
+        self._atera_selection_changed(dataset_name)
 
     def set_gene_spot_size(self, dataset_name: str, size: float):
         for state in self._gene_states_for_control(dataset_name):
@@ -14168,16 +14332,19 @@ class ComparisonViewerController:
                         layer.size = float(size)
                     except Exception:
                         pass
+        self._atera_display_changed(dataset_name)
 
     def set_gene_hide_background(self, dataset_name: str, on: bool):
         for state in self._gene_states_for_control(dataset_name):
             state.hide_background = bool(on)
             self._rebuild_gene_group_layers(state, group_indices=None)
+        self._atera_display_changed(dataset_name)
 
     def set_gene_hide_assigned(self, dataset_name: str, on: bool):
         for state in self._gene_states_for_control(dataset_name):
             state.hide_assigned = bool(on)
             self._rebuild_gene_group_layers(state, group_indices=None)
+        self._atera_display_changed(dataset_name)
 
     def set_gene_colour_by_assignment(self, dataset_name: str, on: bool):
         states = self._gene_states_for_control(dataset_name)
@@ -14192,6 +14359,7 @@ class ComparisonViewerController:
             widget.refresh_decorations()
         else:
             self._populate_gene_inspector(states[0])
+        self._atera_display_changed(dataset_name)
 
     def set_gene_show_controls(self, dataset_name: str, on: bool):
         for state in self._gene_states_for_control(dataset_name):
@@ -14222,8 +14390,10 @@ class ComparisonViewerController:
                     and hasattr(widget, "sync_checked_genes")
                 ):
                     widget.sync_checked_genes(state.enabled_genes)
+        self._atera_selection_changed(dataset_name)
 
     # -- Cell-type mask colouring ------------------------------------------
+
     def _cell_type_state(self, dataset_name: str) -> CellTypeOverlayState:
         ds = str(dataset_name).upper()
         cfg = self.datasets.get(ds)
@@ -16913,6 +17083,8 @@ class ComparisonViewerController:
         self._gene_build_generation += 1
         self._gene_build_worker = None
         state = self._gene_inspector_states.pop(ds, None)
+        if state is not None:
+            self._atera_teardown(state)
         if state is not None and state.rebuild_timer is not None:
             try:
                 state.rebuild_timer.stop()
@@ -16927,6 +17099,7 @@ class ComparisonViewerController:
         self._gene_build_generation += 1
         self._gene_build_worker = None
         for state in list(self._gene_inspector_states.values()):
+            self._atera_teardown(state)
             if state.rebuild_timer is not None:
                 try:
                     state.rebuild_timer.stop()
@@ -17501,9 +17674,30 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--gene-max-render-points",
-        default=DEFAULT_GENE_MAX_RENDER_POINTS,
+        default=None,
         type=int,
-        help="Cap on total per-gene points rendered at once; above this the store is uniformly subsampled",
+        help=(
+            "Cap on total per-gene points rendered at once; above this the store is uniformly "
+            f"subsampled (0 = no cap). MERSCOPE/Xenium default: {DEFAULT_GENE_MAX_RENDER_POINTS:,}. "
+            "Atera: the whole-slide sample budget; unset = AUTO (half the RAM over the measured "
+            "bytes per point), 0 = every transcript, always clamped by the memory guard"
+        ),
+    )
+    parser.add_argument(
+        "--atera-transcript-mode",
+        default=DEFAULT_ATERA_TRANSCRIPT_MODE,
+        choices=ATERA_TRANSCRIPT_MODES,
+        help=(
+            "Atera transcripts: 'full' streams every file into a nested whole-slide sample of "
+            "--gene-max-render-points points (default); 'lazy' shows a density overview and "
+            "loads only the ticked genes"
+        ),
+    )
+    parser.add_argument(
+        "--atera-viewport-max-points",
+        default=DEFAULT_ATERA_VIEWPORT_MAX_POINTS,
+        type=int,
+        help="Atera: cap on the transcripts streamed for the visible field at full density",
     )
     parser.add_argument(
         "--gene-hide-assigned",
@@ -17728,6 +17922,8 @@ def main():
         set_ordering_callback=controller.set_gene_ordering,
         set_genes_visible_callback=controller.set_genes_visible,
         set_overview_callback=controller.set_gene_overview,
+        reload_atera_callback=controller.reload_atera_transcripts,
+        set_atera_viewport_cap_callback=controller.set_atera_viewport_cap,
         spot_size=args.gene_spot_size,
         hide_assigned=args.gene_hide_assigned,
         hide_background=args.gene_hide_background,
