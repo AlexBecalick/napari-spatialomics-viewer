@@ -20,6 +20,15 @@ import zarr
 from shapely.geometry import GeometryCollection, LineString, MultiLineString, MultiPolygon, Point, Polygon, box, mapping, shape
 from shapely.ops import linemerge, polygonize, unary_union
 
+from .platforms import (
+    ATERA_ROOT_ATTR,
+    PIXEL_TRANSFORM_MERSCOPE_AFFINE,
+    PIXEL_TRANSFORM_SPEC_FILE,
+    find_platform_spec,
+    find_spec_path,
+    platform_spec,
+)
+
 try:
     from skimage.draw import polygon as draw_polygon
 except Exception:  # pragma: no cover - import error depends on runtime env
@@ -515,11 +524,9 @@ def make_layer_name(dataset: str, layer_type: str, key: str, channel: str | None
     """Build a standardized layer name for this viewer."""
     if str(layer_type) == "image":
         label = str(channel if channel is not None else key)
-        if str(dataset).upper() == "XENIUM" and label == "DAPI":
-            label = {
-                "morphology_focus": "DAPI Xenium",
-                "post_xenium_if": "DAPI Post Xenium-IF",
-            }.get(str(key), label)
+        spec = find_platform_spec(dataset)
+        if spec is not None:
+            label = spec.channel_alias(str(key), label) or label
         return " | ".join(["Image", label])
     friendly = _FRIENDLY_LAYER_TYPE_LABELS.get(str(layer_type))
     if friendly is not None:
@@ -2032,12 +2039,141 @@ def _resolve_merscope_micron_to_mosaic(
     return None
 
 
+SPEC_FILE_PIXEL_SIZE_KEYS = ("pixel_size", "microns_per_pixel")
+
+
+def read_spec_file_pixel_size(path: str | Path, *, platform: str = "XENIUM") -> float | None:
+    """Return ``pixel_size`` (or ``microns_per_pixel``) in um from a JSON spec file.
+
+    Returns ``None`` (with a warning when the file exists) for a missing,
+    unreadable or implausible value.
+    """
+    path = Path(path)
+    if not path.is_file():
+        return None
+    try:
+        spec = json.loads(path.read_text())
+    except Exception as exc:
+        log.warning("[%s] Failed to parse spec file %s (%s)", platform, path, exc)
+        return None
+    if not isinstance(spec, dict):
+        log.warning("[%s] Spec file %s is not a JSON object", platform, path)
+        return None
+    for key in SPEC_FILE_PIXEL_SIZE_KEYS:
+        if key in spec:
+            value = _positive_float(spec[key])
+            if value is None:
+                log.warning("[%s] Spec file %s has an unusable %s=%r", platform, path, key, spec[key])
+                return None
+            return value
+    return None
+
+
+def _positive_float(value) -> float | None:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if np.isfinite(out) and out > 0 else None
+
+
+def _atera_root_attr_pixel_size(zarr_path: Path) -> float | None:
+    """``merxen_atera.experiment.pixel_size`` from the root attributes, if usable."""
+    root = _read_json_mapping(zarr_path / "zarr.json")
+    attrs = root.get("attributes") if isinstance(root, dict) else None
+    if not isinstance(attrs, dict):
+        attrs = _read_json_mapping(zarr_path / ".zattrs") or {}
+    atera = attrs.get(ATERA_ROOT_ATTR)
+    experiment = atera.get("experiment") if isinstance(atera, dict) else None
+    if not isinstance(experiment, dict):
+        return None
+    return _positive_float(experiment.get("pixel_size"))
+
+
+def _shapes_global_um_per_px(zarr_path: Path, shapes_key: str) -> float | None:
+    """1 / scale of ``shapes/<key>``'s isotropic ``global`` transform (metadata only)."""
+    attrs = _zarr_element_attributes(zarr_path, "shapes", shapes_key)
+    if attrs is None:
+        return None
+    try:
+        matrix = _global_xy_affine_from_ngff(
+            attrs.get("coordinateTransformations"), source=f"shapes/{shapes_key} in {zarr_path}"
+        )
+    except ValueError:
+        return None
+    if matrix is None:
+        return None
+    sx, sy = float(matrix[0, 0]), float(matrix[1, 1])
+    if abs(matrix[0, 1]) > 1e-9 or abs(matrix[1, 0]) > 1e-9 or sx <= 0 or sy <= 0:
+        return None
+    if abs(sx - sy) > 1e-6 * max(sx, sy):
+        return None
+    return _positive_float(1.0 / sx)
+
+
+def _resolve_spec_file_um_per_px(
+    ds: str,
+    spec_path: str | Path | None,
+    zarr_path: str | Path | None,
+) -> float:
+    spec = platform_spec(ds)
+    path = Path(spec_path) if spec_path else None
+    if path is None and zarr_path is not None and spec.name == "ATERA":
+        path = find_spec_path(zarr_path, spec.name)
+    mpp = read_spec_file_pixel_size(path, platform=spec.name) if path is not None else None
+    if mpp is not None:
+        log.info("[%s] Pixel size %s um from %s", spec.name, mpp, path)
+        return mpp
+
+    if spec.name != "ATERA":
+        mpp = float(spec.fallback_um_per_px)
+        log.warning(
+            "[%s] Spec file missing/unreadable; using fallback pixel_size=%s um.",
+            spec.name,
+            mpp,
+        )
+        return mpp
+
+    # ATERA: never fall back silently to a hard-coded value.
+    if zarr_path is not None:
+        store = Path(zarr_path)
+        mpp = _atera_root_attr_pixel_size(store)
+        if mpp is not None:
+            log.warning(
+                "[ATERA] No experiment.spatial found; using pixel_size=%s um from the root "
+                "%s attributes of %s.",
+                mpp,
+                ATERA_ROOT_ATTR,
+                store,
+            )
+            return mpp
+        shapes_key = spec.original_cell_shape_key
+        mpp = _shapes_global_um_per_px(store, shapes_key) if shapes_key else None
+        if mpp is not None:
+            log.warning(
+                "[ATERA] No experiment.spatial or %s pixel_size found; using %s um/px from the "
+                "'global' scale of shapes/%s in %s.",
+                ATERA_ROOT_ATTR,
+                mpp,
+                shapes_key,
+                store,
+            )
+            return mpp
+    raise ValueError(
+        "ATERA pixel size unknown: no experiment.spatial sidecar, no "
+        f"{ATERA_ROOT_ATTR}.experiment.pixel_size attribute and no usable 'global' scale on "
+        f"shapes/{spec.original_cell_shape_key}"
+        + (f" in {zarr_path}" if zarr_path is not None else " (no store path given)")
+    )
+
+
 def resolve_dataset_mask_affine(
     dataset_name: str,
     merscope_transform_path: str | Path | None = None,
     xenium_spec_path: str | Path | None = None,
     *,
     zarr_path: str | Path | None = None,
+    spec_path: str | Path | None = None,
 ) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
     """Resolve pixel->micron affine transform for a dataset.
 
@@ -2046,10 +2182,20 @@ def resolve_dataset_mask_affine(
     transformation of ``shapes/merscope_cell_boundaries`` in ``zarr_path``;
     its inverse (translation included) is returned. Only when neither is usable
     does it fall back to a 0.108 um/px scale with no translation.
-    """
-    ds = str(dataset_name).upper()
 
-    if ds == "MERSCOPE":
+    For spec-file platforms (XENIUM, ATERA) the isotropic pixel size comes from
+    ``spec_path`` (``xenium_spec_path`` is a compatibility alias), reading
+    ``pixel_size`` or ``microns_per_pixel``. XENIUM falls back to 0.2125 um
+    with a warning. ATERA looks for its ``experiment.spatial`` sidecar in or
+    beside ``zarr_path``, then the root ``merxen_atera`` attributes, then the
+    ``global`` scale of ``shapes/atera_cell_boundaries`` (each with a warning),
+    and raises ``ValueError`` when none is available.
+    """
+    spec = find_platform_spec(dataset_name)
+    if spec is None:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
+
+    if spec.pixel_transform == PIXEL_TRANSFORM_MERSCOPE_AFFINE:
         matrix = _resolve_merscope_micron_to_mosaic(merscope_transform_path, zarr_path)
         if matrix is not None:
             inv = np.linalg.inv(matrix)
@@ -2060,24 +2206,9 @@ def resolve_dataset_mask_affine(
         mpp = float(MERSCOPE_FALLBACK_UM_PER_PX)
         return (mpp, 0.0, 0.0), (0.0, mpp, 0.0)
 
-    if ds == "XENIUM":
-        mpp = None
-        path = Path(xenium_spec_path) if xenium_spec_path else None
-        if path is not None and path.exists():
-            try:
-                spec = json.loads(path.read_text())
-                if "pixel_size" in spec:
-                    mpp = float(spec["pixel_size"])
-            except Exception as exc:
-                log.warning("[XENIUM] Failed to parse spec file %s (%s)", path, exc)
-
-        if mpp is None:
-            mpp = 0.2125
-            log.warning(
-                "[XENIUM] Spec file missing/unreadable; using fallback pixel_size=%s um.",
-                mpp,
-            )
-
+    if spec.pixel_transform == PIXEL_TRANSFORM_SPEC_FILE:
+        path = spec_path if spec_path is not None else xenium_spec_path
+        mpp = _resolve_spec_file_um_per_px(spec.name, path, zarr_path)
         return (float(mpp), 0.0, 0.0), (0.0, float(mpp), 0.0)
 
     raise ValueError(f"Unknown dataset: {dataset_name}")

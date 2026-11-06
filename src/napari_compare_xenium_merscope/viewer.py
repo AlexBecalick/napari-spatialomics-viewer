@@ -159,6 +159,7 @@ except Exception:  # pragma: no cover - depends on the installed napari runtime
 
 from .manual_registration_controller import REGISTRATION_DATASET, ManualRegistrationController
 from .manual_registration_model import LAYER_METADATA_KEY, STORE_ATTR
+from .platforms import find_platform_spec
 from .manual_registration_store import (
     StoreBusyError,
     read_root_attrs,
@@ -834,8 +835,18 @@ def segmentation_color(key: str) -> tuple[float, float, float, float]:
     }.get(segmentation_method(key), stable_layer_color(str(key)))
 
 
-def image_colormap_for_channel(channel_name: str, fallback_index: int = 0) -> str:
-    """Select a napari colormap based on channel name."""
+def image_colormap_for_channel(
+    channel_name: str, fallback_index: int = 0, platform: str | None = None
+) -> str:
+    """Select a napari colormap based on channel name.
+
+    The platform's explicit ``image_channel_colormaps`` win; otherwise the
+    dapi / polyT / 18S / rna keyword rules apply, then a rotating fallback.
+    """
+    spec = find_platform_spec(platform)
+    explicit = spec.channel_colormap(channel_name) if spec is not None else None
+    if explicit is not None:
+        return explicit
     name = str(channel_name).lower()
     if "dapi" in name:
         return "blue"
@@ -7917,7 +7928,7 @@ class ComparisonViewerController:
 
                     multiscale = len(channel_levels) > 1
                     ch_data = channel_levels if multiscale else channel_levels[0]
-                    cmap = image_colormap_for_channel(chan_name, chan_idx)
+                    cmap = image_colormap_for_channel(chan_name, chan_idx, platform=ds)
                     # Explicitly-selected channels are shown; the startup "all"
                     # load only shows the default (DAPI-like) channel.
                     if only_channels is not None:
