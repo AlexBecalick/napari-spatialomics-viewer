@@ -149,29 +149,16 @@ def test_original_source_resolves_the_atera_cell_boundaries(atera_store):
     assert U.cell_type_shape_key_for_source(atera_store, "pciseq_original") is None
 
 
-def test_original_source_falls_back_to_the_merxen_schema(atera_store, monkeypatch):
+def test_original_source_never_falls_back_to_the_merxen_schema(atera_store, monkeypatch):
+    # Only exact candidate keys resolve: without atera_cell_boundaries in the
+    # candidates, the merxen_schema registration of it is not consulted.
     original = U.cell_type_source("original")
     without_atera = dataclasses.replace(
         original,
         mask_shape_keys=tuple(k for k in original.mask_shape_keys if k != "atera_cell_boundaries"),
     )
     monkeypatch.setitem(U._CELL_TYPE_SOURCE_BY_KEY, "original", without_atera)
-    assert U.cell_type_shape_key_for_source(atera_store, "original") == "atera_cell_boundaries"
-
-
-def test_schema_fallback_requires_a_matching_table_region(store_copy, monkeypatch):
-    original = U.cell_type_source("original")
-    monkeypatch.setitem(
-        U._CELL_TYPE_SOURCE_BY_KEY,
-        "original",
-        dataclasses.replace(original, mask_shape_keys=("merscope_cell_boundaries",)),
-    )
-    meta = json.loads((store_copy / "zarr.json").read_text())
-    meta["attributes"]["merxen_schema"]["segmentations"]["original"]["shape"] = "atera_nucleus"
-    (store_copy / "zarr.json").write_text(json.dumps(meta))
-    # The clustering table is region atera_cell_boundaries, so the nucleus
-    # registration is not trusted.
-    assert U.cell_type_shape_key_for_source(store_copy, "original") is None
+    assert U.cell_type_shape_key_for_source(atera_store, "original") is None
 
 
 def test_cell_type_assignments_join_the_uint64_instance_ids(atera_store):
@@ -427,6 +414,14 @@ def test_nucleus_click_selects_its_cell_by_cell_instance_id(qapp, atera_store, m
     # Nucleus 8 straddles cell 8's right edge (x = 37 um): click the part outside it.
     picked = ctrl._pick_cell_from_event(_click(38.0, 36.0))
     assert picked is not None and int(picked[0]) == 8
+    # The selected cell comes from the cell_instance_id column, not the
+    # nucleus's own instance id: remap nucleus 8 to cell 4 and click again.
+    nuclei = ctrl._active_sdata.shapes["atera_nucleus"]
+    assert 4 in {c[0] for c in atera_stores.CELLS}
+    nuclei.loc[8, "cell_instance_id"] = 4
+    picked = ctrl._pick_cell_from_event(_click(38.0, 36.0))
+    assert picked is not None and int(picked[0]) == 4
+    nuclei.loc[8, "cell_instance_id"] = 8
     # Inside a cell, the cell itself wins.
     assert int(ctrl._pick_cell_from_event(_click(5.0, 5.0))[0]) == 1
     # Outside every cell and nucleus: nothing.
@@ -540,6 +535,32 @@ def _panel():
         load_standalone_callback=callback,
         initial_dataset=None,
     )
+
+
+def test_atera_explains_why_pciseq_sources_are_not_offered(qapp, atera_store, monkeypatch):
+    ctrl = _controller()
+    session = _activate(ctrl, atera_store)
+    pciseq_keys = [s.key for s in V.CELL_TYPE_SOURCES if getattr(s, "method", "") == "pciseq"]
+    assert pciseq_keys
+    # Even a session that (wrongly) reports pciSeq annotations must not offer them.
+    for key in pciseq_keys:
+        session.cell_type_available[key] = True
+    monkeypatch.setattr(ctrl, "_start_cell_annotation_prefetch", lambda *_a: None)
+    widget = V.CellTypeWidget(*(lambda *_a: None,) * 7)
+    ctrl._cell_type_widget = widget
+    statuses = []
+    widget.status_message.connect(statuses.append)
+    ctrl._publish_cell_type_options()
+
+    offered = [widget._seg_combo.itemData(i) for i in range(widget._seg_combo.count())]
+    assert "original" in offered
+    assert not any(key in offered for key in pciseq_keys)
+    reason = "pciSeq cell types are not available for Atera stores"
+    assert widget._seg_combo.toolTip().startswith(reason)
+    assert reason in statuses[-1]
+
+    # A MERSCOPE dataset has no such explanation.
+    assert ctrl._unsupported_tool_reason("MERSCOPE", "pciseq") is None
 
 
 def test_atera_disables_cortical_depth_and_object_tools(qapp, atera_store):

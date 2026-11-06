@@ -3499,6 +3499,11 @@ class CellTypeWidget(QWidget):
         self._seg_combo.setCurrentIndex(self._seg_combo.findData(self._segmentation))
         self._seg_combo.setEnabled(self._seg_combo.count() > 0)
 
+    def set_source_tooltip(self, text: str):
+        """Explain on the source selector why some sources are not offered."""
+        self._seg_combo.setToolTip(str(text))
+        self._seg_label.setToolTip(str(text))
+
     def set_levels_available(self, levels: dict[str, str]):
         """Offer levels present in this source (or either member of a pair)."""
         self._level_combo.clear()
@@ -5619,7 +5624,7 @@ class ComparisonViewerController:
         self._dataset_capabilities_callback = fn
 
     def _unsupported_tool_reason(self, ds: str | None, tool: str) -> str | None:
-        """Why ``tool`` ('cortical_depth' or 'object_annotations') is off for ``ds``."""
+        """Why ``tool`` ('cortical_depth', 'object_annotations' or 'pciseq') is off for ``ds``."""
         spec = self._dataset_platform_spec(ds)
         if spec is None:
             return None
@@ -5632,6 +5637,11 @@ class ComparisonViewerController:
             return (
                 f"Distance-from-object annotations are not available for {spec.display_name} "
                 "stores yet: their export is defined for MERSCOPE and Xenium datasets."
+            )
+        if tool == "pciseq" and not spec.supports_pciseq:
+            return (
+                f"pciSeq cell types are not available for {spec.display_name} stores yet: "
+                "the pciSeq export is defined for MERSCOPE and Xenium datasets."
             )
         return None
 
@@ -14229,6 +14239,11 @@ class ComparisonViewerController:
                 )
                 for source in CELL_TYPE_SOURCES
             }
+        pciseq_reason = self._unsupported_tool_reason(self.active_dataset, "pciseq")
+        if pciseq_reason is not None:
+            for source in CELL_TYPE_SOURCES:
+                if getattr(source, "method", "") == "pciseq":
+                    available[source.key] = False
         state = self._cell_type_state(self.active_dataset)
         # The previous overlay layer (if any) was dropped by _clear_layers().
         state.layer_name = None
@@ -14242,11 +14257,14 @@ class ComparisonViewerController:
             return
         widget.set_dataset(self.active_dataset)
         widget.set_segmentation_available(available)
+        if hasattr(widget, "set_source_tooltip"):
+            widget.set_source_tooltip(pciseq_reason or "")
         self._publish_cell_type_levels()
         if any(available.values()):
-            widget.set_status("Choose a stored cell-type level to colour the masks.")
+            status = "Choose a stored cell-type level to colour the masks."
         else:
-            widget.set_status("No stored cell-type annotations in this dataset.")
+            status = "No stored cell-type annotations in this dataset."
+        widget.set_status(f"{status} {pciseq_reason}" if pciseq_reason else status)
 
     # -- UMAP view ----------------------------------------------------------
     def _umap_state(self) -> CellUmapState | None:

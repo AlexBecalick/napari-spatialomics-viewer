@@ -3325,42 +3325,11 @@ def cell_type_shape_key_for_source(zarr_path: Any, source_key: str) -> str | Non
     try:
         root = open_zarr_group_unconsolidated(zarr_path)
         shapes = root["shapes"]
-        exact = next((key for key in source.mask_shape_keys if key in shapes), None)
-        return exact if exact is not None else _schema_shape_key_for_source(root, source)
+        # Exact candidates only: a merxen_schema fallback would resolve
+        # 'original' to xenium_cell_boundaries on MerXen-native Xenium stores.
+        return next((key for key in source.mask_shape_keys if key in shapes), None)
     except Exception:
         return None
-
-
-def _schema_shape_key_for_source(root, source: CellTypeSource) -> str | None:
-    """``merxen_schema.segmentations[source.key].shape``, when its table links to it.
-
-    Used only when none of the source's candidate mask keys is present. The
-    registered shape must exist and the source's clustering table (or the
-    registered table) must declare exactly that region and instance key.
-    """
-    schema = root.attrs.get("merxen_schema", {})
-    segmentations = schema.get("segmentations") if isinstance(schema, Mapping) else None
-    entry = segmentations.get(source.key) if isinstance(segmentations, Mapping) else None
-    if not isinstance(entry, Mapping):
-        return None
-    shape_key = entry.get("shape")
-    if not isinstance(shape_key, str) or shape_key not in root["shapes"]:
-        return None
-    instance_key = entry.get("instance_key") or "instance_id"
-    if "tables" not in root:
-        return None
-    tables = root["tables"]
-    candidates = [key for key in source.clustering_tables if key in tables]
-    registered = entry.get("table")
-    if isinstance(registered, str) and registered in tables:
-        candidates.append(registered)
-    for table_key in candidates:
-        try:
-            if _table_region_matches(tables[table_key], shape_key, str(instance_key)):
-                return shape_key
-        except Exception:
-            continue
-    return None
 
 
 def cell_type_table_key_for_source(
