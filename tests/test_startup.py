@@ -112,6 +112,20 @@ def test_no_opengl_package_smoke_test_builds_empty_control_panel(qapp):
     V.run_package_smoke_test_without_opengl()
 
 
+def test_package_smoke_test_checks_the_atera_readers(qapp, monkeypatch):
+    """Both smoke paths prove pyarrow.parquet and the Atera engine work when frozen."""
+    V.check_frozen_atera_readers()
+    calls = []
+    monkeypatch.setattr(V, "check_frozen_atera_readers", lambda: calls.append(True))
+    V.run_package_smoke_test_without_opengl()
+    assert calls == [True]
+    import inspect
+
+    main_source = inspect.getsource(V.main)
+    smoke = main_source[main_source.index("if args.package_smoke_test:"):]
+    assert smoke.index("check_frozen_atera_readers()") < smoke.index("viewer.close()")
+
+
 def test_dataset_startup_keeps_gene_inspector_selected(qapp):
     panel = _panel(["MERSCOPE"], initial_dataset="MERSCOPE")
 

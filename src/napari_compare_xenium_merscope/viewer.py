@@ -2,8 +2,12 @@
 """
 Interactive Napari viewer for comparing MERSCOPE and Xenium SpatialData outputs.
 
+Atera stores open standalone (paired viewing is MERSCOPE + Xenium only); their
+transcripts are read lazily from parquet by ``atera_transcripts`` and wired in
+by ``atera_viewer``.
+
 Features:
-- Single viewer with dataset switcher (MERSCOPE/XENIUM).
+- Single viewer with dataset switcher (MERSCOPE/XENIUM/ATERA).
 - All image channels as separate image layers in micron coordinates.
 - All shape keys as separate polygon layers with deterministic colors.
 - Assigned vs unassigned transcript layers from points['assignment']-style columns.
@@ -18236,8 +18240,40 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
+def check_frozen_atera_readers() -> None:
+    """Prove the Atera transcript readers work in a frozen package.
+
+    Atera transcripts are read with ``pyarrow.parquet`` directly (never through
+    dask), so a bundle that dropped pyarrow's native libraries would only fail
+    when an Atera store is opened. Round-trip a tiny dictionary-encoded parquet
+    table in memory and import the engine and its viewer wiring.
+    """
+    import io
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from . import atera_transcripts, atera_viewer  # noqa: F401
+
+    table = pa.table(
+        {
+            "x": pa.array([0.5, 1.5], type=pa.float32()),
+            "feature_name": pa.array(["GFAP", "SNAP25"]).dictionary_encode(),
+        }
+    )
+    buffer = io.BytesIO()
+    pq.write_table(table, buffer)
+    buffer.seek(0)
+    back = pq.ParquetFile(buffer).read()
+    if back.column("feature_name").to_pylist() != ["GFAP", "SNAP25"]:
+        raise RuntimeError("pyarrow.parquet did not round-trip the Atera smoke-test table.")
+    if atera_transcripts.GENE_COLUMN != "feature_name":
+        raise RuntimeError("The Atera transcript engine did not import correctly.")
+
+
 def run_package_smoke_test_without_opengl() -> None:
     """Exercise the frozen Qt control panel on CI hosts without OpenGL."""
+    check_frozen_atera_readers()
     app = QApplication.instance() or QApplication([])
     callback = lambda *args, **kwargs: None
     panel = ViewerControlPanel(
@@ -18488,6 +18524,7 @@ def main():
     if args.package_smoke_test:
         # Installer CI exercises the fully frozen Qt/napari application, then
         # exits without requiring human interaction or loading a dataset.
+        check_frozen_atera_readers()
         viewer.close()
         return
     napari.run()
