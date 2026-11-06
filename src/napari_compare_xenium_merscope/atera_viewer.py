@@ -83,9 +83,11 @@ ATERA_PROGRESS_POLL_MS = 500
 #: The viewport reads a window this much larger than the view on each side,
 #: so small pans are served from the cached rows.
 ATERA_VIEWPORT_PAD_FRACTION = 0.5
-#: Lazy mode keeps per-gene rows for at most this many rows (LRU over
-#: unticked genes; ticked genes are never evicted).
-ATERA_LAZY_GENE_CACHE_ROWS = 100_000_000
+#: Lazy mode keeps the rows of genes read at full resolution in an LRU of at
+#: most this many bytes (about 14-22 B/row: x, y, code, cell id), so a re-tick
+#: reads nothing.  Ticked genes are never evicted; unticked genes leave the
+#: napari layers at once and stay only in this cache.
+ATERA_LAZY_GENE_CACHE_BYTES = 1 << 30
 ATERA_DENSITY_LAYER = "Genes | density overview"
 ATERA_VIEWPORT_LAYER = "Genes | viewport"
 _READ_COLUMNS = (X_COLUMN, Y_COLUMN, GENE_COLUMN, ASSIGNMENT_COLUMN)
@@ -285,7 +287,9 @@ class AteraTranscriptContext:
     requested_budget: int | None = None
     viewport_cap: int = DEFAULT_ATERA_VIEWPORT_MAX_POINTS
     memory_note: str = ""
-    loaded: dict = field(default_factory=dict)  # lazy: gene -> rows
+    loaded: dict = field(default_factory=dict)  # lazy: gene -> rows, LRU order (oldest first)
+    #: Lazy: the genes whose rows are in the state's point store (the ticked ones).
+    store_genes: frozenset = frozenset()
     gene_runner: LatestWinsRunner | None = None
     view_runner: LatestWinsRunner | None = None
     view_timer: Any = None
@@ -331,8 +335,31 @@ def _concat_gene_rows(engine, rows_by_gene: dict) -> tuple[np.ndarray, ...]:
     )
 
 
-def _rows_count(rows: dict) -> int:
-    return int(len(rows.get("x", ())))
+def _rows_nbytes(rows: dict) -> int:
+    return int(sum(int(getattr(values, "nbytes", 0)) for values in rows.values()))
+
+
+def lru_gene_cache(
+    loaded: dict, new_rows: dict, enabled, budget_bytes: int
+) -> dict:
+    """Merge ``new_rows`` into the per-gene LRU ``loaded`` (oldest first).
+
+    Ticked (``enabled``) genes count as just used, so they move to the end;
+    unticked genes are then evicted oldest first until the cache fits
+    ``budget_bytes``.  Ticked genes are never evicted.
+    """
+    enabled = set(enabled)
+    merged = {g: r for g, r in loaded.items() if g not in enabled and g not in new_rows}
+    merged.update((g, r) for g, r in loaded.items() if g in enabled and g not in new_rows)
+    merged.update(new_rows)
+    total = sum(_rows_nbytes(r) for r in merged.values())
+    for gene in list(merged):
+        if total <= budget_bytes:
+            break
+        if gene in enabled:
+            continue
+        total -= _rows_nbytes(merged.pop(gene))
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -452,10 +479,18 @@ class AteraTranscriptMixin:
         progress: dict = {"done": 0, "total": 0, "phase": ""}
         self._atera_start_progress_poll(ds, generation, progress, announce)
 
+        # A note left by a layer-creation MemoryError (see
+        # _atera_layers_out_of_memory) is carried into this load's status.
+        carried_note = str(self._atera_options_store().get(ds, {}).pop("memory_note", "") or "")
+
         def compute():
-            return self._atera_compute_payload(
+            payload = self._atera_compute_payload(
                 ds, str(zarr_path), points_key, mode, requested, cap, cancel_token, progress
             )
+            if carried_note:
+                ctx = payload["atera"]
+                ctx.memory_note = f"{carried_note} {ctx.memory_note}".strip()
+            return payload
 
         factory = _thread_worker()
         if factory is None:
@@ -653,6 +688,7 @@ class AteraTranscriptMixin:
         ctx.view_request = None
         if ctx.mode == ATERA_MODE_LAZY:
             ctx.loaded = {}
+            ctx.store_genes = frozenset()
         ctx.gene_runner = LatestWinsRunner(
             lambda request, gen, cancel, d=ds: self._atera_start_gene_read(d, request, gen, cancel)
         )
@@ -768,10 +804,47 @@ class AteraTranscriptMixin:
                         pass
         ctx.camera_callback = None
         ctx.viewport_cache = None
+        ctx.viewport_codes = np.zeros(0, dtype=np.int32)
         ctx.view_request = None
+        # The lazy per-gene rows are only useful to this live state: a reuse
+        # of the cached session starts a fresh cache, so drop them here rather
+        # than keep them (unbudgeted) in the retained session payload.
+        ctx.loaded = {}
+        ctx.store_genes = frozenset()
         widget = getattr(self, "_gene_inspector_widget", None)
         if widget is not None and hasattr(widget, "set_atera_controls"):
             widget.set_atera_controls(False)
+
+    def _atera_layers_out_of_memory(self, ds: str, ctx) -> None:
+        """Creating the napari layers ran out of memory: reload at half the budget.
+
+        The worker-side guard in :meth:`_atera_compute_payload` only covers the
+        sample and the point store; the layers (data, colours, sizes, shown
+        mask) are the larger share per point, so they get the same fallback.
+        """
+        ds = str(ds).upper()
+        self._teardown_gene_inspector(ds)
+        session = self._dataset_sessions.get(ds)
+        if session is not None:
+            session.gene_payload = None
+        gc.collect()
+        budget = ctx.budget
+        if ctx.mode != ATERA_MODE_FULL or budget is None or budget.budget <= ATERA_MIN_BUDGET:
+            message = f"{ds}: out of memory while creating the transcript layers."
+            if ctx.mode == ATERA_MODE_FULL:
+                message += " Lower the point budget or use the lazy mode."
+            log.error("[%s] %s", ds, message)
+            self._set_status(message)
+            return
+        halved = budget.budget // 2
+        note = (
+            f"Out of memory creating the layers for {budget.budget / 1e6:,.1f}M points; "
+            f"reloaded with half ({halved / 1e6:,.1f}M)."
+        )
+        log.warning("[%s] %s", ds, note)
+        self._atera_options_store().setdefault(ds, {})["memory_note"] = note
+        self._set_status(f"{ds}: {note}")
+        self.reload_atera_transcripts(ds, ctx.mode, halved, ctx.viewport_cap)
 
     def _atera_cancel_all(self) -> None:
         for state in list(getattr(self, "_gene_inspector_states", {}).values()):
@@ -864,7 +937,7 @@ class AteraTranscriptMixin:
             ctx = state.atera
             if ctx.mode == ATERA_MODE_LAZY:
                 self._atera_set_density_visible(state, True)
-                if self._atera_missing_genes(state):
+                if self._atera_missing_genes(state) or self._atera_store_stale(state):
                     if ctx.gene_timer is not None:
                         ctx.gene_timer.start()
                     else:
@@ -891,12 +964,26 @@ class AteraTranscriptMixin:
         counts = state.store.source_gene_counts or {}
         return sorted(g for g in state.enabled_genes if g not in ctx.loaded and int(counts.get(g, 0)) > 0)
 
+    def _atera_store_stale(self, state) -> bool:
+        """Lazy: the point store does not hold exactly the ticked, cached genes.
+
+        An untick removes the gene's points from the layers (its rows stay in
+        the LRU); a re-tick of a cached gene puts them back without a read.
+        """
+        ctx = state.atera
+        if ctx.mode != ATERA_MODE_LAZY:
+            return False
+        wanted = {g for g in state.enabled_genes if g in ctx.loaded}
+        return wanted != set(ctx.store_genes)
+
     def _atera_flush_gene_reads(self, ds: str) -> None:
         state = self._gene_inspector_states.get(str(ds).upper())
         if state is None or getattr(state, "atera", None) is None:
             return
         ctx = state.atera
-        if ctx.mode != ATERA_MODE_LAZY or not self._atera_missing_genes(state):
+        if ctx.mode != ATERA_MODE_LAZY:
+            return
+        if not self._atera_missing_genes(state) and not self._atera_store_stale(state):
             return
         # The job reads whatever is missing when it starts, so requests made
         # while one runs are merged rather than lost (never superseded).
@@ -908,7 +995,7 @@ class AteraTranscriptMixin:
         if ctx is None:
             return
         wanted = self._atera_missing_genes(state)
-        if not wanted:
+        if not wanted and not self._atera_store_stale(state):
             ctx.gene_runner.finish(generation)
             return
         enabled = set(state.enabled_genes)
@@ -916,25 +1003,18 @@ class AteraTranscriptMixin:
         # Broad and fine schemes share symbols, so the current colours keep the
         # layer grouping of the symbol each gene was listed with.
         visuals = dict(state.gene_visuals or {})
-        self._set_status(f"{ds}: loading {len(wanted)} gene(s) at full resolution…")
+        if wanted:
+            self._set_status(f"{ds}: loading {len(wanted)} gene(s) at full resolution…")
 
         def compute():
-            rows = ctx.engine.read_genes(wanted, columns=_READ_COLUMNS, cancel=cancel)
-            merged = dict(loaded)
-            merged.update(rows)
-            budget = ATERA_LAZY_GENE_CACHE_ROWS
-            total = sum(_rows_count(r) for r in merged.values())
-            for gene in list(merged):
-                if total <= budget:
-                    break
-                if gene in enabled:
-                    continue
-                total -= _rows_count(merged.pop(gene))
-            shown = {g: r for g, r in merged.items()}
+            rows = ctx.engine.read_genes(wanted, columns=_READ_COLUMNS, cancel=cancel) if wanted else {}
+            merged = lru_gene_cache(loaded, rows, enabled, ATERA_LAZY_GENE_CACHE_BYTES)
+            # Only the ticked genes become points; unticked rows stay in the LRU.
+            shown = {g: r for g, r in merged.items() if g in enabled}
             store = gene_point_store_from_rows(
                 ctx.overview, *_concat_gene_rows(ctx.engine, shown), sampled=False, gene_visuals=visuals,
             )
-            return merged, store
+            return merged, store, frozenset(shown)
 
         def done(result, gen=generation):
             self._atera_gene_read_done(ds, ctx, gen, result)
@@ -952,15 +1032,16 @@ class AteraTranscriptMixin:
         state = self._gene_inspector_states.get(str(ds).upper())
         if state is None or getattr(state, "atera", None) is not ctx:
             return
-        merged, store = result
+        merged, store, shown = result
         ctx.loaded = merged
+        ctx.store_genes = frozenset(shown)
         self._atera_swap_store(state, store)
         ctx.gene_runner.finish(generation)
-        if self._atera_missing_genes(state) and not ctx.gene_runner.busy:
+        if (self._atera_missing_genes(state) or self._atera_store_stale(state)) and not ctx.gene_runner.busy:
             self._atera_flush_gene_reads(ds)
         self._atera_schedule_viewport(ds)
         self._set_status(
-            f"{ds}: {len(merged)} gene(s) at full resolution ({store.total_points / 1e6:,.2f}M points)."
+            f"{ds}: {len(shown)} gene(s) at full resolution ({store.total_points / 1e6:,.2f}M points)."
         )
 
     def _atera_swap_store(self, state, store) -> None:
@@ -1008,8 +1089,8 @@ class AteraTranscriptMixin:
 
         Full mode: the ticked genes, plus every real gene under the overview
         (the rows the sample left out).  Lazy mode: only the overview genes
-        that are neither ticked nor loaded - ticked genes arrive at full
-        resolution through their own per-gene read.
+        that are neither ticked nor in the point store - ticked genes arrive
+        at full resolution through their own per-gene read.
         """
         ctx = state.atera
         vocab_codes = {name: i for i, name in enumerate(ctx.overview.vocabulary)}
@@ -1017,7 +1098,7 @@ class AteraTranscriptMixin:
         if getattr(state, "overview_visible", False):
             names |= {g for g in state.store.genes if g not in state.store.control_genes}
         if ctx.mode == ATERA_MODE_LAZY:
-            names -= set(ctx.loaded) | set(state.enabled_genes)
+            names -= set(ctx.store_genes) | set(state.enabled_genes)
         codes = sorted(vocab_codes[n] for n in names if n in vocab_codes)
         return np.asarray(codes, dtype=np.int64)
 

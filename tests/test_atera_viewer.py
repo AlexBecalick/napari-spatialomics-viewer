@@ -467,16 +467,97 @@ def test_lazy_mode_density_overview_and_batched_gene_reads(qapp, atera_store, mo
     assert gene not in state.slot_allocator and gene not in state.enabled_genes
     shown = sum(int(np.count_nonzero(_layer(ctrl, n).shown)) for n in state.layer_names)
     assert shown == sum(counts[g] for g in wanted[1:])
-    # A re-tick of a loaded gene reads nothing.
+    # The debounced flush removes the unticked gene's points from the layers
+    # (never kept hidden); its rows stay only in the LRU.
+    ctrl._atera_flush_gene_reads("ATERA")
+    assert len(reads) == 1
+    assert gene in ctx.loaded and gene not in ctx.store_genes
+    assert state.store.gene_offsets.get(gene) is None
+    in_layers = sum(len(_layer(ctrl, n).data) for n in state.layer_names)
+    assert in_layers == state.store.total_points == sum(counts[g] for g in wanted[1:])
+    # A re-tick of a loaded gene reads nothing and puts its points back.
     ctrl.set_gene_visible("ATERA", gene, True)
     ctrl._atera_flush_gene_reads("ATERA")
     assert len(reads) == 1
+    assert gene in ctx.store_genes
+    in_layers = sum(len(_layer(ctrl, n).data) for n in state.layer_names)
+    assert in_layers == sum(counts[g] for g in wanted)
     # The lazy viewport shows the other genes under the overview, never the
     # ticked or loaded ones (they have their own full-resolution layers).
     ctrl.set_gene_overview("ATERA", True)
     assert ctx.viewport_cache is not None and len(ctx.viewport_codes) > 0
     assert not np.isin(ctx.viewport_codes, [ctx.overview.vocabulary.index(g) for g in wanted]).any()
     assert not np.isin(ctx.viewport_codes, [ctx.overview.vocabulary.index(g) for g in state.store.control_genes]).any()
+
+
+def test_lazy_gene_cache_is_an_lru_that_never_evicts_ticked_genes():
+    def rows(n):
+        return {"x": np.zeros(n, np.float32), "y": np.zeros(n, np.float32)}
+
+    loaded = {"A": rows(10), "B": rows(10), "C": rows(10)}  # 80 B each
+    # A re-tick of A makes it the most recent; a new gene D then evicts B, the
+    # oldest unticked gene, and never the ticked ones.
+    merged = AV.lru_gene_cache(loaded, {"D": rows(10)}, {"A", "D"}, 3 * 80)
+    assert list(merged) == ["C", "A", "D"]
+    merged = AV.lru_gene_cache(merged, {}, {"A", "D"}, 80)
+    assert list(merged) == ["A", "D"]  # over budget, but ticked genes stay
+
+
+def test_teardown_drops_the_lazy_gene_rows(qapp, atera_store, monkeypatch):
+    ctrl = _controller(atera_store, monkeypatch, atera_transcript_mode="lazy")
+    ctrl.open_gene_inspector("ATERA")
+    state = _state(ctrl)
+    ctx = state.atera
+    ctx.view_timer = None
+    ctrl.set_gene_visible("ATERA", _real_genes(state)[0], True)
+    ctrl._atera_flush_gene_reads("ATERA")
+    assert ctx.loaded
+    session = ctrl._dataset_sessions.get("ATERA")
+    if session is not None and session.gene_payload is not None:
+        assert session.gene_payload["atera"] is ctx
+    ctrl._teardown_gene_inspector("ATERA")
+    # Nothing references the per-gene rows from a retained session any more.
+    assert ctx.loaded == {} and ctx.store_genes == frozenset()
+    assert ctx.viewport_cache is None and len(ctx.viewport_codes) == 0
+
+
+def test_memory_error_creating_the_layers_reloads_at_half_the_budget(qapp, atera_store, monkeypatch):
+    total = _total_rows(atera_store)
+    monkeypatch.setattr(AV, "ATERA_MIN_BUDGET", 1)
+    ctrl = _controller(atera_store, monkeypatch, gene_max_render_points=total // 2)
+    original = ctrl._create_gene_points_layer
+    calls = []
+
+    def flaky(name, *args, **kwargs):
+        if name != AV.ATERA_VIEWPORT_LAYER:
+            calls.append(name)
+            if len(calls) == 1:
+                raise MemoryError("synthetic")
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(ctrl, "_create_gene_points_layer", flaky)
+    ctrl.open_gene_inspector("ATERA")
+    state = _state(ctrl)
+    assert state.atera.budget.budget == (total // 2) // 2
+    assert state.atera.requested_budget == (total // 2) // 2
+    assert "Out of memory creating the layers" in ctrl.statuses[-1]
+    # The partial layers were torn down: one layer per group, none left over.
+    names = [str(layer.name) for layer in ctrl.viewer.layers]
+    assert sorted(n for n in names if n in state.layer_names) == sorted(state.layer_names)
+    assert len(names) == len(set(names))
+    assert all(_layer(ctrl, n) is not None for n in state.layer_names)
+
+
+def test_memory_error_creating_lazy_layers_is_reported(qapp, atera_store, monkeypatch):
+    ctrl = _controller(atera_store, monkeypatch, atera_transcript_mode="lazy")
+
+    def boom(*_a, **_k):
+        raise MemoryError("synthetic")
+
+    monkeypatch.setattr(ctrl, "_atera_add_density_layer", boom)
+    ctrl.open_gene_inspector("ATERA")
+    assert "ATERA" not in ctrl._gene_inspector_states
+    assert "out of memory" in ctrl.statuses[-1]
 
 
 def test_teardown_removes_atera_layers_and_stops_reads(qapp, atera_store, monkeypatch):

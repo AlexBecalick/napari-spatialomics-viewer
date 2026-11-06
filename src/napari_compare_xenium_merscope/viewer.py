@@ -12002,23 +12002,32 @@ class ComparisonViewerController(AteraTranscriptMixin):
         # per-point colours + symbol. Building populated (vs. empty then growing)
         # avoids napari's data-resize path that both drops the per-point symbol
         # back to the default disc and can reset colours to white.
-        for gi, symbol in enumerate(store.group_symbols):
-            coords, colors, sizes, ranges, shown = self._gene_group_arrays(state, gi)
-            state.group_display_ranges[gi] = ranges
-            layer_name = self._gene_layer_name(ds, symbol)
-            self._create_gene_points_layer(
-                layer_name, symbol, spot_size, coords, colors, sizes, shown=shown
-            )
-            state.layer_names.append(layer_name)
-        layer_names = state.layer_names
-        # Pin the (long) gene-layer block to the bottom of the layer list so it
-        # stays below images and masks regardless of which background load finishes
-        # first. Layers added later by napari sit on top, so without this the
-        # slow-to-build transcripts would land at the top.
-        self._move_gene_layers_to_bottom(state)
-        if atera is not None:
+        try:
+            for gi, symbol in enumerate(store.group_symbols):
+                coords, colors, sizes, ranges, shown = self._gene_group_arrays(state, gi)
+                state.group_display_ranges[gi] = ranges
+                layer_name = self._gene_layer_name(ds, symbol)
+                self._create_gene_points_layer(
+                    layer_name, symbol, spot_size, coords, colors, sizes, shown=shown
+                )
+                state.layer_names.append(layer_name)
+            # Pin the (long) gene-layer block to the bottom of the layer list so it
+            # stays below images and masks regardless of which background load finishes
+            # first. Layers added later by napari sit on top, so without this the
+            # slow-to-build transcripts would land at the top.
+            self._move_gene_layers_to_bottom(state)
+            if atera is not None:
+                state.atera = atera
+                self._atera_install(state)
+        except MemoryError:
+            if atera is None:
+                raise
+            # Atera layers are the bulk of the per-point memory: tear the
+            # partial layers down and reload at half the budget.
             state.atera = atera
-            self._atera_install(state)
+            self._atera_layers_out_of_memory(ds, atera)
+            return
+        layer_names = state.layer_names
 
         if self._gene_inspector_widget is not None:
             self._populate_gene_inspector(state)

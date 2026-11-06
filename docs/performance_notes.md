@@ -308,7 +308,19 @@ What this means in practice:
   back to about 40M, or use lazy mode, where the overview is the density image.
 - Creating the layers for a large sample runs on the Qt thread: about 10-15 s
   at AUTO, during which the window does not respond. The read, sample and
-  store build stay in the background.
+  store build stay in the background. This, and the 1 fps All-transcript
+  overview at AUTO, are open against the M7 acceptance ("nothing blocks image
+  or mask loads", "a pan storm stays responsive"); the queued M10 splits the
+  layer creation into per-group chunks on a QTimer chain with a determinate
+  progress bar, and caps the All-transcript overview at a nested 40M
+  sub-sample. Until then, a 40M budget or the lazy mode avoids both.
+- A MemoryError while creating the layers (not only while sampling) tears the
+  partial layers down and reloads at half the budget, saying so in the
+  status bar.
+- Lazy mode keeps the rows of genes read at full resolution in a 1 GiB LRU
+  (about 14-22 B per row). Only ticked genes are napari points: unticking a
+  gene removes its points from the layers, a re-tick restores them from the
+  LRU without a read, and the LRU is dropped when the inspector is torn down.
 - The viewport needs about 0.5 s to read a 500 um window and about 2 s to
   swap 7M points into its layer, with one vispy upload. Pans inside the
   padded window reuse its rows.
