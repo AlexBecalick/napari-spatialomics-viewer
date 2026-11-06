@@ -110,6 +110,7 @@ try:
         QPen,
         QPixmap,
         QPolygonF,
+        QTextDocument,
     )
     from qtpy.QtWidgets import (
         QAbstractItemView,
@@ -136,6 +137,7 @@ try:
         QToolButton,
         QVBoxLayout,
         QWidget,
+        QWidgetItem,
     )
 except ImportError:
     print(
@@ -248,6 +250,7 @@ from .utils import (
     build_gene_point_groups,
     build_napari_affine_from_px_to_um,
     cellpose_quantification_features,
+    cellpose_cell_mean_intensities,
     cellpose_quantification_channel_labels,
     cellpose_quantification_table_available,
     cellpose_value_clip_range,
@@ -1250,6 +1253,17 @@ class FlowLayout(QLayout):
         return y + line_height - rect.y() + margins.bottom()
 
 
+class ResponsiveTabStack(QStackedWidget):
+    """Hidden tabs must not impose their minimum size on the entire window."""
+
+    def minimumSizeHint(self):
+        return QSize(120, 0)
+
+    def sizeHint(self):
+        current = self.currentWidget()
+        return current.sizeHint() if current is not None else QSize(300, 400)
+
+
 class ViewerControlPanel(QWidget):
     """Right-dock control panel: tabbed controls with a shared progress bar.
 
@@ -1508,7 +1522,7 @@ class ViewerControlPanel(QWidget):
         _tab_bar_policy.setHeightForWidth(True)
         _tab_bar_policy.setVerticalPolicy(QSizePolicy.Minimum)
         self._tab_bar.setSizePolicy(_tab_bar_policy)
-        self._tab_stack = QStackedWidget()
+        self._tab_stack = ResponsiveTabStack()
         tabs = (
             ("Gene inspector", self._build_genes_tab),
             ("Cell segmentation", self._build_segmentation_tab),
@@ -1734,7 +1748,6 @@ class ViewerControlPanel(QWidget):
             layout.addWidget(self._registration_widget, stretch=1)
         else:
             layout.addWidget(QLabel("Manual registration is unavailable in this build."))
-        layout.addStretch(1)
         return self._scrollable(layout)
 
     # -- public API ---------------------------------------------------------
@@ -3628,6 +3641,8 @@ def _cell_summary_html(cell: dict) -> str:
     intensity_rows = cell.get("intensities") or []
     if intensity_rows:
         lines.append("<b>Mean intensity:</b>")
+        if cell.get("cellpose_cell_id") is not None:
+            lines.append(f"Cellpose cell: {html.escape(str(cell['cellpose_cell_id']))}")
         for channel, value in intensity_rows:
             value_text = f"{value:,.1f}" if value is not None else "n/a"
             lines.append(f"&nbsp;&nbsp;{html.escape(str(channel))}: {value_text}")
@@ -3637,6 +3652,8 @@ def _cell_summary_html(cell: dict) -> str:
 
 
 def _cell_gene_list_html(cell: dict) -> str:
+    if cell.get("inspection_error"):
+        return "<i>Transcript data could not be loaded</i>"
     if cell.get("loading"):
         return "<i>Loading…</i>"
     lines = []
@@ -3671,118 +3688,114 @@ def _rgba_css_color(rgba, fallback: str = "#9aa4b2") -> str:
 
 
 class _CellPanel(QWidget):
-    """One selected cell's column: coloured Cell ID + summary, pie, gene list.
-
-    The pie and title/summary are pinned to the top; the gene list fills the
-    remaining panel height and scrolls internally, so a long gene list never
-    pushes the pie down or makes the panel taller than the visible window.
-    """
+    """Persistent selected-cell widgets, updated without creating windows."""
 
     def __init__(self, cell: dict, parent=None):
         super().__init__(parent)
         self.setObjectName("CellPanel")
-        self.setStyleSheet(" QLabel { background: transparent; }")
-        # Fill the row's (viewport) height so the gene list can size to it.
+        self.setStyleSheet("QLabel { background: transparent; }")
         self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(6, 2, 6, 2)
+        outer.setSpacing(6)
+        self._statistics = QWidget(self)
+        self._statistics.setObjectName("CellStatistics")
+        left = QVBoxLayout(self._statistics)
+        left.setContentsMargins(0, 0, 0, 0)
+        left.setSpacing(2)
+        self._title = QLabel(self._statistics)
+        self._title.setTextFormat(Qt.RichText)
+        self._broad = QLabel(self._statistics)
+        self._broad.setObjectName("BroadCellType")
+        self._fine = QLabel(self._statistics)
+        self._fine.setObjectName("FineCellType")
+        self._summary = QLabel(self._statistics)
+        for label in (self._broad, self._fine):
+            label.setTextFormat(Qt.PlainText)
+            label.setWordWrap(True)
+        self._summary.setTextFormat(Qt.RichText)
+        self._summary.setWordWrap(True)
+        self._summary.setStyleSheet("color: #e6ebf2; font-size: 10pt;")
+        self._summary.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        for label in (self._title, self._broad, self._fine, self._summary):
+            left.addWidget(label)
+        left.addStretch(1)
+        outer.addWidget(self._statistics)
+        self._pie = CellInfoPieChart(self)
+        self._pie.setFixedSize(170, 170)
+        outer.addWidget(self._pie, 0, Qt.AlignTop)
+        self._gene_scroll = QScrollArea(self)
+        self._gene_scroll.setObjectName("CellGenes")
+        self._gene_scroll.setWidgetResizable(True)
+        self._gene_scroll.setFrameShape(QScrollArea.NoFrame)
+        self._gene_scroll.setStyleSheet("background: transparent;")
+        self._gene_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._gene_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self._gene_scroll.setFixedHeight(150)
+        self._gene_list = QLabel(self._gene_scroll)
+        self._gene_list.setTextFormat(Qt.RichText)
+        self._gene_list.setWordWrap(False)
+        self._gene_list.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self._gene_scroll.setWidget(self._gene_list)
+        outer.addWidget(self._gene_scroll, 0, Qt.AlignTop)
+        self.set_cell(cell)
+
+    def set_cell(self, cell: dict):
         color = str(cell.get("color", "#ffffff"))
-
-        outer = QHBoxLayout()
-        outer.setContentsMargins(10, 2, 10, 2)
-        outer.setSpacing(12)
-
-        # -- Left: Cell ID (in the cell's highlight colour) + summary -------
-        left = QVBoxLayout()
-        left.setSpacing(5)
-        display_cell_id = cell.get("display_cell_id", cell.get("cell_id", ""))
-        title = QLabel(f"Cell {html.escape(str(display_cell_id))}")
-        title.setStyleSheet(f"color: {color}; font-size: 22pt; font-weight: bold;")
-        title.setTextFormat(Qt.RichText)
-        broad_text = str(cell.get("broad_cell_type", "Unannotated"))
-        fine_text = str(cell.get("fine_cell_type", "Unannotated"))
-        is_pciseq = cell.get("annotation_method") == "pciseq"
-        broad = QLabel(f"{'pciSeq' if is_pciseq else 'Broad'}: {broad_text}")
-        broad.setObjectName("BroadCellType")
-        broad.setTextFormat(Qt.PlainText)
-        broad.setStyleSheet(
-            f"color: {_rgba_css_color(cell.get('broad_cell_type_rgba'))}; "
-            "font-size: 22pt; font-weight: bold;"
-        )
-        fine = QLabel(f"Fine: {fine_text}")
-        fine.setObjectName("FineCellType")
-        fine.setTextFormat(Qt.PlainText)
-        fine.setStyleSheet(
-            f"color: {_rgba_css_color(cell.get('fine_cell_type_rgba'))}; "
-            "font-size: 22pt; font-weight: bold;"
-        )
-        fine.setVisible(not is_pciseq)
-        summary = QLabel(_cell_summary_html(cell))
-        summary.setTextFormat(Qt.RichText)
-        summary.setWordWrap(True)
-        summary.setStyleSheet("color: #e6ebf2; font-size: 12pt;")
-        summary.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        left.addWidget(title)
-        left.addWidget(broad)
-        left.addWidget(fine)
-        left.addWidget(summary)
-        left.addStretch(1)  # keep title + summary pinned to the top
-        left_widget = QWidget()
-        left_widget.setLayout(left)
-        left_widget.setFixedWidth(360)
-        outer.addWidget(left_widget)
-
-        # -- Middle: pie chart (slices darkened a shade), pinned to the top -
-        pie = CellInfoPieChart()
-        pie.setFixedSize(170, 170)
-        pie.set_slices(
-            [
-                {
-                    "count": row.get("count", 0),
-                    "glyph": row.get("glyph", ""),
-                    "rgba": darken_rgba(row.get("rgba", (0.6, 0.6, 0.6, 1.0)), CELL_PIE_SLICE_DARKEN),
-                }
-                for row in cell.get("gene_rows", [])
-            ]
-        )
-        outer.addWidget(pie, 0, Qt.AlignTop)
-
-        # -- Right: ranked gene list, fills panel height + scrolls ----------
-        gene_list = QLabel(_cell_gene_list_html(cell))
-        gene_list.setTextFormat(Qt.RichText)
-        gene_list.setWordWrap(False)
-        gene_list.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        gene_scroll = QScrollArea()
-        gene_scroll.setWidgetResizable(True)
-        gene_scroll.setFrameShape(QScrollArea.NoFrame)
-        gene_scroll.setStyleSheet("background: transparent;")
-        gene_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        gene_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        gene_scroll.setWidget(gene_list)
-        gene_scroll.setFixedWidth(230)
-        # Expanding height + a small minimum so the panel never demands more
-        # vertical space than the visible window; the list scrolls instead.
-        gene_scroll.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
-        gene_scroll.setMinimumHeight(60)
-        outer.addWidget(gene_scroll)
-
-        self.setLayout(outer)
+        self._title.setText(f"Cell {html.escape(str(cell.get('display_cell_id', cell.get('cell_id', ''))))}")
+        self._title.setStyleSheet(f"color: {color}; font-size: 13pt; font-weight: bold;")
+        pciseq = cell.get("annotation_method") == "pciseq"
+        self._broad.setText(f"{'pciSeq' if pciseq else 'Broad'}: {cell.get('broad_cell_type', 'Unannotated')}")
+        self._fine.setText(f"{'Type' if cell.get('selected_cell_type') else 'Fine'}: "
+                           f"{cell.get('selected_cell_type') or cell.get('fine_cell_type', 'Unannotated')}")
+        self._broad.setStyleSheet(f"color: {_rgba_css_color(cell.get('broad_cell_type_rgba'))}; font-size: 13pt; font-weight: bold;")
+        self._fine.setStyleSheet(f"color: {_rgba_css_color(cell.get('selected_cell_type_rgba', cell.get('fine_cell_type_rgba')))}; font-size: 13pt; font-weight: bold;")
+        self._fine.setVisible(not pciseq)
+        self._summary.setText(_cell_summary_html(cell))
+        self._summary.ensurePolished()
+        document = QTextDocument()
+        document.setDefaultFont(self._summary.font())
+        document.setHtml(self._summary.text())
+        width = max(document.idealWidth(), self._title.sizeHint().width(),
+                    min(280, self._broad.sizeHint().width()),
+                    min(280, self._fine.sizeHint().width()) if not pciseq else 0)
+        self._statistics.setFixedWidth(int(min(310, max(170, width + 8))))
+        self._pie.set_slices([
+            {"count": row.get("count", 0), "glyph": row.get("glyph", ""),
+             "rgba": darken_rgba(row.get("rgba", (.6, .6, .6, 1.)), CELL_PIE_SLICE_DARKEN)}
+            for row in cell.get("gene_rows", [])])
+        self._gene_list.setText(_cell_gene_list_html(cell))
+        self._gene_list.ensurePolished()
+        document.setDefaultFont(self._gene_list.font())
+        # Measure the rows initially in view. A long rare gene farther down
+        # remains scrollable without reserving blank width beside the top genes.
+        visible_rows = {**cell, "gene_rows": cell.get("gene_rows", [])[:8]}
+        document.setHtml(_cell_gene_list_html(visible_rows))
+        natural = int(document.idealWidth()) + self._gene_scroll.verticalScrollBar().sizeHint().width() + 8
+        # A rare long gene name must not widen the entire cell panel. Keep its
+        # full text available via the gene list's own horizontal scrollbar.
+        self._gene_scroll.setFixedWidth(min(190, natural))
+        self.updateGeometry()
 
 
 class CellInfoOverlay(QWidget):
     """Docked bottom bar summarising every currently highlighted cell.
 
-    A persistent instruction header sits above a horizontally-scrolling row of
-    :class:`_CellPanel` columns — one per selected cell, packed left-to-right,
-    with a horizontal scrollbar once they overflow the viewport width.
+    A persistent instruction header sits above a row of selected-cell panels.
+    Prefer enough height for every measurement, but allow scrolling on small
+    windows instead of forcing the canvas and status bar off screen.
     """
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setObjectName("CellInfoOverlay")
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
         self.setStyleSheet(
             "#CellInfoOverlay { background: #14161c; }"
             " QLabel { color: #f0f0f0; background: transparent; }"
         )
-        self.setMaximumHeight(260)
+        self._preferred_height = 320
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
         outer = QVBoxLayout()
         outer.setContentsMargins(8, 6, 8, 4)
@@ -3790,20 +3803,20 @@ class CellInfoOverlay(QWidget):
 
         self._instruction = QLabel(
             "To deselect all currently highlighted cells, close this window "
-            "with the X in the top left of the window"
+            "with the X in the top left of the window", self
         )
         self._instruction.setStyleSheet("color: #9aa4b2; font-size: 9pt;")
         self._instruction.setWordWrap(True)
         outer.addWidget(self._instruction)
 
-        self._scroll = QScrollArea()
+        self._scroll = QScrollArea(self)
         self._scroll.setWidgetResizable(True)
         self._scroll.setFrameShape(QScrollArea.NoFrame)
         self._scroll.setStyleSheet("background: transparent;")
         self._scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
 
-        self._row = QWidget()
+        self._row = QWidget(self._scroll)
         self._row_layout = QHBoxLayout()
         self._row_layout.setContentsMargins(0, 0, 0, 0)
         self._row_layout.setSpacing(0)
@@ -3814,10 +3827,16 @@ class CellInfoOverlay(QWidget):
 
         self.setLayout(outer)
 
-    @staticmethod
-    def _divider() -> QFrame:
-        """A thick vertical rule drawn between adjacent cell panels."""
-        line = QFrame()
+    def minimumSizeHint(self):
+        # A dock's preferred content height must never become the main window's
+        # minimum height. The canvas and status bar must still fit small screens.
+        return QSize(120, 100)
+
+    def sizeHint(self):
+        return QSize(800, self._preferred_height)
+
+    def _divider(self) -> QFrame:
+        line = QFrame(self._row)
         line.setObjectName("CellDivider")
         line.setFixedWidth(3)
         line.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
@@ -3825,17 +3844,34 @@ class CellInfoOverlay(QWidget):
         return line
 
     def set_cells(self, cells: list[dict]):
-        """Rebuild the panel row, one :class:`_CellPanel` per cell (in order)."""
+        """Reuse panels and their child widgets across loading/click updates."""
+        previous = getattr(self, "_panels_by_key", {})
+        panels = {}
+        old_dividers = []
         while self._row_layout.count():
             item = self._row_layout.takeAt(0)
             widget = item.widget()
-            if widget is not None:
-                widget.deleteLater()
+            if widget is not None and not isinstance(widget, _CellPanel):
+                old_dividers.append(widget)
         for index, cell in enumerate(cells):
-            if index > 0:
-                self._row_layout.addWidget(self._divider())  # separate the sets
-            self._row_layout.addWidget(_CellPanel(cell))
+            key = (str(cell.get("display_cell_id", cell.get("cell_id", ""))), str(cell.get("color", "")))
+            panel = previous.pop(key, None)
+            if panel is None:
+                panel = _CellPanel(cell, self._row)
+            else:
+                panel.set_cell(cell)
+            if index:
+                divider = old_dividers.pop() if old_dividers else self._divider()
+                self._row_layout.addWidget(divider)
+            self._row_layout.addWidget(panel)
+            panels[key] = panel
+        for widget in [*previous.values(), *old_dividers]:
+            widget.hide()
+            widget.deleteLater()
+        self._panels_by_key = panels
         self._row_layout.addStretch(1)
+        self._preferred_height = max(260, self._row.minimumSizeHint().height() + 65)
+        self.updateGeometry()
 
     def cell_panels(self) -> list[_CellPanel]:
         panels = []
@@ -3854,7 +3890,7 @@ class _WidgetResizeRelay(QObject):
         self._callback = callback
 
     def eventFilter(self, _obj, event):  # noqa: N802 (Qt override)
-        if event.type() == QEvent.Resize:
+        if event.type() in (QEvent.Resize, QEvent.Show):
             try:
                 self._callback()
             except Exception:
@@ -3907,12 +3943,16 @@ class ScaleBarOverlay(QWidget):
         parent = self.parentWidget()
         if parent is None:
             return
-        pw, ph = int(parent.width()), int(parent.height())
+        visible = parent.visibleRegion().boundingRect()
+        if visible.isEmpty():
+            visible = parent.rect()
+        pw, ph = visible.width(), visible.height()
         self._bar_px = max(20, int(pw * self._width_fraction))
         pad = 6
         w = self._bar_px + 2 * pad
         h = 66
-        self.setGeometry(max(0, pw - self._margin - w), max(0, ph - self._margin - h), w, h)
+        self.setGeometry(visible.left() + max(0, pw - self._margin - w),
+                         visible.top() + max(0, ph - self._margin - h), w, h)
         self.update()
 
     @staticmethod
@@ -4103,6 +4143,14 @@ class GeneLayerAggregateRow(QFrame):
         self.refresh()
 
 
+class _ContentHeightLayerListItem(QWidgetItem):
+    """Prefer the rendered rows' height instead of QListView's generic hint."""
+
+    def sizeHint(self):
+        hint = super().sizeHint()
+        return QSize(hint.width(), self.widget().maximumHeight())
+
+
 class NapariLeftPanelAdapter(QObject):
     """Apply the viewer-specific, non-destructive presentation of napari's left dock."""
 
@@ -4149,6 +4197,18 @@ class NapariLeftPanelAdapter(QObject):
             if button is not None:
                 button.hide()
 
+        home_button = getattr(viewer_buttons, "resetViewButton", None)
+        delete_button = getattr(layer_buttons, "deleteButton", None)
+        if home_button is not None and delete_button is not None:
+            viewer_buttons.layout().removeWidget(home_button)
+            home_button.setParent(layer_buttons)
+            home_button.setFixedSize(delete_button.sizeHint())
+            home_button.setIconSize(delete_button.iconSize())
+            layer_buttons.layout().insertWidget(
+                layer_buttons.layout().indexOf(delete_button), home_button)
+            home_button.show()
+            viewer_buttons.hide()
+
         self._layer_view = qt_viewer.layers
         self._delete_button = getattr(layer_buttons, "deleteButton", None)
         self._delete_button_was_enabled = (
@@ -4187,17 +4247,21 @@ class NapariLeftPanelAdapter(QObject):
         layer_list_layout.insertWidget(2, self._gene_rows_container)
         self.rotation_control = self._build_rotation_control(layer_list_container)
         layer_list_layout.insertWidget(3, self.rotation_control)
-        # Let the native list consume the dock's spare vertical space.  The gene
-        # aggregate rows and rotation/reset controls retain their size hints and
-        # remain directly below it, while substantially more layers are visible
-        # before Qt needs to show a scrollbar.
+        # Fit the list to visible rows, then leave spare room below Genes and
+        # the toolbar. Long lists scroll within the remaining dock height.
         self._layer_view.setMinimumHeight(0)
         self._layer_view.setMaximumHeight(16777215)
         self._layer_view.setSizePolicy(
             self._layer_view.sizePolicy().horizontalPolicy(),
             QSizePolicy.Expanding,
         )
-        layer_list_layout.setStretchFactor(self._layer_view, 1)
+        list_index = layer_list_layout.indexOf(self._layer_view)
+        layer_list_layout.takeAt(list_index)
+        layer_list_layout.insertItem(list_index, _ContentHeightLayerListItem(self._layer_view))
+        layer_list_layout.addStretch(1)
+        self._layer_list_container = layer_list_container
+        self._list_resize_relay = _WidgetResizeRelay(self._fit_layer_list_height)
+        layer_list_container.installEventFilter(self._list_resize_relay)
 
         for event_name in ("inserted", "removed", "moved", "reordered", "renamed"):
             emitter = getattr(viewer.layers.events, event_name, None)
@@ -4500,6 +4564,31 @@ class NapariLeftPanelAdapter(QObject):
                 for row in (self.gene_row, *self.paired_gene_rows.values())
             )
         )
+        self._fit_layer_list_height()
+
+    def _fit_layer_list_height(self):
+        """Keep Genes directly after the visible rows; scroll long layer lists."""
+        view = self._layer_view
+        model = view.model()
+        rows_height = sum(max(1, view.sizeHintForRow(row))
+                          for row in range(model.rowCount()) if not view.isRowHidden(row))
+        desired = rows_height + 2 * view.frameWidth()
+        if view.horizontalScrollBar().isVisible():
+            desired += view.horizontalScrollBar().sizeHint().height()
+        container = self._layer_list_container
+        layout = container.layout()
+        reserved = layout.contentsMargins().top() + layout.contentsMargins().bottom()
+        visible_count = 0
+        for index in range(layout.count()):
+            widget = layout.itemAt(index).widget()
+            if widget is not None and widget is not view and not widget.isHidden():
+                reserved += widget.sizeHint().height()
+                visible_count += 1
+        reserved += max(0, layout.spacing()) * visible_count
+        available = max(0, container.height() - reserved)
+        height = min(desired, available)
+        if view.maximumHeight() != height:
+            view.setMaximumHeight(height)
 
     def _on_controls_dock_visibility(self, visible: bool):
         if visible:
@@ -9631,6 +9720,11 @@ class ComparisonViewerController:
             return
         import dask.dataframe as dd
 
+        categorical = {column: "string" for column, dtype in points.dtypes.items()
+                       if isinstance(dtype, pd.CategoricalDtype)}
+        if categorical:
+            points = points.astype(categorical)
+
         # A lazy shuffled graph would otherwise be recomputed for each output
         # partition in each streaming pass. Spool its narrow columns once,
         # outside the sample, without retaining all transcripts in memory.
@@ -10792,9 +10886,7 @@ class ComparisonViewerController:
                 self._add_highlighted_gene(state, gene)
                 return
 
-        # 2) Otherwise a click inside a segmentation mask adds it to the set of
-        #    highlighted cells (existing highlights are kept) -- but only while the
-        #    gating segmentation layer (ProSeg) is visible.
+        # 2) Inspect the selected cell-type source while any mask/fill is visible.
         if self._cell_inspector_pickable():
             picked = self._pick_cell_from_event(event)
             if picked is not None:
@@ -10813,63 +10905,15 @@ class ComparisonViewerController:
         if session is None or registry is None:
             return None
         profile = session.contract.profile(platform)
-        assignment_source = self._transcript_source_key(platform)
-        if assignment_source != "native":
-            selected = self._paired_segmentation_for_cell_type(platform, assignment_source)
-            if selected is None:
-                return None
-            candidates = [selected]
-        else:
-            candidates = sorted(
-                profile.segmentations,
-                key=lambda segmentation: (
-                    "proseg" not in segmentation.logical_key.lower(),
-                    "cellpose" not in segmentation.logical_key.lower(),
-                    segmentation.logical_key,
-                ),
-            )
-        loaded_regular_layers = []
-        for segmentation in candidates:
-            layer = registry.layer_for(
-                LayerIdentity(
-                    platform, "segmentation", segmentation.logical_key
-                )
-            )
-            if layer is None:
-                continue
-            loaded_regular_layers.append(layer)
-            if bool(getattr(layer, "visible", True)):
-                return segmentation
-        # A visible cell-type fill is itself a rendered mask and remains a valid
-        # picking gate when its separate boundary/outline layer is unloaded.
-        state = self._cell_type_states.get(str(platform).upper())
-        if state is not None:
-            sources = [state.segmentation]
-            sources.extend(
-                source.key
-                for source in CELL_TYPE_SOURCES
-                if source.key != state.segmentation
-            )
-            for source_key in sources:
-                layer = registry.layer_for(
-                    LayerIdentity(platform, "cell_types", source_key)
-                )
-                if layer is None or not bool(getattr(layer, "visible", True)):
-                    continue
-                segmentation = self._paired_segmentation_for_cell_type(
-                    platform,
-                    source_key,
-                )
-                if segmentation is not None and (
-                    assignment_source == "native" or segmentation.logical_key == candidates[0].logical_key
-                ):
-                    return segmentation
-        # Match standalone picking semantics: if no mask layer was loaded at
-        # all, the stored vector geometry can still be inspected.  A deliberately
-        # hidden loaded layer, however, suppresses picking.
-        if not loaded_regular_layers and candidates:
-            return candidates[0]
-        return None
+        selected = self._paired_segmentation_for_cell_type(platform, self._inspection_source(platform))
+        if selected is None:
+            return None
+        layers = [registry.layer_for(LayerIdentity(platform, "segmentation", seg.logical_key))
+                  for seg in profile.segmentations]
+        layers.extend(registry.layer_for(LayerIdentity(platform, "cell_types", source.key))
+                      for source in CELL_TYPE_SOURCES)
+        loaded = [layer for layer in layers if layer is not None]
+        return selected if not loaded or any(bool(layer.visible) for layer in loaded) else None
 
     def _replace_paired_selection_layer(self, platform: str) -> None:
         registry = self._paired_registry
@@ -10891,6 +10935,12 @@ class ComparisonViewerController:
             if registry.layer_for(identity) is not None:
                 registry.unload_layer(identity)
             return
+        existing = registry.layer_for(identity)
+        if existing is not None:
+            existing.data = paths
+            existing.edge_color = np.asarray(colors, dtype=float)
+            existing.metadata["selected_cell_ids"] = [str(item[0]) for item in selections]
+            return
         layer = napari.layers.Shapes(
             paths,
             shape_type="polygon",
@@ -10904,7 +10954,8 @@ class ComparisonViewerController:
             opacity=1.0,
             metadata={"selected_cell_ids": [str(item[0]) for item in selections]},
         )
-        registry.register_layer(identity, layer)
+        with self._preserve_active_layer():
+            registry.register_layer(identity, layer)
 
     def _paired_cell_panel_entry(
         self,
@@ -10920,37 +10971,40 @@ class ComparisonViewerController:
             geometry,
             color,
         )
-        index = self._get_cell_transcript_index(platform)
-        coords_yx, genes = index.transcripts_for(cell_id)
-        state = self._gene_inspector_states.get(platform)
-        visuals = state.gene_visuals if state is not None else {}
-        gene_rows = []
-        for gene, count in ranked_gene_counts(genes):
-            visual = visuals.get(gene) if visuals else None
-            rgba = (
-                tuple(visual.rgba)
-                if visual is not None
-                else (0.6, 0.6, 0.6, 1.0)
-            )
-            symbol = str(visual.symbol) if visual is not None else "disc"
-            gene_rows.append(
-                {
-                    "gene": gene,
-                    "count": int(count),
-                    "rgba": rgba,
-                    "glyph": GENE_STATUS_SYMBOL_GLYPHS.get(symbol, "●"),
-                }
-            )
-        entry.update(
-            {
-                "display_cell_id": f"{platform} · {cell_id}",
-                "coords_yx": np.asarray(coords_yx, dtype=float),
-                "gene_rows": gene_rows,
-                "total": int(len(genes)),
-                "loading": False,
-            }
-        )
+        cache_key = (platform, normalize_cell_key(cell_id), *self._inspection_identity(platform))
+        cached = getattr(self, "_paired_cell_payloads", {}).get(cache_key)
+        if cached is not None:
+            entry.update(cached)
+            entry.update(self._cell_type_annotation_for_cell(platform, cell_id, load=False))
+        entry["display_cell_id"] = f"{platform} · {cell_id}"
         return entry
+
+    def _update_paired_cell_links(self, platform: str, panels: list[dict]) -> None:
+        registry = self._paired_registry
+        if registry is None:
+            return
+        identity = LayerIdentity(platform, "selection", "transcript-links")
+        lines = []
+        for panel in panels:
+            centre = panel.get("centroid_yx")
+            if centre is None:
+                continue
+            lines.extend(np.asarray([point, centre], dtype=float)
+                         for point in panel.get("coords_yx", []))
+        if not lines:
+            if registry.layer_for(identity) is not None:
+                registry.unload_layer(identity)
+            return
+        existing = registry.layer_for(identity)
+        if existing is not None:
+            existing.data = lines
+            return
+        layer = napari.layers.Shapes(
+            lines, shape_type="line", name="cell transcript links",
+            edge_color="#ffffff", edge_width=CELL_LINK_WIDTH,
+            opacity=float(CELL_LINK_COLOR[3]))
+        with self._preserve_active_layer():
+            registry.register_layer(identity, layer)
 
     def _update_paired_cell_info_overlay(self) -> None:
         """Show both platforms' selected cells in the shared bottom dock."""
@@ -10973,6 +11027,9 @@ class ComparisonViewerController:
                         color,
                     )
                 )
+        for platform in ("MERSCOPE", "XENIUM"):
+            self._update_paired_cell_links(platform, [panel for panel in panels
+                if str(panel.get("display_cell_id", "")).startswith(platform + " · ")])
         if not panels:
             if self._cell_info_overlay is not None:
                 self._cell_info_overlay.set_cells([])
@@ -10982,10 +11039,18 @@ class ComparisonViewerController:
         if overlay is not None:
             overlay.set_cells(panels)
             self._show_cell_dock()
+        for entry in panels:
+            if entry.get("loading"):
+                platform = str(entry["display_cell_id"]).split(" · ")[0]
+                self._start_cell_selection_build(platform, entry["cell_id"], entry["geometry"], entry["color"])
 
     def _clear_paired_cell_selections(self) -> None:
         """Remove every paired selection layer and reset the shared cell dock."""
         self._paired_selected_cells = {"MERSCOPE": [], "XENIUM": []}
+        self._paired_cell_payloads = {}
+        if getattr(self, "_paired_session", None) is not None:
+            self._cell_inspection_generation = getattr(self, "_cell_inspection_generation", 0) + 1
+            self._cell_inspection_workers = {}
         registry = self._paired_registry
         if registry is not None:
             for key in list(registry.slot_keys):
@@ -11050,6 +11115,17 @@ class ComparisonViewerController:
                     world[0],
                     world[1],
                 )
+                if picked is None:
+                    target = session.sdata[platform].shapes[segmentation.shape_key]
+                    for other in session.contract.profile(platform).segmentations:
+                        layer = registry.layer_for(LayerIdentity(platform, "segmentation", other.logical_key))
+                        if layer is None or not bool(layer.visible):
+                            continue
+                        hit = pick_cell_at_point(session.sdata[platform].shapes[other.shape_key], *world)
+                        if hit is not None:
+                            picked = self._match_inspection_geometry(target, hit[1])
+                            if picked is not None:
+                                break
             except Exception as exc:
                 log.debug("%s paired cell pick failed: %s", platform, exc)
                 picked = None
@@ -11091,14 +11167,46 @@ class ComparisonViewerController:
         y_um, x_um = float(coords[-2]), float(coords[-1])
         return x_um, y_um
 
+    def _inspection_source(self, ds: str) -> str:
+        state = getattr(self, "_cell_type_states", {}).get(str(ds).upper())
+        return state.segmentation if state is not None else (
+            self._transcript_source_key(ds) if self._transcript_source_key(ds) != "native" else "proseg")
+
+    def _inspection_identity(self, ds: str) -> tuple[str, str]:
+        source = self._inspection_source(ds)
+        metadata = self._transcript_source_metadata(ds, source)
+        return source, str(metadata.get("analysis_id", "")) if metadata else ""
+
+    def _inspection_sdata(self, ds: str):
+        if self._paired_session is not None:
+            return self._paired_session.sdata[str(ds).upper()]
+        return self._active_sdata
+
+    def _inspection_shape(self, ds: str) -> str | None:
+        source = self._inspection_source(ds)
+        if getattr(self, "_paired_session", None) is not None:
+            segmentation = self._paired_segmentation_for_cell_type(ds, source)
+            return segmentation.shape_key if segmentation is not None else None
+        sdata = self._inspection_sdata(ds)
+        spec = cell_type_source(source)
+        metadata = self._transcript_source_metadata(ds, source)
+        if spec is not None and spec.method == "pciseq":
+            return str(metadata["shape"]) if metadata else None
+        keys = getattr(sdata, "shapes", {})
+        return next((key for key in (spec.mask_shape_keys if spec else ()) if key in keys), None)
+
     def _cell_inspector_shape_key(self) -> str | None:
-        """Resolve the segmentation GeoDataFrame to hit-test, preferring ProSeg."""
+        """Resolve the Cell type labels mask, with a legacy ProSeg fallback."""
         if self._active_sdata is None:
             return None
         ds = getattr(self, "active_dataset", None)
-        if ds is not None and self._transcript_source_key(ds) != "native":
-            metadata = self._transcript_source_metadata(ds)
-            return str(metadata["shape"]) if metadata is not None else None
+        if ds is not None:
+            shape = self._inspection_shape(ds)
+            if shape is not None:
+                return shape
+            spec = cell_type_source(self._inspection_source(ds))
+            if spec is not None and spec.method == "pciseq":
+                return None
         try:
             shape_keys = [str(k) for k in self._active_sdata.shapes.keys()]
         except Exception:
@@ -11112,12 +11220,7 @@ class ComparisonViewerController:
         return shape_keys[0]
 
     def _cell_inspector_layer(self):
-        """Return the rendered napari layer whose visibility gates cell picking.
-
-        This is the layer for the same segmentation the click hit-test uses
-        (ProSeg first, per :meth:`_cell_inspector_shape_key`), or ``None`` if it
-        isn't currently loaded.
-        """
+        """Return the boundary layer for the selected cell-type mask."""
         shape_key = self._cell_inspector_shape_key()
         if shape_key is None or self.active_dataset is None:
             return None
@@ -11141,13 +11244,14 @@ class ComparisonViewerController:
         return None
 
     def _cell_inspector_pickable(self) -> bool:
-        """Cells are clickable unless the gating segmentation layer is hidden.
-
-        Only blocks when that layer is present *and* not visible; if no such layer
-        is loaded there is nothing to hide, so picking behaves as before.
-        """
-        layer = self._cell_inspector_layer()
-        return layer is None or bool(getattr(layer, "visible", True))
+        """Any visible segmentation or cell-type fill permits inspection."""
+        ds = str(self.active_dataset).upper()
+        layers = [layer for layer in self.viewer.layers
+                  if str(getattr(layer, "name", "")).startswith((
+                      layer_name_prefix(ds, "labels"),
+                      layer_name_prefix(ds, "shapes"),
+                      layer_name_prefix(ds, "cell_types")))]
+        return not layers or any(bool(getattr(layer, "visible", True)) for layer in layers)
 
     def _on_segmentation_visibility_changed(self, _event=None):
         """Clear highlighted cells when the gating segmentation layer is hidden."""
@@ -11164,7 +11268,7 @@ class ComparisonViewerController:
                 self._clear_paired_cell_selections()
             return
         layer = self._cell_inspector_layer()
-        if layer is not None and not bool(getattr(layer, "visible", True)):
+        if not self._cell_inspector_pickable():
             if any(self._selected_cells.values()):
                 self._clear_all_cell_selections()
 
@@ -11178,7 +11282,23 @@ class ComparisonViewerController:
             return None
         try:
             gdf = self._active_sdata.shapes[shape_key]
-            return pick_cell_at_point(gdf, world[0], world[1])
+            picked = pick_cell_at_point(gdf, world[0], world[1])
+            if picked is not None:
+                return picked
+            # Clicking the protruding part of another visible mask still selects
+            # its corresponding cell in the chosen annotation segmentation.
+            for key, other in self._active_sdata.shapes.items():
+                if str(key) == shape_key:
+                    continue
+                names = (make_layer_name(self.active_dataset, "labels", self._label_key_for_shape_key(str(key))),
+                         make_layer_name(self.active_dataset, self._segmentation_layer_type(), str(key)))
+                if not any((layer := self._get_layer_by_name(name)) is not None
+                           and bool(layer.visible) for name in names):
+                    continue
+                hit = pick_cell_at_point(other, *world)
+                if hit is not None:
+                    return self._match_inspection_geometry(gdf, hit[1])
+            return None
         except Exception as exc:
             log.debug("Cell pick failed: %s", exc)
             return None
@@ -11186,58 +11306,8 @@ class ComparisonViewerController:
     def _cell_inspector_annotation_source(
         self, state: CellTypeOverlayState
     ) -> str | None:
-        """Choose annotations joined to the same masks the inspector picks.
-
-        Prefer the source currently selected in the Cell type labels panel when
-        it annotates the inspector mask. Otherwise use the first available
-        matching source (normally ProSeg reseg for ``MOSAIK_proseg``).
-        """
-        if self._paired_session is not None:
-            segmentation = self._paired_pick_segmentation(state.dataset)
-            if segmentation is None:
-                return None
-            selected = self._transcript_source_key(state.dataset)
-            candidates = ([selected] if selected != "native" else []) + [state.segmentation]
-            candidates.extend(
-                source.key
-                for source in CELL_TYPE_SOURCES
-                if source.key != state.segmentation
-            )
-            for key in candidates:
-                resolved = self._paired_segmentation_for_cell_type(
-                    state.dataset,
-                    key,
-                )
-                if (
-                    resolved is not None
-                    and resolved.logical_key == segmentation.logical_key
-                ):
-                    return str(key)
-            return None
-        shape_key = self._cell_inspector_shape_key()
-        if shape_key is None:
-            return None
-        session = self._dataset_sessions.get(state.dataset)
-        available = dict(session.cell_type_available) if session is not None else {}
-        selected = self._transcript_source_key(state.dataset)
-        candidates = ([selected] if selected != "native" else []) + [state.segmentation]
-        candidates.extend(
-            source.key
-            for source in CELL_TYPE_SOURCES
-            if source.key != state.segmentation
-        )
-        for key in candidates:
-            source = cell_type_source(key)
-            if source is None:
-                continue
-            metadata = self._transcript_source_metadata(state.dataset, key) if getattr(source, "method", "") == "pciseq" else None
-            shapes = (str(metadata["shape"]),) if metadata is not None else source.mask_shape_keys
-            if shape_key not in shapes:
-                continue
-            if available.get(key) is False and state.assignments.get(key) is None:
-                continue
-            return str(key)
-        return None
+        """Use the source selected in the Cell type labels tab."""
+        return state.segmentation
 
     @staticmethod
     def _unannotated_cell_type_fields() -> dict[str, object]:
@@ -11247,6 +11317,8 @@ class ComparisonViewerController:
             "fine_cell_type": "Unannotated",
             "broad_cell_type_rgba": neutral,
             "fine_cell_type_rgba": neutral,
+            "selected_cell_type": None,
+            "selected_cell_type_rgba": neutral,
         }
 
     def _cell_type_annotation_for_cell(
@@ -11295,6 +11367,15 @@ class ComparisonViewerController:
             "broad_cell_type_rgba": broad_scheme.colors.get(broad, neutral) if broad_scheme else neutral,
             "fine_cell_type_rgba": fine_scheme.colors.get(fine, neutral) if fine_scheme else neutral,
         }
+        result["selected_cell_type"] = None
+        result["selected_cell_type_rgba"] = result["fine_cell_type_rgba"]
+        selected_scheme = schemes.get(state.kind)
+        if selected_scheme is not None and state.kind not in ("broad", "fine"):
+            values = assignments.labels_for(state.kind)
+            if values is not None:
+                selected_label = str(values[labels[2]])
+                result["selected_cell_type"] = selected_label
+                result["selected_cell_type_rgba"] = selected_scheme.colors.get(selected_label, neutral)
         if getattr(cell_type_source(segmentation), "method", "") == "pciseq":
             result["annotation_method"] = "pciseq"
             row = labels[2] if len(labels) > 2 else None
@@ -11349,6 +11430,11 @@ class ComparisonViewerController:
     def _invalidate_cell_inspection(self, ds: str | None = None):
         """Drop cached cell index(es) and clear highlighted cells."""
         self._cell_inspection_generation += 1
+        if ds is None:
+            self._inspection_indexes = {}
+        else:
+            self._inspection_indexes = {key: value for key, value in
+                getattr(self, "_inspection_indexes", {}).items() if key[0] != str(ds).upper()}
         for worker in list(self._cell_inspection_workers.values()):
             try:
                 worker.quit()
@@ -11395,6 +11481,142 @@ class ComparisonViewerController:
             tuple((name, id(data), matrix.tobytes()) for name, data, matrix in image_specs),
         )
 
+    @staticmethod
+    def _match_inspection_geometry(gdf, geometry):
+        """Match masks by greatest positive overlap, never by unrelated row IDs."""
+        try:
+            positions = gdf.sindex.query(geometry, predicate="intersects")
+            candidates = gdf.iloc[positions]
+            if len(candidates) == 0:
+                return None
+            areas = candidates.geometry.intersection(geometry).area.to_numpy()
+            row = int(np.argmax(areas))
+            return (candidates.index[row], candidates.geometry.iloc[row]) if areas[row] > 0 else None
+        except Exception as exc:
+            log.debug("Mask correspondence failed: %s", exc)
+            return None
+
+    def _inspection_transcript_index(self, ds, cell_id, geometry, native_index):
+        """Use source assignments when provided, otherwise the selected polygon.
+
+        Cellpose/in-mask counts have no probabilistic assignment column. Their
+        transcripts are the measured points inside that mask, including points
+        assigned elsewhere by ProSeg.
+        """
+        source, analysis = self._inspection_identity(ds)
+        cache_key = (str(ds).upper(), source, analysis, normalize_cell_key(cell_id))
+        if not hasattr(self, "_inspection_indexes"):
+            self._inspection_indexes = {}
+        if cache_key in self._inspection_indexes:
+            return self._inspection_indexes[cache_key]
+        if (native_index.slices and (source, analysis) == self._transcript_source_identity(ds)
+                and source != "native"):
+            return native_index
+        sdata = self._inspection_sdata(ds)
+        spec = cell_type_source(source)
+        metadata = self._transcript_source_metadata(ds, source)
+        if spec is not None and spec.method == "pciseq" and metadata is None:
+            return self._empty_cell_transcript_index()
+        shape = self._inspection_shape(ds)
+        schema = getattr(sdata, "attrs", {}).get("merxen_schema", {})
+        branch = next((entry for entry in schema.get("segmentations", {}).values()
+                       if entry.get("shape") == shape), {})
+        paired = self._paired_session is not None
+        default_points = (self._paired_session.contract.profile(ds).points_key if paired
+                          else "transcripts" if "transcripts" in sdata.points else
+                          next((str(k) for k in sdata.points if not str(k).startswith("transcripts_pciseq_")), ""))
+        points_key = str((metadata or branch).get("points") or default_points)
+        try:
+            _, points, x, y, _ = self._resolve_points_columns_for(sdata, points_key)
+            gene = resolve_gene_column(points)
+            assignment = (metadata or branch).get("assignment_column")
+            if source == "proseg_mask":
+                assignment = None
+            if not branch and not metadata and source == "proseg":
+                if self._transcript_source_key(ds) == "native" and native_index.slices:
+                    return native_index
+                assignment = first_existing_col(points, ["assignment", "cell", "cell_id"])
+            if gene is None:
+                return self._empty_cell_transcript_index()
+            if (source == "proseg" and assignment == "assignment"
+                    and self._transcript_source_key(ds) == "native" and native_index.slices):
+                return native_index
+            if metadata and paired:
+                display = self._paired_assignment_display_input(ds, metadata)
+                if display is not None:
+                    _, measured, dx, dy, dg = display
+                    value = int(normalize_cell_key(cell_id)) if pd.api.types.is_numeric_dtype(points.dtypes[assignment]) else str(cell_id)
+                    points = points[points[assignment] == value]
+                    if hasattr(points, "compute"):
+                        points = points.compute()
+                    measured = measured[measured["transcript_id"].isin(points["transcript_id"].to_numpy())]
+                    if hasattr(measured, "compute"):
+                        measured = measured.compute()
+                    points = assignment_points_in_display_frame(
+                        points, measured, assignment_gene_col=gene,
+                        display_gene_col=dg, assignment_col=assignment,
+                        background_col=metadata["background_column"],
+                        status_col=metadata.get("status_column"), coordinate_cols=(dx, dy))
+                    x, y, gene = dx, dy, dg
+            if assignment:
+                # A cell click should not build a second whole-store index.
+                # Lazy column filtering keeps I/O bounded and reduces encoding
+                # and sorting to the few hundred transcripts for this cell.
+                value = cell_id
+                dtype = points.dtypes[assignment]
+                if pd.api.types.is_numeric_dtype(dtype):
+                    value = int(normalize_cell_key(cell_id))
+                else:
+                    value = str(cell_id)
+                selected = points[points[assignment] == value][[x, y, gene, assignment]]
+                index = build_cell_transcript_index(selected, x, y, gene, assignment)
+                self._inspection_indexes[cache_key] = index
+                return index
+            xmin, ymin, xmax, ymax = geometry.bounds
+            frame = points[(points[x] >= xmin) & (points[x] <= xmax)
+                           & (points[y] >= ymin) & (points[y] <= ymax)][[x, y, gene]]
+            if hasattr(frame, "compute"):
+                frame = frame.compute()
+            from shapely import intersects_xy
+            inside = intersects_xy(geometry, frame[x].to_numpy(), frame[y].to_numpy())
+            frame = frame.loc[inside].copy()
+            frame["_inspection_cell"] = cell_id
+            index = build_cell_transcript_index(frame, x, y, gene, "_inspection_cell")
+            self._inspection_indexes[cache_key] = index
+            return index
+        except Exception as exc:
+            raise RuntimeError(f"{ds} {source} transcript inspection failed: {exc}") from exc
+
+    def _inspection_intensities(self, ds, cell_id, geometry, specs):
+        sdata = self._inspection_sdata(ds)
+        cellpose_shape = "MOSAIK_cellpose"
+        if self._paired_session is not None:
+            segmentation = self._paired_segmentation_for_cell_type(ds, "cellpose")
+            cellpose_shape = segmentation.shape_key if segmentation else cellpose_shape
+        shapes = getattr(sdata, "shapes", {})
+        matched = None
+        if cellpose_shape in shapes:
+            if self._inspection_shape(ds) == cellpose_shape:
+                matched = self._shape_for_cell_id(shapes[cellpose_shape], cell_id)
+            else:
+                matched = self._match_inspection_geometry(shapes[cellpose_shape], geometry)
+        cfg = getattr(self, "datasets", {}).get(str(ds).upper())
+        if self._paired_session is not None:
+            cfg = self._paired_session.configs.get(str(ds).upper())
+        path = getattr(cfg, "zarr_path", None)
+        if path is not None and cellpose_quantification_table_available(path):
+            if matched is None:
+                return [(channel, None) for channel in cellpose_quantification_channel_labels(
+                    [f for f in cellpose_quantification_features(path) if f.statistic == "mean"])], None
+            label = normalize_cell_key(matched[0])
+            if label.startswith("cellpose_"):
+                label = label[len("cellpose_"):]
+            return cellpose_cell_mean_intensities(path, label), matched[0]
+        # Older stores can still calculate means, using the matched Cellpose
+        # polygon whenever available rather than the clicked ProSeg boundary.
+        return self._compute_cell_channel_intensities_from_specs(
+            matched[1] if matched is not None else geometry, specs), matched[0] if matched else None
+
     def _cell_selection_display(
         self,
         ds: str,
@@ -11410,6 +11632,7 @@ class ComparisonViewerController:
         key = str(ds).upper()
         if index is None:
             index = self._get_cell_transcript_index(ds)
+        index = self._inspection_transcript_index(ds, cell_id, geometry, index)
         coords_yx, genes = index.transcripts_for(cell_id)
 
         if gene_visuals is None:
@@ -11444,14 +11667,17 @@ class ComparisonViewerController:
 
         specs = self._cell_image_specs() if image_specs is None else list(image_specs)
         cache_key = self._cell_intensity_cache_key(key, cell_id, specs)
-        intensities = self._cell_intensity_cache.get(cache_key)
-        if intensities is None:
-            intensities = self._compute_cell_channel_intensities_from_specs(geometry, specs)
-            self._cell_intensity_cache[cache_key] = intensities
+        cache_key = (*cache_key, *self._inspection_identity(ds))
+        intensity_result = self._cell_intensity_cache.get(cache_key)
+        if intensity_result is None:
+            intensity_result = self._inspection_intensities(ds, cell_id, geometry, specs)
+            self._cell_intensity_cache[cache_key] = intensity_result
+        intensities, cellpose_id = intensity_result
 
         annotation = self._cell_type_annotation_for_cell(key, cell_id, load=True)
         return {
             "cell_id": cell_id,
+            "geometry": geometry,
             "color": str(color),
             "paths": self._polygon_to_napari_paths(geometry),
             "coords_yx": np.asarray(coords_yx, dtype=float),
@@ -11460,6 +11686,7 @@ class ComparisonViewerController:
             "total": int(len(genes)),
             "area": area_um2,
             "intensities": intensities,
+            "cellpose_cell_id": cellpose_id,
             "loading": False,
             **annotation,
         }
@@ -11481,6 +11708,7 @@ class ComparisonViewerController:
         )
         return {
             "cell_id": cell_id,
+            "geometry": geometry,
             "color": str(color),
             "paths": self._polygon_to_napari_paths(geometry),
             "coords_yx": np.empty((0, 2), dtype=float),
@@ -11512,7 +11740,6 @@ class ComparisonViewerController:
         index = self._cell_transcript_index.get(ds_key)
         if getattr(self, "_cell_transcript_index_sources", {}).get(ds_key, ("native", "")) != self._transcript_source_identity(ds_key):
             index = None
-        index_inputs = None if index is not None else self._cell_index_build_inputs()
         state = self._gene_inspector_states.get(ds_key)
         visuals = dict(state.gene_visuals) if state is not None else None
         image_specs = self._cell_image_specs()
@@ -11523,10 +11750,7 @@ class ComparisonViewerController:
             with self._store_io_slots:
                 local_index = index
                 if local_index is None:
-                    if index_inputs is None:
-                        local_index = self._empty_cell_transcript_index()
-                    else:
-                        local_index = build_cell_transcript_index(*index_inputs)
+                    local_index = self._empty_cell_transcript_index()
                 payload = self._cell_selection_display(
                     ds_key,
                     cell_id,
@@ -11570,13 +11794,20 @@ class ComparisonViewerController:
         payload: dict,
         index: CellTranscriptIndex,
     ):
+        if generation != self._cell_inspection_generation:
+            return
         self._cell_inspection_workers.pop(worker_key, None)
         ds, norm = worker_key[:2]
-        if generation != self._cell_inspection_generation or self.active_dataset != ds:
+        if self._paired_session is None and self.active_dataset != ds:
             return
         if len(worker_key) > 2 and tuple(worker_key[2:]) != self._transcript_source_identity(ds):
             return
-        self._cache_cell_transcript_index(ds, index, tuple(worker_key[2:]) if len(worker_key) > 2 else None)
+        if self._paired_session is not None:
+            if not hasattr(self, "_paired_cell_payloads"):
+                self._paired_cell_payloads = {}
+            self._paired_cell_payloads[(ds, norm, *self._inspection_identity(ds))] = payload
+            self._update_paired_cell_info_overlay()
+            return
         entries = self._selected_cells.get(ds, [])
         for entry in entries:
             if normalize_cell_key(entry.get("cell_id")) == norm:
@@ -11588,10 +11819,23 @@ class ComparisonViewerController:
     def _handle_cell_selection_error(
         self, generation: int, worker_key: tuple[str, str], exc
     ):
-        self._cell_inspection_workers.pop(worker_key, None)
         if generation != self._cell_inspection_generation:
             return
+        self._cell_inspection_workers.pop(worker_key, None)
         message = exc[1] if isinstance(exc, tuple) and len(exc) > 1 else exc
+        if self._paired_session is not None:
+            ds, norm = worker_key[:2]
+            if not hasattr(self, "_paired_cell_payloads"):
+                self._paired_cell_payloads = {}
+            self._paired_cell_payloads[(ds, norm, *self._inspection_identity(ds))] = {
+                "loading": False, "inspection_error": str(message)}
+            self._update_paired_cell_info_overlay()
+            self._set_status(str(message))
+            return
+        for entry in self._selected_cells.get(worker_key[0], []):
+            if normalize_cell_key(entry.get("cell_id")) == worker_key[1]:
+                entry.update(loading=False, inspection_error=str(message))
+        self._rebuild_cell_highlights(worker_key[0])
         self._set_status(f"{worker_key[0]} cell inspection failed: {message}")
         log.error("[%s] Cell inspection failed: %s", worker_key[0], message)
 
@@ -11677,8 +11921,30 @@ class ComparisonViewerController:
                 return um_per_px * outline_px * CELL_BOUNDARY_WIDTH_FACTOR
         return CELL_BOUNDARY_FALLBACK_WIDTH_UM
 
+    @contextmanager
+    def _preserve_active_layer(self):
+        """Inspection overlays must not activate new layer-control widgets."""
+        selection = getattr(self.viewer.layers, "selection", None)
+        events = getattr(selection, "events", None)
+        if selection is None or events is None or not hasattr(events, "blocker_all"):
+            yield
+            return
+        saved = list(selection)
+        active = selection.active
+        with events.blocker_all():
+            try:
+                yield
+            finally:
+                selection.clear()
+                selection.update(layer for layer in saved if layer in self.viewer.layers)
+                if active is None or active in self.viewer.layers:
+                    selection.active = active
+
+    def _add_inspection_shapes(self, *args, **kwargs):
+        with self._preserve_active_layer():
+            return self.viewer.add_shapes(*args, **kwargs)
+
     def _update_cell_boundary_layer(self, entries: list[dict]):
-        self._remove_layer_by_name(CELL_INSPECTOR_BOUNDARY_LAYER)
         all_paths: list[np.ndarray] = []
         edge_colors: list[np.ndarray] = []
         for entry in entries:
@@ -11686,10 +11952,18 @@ class ComparisonViewerController:
             for path in entry.get("paths", []):
                 all_paths.append(path)
                 edge_colors.append(rgba)
+        existing = self._get_layer_by_name(CELL_INSPECTOR_BOUNDARY_LAYER)
         if not all_paths:
+            if existing is not None:
+                existing.visible = False
+            return
+        if existing is not None:
+            existing.data = all_paths
+            existing.edge_color = np.asarray(edge_colors, dtype=float)
+            existing.visible = True
             return
         try:
-            self.viewer.add_shapes(
+            self._add_inspection_shapes(
                 all_paths,
                 shape_type="polygon",
                 name=CELL_INSPECTOR_BOUNDARY_LAYER,
@@ -11702,7 +11976,6 @@ class ComparisonViewerController:
             log.debug("Could not draw cell boundary highlight: %s", exc)
 
     def _update_cell_links_layer(self, entries: list[dict]):
-        self._remove_layer_by_name(CELL_INSPECTOR_LINKS_LAYER)
         lines: list[np.ndarray] = []
         for entry in entries:
             centroid_yx = entry.get("centroid_yx")
@@ -11712,10 +11985,17 @@ class ComparisonViewerController:
             cy, cx = float(centroid_yx[0]), float(centroid_yx[1])
             for y, x in np.asarray(coords, dtype=float):
                 lines.append(np.array([[float(y), float(x)], [cy, cx]], dtype=float))
+        existing = self._get_layer_by_name(CELL_INSPECTOR_LINKS_LAYER)
         if not lines:
+            if existing is not None:
+                existing.visible = False
+            return
+        if existing is not None:
+            existing.data = lines
+            existing.visible = True
             return
         try:
-            layer = self.viewer.add_shapes(
+            layer = self._add_inspection_shapes(
                 lines,
                 shape_type="line",
                 name=CELL_INSPECTOR_LINKS_LAYER,
@@ -11809,7 +12089,8 @@ class ComparisonViewerController:
         if self._cell_info_overlay is not None:
             return self._cell_info_overlay
         try:
-            widget = CellInfoOverlay()
+            parent = getattr(getattr(self.viewer, "window", None), "_qt_window", None)
+            widget = CellInfoOverlay(parent if isinstance(parent, QWidget) else None)
         except Exception as exc:
             log.debug("Could not create cell info overlay: %s", exc)
             return None
@@ -11820,9 +12101,21 @@ class ComparisonViewerController:
         if window is not None and hasattr(window, "add_dock_widget"):
             try:
                 dock = window.add_dock_widget(widget, area="bottom", name="Cell inspector")
+                if hasattr(dock, "setAttribute"):
+                    dock.setAttribute(Qt.WA_ShowWithoutActivating, True)
                 self._cell_info_dock = dock
                 visibility_changed = getattr(dock, "visibilityChanged", None)
                 if visibility_changed is not None:
+                    # napari replaces the custom titlebar with a native one and
+                    # back on every visibility change. On macOS that native
+                    # window churn can leave the current full-screen Space.
+                    # The inspector keeps its existing custom titlebar instead.
+                    native_titlebar_reset = getattr(dock, "_on_visibility_changed", None)
+                    if native_titlebar_reset is not None:
+                        try:
+                            visibility_changed.disconnect(native_titlebar_reset)
+                        except (TypeError, RuntimeError):
+                            pass
                     try:
                         visibility_changed.connect(self._on_cell_dock_visibility_changed)
                     except Exception:
@@ -11838,9 +12131,10 @@ class ComparisonViewerController:
         if dock is not None:
             self._suppress_dock_visibility = True
             try:
-                dock.show()
-                if hasattr(dock, "raise_"):
-                    dock.raise_()
+                # Repeated show/raise requests can switch macOS Spaces when
+                # the parent window is full screen. Updates need no activation.
+                if getattr(dock, "isHidden", lambda: True)():
+                    dock.show()
             except Exception:
                 pass
             finally:
@@ -11870,6 +12164,9 @@ class ComparisonViewerController:
         """
         if visible or self._suppress_dock_visibility:
             return
+        dock = self._cell_info_dock
+        if dock is not None and hasattr(dock, "isHidden") and not dock.isHidden():
+            return  # ancestor/Space visibility changed; the dock was not closed
         if (
             not self._selected_cells
             and not any(self._paired_selected_cells.values())
@@ -12662,6 +12959,8 @@ class ComparisonViewerController:
 
     def _set_paired_cell_type_segmentation(self, segmentation: str) -> None:
         states = self._paired_cell_type_states()
+        previous = {ds: list(items) for ds, items in self._paired_selected_cells.items()}
+        self._clear_paired_cell_selections()
         for state in states:
             state.segmentation = str(segmentation)
             self._load_cell_type_data(state, state.segmentation)
@@ -12687,6 +12986,14 @@ class ComparisonViewerController:
             return
         self._synchronize_paired_cell_type_schemes(available)
         self._publish_cell_type_levels()
+        for state in available:
+            shape = self._inspection_shape(state.dataset)
+            gdf = self._paired_session.sdata[state.dataset].shapes.get(shape)
+            if gdf is not None:
+                for _cell_id, geometry in previous.get(state.dataset, []):
+                    match = self._match_inspection_geometry(gdf, geometry)
+                    if match is not None:
+                        self._add_paired_cell_selection(state.dataset, *match)
         if available[0].kind:
             self._apply_paired_cell_type_layers(available)
             self._populate_paired_cell_type_panel(available)
@@ -12718,6 +13025,8 @@ class ComparisonViewerController:
         self._synchronize_paired_cell_type_schemes(tuple(available))
         added = self._apply_paired_cell_type_layers(tuple(available))
         self._populate_paired_cell_type_panel(tuple(available))
+        if any(self._paired_selected_cells.values()):
+            self._update_paired_cell_info_overlay()
         if added == len(states):
             self._set_status(
                 f"Applied {kind} cell-type colouring to both paired datasets."
@@ -12736,6 +13045,7 @@ class ComparisonViewerController:
             )
             return
         state = self._cell_type_state(dataset_name)
+        previous = list(self._selected_cells.get(state.dataset, []))
         self._cell_type_generation += 1
         token = self._task_cancel_events.get("cell-types")
         if token is not None:
@@ -12743,6 +13053,7 @@ class ComparisonViewerController:
         self._remove_layers_by_prefix(layer_name_prefix(state.dataset, "cell_types"))
         state.layer_name = None
         state.segmentation = str(segmentation)
+        self._invalidate_cell_inspection(state.dataset)
         if not self._load_cell_type_data(state, state.segmentation):
             self._set_status(
                 f"{state.dataset}: no cell-type annotations for {state.segmentation} segmentation."
@@ -12751,6 +13062,15 @@ class ComparisonViewerController:
                 self._cell_type_widget.set_dataset(state.dataset)
             return
         self._publish_cell_type_levels()
+        shape_key = self._inspection_shape(state.dataset)
+        gdf = self._active_sdata.shapes.get(shape_key) if shape_key else None
+        if gdf is not None:
+            for entry in previous:
+                geometry = entry.get("geometry")
+                if geometry is not None:
+                    match = self._match_inspection_geometry(gdf, geometry)
+                    if match is not None:
+                        self._add_cell_selection(state.dataset, *match)
         self._refresh_cell_selection_annotations(state.dataset)
         # Re-colour for the new segmentation only when a level is already active.
         if state.kind:
@@ -12780,6 +13100,7 @@ class ComparisonViewerController:
             return
         self._populate_cell_type_panel(state)
         self._start_cell_type_overlay_build(state)
+        self._refresh_cell_selection_annotations(state.dataset)
         self._sync_umap_from_cell_types(state.segmentation, state.kind)
 
     def set_cell_type_visible(self, dataset_name: str, label: str, on: bool):
@@ -15689,6 +16010,9 @@ def main():
         controller._registration_close_guard = registration_close_guard  # keep alive
 
     controller.install_canvas_overlays()
+    # Register the hidden inspector before the user enters full screen; clicks
+    # then reveal/update an existing child dock rather than adding a new one.
+    controller._ensure_cell_info_overlay()
     if initial_pair:
         controller.load_paired_dataset(
             datasets["MERSCOPE"].zarr_path,

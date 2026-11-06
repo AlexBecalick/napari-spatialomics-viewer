@@ -392,14 +392,13 @@ def test_left_panel_adapter_collapses_controls_and_aggregates_gene_rows(qapp):
     }
     assert hidden_names == {"Genes | Disc", "Genes | Ring"}
     assert not adapter.gene_row.isHidden()
-    # The native layer list consumes spare dock height instead of being capped
-    # to its current rows; the separate aggregate remains immediately below it.
-    assert layer_view.maximumHeight() == 16777215
+    # The list ends after its visible rows so Genes follows the last layer.
+    assert layer_view.maximumHeight() < 16777215
     assert (
         layer_view.sizePolicy().verticalPolicy()
         == layer_view.sizePolicy().Expanding
     )
-    assert layer_layout.stretch(layer_layout.indexOf(layer_view)) == 1
+    assert layer_layout.stretch(layer_layout.indexOf(layer_view)) == 0
     assert layer_layout.indexOf(adapter.rotation_control) == 3
     assert adapter.rotation_slider.minimum() == 0
     assert adapter.rotation_slider.maximum() == 36000
@@ -412,8 +411,51 @@ def test_left_panel_adapter_collapses_controls_and_aggregates_gene_rows(qapp):
     assert not layer_buttons.deleteButton.isHidden()
     assert viewer_buttons.consoleButton.isHidden()
     assert not viewer_buttons.resetViewButton.isHidden()
+    home = viewer_buttons.resetViewButton
+    assert home.parentWidget() is layer_buttons
+    assert layer_buttons.layout().indexOf(home) + 1 == layer_buttons.layout().indexOf(layer_buttons.deleteButton)
+    assert home.size() == layer_buttons.deleteButton.sizeHint()
+    assert viewer_buttons.isHidden()
     assert not adapter._layer_controls_expanded
     assert controls.isHidden()
+
+    viewer.window._qt_viewer.dockLayerList.resize(400, 650)
+    viewer.window._qt_viewer.dockLayerList.show()
+    qapp.processEvents()
+    adapter._refresh_gene_presentation()
+    qapp.processEvents()
+    original_top = adapter._gene_rows_container.y()
+    assert layer_view.verticalScrollBar().maximum() == 0
+    # A few rows should all fit even when there is more room below Genes.
+    extras = [model.add_image(np.zeros((2, 2)), name=f"Image | Extra {i}") for i in range(5)]
+    qapp.processEvents()
+    adapter._refresh_gene_presentation()
+    qapp.processEvents()
+    assert layer_view.verticalScrollBar().maximum() == 0
+    # Only a list that exceeds the actual available dock height should scroll.
+    overflow = [model.add_image(np.zeros((2, 2)), name=f"Image | Overflow {i}") for i in range(20)]
+    qapp.processEvents()
+    adapter._refresh_gene_presentation()
+    qapp.processEvents()
+    assert layer_view.verticalScrollBar().maximum() > 0
+    for extra in extras + overflow:
+        model.layers.remove(extra)
+    qapp.processEvents()
+    adapter._refresh_gene_presentation()
+    qapp.processEvents()
+    added = model.add_image(np.zeros((2, 2)), name="Image | Extra")
+    qapp.processEvents()
+    adapter._refresh_gene_presentation()
+    qapp.processEvents()
+    assert adapter._gene_rows_container.y() > original_top
+    model.layers.remove(added)
+    qapp.processEvents()
+    adapter._refresh_gene_presentation()
+    qapp.processEvents()
+    assert adapter._gene_rows_container.y() == original_top
+    assert (adapter._gene_rows_container.y() - layer_view.geometry().bottom()
+            <= layer_layout.spacing() + 2)
+    viewer.window._qt_viewer.dockLayerList.hide()
 
     merscope_genes = [
         attach_layer_identity(
@@ -627,3 +669,45 @@ def test_spatialdata_explorer_button_opens_its_tab(qapp):
     assert panel._tab_stack.currentWidget() is panel.spatialdata_explorer
     assert button.isChecked()
     panel.close()
+
+
+def test_docks_allow_small_window_and_keep_status_and_scale_visible(qapp):
+    from qtpy.QtCore import Qt
+    from qtpy.QtWidgets import QMainWindow, QDockWidget, QWidget
+    registration = V.ManualRegistrationWidget()
+    registration.set_session('prepared', 'Example')
+    panel = _panel([], registration_widget=registration)
+    window = QMainWindow()
+    canvas = QWidget()
+    window.setCentralWidget(canvas)
+    controls = QDockWidget('Controls', window)
+    controls.setWidget(panel)
+    window.addDockWidget(Qt.RightDockWidgetArea, controls)
+    inspector = V.CellInfoOverlay()
+    inspector.set_cells([{'cell_id': 1, 'intensities': [('DAPI', 10.)]}])
+    bottom = QDockWidget('Cell inspector', window)
+    bottom.setWidget(inspector)
+    window.addDockWidget(Qt.BottomDockWidgetArea, bottom)
+    window.statusBar().showMessage('Ready')
+    bar = V.ScaleBarOverlay(canvas)
+    bar.show()
+    window.resize(1100, 800)
+    window.show()
+    qapp.processEvents()
+    # Hidden registration controls must not force a tall window on other tabs.
+    assert window.minimumSizeHint().height() < 600
+    for height in (650, 900, 600):
+        window.resize(1000, height)
+        qapp.processEvents()
+        bar.reposition()
+        assert window.height() == height
+        assert canvas.rect().contains(bar.geometry())
+        assert window.rect().contains(window.statusBar().geometry())
+        assert panel.rect().contains(panel._status_label.geometry())
+    panel._tab_stack.setCurrentIndex(panel._registration_tab_index)
+    qapp.processEvents()
+    window.resize(1000, 600)
+    qapp.processEvents()
+    assert window.height() == 600
+    window.close()
+    window.deleteLater()

@@ -12,7 +12,7 @@ import math
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 
-from qtpy.QtCore import QItemSelectionModel, Qt, Signal
+from qtpy.QtCore import QEvent, QItemSelectionModel, Qt, Signal
 from qtpy.QtGui import QBrush, QColor
 from qtpy.QtWidgets import (
     QAbstractItemView,
@@ -26,8 +26,8 @@ from qtpy.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QScrollArea,
     QSpinBox,
+    QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -175,20 +175,22 @@ class ManualRegistrationWidget(QWidget):
         self._crop_outside: dict[str, int] = {r: 0 for r in ROLES}
         self._build()
         self.set_session(None, "")
+        for spin in self.findChildren(QSpinBox) + self.findChildren(QDoubleSpinBox):
+            spin.installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        # Trackpads should never alter an alignment while moving through controls.
+        if event.type() == QEvent.Wheel and isinstance(obj, (QSpinBox, QDoubleSpinBox)):
+            event.ignore()
+            return True
+        return super().eventFilter(obj, event)
 
     # ------------------------------------------------------------------ construction
 
     def _build(self) -> None:
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
-        scroll = QScrollArea(self)
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
-        outer.addWidget(scroll)
-        content = QWidget()
-        scroll.setWidget(content)
-        self._scroll = scroll
-        layout = QVBoxLayout(content)
+        layout = outer
         layout.setContentsMargins(6, 6, 6, 6)
         layout.setSpacing(8)
 
@@ -199,7 +201,15 @@ class ManualRegistrationWidget(QWidget):
         editing = QVBoxLayout(self._editing_box)
         editing.setContentsMargins(0, 0, 0, 0)
         editing.setSpacing(8)
-        editing.addWidget(self._build_crop())
+        crop = self._build_crop()
+        crop_toggle = QPushButton("Crop settings ▸")
+        crop_toggle.setCheckable(True)
+        crop_toggle.toggled.connect(crop.setVisible)
+        crop_toggle.toggled.connect(lambda checked: crop_toggle.setText(
+            "Crop settings ▾" if checked else "Crop settings ▸"))
+        editing.addWidget(crop_toggle)
+        crop.hide()
+        editing.addWidget(crop)
         editing.addWidget(self._build_coarse())
         editing.addWidget(self._build_landmarks())
         editing.addWidget(self._build_preview())
@@ -208,6 +218,11 @@ class ManualRegistrationWidget(QWidget):
 
         layout.addWidget(self._build_result())
         layout.addStretch(1)
+        # Spend the dock height on controls, with the landmark table absorbing
+        # extra room. Compact group padding avoids imposing a screen-sized minimum.
+        for child_layout in self.findChildren(QVBoxLayout) + self.findChildren(QHBoxLayout):
+            child_layout.setContentsMargins(4, 2, 4, 2)
+            child_layout.setSpacing(3)
 
     def _build_status(self) -> QWidget:
         box = QWidget()
@@ -247,7 +262,7 @@ class ManualRegistrationWidget(QWidget):
         self._flick_button = QPushButton("Flick (F)")
         self._flick_button.setToolTip("F flicks between the images; hold Shift+F to peek")
         self._flick_button.clicked.connect(self._on_flick)
-        lay.addWidget(self._flick_button)
+        row.addWidget(self._flick_button)
         self._auto_switch_check = QCheckBox("Auto-switch after each click")
         self._auto_switch_check.setChecked(True)
         self._auto_switch_check.toggled.connect(self._on_auto_switch)
@@ -298,7 +313,7 @@ class ManualRegistrationWidget(QWidget):
         self._coarse_box = QGroupBox("Coarse alignment")
         lay = QVBoxLayout(self._coarse_box)
 
-        lay.addWidget(QLabel("Rotation (counter-clockwise on screen)"))
+        lay.addWidget(QLabel("Rotation (counter-clockwise)"))
         self._rotation_spin = _AngleSpinBox()
         self._rotation_spin.setRange(-180.0, 180.0)
         self._rotation_spin.setWrapping(True)
@@ -312,15 +327,19 @@ class ManualRegistrationWidget(QWidget):
         self._rotate_buttons: dict[float, QPushButton] = {}
         for step in _ROTATE_STEPS:
             button = QPushButton(_ROTATE_LABELS[step])
+            button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+            button.setMinimumWidth(28)
             button.clicked.connect(lambda _=False, s=step: self._on_rotate(s))
             self._rotate_buttons[step] = button
             row.addWidget(button)
         lay.addLayout(row)
         self._rotate_180_button = QPushButton("180°")
         self._rotate_180_button.clicked.connect(lambda _=False: self._on_rotate(180.0))
-        lay.addWidget(self._rotate_180_button)
+        self._rotate_180_button.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self._rotate_180_button.setMinimumWidth(28)
+        row.addWidget(self._rotate_180_button)
 
-        lay.addWidget(QLabel("Offset of the moving centre from the reference centre"))
+        lay.addWidget(QLabel("Moving centre offset"))
         offset_row = QHBoxLayout()
         self._offset_x_spin = self._make_offset_spin("x ")
         self._offset_y_spin = self._make_offset_spin("y ")
@@ -330,7 +349,7 @@ class ManualRegistrationWidget(QWidget):
         offset_row.addWidget(self._offset_y_spin)
         lay.addLayout(offset_row)
 
-        grid = QGridLayout()
+        grid = QHBoxLayout()
         self._shift_buttons: dict[str, QPushButton] = {}
         for key, text, (r, c) in (
             ("up", "↑", (0, 1)),
@@ -341,12 +360,12 @@ class ManualRegistrationWidget(QWidget):
             button = QPushButton(text)
             button.clicked.connect(lambda _=False, k=key: self._on_shift(k))
             self._shift_buttons[key] = button
-            grid.addWidget(button, r, c)
+            grid.addWidget(button)
         self._shift_step_combo = QComboBox()
         for step in _SHIFT_STEPS_UM:
             self._shift_step_combo.addItem(f"{step:g} µm", step)
         self._shift_step_combo.setCurrentIndex(_SHIFT_STEPS_UM.index(100.0))
-        grid.addWidget(self._shift_step_combo, 1, 1)
+        grid.insertWidget(2, self._shift_step_combo)
         lay.addLayout(grid)
 
         flip_row = QHBoxLayout()
@@ -391,7 +410,7 @@ class ManualRegistrationWidget(QWidget):
         self._table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._table.verticalHeader().setVisible(False)
-        self._table.setMinimumHeight(160)
+        self._table.setMinimumHeight(90)
         self._table.cellClicked.connect(self._on_table_clicked)
         self._table.itemChanged.connect(self._on_table_item_changed)
         self._table.itemSelectionChanged.connect(self._update_delete_enabled)
@@ -432,7 +451,8 @@ class ManualRegistrationWidget(QWidget):
             "Preview matches the register run only at the preset's floor (same 10 µm, serial 30 µm)"
         )
         self._floor_hint.setWordWrap(True)
-        lay.addWidget(self._floor_hint)
+        self._floor_spin.setToolTip(self._floor_hint.text())
+        self._floor_hint.hide()
 
         self._summary_label = QLabel("A fit needs at least 2 enabled pairs.")
         self._summary_label.setWordWrap(True)
@@ -566,6 +586,7 @@ class ManualRegistrationWidget(QWidget):
         else:
             text = ""
         self._prompt_label.setText(text)
+        self._prompt_label.setVisible(bool(text))
 
     def _update_crop_labels(self, role: str, *, invalid: bool = False) -> None:
         label = self._crop_labels[role]
@@ -637,6 +658,8 @@ class ManualRegistrationWidget(QWidget):
                 self._title_label.setText(title)
                 if changed:
                     self._status_label.setText("")
+            self._status_label.setVisible(bool(self._status_label.text()))
+            self._title_label.setVisible(bool(self._title_label.text()))
             self._update_prompt()
             self._refresh_enabled()
 
@@ -822,6 +845,7 @@ class ManualRegistrationWidget(QWidget):
         with self._quiet():
             prefix = "● unsaved changes · " if dirty else ""
             self._status_label.setText(prefix + status_text)
+            self._status_label.setVisible(bool(self._status_label.text()))
 
     def set_busy(self, busy: bool) -> None:
         """Disable saving, crops, coarse and landmark sections while a save runs."""

@@ -368,6 +368,19 @@ def load_cellpose_quantification_values(
     return CellposeQuantificationValues(feature=feature, label_ids=label_ids, values=values)
 
 
+def cellpose_cell_mean_intensities(zarr_path, label_id) -> list[tuple[str, float | None]]:
+    """Read only one Cellpose row, retaining image-qualified channel names."""
+    root = open_zarr_group_unconsolidated(zarr_path)
+    table = _cellpose_quantification_table(root)
+    features = _cellpose_quantification_features_from_table(table)
+    labels = cellpose_quantification_channel_labels(features)
+    matches = np.flatnonzero(np.asarray(table["obs/label_id"][:]).astype(str) == str(label_id))
+    row = np.asarray(table["X"][int(matches[0]), :]) if matches.size else None
+    return [(label, float(row[feature.column_index])
+             if row is not None and np.isfinite(row[feature.column_index]) else None)
+            for label, feature in zip(labels, features) if feature.statistic == "mean"]
+
+
 def cellpose_value_clip_range(
     values,
     lower_percentile: float = CELLPOSE_VALUE_CLIP_PERCENTILES[0],

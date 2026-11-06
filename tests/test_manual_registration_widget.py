@@ -425,3 +425,26 @@ def test_rotation_spin_arrows_cross_180(qapp):
     rec.pop()
     w._rotation_spin.stepBy(-1)
     assert rec.pop() == [("rotation_set", (180.0,))]
+
+
+def test_registration_has_no_nested_scroll_area_and_wheel_does_not_edit(widget, qapp):
+    from qtpy.QtCore import QPoint, QPointF, Qt
+    from qtpy.QtGui import QWheelEvent
+    from qtpy.QtWidgets import QApplication, QDoubleSpinBox, QScrollArea
+    assert not widget.findChildren(QScrollArea)
+    spin = widget.findChildren(QDoubleSpinBox)[0]
+    spin.setValue(10)
+    wheel = QWheelEvent(QPointF(5, 5), QPointF(5, 5), QPoint(), QPoint(0, 120),
+                        Qt.NoButton, Qt.NoModifier, Qt.NoScrollPhase, False)
+    QApplication.sendEvent(spin, wheel)
+    assert spin.value() == 10
+
+
+def test_registration_controls_fit_window_height(widget, qapp):
+    widget.set_session('prepared', 'Example pair')
+    widget.resize(500, 850)
+    widget.show()
+    qapp.processEvents()
+    assert widget.minimumSizeHint().height() <= 850
+    assert widget._finish_button.mapTo(widget, widget._finish_button.rect().bottomLeft()).y() < widget.height()
+    widget.close()

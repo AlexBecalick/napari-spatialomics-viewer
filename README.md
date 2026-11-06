@@ -281,9 +281,9 @@ outline view. Paired mode only reads the materialized labels or outlines named
 by the validated MerXen contract and never takes this cache-generation path.
 
 Clicking inside a cell mask highlights that cell (repeated clicks accumulate
-highlights). This is gated on the **ProSeg** (cell-inspector) layer's visibility:
-hiding that layer in the napari layer list disables click-to-highlight and clears
-any current highlights, and showing it again re-enables clicking.
+highlights). Any visible segmentation mask or cell-type fill permits picking;
+hiding ProSeg alone does not disable it. The selected source in **Cell type labels**
+determines the inspected cell, its annotation, and its transcript links.
 
 The transcript renderer still uses one real napari Points layer for each marker
 symbol behind the scenes, but those implementation layers are hidden from the
@@ -441,7 +441,43 @@ and its broad and fine cell-type annotations in napari's status bar. This
 readout remains active whether or not the Cell inspector dock is open. Clicking
 a cell adds its exact transcript and image summary to that dock; the broad and
 fine annotations appear directly below the Cell ID using the same colours as
-the corresponding entries in the **Cell type labels** panel.
+the corresponding entries in the **Cell type labels** panel. Choosing another
+**Colour by** level also shows that level's label. Changing segmentation rematches
+selected cells by greatest polygon overlap and rebuilds their summaries.
+
+ProSeg and pciSeq use their registered transcript assignments. Cellpose and
+in-mask sources count measured transcripts inside the selected polygon. These
+inspector assignments follow **Cell type labels** independently of the Gene
+inspector's assignment-source control.
+
+Mean intensities come from the stored Cellpose image quantification, using the
+Cellpose polygon with the greatest positive overlap with the selected cell. The
+matched Cellpose ID is shown alongside the measurements; unmatched cells remain
+unavailable. Older stores without quantification fall back to measuring loaded
+images within the matched Cellpose mask. The compact bottom dock grows to fit
+labels and intensities; the shorter transcript list scrolls independently.
+
+Manual registration uses a single viewport filling the control-panel height,
+with scrolling available when the window is too small for the form. Optional
+crop controls expand via **Crop settings**. Mouse-wheel gestures do not edit
+numeric registration values. Inactive tabs and the inspector do not force the
+window to remain tall; the inspector can scroll when screen space is limited.
+The Genes control follows the last visible layer row as layers are added or
+removed. Layer rows use the available dock height before scrolling. Cell panels
+size their statistics to their content and their gene columns to the initially
+visible rows. Long gene names farther down the list remain available through
+that list's horizontal scrollbar without widening the whole cell panel. Home
+sits beside the bin in the left toolbar at the same size.
+
+Inspector updates reuse existing panels and highlight layers, preserve the
+active layer, and keep the custom dock titlebar instead of swapping native
+titlebars on visibility changes. Inspector updates do not activate or raise
+the dock, to preserve the current macOS full-screen Space.
+
+Cell inspection reuses a matching loaded transcript index when available;
+otherwise it reads the selected cell's assignments instead of constructing a
+second index for the whole store. Both standalone and paired cell statistics
+load in background workers, with a loading panel shown immediately.
 
 ```bash
 napari-compare-xenium-merscope ... \
@@ -544,7 +580,7 @@ and stays above the viewer.
   inspector panel, and the view pans to it (untick **Centre the spatial view
   on cells picked in the UMAP** to turn off the panning). When the UMAP's source
   uses different masks from the cell inspector (e.g. a Cellpose UMAP while
-  clicks pick ProSeg cells), the selection is matched by location: the cell
+  **Cell type labels** selects ProSeg), the selection is matched by location: the cell
   whose mask contains the other cell's centre.
 
 Scroll to zoom, drag to pan, and double-click (or **Reset view**) to fit the
