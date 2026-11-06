@@ -168,6 +168,7 @@ class TranscriptCacheRequest:
     analysis_id: str = ""
     status_col: str | None = None
     coordinate_points_key: str | None = None
+    is_gene_col: str | None = None
 
     @classmethod
     def create(
@@ -187,6 +188,7 @@ class TranscriptCacheRequest:
         analysis_id: str = "",
         status_col: str | None = None,
         coordinate_points_key: str | None = None,
+        is_gene_col: str | None = None,
     ) -> "TranscriptCacheRequest | None":
         """Create a request for a readable local SpatialData points element.
 
@@ -259,6 +261,10 @@ class TranscriptCacheRequest:
             family_identity["assignment_source"] = str(assignment_source)
             family_identity["analysis_id"] = str(analysis_id)
             family_identity["columns"]["status"] = status_col
+        if is_gene_col is not None:
+            # The control set then comes from the column; keep the address of
+            # every name-only build unchanged.
+            family_identity["columns"]["is_gene"] = str(is_gene_col)
         identity = {**family_identity, "point_tree": tree}
         if coordinate_tree is not None:
             family_identity["coordinate_points_key"] = str(coordinate_points_key)
@@ -282,6 +288,7 @@ class TranscriptCacheRequest:
             analysis_id=str(analysis_id),
             status_col=status_col,
             coordinate_points_key=coordinate_points_key,
+            is_gene_col=None if is_gene_col is None else str(is_gene_col),
         )
 
     @property
@@ -914,6 +921,7 @@ def make_transcript_cache_request(
     analysis_id: str = "",
     status_col: str | None = None,
     coordinate_points_key: str | None = None,
+    is_gene_col: str | None = None,
 ) -> TranscriptCacheRequest | None:
     """Return the cache request corresponding to one viewer transcript build."""
     return TranscriptCacheRequest.create(
@@ -932,6 +940,7 @@ def make_transcript_cache_request(
         analysis_id=analysis_id,
         status_col=status_col,
         coordinate_points_key=coordinate_points_key,
+        is_gene_col=is_gene_col,
     )
 
 

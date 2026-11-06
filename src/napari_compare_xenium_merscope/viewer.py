@@ -11603,6 +11603,9 @@ class ComparisonViewerController:
         if self._uses_lazy_cell_queries(ds):
             # The eager build would stream every transcript row of an Atera store
             # (~1.4e9) and the marker-reference lookup would read the whole table X.
+            # M7's lazy store must take its control set from the points' is_gene
+            # column via utils.control_genes_from_is_gene (as build_gene_point_groups
+            # does with is_gene_col), not from the name rule alone.
             self._set_status(
                 f"{platform_display_name(self._config_platform(ds, self.datasets.get(ds)))} "
                 "transcripts: lazy engine not available yet"

@@ -25,6 +25,7 @@ from napari_compare_xenium_merscope.utils import (
     GeneSlotAllocator,
     assign_gene_visuals,
     build_gene_point_groups,
+    control_genes_from_is_gene,
     gene_palette_rgba,
     is_control_gene,
     load_cell_type_marker_reference,
@@ -120,6 +121,85 @@ def test_is_control_gene_covers_the_five_atera_families_and_matches_is_gene():
     names = np.asarray(atera_stores.FEATURE_DICTIONARY)[frame["code"].to_numpy()]
     flagged = np.fromiter((is_control_gene(n) for n in names), dtype=bool, count=len(names))
     np.testing.assert_array_equal(flagged, ~frame["is_gene"].to_numpy(bool))
+
+
+def test_control_genes_from_is_gene_trusts_the_flag_and_warns_on_disagreement(caplog):
+    names = ["AAA", "MYSTERY1", "Blank-1", "NegControlProbe_00001", "UNFLAGGED_Blank"]
+    flags = {"AAA": True, "MYSTERY1": False, "Blank-1": False, "NegControlProbe_00001": True}
+    with caplog.at_level("WARNING", logger="napari_compare_utils"):
+        controls = control_genes_from_is_gene(names, flags, source="test")
+    # The flag wins both ways; an unflagged name falls back to the name rule.
+    assert controls == {"MYSTERY1", "Blank-1", "UNFLAGGED_Blank"}
+    text = caplog.text
+    assert "is_gene disagrees" in text and "MYSTERY1" in text and "NegControlProbe_00001" in text
+    caplog.clear()
+    # Agreement is silent; no flags is exactly the name rule (Xenium/MERSCOPE).
+    with caplog.at_level("WARNING", logger="napari_compare_utils"):
+        assert control_genes_from_is_gene(["AAA", "Blank-1"], {"AAA": True, "Blank-1": False}) == {"Blank-1"}
+        assert control_genes_from_is_gene(names, None) == {
+            n for n in names if is_control_gene(n)
+        }
+    assert "is_gene disagrees" not in caplog.text
+
+
+def _is_gene_frame():
+    return pd.DataFrame(
+        {
+            "x": np.arange(8, dtype=float),
+            "y": np.arange(8, dtype=float),
+            "feature_name": ["AAA", "AAA", "BBB", "MYSTERY1", "MYSTERY1", "Blank-1", "BBB", "CCC"],
+            # MYSTERY1 has a gene-like name but is a control by the vendor flag.
+            "is_gene": [True, True, True, False, False, False, True, True],
+        }
+    )
+
+
+def test_point_store_takes_controls_from_the_is_gene_column(caplog):
+    frame = _is_gene_frame()
+    with caplog.at_level("WARNING", logger="napari_compare_utils"):
+        store = build_gene_point_groups(frame, "x", "y", "feature_name", is_gene_col="is_gene")
+    assert store.control_genes == {"MYSTERY1", "Blank-1"}
+    assert "MYSTERY1" in caplog.text
+    # Without the column hook the name rule alone is used (unchanged behaviour).
+    plain = build_gene_point_groups(frame, "x", "y", "feature_name")
+    assert plain.control_genes == {"Blank-1"}
+
+
+def test_point_store_controls_match_is_gene_on_the_synthetic_atera_frame():
+    frame = atera_stores.synthetic_transcripts()
+    names = np.asarray(atera_stores.FEATURE_DICTIONARY)[frame["code"].to_numpy()]
+    points = pd.DataFrame(
+        {"x": frame["x"].to_numpy(float), "y": frame["y"].to_numpy(float),
+         "feature_name": names, "is_gene": frame["is_gene"].to_numpy(bool)}
+    )
+    store = build_gene_point_groups(points, "x", "y", "feature_name", is_gene_col="is_gene", max_points=10)
+    assert store.control_genes == set(names[~points["is_gene"].to_numpy(bool)].tolist())
+
+
+def test_selection_layout_files_an_is_gene_false_feature_under_the_control_heading():
+    store = build_gene_point_groups(_is_gene_frame(), "x", "y", "feature_name", is_gene_col="is_gene")
+    state = V.GeneInspectorState(
+        dataset="ATERA", points_key="transcripts", store=store, gene_visuals={},
+        layer_names=[], enabled_genes=set(), spot_size=1.0,
+        panel_mode=P.GENE_PANEL_MODE_SELECTION,
+    )
+    # The scheme layout files MYSTERY1 among the genes (its name is not a control).
+    layout = [
+        ("header", "Neuron", (0.2, 0.3, 0.9, 1.0)),
+        ("gene", "AAA"), ("gene", "MYSTERY1"), ("gene", "BBB"),
+        ("header", "Unclassified", (0.5, 0.5, 0.5, 1.0)),
+        ("gene", "CCC"),
+        ("header", CONTROL_GROUP_TITLE, (0.6, 0.6, 0.6, 1.0)),
+        ("gene", "Blank-1"),
+    ]
+    out = V.ComparisonViewerController._selection_gene_layout(
+        types.SimpleNamespace(_gene_control_set=V.ComparisonViewerController._gene_control_set),
+        state, layout,
+    )
+    heading = out.index(("header", CONTROL_GROUP_TITLE, (0.6, 0.6, 0.6, 1.0)))
+    assert [e[1] for e in out[heading + 1:]] == ["Blank-1", "MYSTERY1"]
+    assert ("gene", "MYSTERY1") not in out[:heading]
+    assert [e[1] for e in out[:heading] if e[0] == "gene"] == ["AAA", "BBB", "CCC"]
 
 
 def _write_marker_tables(path):

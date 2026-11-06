@@ -2475,6 +2475,85 @@ def is_control_gene(name: object) -> bool:
     return any(pattern in text for pattern in _CONTROL_GENE_PATTERNS)
 
 
+#: Atera transcript column flagging a real gene (False for control probes and
+#: codewords).  It is the authority for the control set when present; the name
+#: rule (:func:`is_control_gene`) is only cross-checked against it.
+IS_GENE_COLUMN = "is_gene"
+
+
+def accumulate_is_gene_flags(flags: dict[str, bool], names, is_gene) -> None:
+    """Fold one partition's ``(feature name, is_gene)`` rows into ``flags``.
+
+    A feature counts as a real gene only if every one of its rows says so, so a
+    feature with any ``is_gene == False`` row (or a missing flag) is a control.
+    """
+    names = np.asarray(names, dtype=object)
+    values = pd.Series(is_gene).astype("boolean").fillna(False).to_numpy(dtype=bool)
+    if names.size == 0:
+        return
+    keep = pd.notna(names)
+    names = names[keep].astype(str)
+    values = values[keep]
+    if names.size == 0:
+        return
+    unique, inverse = np.unique(names, return_inverse=True)
+    # A per-feature all(): one False row makes the feature a control.
+    gene_all = np.ones(len(unique), dtype=bool)
+    np.logical_and.at(gene_all, inverse, values)
+    for name, flag in zip(unique.tolist(), gene_all.tolist(), strict=True):
+        text = str(name)
+        flags[text] = bool(flags.get(text, True) and flag)
+
+
+def control_genes_from_is_gene(
+    names: Iterable[str],
+    is_gene_flags: Mapping[str, bool] | None,
+    *,
+    source: str = "",
+) -> set[str]:
+    """Return the control features of ``names``, preferring an ``is_gene`` flag.
+
+    With ``is_gene_flags`` (Atera points carry ``is_gene``) a feature is a control
+    exactly when it is flagged ``False``; a name the flags do not cover falls back
+    to :func:`is_control_gene`.  Every disagreement between the flag and the name
+    rule is logged once as a warning so a new control family, or a gene whose name
+    merely looks like a control, is visible rather than silently misfiled.
+    Without flags this is the name rule alone (Xenium/MERSCOPE behaviour).
+    """
+    names = [str(name) for name in names]
+    if not is_gene_flags:
+        return {name for name in names if is_control_gene(name)}
+    controls: set[str] = set()
+    flag_only: list[str] = []
+    name_only: list[str] = []
+    for name in names:
+        by_name = is_control_gene(name)
+        flag = is_gene_flags.get(name)
+        if flag is None:
+            if by_name:
+                controls.add(name)
+            continue
+        if not flag:
+            controls.add(name)
+            if not by_name:
+                flag_only.append(name)
+        elif by_name:
+            name_only.append(name)
+    if flag_only or name_only:
+        where = f" in {source}" if source else ""
+        log.warning(
+            "is_gene disagrees with the control-name rule%s: %d feature(s) flagged "
+            "is_gene=False with a gene-like name (treated as controls, e.g. %s); "
+            "%d flagged is_gene=True with a control-like name (treated as genes, e.g. %s)",
+            where,
+            len(flag_only),
+            sorted(flag_only)[:5],
+            len(name_only),
+            sorted(name_only)[:5],
+        )
+    return controls
+
+
 def _hex_to_rgba(value: str, alpha: float) -> tuple[float, float, float, float]:
     text = str(value).lstrip("#")
     r = int(text[0:2], 16) / 255.0
@@ -4192,6 +4271,7 @@ def build_gene_point_groups(
     build_cell_index: bool = False,
     cancel_check: Callable[[], bool] | None = None,
     status_col: str | None = None,
+    is_gene_col: str | None = None,
 ) -> GenePointStore:
     """Read all transcripts into a symbol-grouped, gene-sorted point store.
 
@@ -4199,8 +4279,15 @@ def build_gene_point_groups(
     ``assignment_col`` (unassigned == not :func:`assignment_mask`), else all
     foreground. If the total exceeds ``max_points`` a uniform random subsample is
     taken (this preserves per-gene proportions in expectation).
+
+    ``is_gene_col`` (Atera's ``is_gene``) makes the store's ``control_genes`` the
+    features flagged not-a-gene, cross-checked against the name rule by
+    :func:`control_genes_from_is_gene`.  Without it controls are name-only.
     """
     cols = [x_col, y_col, gene_col]
+    if is_gene_col is not None and is_gene_col not in cols:
+        cols.append(is_gene_col)
+    is_gene_flags: dict[str, bool] | None = {} if is_gene_col is not None else None
     if background_col is not None:
         cols.append(background_col)
     if assignment_col is not None and assignment_col not in cols:
@@ -4217,6 +4304,11 @@ def build_gene_point_groups(
     total_source = 0
     for pdf in _iter_point_partitions(points_obj, cols):
         _check_transcript_cancelled(cancel_check)
+        if is_gene_flags is not None:
+            # Raw rows, before coordinate filtering: the flag is per feature.
+            accumulate_is_gene_flags(
+                is_gene_flags, pdf[gene_col].astype("string").to_numpy(dtype=object), pdf[is_gene_col]
+            )
         if status_col is not None:
             # Status totals describe the complete source, independent of the
             # render cap and coordinate filtering used for the point layers.
@@ -4486,7 +4578,9 @@ def build_gene_point_groups(
         gene_offsets[name] = (g, cs - gstart, cs + fg_count - gstart, ce - gstart)
         gene_counts[name] = ce - cs
 
-    control_genes = {name for name in unique_names if is_control_gene(name)}
+    control_genes = control_genes_from_is_gene(
+        unique_names, is_gene_flags, source=f"column {is_gene_col!r}" if is_gene_col else ""
+    )
     return GenePointStore(
         group_symbols=group_symbols,
         group_coords=group_coords,
