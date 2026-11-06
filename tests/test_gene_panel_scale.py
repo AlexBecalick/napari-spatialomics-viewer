@@ -552,3 +552,117 @@ def test_controller_full_mode_is_untouched_by_selection_wiring(qapp):
     assert state.panel_mode == P.GENE_PANEL_MODE_FULL
     assert state.slot_allocator is None
     assert state.enabled_genes == {"AAA", "BBB"}
+
+
+# -- paired selection mode (union panel above the threshold) -----------------------------------
+
+
+def _paired_selection_controller(monkeypatch, widget=None, threshold=4):
+    """Two platform states built and harmonised the way ``_apply_paired_gene_build`` does."""
+    # Each local panel (3 features) is below the threshold; the union (5) is above it,
+    # so selection mode can only come from the union decision.
+    monkeypatch.setattr(P, "GENE_SELECTION_MODE_FEATURE_THRESHOLD", threshold)
+    panels = {
+        "MERSCOPE": (("AAA", 4), ("BBB", 3), ("Blank-1", 2)),
+        "XENIUM": (("BBB", 2), ("CCC", 3), ("DDD", 2)),
+    }
+    args = types.SimpleNamespace(
+        gene_spot_size=2.0, gene_max_render_points=40_000_000,
+        gene_hide_background=False, gene_show_controls=False, random_state=42,
+    )
+    ctrl = V.ComparisonViewerController(_FakeViewer(), {}, args)
+    ctrl._gene_inspector_widget = widget
+    states = []
+    for platform, panel in panels.items():
+        rows = []
+        for gene, n in panel:
+            rows.extend((gene, float(i), float(i), i == n - 1) for i in range(n))
+        df = pd.DataFrame(rows, columns=["gene", "x", "y", "background"])
+        store = build_gene_point_groups(df, x_col="x", y_col="y", gene_col="gene", background_col="background")
+        state = ctrl._new_gene_inspector_state(platform, {"points_key": "transcripts", "store": store})
+        ctrl._gene_inspector_states[platform] = state
+        states.append(state)
+    ctrl._harmonize_paired_gene_states(states)
+    for state in states:
+        for gi, symbol in enumerate(state.store.group_symbols):
+            coords, colors, _sizes, ranges, shown = ctrl._gene_group_arrays(state, gi)
+            state.group_display_ranges[gi] = ranges
+            layer = ctrl.viewer.add_points(
+                coords, name=f"{state.dataset} {symbol}", face_color=colors, shown=shown, symbol=symbol,
+            )
+            state.layer_names.append(layer.name)
+    # Only its presence matters to the paired control routing.
+    ctrl._paired_session = types.SimpleNamespace()
+    return ctrl, states
+
+
+def test_paired_union_above_threshold_opens_in_selection_mode_with_lockstep_slots(monkeypatch, qapp):
+    w = _widget()
+    ctrl, (merscope, xenium) = _paired_selection_controller(monkeypatch, widget=w)
+    monkeypatch.setattr(ctrl, "_publish_transcript_sources", lambda *_a, **_k: None)
+    statuses = []
+    ctrl.set_status_callback(statuses.append)
+
+    for state in (merscope, xenium):
+        assert state.panel_mode == P.GENE_PANEL_MODE_SELECTION
+        assert state.enabled_genes == set()
+        assert state.slot_allocator is not None
+        assert _shown_total(ctrl, state) == 0
+    assert merscope.slot_allocator is not xenium.slot_allocator
+
+    ctrl._populate_gene_inspector(merscope)
+    assert w.panel_mode == P.GENE_PANEL_MODE_SELECTION
+    assert w.header_titles()[-1] == CONTROL_GROUP_TITLE
+
+    # A platform-only gene still takes the same slot on both platforms.
+    ctrl.set_gene_visible("PAIRED", "CCC", True)
+    ctrl.set_gene_visible("PAIRED", "BBB", True)
+    for state in (merscope, xenium):
+        ctrl._flush_gene_group_rebuild(state.dataset)
+        assert state.enabled_genes == {"CCC", "BBB"}
+        assert state.slot_allocator.slot_of("CCC") == 0
+        assert state.slot_allocator.slot_of("BBB") == 1
+    np.testing.assert_allclose(_face(ctrl, merscope, "BBB"), _face(ctrl, xenium, "BBB"), atol=1e-6)
+    np.testing.assert_allclose(
+        _face(ctrl, xenium, "BBB"),
+        np.asarray(xenium.slot_allocator.visual("BBB").rgba, dtype=np.float32),
+        atol=1e-6,
+    )
+    assert _shown_total(ctrl, merscope) == 3
+    assert _shown_total(ctrl, xenium) == 2 + 3
+
+    # Freeing a slot keeps both allocators in step; the next gene reuses it on both.
+    ctrl.set_gene_visible("PAIRED", "CCC", False)
+    ctrl.set_gene_visible("PAIRED", "AAA", True)
+    assert merscope.slot_allocator.slot_of("AAA") == xenium.slot_allocator.slot_of("AAA") == 0
+
+    # The cap is refused once for the pair, and neither platform changes.
+    for state in (merscope, xenium):
+        state.slot_allocator.cap = 2
+    before = len(statuses)
+    ctrl.set_gene_visible("PAIRED", "DDD", True)
+    refusals = [s for s in statuses[before:] if "Selection is full" in s]
+    assert len(refusals) == 1
+    before = len(statuses)
+    ctrl.set_genes_visible("PAIRED", ["CCC", "DDD"], True)
+    assert len([s for s in statuses[before:] if "Selection is full" in s]) == 1
+    for state in (merscope, xenium):
+        assert state.enabled_genes == {"AAA", "BBB"}
+        assert state.slot_allocator.genes == ["AAA", "BBB"]
+
+    # Clearing releases every slot on both platforms and restores scheme colours.
+    ctrl.set_all_genes_visible("PAIRED", False)
+    for state in (merscope, xenium):
+        assert state.enabled_genes == set() and len(state.slot_allocator) == 0
+        np.testing.assert_allclose(
+            _face(ctrl, state, "BBB"), np.asarray(state.gene_visuals["BBB"].rgba, dtype=np.float32), atol=1e-6
+        )
+    w.close()
+
+
+def test_paired_union_at_or_below_threshold_stays_in_full_mode(monkeypatch, qapp):
+    ctrl, (merscope, xenium) = _paired_selection_controller(monkeypatch, threshold=5)
+    for state in (merscope, xenium):
+        assert state.panel_mode == P.GENE_PANEL_MODE_FULL
+        assert state.slot_allocator is None
+        assert state.enabled_genes == {"AAA", "BBB", "CCC", "DDD"}

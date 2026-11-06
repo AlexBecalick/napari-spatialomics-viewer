@@ -11204,6 +11204,17 @@ class ComparisonViewerController:
             else "fine" if fine_available else "alphabetical"
         )
         show_controls = bool(getattr(self.args, "gene_show_controls", False))
+        # Provisional per-platform mode; ``_harmonize_paired_gene_states``
+        # settles the final mode over the union panel.
+        panel_mode = gene_panel_mode_for(platform, len(store.genes))
+        if panel_mode == GENE_PANEL_MODE_SELECTION:
+            enabled: set[str] = set()
+        else:
+            enabled = {
+                gene
+                for gene in store.genes
+                if show_controls or gene not in store.control_genes
+            }
         timer = QTimer()
         timer.setSingleShot(True)
         state = GeneInspectorState(
@@ -11214,11 +11225,7 @@ class ComparisonViewerController:
             store=store,
             gene_visuals=store.gene_visuals or coarse_scheme.visuals,
             layer_names=[],
-            enabled_genes={
-                gene
-                for gene in store.genes
-                if show_controls or gene not in store.control_genes
-            },
+            enabled_genes=enabled,
             spot_size=float(
                 getattr(self.args, "gene_spot_size", DEFAULT_GENE_SPOT_SIZE)
             ),
@@ -11248,6 +11255,12 @@ class ComparisonViewerController:
             ordering=ordering,
             color_kind="coarse",
             colour_by_assignment=False,
+            panel_mode=panel_mode,
+            slot_allocator=(
+                GeneSlotAllocator(GENE_SELECTION_SLOT_CAP)
+                if panel_mode == GENE_PANEL_MODE_SELECTION
+                else None
+            ),
         )
         timer.timeout.connect(lambda ds=platform: self._flush_gene_group_rebuild(ds))
         return state
@@ -11387,11 +11400,26 @@ class ComparisonViewerController:
             for gene in union_genes
         }
         show_controls = any(state.show_controls for state in states)
-        enabled = {
-            gene
-            for gene in union_genes
-            if show_controls or gene not in control_genes
-        }
+        # One mode for the pair, decided over the union panel (controls
+        # included, like the standalone path's ``len(store.genes)``).
+        panel_mode = (
+            GENE_PANEL_MODE_SELECTION
+            if any(
+                gene_panel_mode_for(state.dataset, len(union_genes))
+                == GENE_PANEL_MODE_SELECTION
+                for state in states
+            )
+            else GENE_PANEL_MODE_FULL
+        )
+        if panel_mode == GENE_PANEL_MODE_SELECTION:
+            # Too many features to draw or tick them all: start empty.
+            enabled: set[str] = set()
+        else:
+            enabled = {
+                gene
+                for gene in union_genes
+                if show_controls or gene not in control_genes
+            }
         summary = (
             f"Shared paired panel: {len(union_genes)} unique genes across "
             f"{len(states)} datasets."
@@ -11421,6 +11449,19 @@ class ComparisonViewerController:
             # gene is checked consistently in the UI but rebuilt only where it
             # actually has points.
             state.enabled_genes = set(enabled)
+            state.panel_mode = panel_mode
+            # One allocator per state, kept in lock step: every paired toggle
+            # applies the same gene list to both states in the same order and
+            # the cap is checked once for the pair before either changes, so
+            # lowest-free-slot allocation gives each gene the same slot (and
+            # colour) on both platforms.  Separate instances keep each state's
+            # release/repaint bookkeeping (which reads ``allocator.genes``)
+            # independent.
+            state.slot_allocator = (
+                GeneSlotAllocator(GENE_SELECTION_SLOT_CAP)
+                if panel_mode == GENE_PANEL_MODE_SELECTION
+                else None
+            )
 
     def _apply_paired_gene_build(
         self,
@@ -13985,9 +14026,30 @@ class ComparisonViewerController:
                 state.ordering = "alphabetical"
         self._populate_gene_inspector(states[0])
 
+    def _selection_overflow_refused(self, states, genes) -> bool:
+        """Refuse (once, for every state) a tick that would exceed a slot cap.
+
+        Paired states keep lock-stepped allocators, so the check runs before
+        either state changes: the pair is refused together with one status
+        rather than one platform accepting what the other refuses.
+        """
+        wanted = [str(g) for g in genes]
+        for state in states:
+            allocator = getattr(state, "slot_allocator", None)
+            if allocator is None:
+                continue
+            fresh = [g for g in dict.fromkeys(wanted) if g not in allocator]
+            if fresh and len(allocator) + len(fresh) > allocator.cap:
+                self._refuse_selection_overflow(state, fresh)
+                return True
+        return False
+
     def set_gene_visible(self, dataset_name: str, gene: str, on: bool):
         gene = str(gene)
-        for state in self._gene_states_for_control(dataset_name):
+        states = self._gene_states_for_control(dataset_name)
+        if on and self._selection_overflow_refused(states, [gene]):
+            return
+        for state in states:
             if getattr(state, "slot_allocator", None) is not None:
                 accepted, groups = self._apply_selection_slots(state, [gene], bool(on))
                 if not accepted:
@@ -14007,7 +14069,11 @@ class ComparisonViewerController:
     def set_genes_visible(self, dataset_name: str, genes: list[str], on: bool):
         """Show/hide a batch of genes at once (used by group-heading clicks)."""
         on = bool(on)
-        for state in self._gene_states_for_control(dataset_name):
+        states = self._gene_states_for_control(dataset_name)
+        if on and self._selection_overflow_refused(states, genes):
+            # All or nothing: a heading never half-enables past the cap.
+            return
+        for state in states:
             groups: set[int] = set()
             if getattr(state, "slot_allocator", None) is not None:
                 wanted = [str(g) for g in genes]
