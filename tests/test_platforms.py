@@ -301,15 +301,23 @@ def test_make_layer_name_uses_platform_dapi_aliases():
 
 def test_atera_channel_colormaps_are_distinct_and_explicit():
     fallback = {"gray", "magenta", "cyan", "yellow", "red", "orange"}
+    # The store's channel order (DAPI, ATP1A1/..., 18S, alphaSMA/...) lines the
+    # rotating fallback up with the spec by coincidence, so pin fallback_index=0
+    # (gray) to prove the explicit platform mapping is what assigns the colours.
     cmaps = [
-        V.image_colormap_for_channel(name, index, platform="ATERA")
-        for index, name in enumerate(atera_stores.CHANNELS)
+        V.image_colormap_for_channel(name, 0, platform="ATERA")
+        for name in atera_stores.CHANNELS
     ]
     assert len(set(cmaps)) == len(cmaps)
-    assert cmaps[0] == "blue" and cmaps[2] == "green"
+    assert "gray" not in cmaps
+    assert cmaps == ["blue", "magenta", "green", "yellow"]
     spec = P.platform_spec("ATERA")
     for name, cmap in zip(atera_stores.CHANNELS, cmaps):
         assert spec.channel_colormap(name) == cmap
+    # Without the platform lookup the same calls fall back to gray.
+    assert V.image_colormap_for_channel("ATP1A1/CD45/E-Cadherin", 0) == "gray"
+    assert V.image_colormap_for_channel("alphaSMA/Vimentin", 0) == "gray"
+    assert V.image_colormap_for_channel("ATP1A1/CD45/E-Cadherin", 0, platform="XENIUM") == "gray"
     # Existing rules are unchanged for other platforms and without a platform.
     assert V.image_colormap_for_channel("DAPI", 3, platform="XENIUM") == "blue"
     assert V.image_colormap_for_channel("PolyT", 0, platform="MERSCOPE") == "green"
