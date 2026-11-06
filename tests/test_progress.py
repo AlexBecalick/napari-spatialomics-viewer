@@ -178,7 +178,7 @@ def test_display_ignores_values_for_inactive_stages_and_end_clears_them():
     assert display.bar() == (0, 0, 0)  # a fresh stage starts busy
 
 
-def test_display_concurrent_stages_follow_the_latest_determinate_one():
+def test_display_concurrent_stages_stay_with_the_first_determinate_one():
     clock = _Clock()
     display = P.ProgressDisplay(clock)
     display.set_stage("images", "images…", True)
@@ -191,13 +191,37 @@ def test_display_concurrent_stages_follow_the_latest_determinate_one():
     display.set_stage("masks", "masks…", True)
     clock.t += 0.5
     display.set_value("masks", 1, 2, unit="segmentations")
-    assert display.bar() == (0, 2, 1)
+    # The newer stage shows in the label only; the bar keeps the first one.
+    assert display.bar() == (0, 10, 3)
     assert display.label() == "images… | transcripts… — 3/10 files (30%) | masks… — 1/2 segmentations (50%)"
-    display.set_stage("masks", "", False)
-    assert display.bar() == (0, 10, 3)
+    display.set_stage("transcripts", "", False)
+    assert display.bar() == (0, 2, 1)  # the first stage ended: the next one takes over
+    display.set_stage("transcripts", "transcripts…", True)
+    display.set_value("transcripts", 5, 10, unit="files")
+    assert display.bar() == (0, 2, 1)
     # Values within a phase never go backwards on the display either.
-    display.set_value("transcripts", 2, 10, unit="files")
-    assert display.bar() == (0, 10, 3)
+    display.set_value("masks", 0, 2, unit="segmentations")
+    assert display.bar() == (0, 2, 1)
+    # A stage that goes busy again gives the bar up until it has a total again.
+    display.set_value("masks", 0, 0, text="masks: saving…")
+    assert display.bar() == (0, 10, 5)
+
+
+def test_display_bar_never_decreases_while_interleaved_stages_report():
+    clock = _Clock()
+    display = P.ProgressDisplay(clock)
+    display.set_stage("transcripts", "partitions…", True)
+    display.set_stage("masks", "segmentations…", True)
+    fractions = []
+    # The interleaving the real viewer produced: 2/4, 1/3, 3/4, 2/3, 4/4, 3/3.
+    for key, done, total in [("transcripts", 1, 4), ("transcripts", 2, 4), ("masks", 1, 3), ("transcripts", 3, 4),
+                             ("masks", 2, 3), ("transcripts", 4, 4), ("masks", 3, 3)]:
+        clock.t += 0.1
+        display.set_value(key, done, total)
+        lo, hi, value = display.bar()
+        fractions.append(value / hi)
+    assert fractions == sorted(fractions)
+    assert fractions[-1] == 1.0
 
 
 def test_display_scales_totals_beyond_int32_and_formats_bytes():
@@ -315,7 +339,9 @@ def test_large_stores_create_their_layers_one_group_per_event_loop_turn(qapp, mo
     while steps:
         steps.pop(0)()
         created.append(len(ctrl.viewer.layers))
-    assert created == [1, 2, 3]
+    # Each group: one turn builds its arrays and layer, the next adds (draws)
+    # it; the finish (ordering, widget) runs on a turn of its own.
+    assert created == [0, 1, 1, 2, 2, 3, 3]
     assert [v[1:3] for v in values if v[0] == key] == [(0, n), (1, n), (2, n), (3, n)]
     assert stages[-1] == (key, "", False)
     assert state.layer_chain is None
@@ -324,6 +350,122 @@ def test_large_stores_create_their_layers_one_group_per_event_loop_turn(qapp, mo
     sync_state = sync._gene_inspector_states["TEST"]
     assert state.layer_names == sync_state.layer_names
     assert GI._total(ctrl, state) == GI._total(sync, sync_state) == 9
+
+
+def test_a_generation_bump_mid_chain_still_finishes_the_registered_build(qapp, monkeypatch):
+    # ``load_dataset(other)`` cancels the background tasks (a generation bump)
+    # before the switch, which may fail and keep this dataset: the chain must
+    # not leave a half-built state behind.
+    store = GI._demo_store()
+    steps = []
+    ctrl, stages, _values = _chunked_controller(store, monkeypatch, steps)
+    finished = []
+    original = ctrl._finish_gene_inspector_build
+    monkeypatch.setattr(ctrl, "_finish_gene_inspector_build", lambda *a: (finished.append(a), original(*a)))
+    _apply(ctrl, store)
+    steps.pop(0)()
+    steps.pop(0)()
+    assert len(ctrl.viewer.layers) == 1
+    ctrl._cancel_background_tasks()
+    while steps:
+        steps.pop(0)()
+    state = ctrl._gene_inspector_states["TEST"]
+    assert len(state.layer_names) == len(store.group_symbols) == len(ctrl.viewer.layers)
+    assert state.layer_chain is None and ctrl._gene_layer_chain is None
+    assert len(finished) == 1
+    assert stages[-1] == (V.GENE_LAYERS_PROGRESS_KEY, "", False)
+    # A session apply (what a successful switch does) still stops a chain.
+    _apply(ctrl, store)
+    ctrl._teardown_gene_inspector("TEST")
+    _apply(ctrl, store)
+    steps.pop(0)()
+    ctrl._clear_layers()
+    while steps:
+        steps.pop(0)()
+    assert ctrl._gene_inspector_states == {} and ctrl.viewer.layers == []
+
+
+class _FakePairedRegistry:
+    def __init__(self, viewer):
+        self.viewer = viewer
+        self.slot_keys = []
+        self.repaired = 0
+
+    def register_layer(self, identity, layer):
+        self.viewer.layers.append(layer)
+        self.slot_keys.append(identity.slot_key)
+        return layer
+
+    def repair_order(self):
+        self.repaired += 1
+
+
+def _paired_chunked_controller(monkeypatch, steps, chunk_min_points=1):
+    store = GI._demo_store()
+    ctrl, stages, values = _chunked_controller(store, monkeypatch, steps)
+    ctrl.args.gene_layer_chunk_min_points = chunk_min_points
+    ctrl._paired_session = SimpleNamespace(
+        contract=SimpleNamespace(pair_id="pair", profile=lambda ds: SimpleNamespace(points_key="transcripts")),
+    )
+    ctrl._paired_registry = _FakePairedRegistry(ctrl.viewer)
+    monkeypatch.setattr(ctrl, "_transcript_payload_is_current", lambda *_a: True)
+    monkeypatch.setattr(ctrl, "_remove_paired_anchor", lambda: None)
+    monkeypatch.setattr(ctrl, "_schedule_canvas_visibility_repair", lambda *_a: None)
+    statuses = []
+    ctrl.set_status_callback(statuses.append)
+    payloads = {
+        ds: {"points_key": "transcripts", "store": GI._demo_store(), "build_seconds": 0.0}
+        for ds in ("MERSCOPE", "XENIUM")
+    }
+    ctrl._gene_build_generation += 1
+    ctrl._apply_paired_gene_build(ctrl._gene_build_generation, "pair", payloads, None)
+    return ctrl, stages, values, statuses
+
+
+def test_large_pairs_create_their_layers_one_per_event_loop_turn_across_both_platforms(qapp, monkeypatch):
+    steps = []
+    ctrl, stages, values, statuses = _paired_chunked_controller(monkeypatch, steps)
+    key = V.GENE_LAYERS_PROGRESS_KEY
+    n = 6  # 3 groups on each platform
+    assert ctrl.viewer.layers == [] and len(steps) == 1
+    assert (key, "Paired: creating the transcript layers…", True) in stages
+    created = []
+    while steps:
+        steps.pop(0)()
+        created.append(len(ctrl.viewer.layers))
+    assert created == [0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6]
+    assert [v[1:3] for v in values if v[0] == key] == [(i, n) for i in range(n + 1)]
+    assert stages[-1] == (key, "", False)
+    states = [ctrl._gene_inspector_states[ds] for ds in ("MERSCOPE", "XENIUM")]
+    assert [len(state.layer_names) for state in states] == [3, 3]
+    assert all(state.layer_chain is None for state in states)
+    assert ctrl._paired_registry.repaired == 1
+    assert statuses[-1].startswith("Paired transcripts: 22 points in 6 platform-qualified layer(s)")
+    assert all(isinstance(layer, V.FastPoints) for layer in ctrl.viewer.layers)
+
+
+def test_small_pairs_keep_the_one_shot_layer_build(qapp, monkeypatch):
+    steps = []
+    ctrl, _stages, _values, statuses = _paired_chunked_controller(monkeypatch, steps, chunk_min_points=10**9)
+    assert steps == [] and len(ctrl.viewer.layers) == 6
+    assert ctrl._paired_registry.repaired == 1
+    assert "6 platform-qualified layer(s)" in statuses[-1]
+
+
+def test_paired_teardown_mid_way_stops_the_chunks_and_hides_their_progress(qapp, monkeypatch):
+    steps = []
+    ctrl, stages, _values, _statuses = _paired_chunked_controller(monkeypatch, steps)
+    steps.pop(0)()
+    steps.pop(0)()
+    assert len(ctrl.viewer.layers) == 1
+    monkeypatch.setattr(ctrl, "_remove_paired_slot", lambda key: ctrl._paired_registry.slot_keys.remove(key))
+    ctrl._teardown_paired_gene_inspector()
+    assert stages[-1] == (V.GENE_LAYERS_PROGRESS_KEY, "", False)
+    ended = len(stages)
+    while steps:
+        steps.pop(0)()
+    assert ctrl._gene_inspector_states == {}
+    assert len(stages) == ended and ctrl._paired_registry.repaired == 0
 
 
 def test_small_stores_keep_the_one_shot_layer_build(qapp, monkeypatch):
@@ -341,7 +483,8 @@ def test_teardown_mid_way_stops_the_chunks_and_hides_their_progress(qapp, monkey
     steps = []
     ctrl, stages, _values = _chunked_controller(store, monkeypatch, steps)
     _apply(ctrl, store)
-    steps.pop(0)()
+    steps.pop(0)()  # builds group 0
+    steps.pop(0)()  # adds it
     assert len(ctrl.viewer.layers) == 1
     ctrl._teardown_gene_inspector("TEST")
     assert stages[-1] == (V.GENE_LAYERS_PROGRESS_KEY, "", False)

@@ -536,18 +536,47 @@ sample-cache restore (bytes), the Atera lazy gene reads and wide viewport reads
 (files), the Xenium/MERSCOPE eager build and the paired build (partition reads
 over both passes), multi-segmentation mask loads and multi-image pyramid builds.
 Workers report through a thread-safe reporter that keeps values monotonic and
-forwards at most about 10 updates per second. Stores of at least 5M points
-create their gene layers one marker group per Qt event-loop turn (QTimer chain,
-15 ms apart), and report `k/14 layers`.
+forwards at most about 10 updates per second. When several stages report at
+once, the bar stays with the first stage that got a total until that stage
+ends; the other stages' counts appear in the label only, so the bar never jumps
+between stages with different totals. Stores (or Xenium+MERSCOPE pairs) of at
+least 5M points create their gene layers over Qt event-loop turns (QTimer
+chain, 15 ms apart): one turn builds a layer's arrays and napari layer without
+adding it, the next adds it (napari slices it, vispy uploads and draws it), and
+a final turn orders the layers and fills the Gene inspector. The bar reports
+`k/14 layers` (`k/28` for a pair). A chain stops only when its dataset's gene
+state is torn down or replaced, not when a dataset switch merely starts.
 
-Bar values sampled every 100 ms in the real viewer on this Mac:
+Gene layers are `FastPoints` (`fast_points.py`), a napari `Points` subclass
+that removes two per-point costs napari pays far more often than the points
+change:
 
-| run | what the bar showed | longest Qt-thread stall during the transcript load |
-|---|---|---|
-| Atera AUTO (171.8M), empty transcript cache | 1/409 to 409/409 files over 13 s, then busy while saving and grouping, then 0/14 to 13/14 layers over 15 s | 2.5 s (formerly one freeze of about 15 s) |
-| Atera AUTO, warm cache | 0 B to 2.9 GB restored, busy grouping (6 s), 0/14 to 13/14 layers | 2.4 s |
-| P7513 Xenium, empty transcript cache | 1/4 to 4/4 partition reads, 1/14 to 13/14 layers | 1.6 s |
+* napari's vispy layer turns every point's symbol into a string on each data
+  update (`[str(x) for x in layer._view_symbol]`): about 3.5 s of the 4.4 s it
+  took to show an 11M-point layer. Gene layers use one symbol, so
+  `FastPoints` hands vispy one symbol, which vispy broadcasts.
+* napari clears a layer's extent after every asynchronous slice and the next
+  draw recomputes it as a min/max over all points (about 0.2 s per 13M-point
+  layer, 3 to 4 times per layer during a build). `FastPoints` caches the data
+  extent per data array and drops it whenever napari changes the points.
 
-Creating each layer's arrays and napari layer takes 0.05 to 0.5 s; most of each
-stall is the first draw of the new layer's points, which happens on the Qt
-thread after the chunk.
+Bar values sampled every 100 ms in the real viewer on this Mac. "Gap" is the
+longest interval between two 100 ms samples, so it is how long the Qt thread
+was blocked.
+
+| run | what the bar showed | layer creation | longest gap while the layers were created |
+|---|---|---|---|
+| Atera AUTO (171.8M), empty transcript cache (M10b, before FastPoints) | 1/409 to 409/409 files over 13 s, then busy while saving and grouping, then 0/14 to 13/14 layers | about 15 s | 2.5 s (formerly one freeze of about 15 s) |
+| Atera AUTO, warm cache (M10b) | 0 B to 2.9 GB restored, busy grouping (6 s), 0/14 to 13/14 layers | about 15 s | 2.4 s |
+| Atera AUTO, warm cache (now) | 0/14 to 14/14 layers | 7.8 s | 0.49 s (most turns 0.35 s) |
+| P7513 Xenium, empty transcript cache (M10b) | 1/4 to 4/4 partition reads, 1/14 to 13/14 layers | about 10 s | 1.6 s |
+| P7513 Xenium, empty transcript cache (now) | 1/4 to 4/4 partition reads, 0/14 to 14/14 layers | 4.3 s | 0.45 s |
+
+Each turn is still above 200 ms. A build turn takes 0.3 to 0.37 s at Atera
+AUTO (the arrays of a group of about 12M points, plus the extent), and an add
+turn takes about 0.13 s plus the repaint. Every repaint also draws the layers
+that are already shown, which is about 0.15 to 0.2 s with the 40M-point
+all-genes view on. Going lower would mean splitting one gene group across
+several napari layers. The longer Xenium gaps (1.7 s and 2.2 s) come earlier,
+while the dataset opens and its image layers are added, and they did not
+change.

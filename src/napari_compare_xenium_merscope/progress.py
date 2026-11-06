@@ -8,8 +8,8 @@ Two small, Qt-free pieces:
   update per :data:`PROGRESS_MIN_INTERVAL_S` (the first and the final value of
   a phase always pass), so a 409-file pass never floods the Qt event queue.
 * :class:`ProgressDisplay` sits on the panel.  It combines the active stages
-  into one bar (determinate for the most recently updated stage that has a
-  total, else busy) and one label such as
+  into one bar (determinate for the first stage that got a total, until it
+  ends; else busy) and one label such as
   ``"ATERA: streaming transcripts — 123/409 files (30%), about 40 s left"``.
 
 The controller marshals updates to the GUI thread through a queued Qt signal,
@@ -191,11 +191,19 @@ class ProgressDisplay:
         return bool(self.stages)
 
     def current(self) -> tuple[str, _StageValue] | None:
-        """The determinate stage the bar follows: the most recently updated one."""
-        live = [(k, v) for k, v in self.values.items() if k in self.stages]
-        if not live:
-            return None
-        return max(live, key=lambda item: item[1].updated_at)
+        """The determinate stage the bar follows.
+
+        The bar stays with the first stage that got a total until that stage
+        ends or goes busy again, so interleaved reports from concurrent stages
+        (different totals) never make it jump back and forth; the other
+        stages' counts are shown in the label only. ``values`` keeps the order
+        in which stages first got a total (a new phase of the same stage keeps
+        its place; a busy or ended stage is removed).
+        """
+        for key, value in self.values.items():
+            if key in self.stages:
+                return key, value
+        return None
 
     def bar(self) -> tuple[int, int, int]:
         """``(minimum, maximum, value)``; ``(0, 0, 0)`` is Qt's busy bar."""

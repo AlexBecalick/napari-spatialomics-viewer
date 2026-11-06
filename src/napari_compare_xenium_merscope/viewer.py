@@ -72,6 +72,7 @@ _ignore_macos_zarr_metadata_warning()
 
 import spatialdata as sd
 import zarr
+from napari.components import ViewerModel
 from napari.utils.colormaps import Colormap, DirectLabelColormap, ensure_colormap
 from packaging.version import InvalidVersion, Version
 from spatialdata.models import Image2DModel, Labels2DModel
@@ -184,6 +185,7 @@ from .atera_viewer import (
     AteraTranscriptMixin,
 )
 from .progress import ProgressDisplay, ProgressReporter
+from .fast_points import FastPoints
 from .manual_registration_model import LAYER_METADATA_KEY, STORE_ATTR
 from .platforms import (
     ATERA,
@@ -12022,7 +12024,6 @@ class ComparisonViewerController(AteraTranscriptMixin):
         registry = self._paired_registry
         if registry is None:
             return
-        total_layers = 0
         total_points = 0
         paired_states: list[GeneInspectorState] = []
         for platform in ("MERSCOPE", "XENIUM"):
@@ -12041,31 +12042,68 @@ class ComparisonViewerController(AteraTranscriptMixin):
             total_points += int(store.total_points)
 
         self._harmonize_paired_gene_states(paired_states)
+        tasks = []
         for state in paired_states:
-            platform = state.dataset
             store = state.store
             state.group_display_ranges = [[] for _ in store.group_symbols]
             state.group_shown_masks = [
                 np.zeros(len(coords), dtype=bool) for coords in store.group_coords
             ]
-            for group_index, symbol in enumerate(store.group_symbols):
-                coords, colors, sizes, ranges, shown = self._gene_group_arrays(
-                    state, group_index
-                )
-                state.group_display_ranges[group_index] = ranges
-                identity = LayerIdentity(platform, "genes", channel=str(symbol))
-                layer = self._create_gene_points_layer(
-                    str(symbol),
-                    symbol,
-                    state.spot_size,
-                    coords,
-                    colors,
-                    sizes,
-                    shown=shown,
-                    paired_identity=identity,
-                )
-                state.layer_names.append(str(layer.name))
-                total_layers += 1
+            tasks.extend(
+                (lambda state=state, gi=gi: self._create_paired_gene_group_layer(state, gi, defer_add=True))
+                for gi in range(len(store.group_symbols))
+            )
+
+        def finish():
+            self._finish_paired_gene_build(paired_states, payloads, registry, total_points)
+
+        if self._gene_layer_count_chunked(len(tasks), total_points):
+            # Large pairs: one layer per two Qt event-loop turns across both
+            # platforms, with a k/N layers count, like the single-dataset build.
+            self._start_gene_layer_chain(
+                paired_states,
+                tasks,
+                "Paired: creating the transcript layers…",
+                finish=finish,
+                on_memory_error=self._paired_gene_layers_out_of_memory,
+            )
+            return
+        for task in tasks:
+            task()()
+        finish()
+
+    def _create_paired_gene_group_layer(self, state: GeneInspectorState, gi: int, defer_add: bool = False):
+        """Create a paired group layer; with ``defer_add`` return a callable that registers it."""
+        symbol = state.store.group_symbols[gi]
+        coords, colors, sizes, ranges, shown = self._gene_group_arrays(state, gi)
+        state.group_display_ranges[gi] = ranges
+        identity = LayerIdentity(state.dataset, "genes", channel=str(symbol))
+        add = self._create_gene_points_layer(
+            str(symbol),
+            symbol,
+            state.spot_size,
+            coords,
+            colors,
+            sizes,
+            shown=shown,
+            paired_identity=identity,
+            defer_add=True,
+        )
+
+        def finish():
+            layer = add()
+            state.layer_names.append(str(layer.name))
+            return layer
+
+        return finish if defer_add else finish()
+
+    def _paired_gene_layers_out_of_memory(self) -> None:
+        self._teardown_paired_gene_inspector()
+        self._set_status("Paired: out of memory while creating the transcript layers.")
+        log.error("Paired: out of memory while creating the transcript layers.")
+
+    def _finish_paired_gene_build(self, paired_states, payloads: dict, registry, total_points: int) -> None:
+        total_layers = sum(len(state.layer_names) for state in paired_states)
         if total_layers:
             self._remove_paired_anchor()
             registry.repair_order()
@@ -12113,6 +12151,8 @@ class ComparisonViewerController(AteraTranscriptMixin):
         self._invalidate_cell_inspection(None)
         for platform in ("MERSCOPE", "XENIUM"):
             state = self._gene_inspector_states.pop(platform, None)
+            if state is not None:
+                self._cancel_gene_layer_chain(state)
             if state is not None and state.rebuild_timer is not None:
                 state.rebuild_timer.stop()
         registry = self._paired_registry
@@ -12391,17 +12431,17 @@ class ComparisonViewerController(AteraTranscriptMixin):
         # back to the default disc and can reset colours to white.
         n_groups = len(store.group_symbols)
         if self._gene_layers_chunked(store):
-            # Large stores: one group per Qt event-loop turn, so the window
-            # repaints and the progress bar moves between chunks.
-            chain = object()
-            self._gene_layer_chain = chain
-            state.layer_chain = chain
-            self._begin_progress(
-                GENE_LAYERS_PROGRESS_KEY, f"{ds}: creating the transcript layers…", total=n_groups, status=False,
-                unit="layers",
-            )
-            self._defer_gene_layer_step(
-                lambda: self._gene_layer_step(chain, generation, ds, state, payload, 0)
+            # Large stores: one group per two Qt event-loop turns (add hidden,
+            # then show), so the window repaints and the progress bar moves.
+            self._start_gene_layer_chain(
+                [state],
+                [
+                    (lambda gi=gi: self._create_gene_group_layer(state, gi, defer_add=True))
+                    for gi in range(n_groups)
+                ],
+                f"{ds}: creating the transcript layers…",
+                finish=lambda: self._finish_gene_inspector_build(state, payload),
+                on_memory_error=lambda: self._single_gene_layers_out_of_memory(state, payload),
             )
             return
         try:
@@ -12419,8 +12459,11 @@ class ComparisonViewerController(AteraTranscriptMixin):
 
     def _gene_layers_chunked(self, store) -> bool:
         """Create the gene layers over several event-loop turns (large stores only)."""
+        return self._gene_layer_count_chunked(len(store.group_symbols), int(store.total_points))
+
+    def _gene_layer_count_chunked(self, n_layers: int, total_points: int) -> bool:
         threshold = int(getattr(self.args, "gene_layer_chunk_min_points", GENE_LAYER_CHUNK_MIN_POINTS) or 0)
-        return threshold > 0 and len(store.group_symbols) > 1 and int(store.total_points) >= threshold
+        return threshold > 0 and int(n_layers) > 1 and int(total_points) >= threshold
 
     def _defer_gene_layer_step(self, step) -> None:
         """Run ``step`` on a later Qt event-loop turn (tests swap this out).
@@ -12430,59 +12473,112 @@ class ComparisonViewerController(AteraTranscriptMixin):
         """
         QTimer.singleShot(GENE_LAYER_CHUNK_DELAY_MS, step)
 
-    def _create_gene_group_layer(self, state: GeneInspectorState, gi: int) -> None:
+    def _create_gene_group_layer(self, state: GeneInspectorState, gi: int, defer_add: bool = False):
+        """Create group ``gi``'s layer; with ``defer_add`` return a callable that adds it."""
         symbol = state.store.group_symbols[gi]
         coords, colors, sizes, ranges, shown = self._gene_group_arrays(state, gi)
         state.group_display_ranges[gi] = ranges
         layer_name = self._gene_layer_name(state.dataset, symbol)
-        self._create_gene_points_layer(
-            layer_name, symbol, state.spot_size, coords, colors, sizes, shown=shown
+        add = self._create_gene_points_layer(
+            layer_name, symbol, state.spot_size, coords, colors, sizes, shown=shown, defer_add=True,
         )
-        state.layer_names.append(layer_name)
 
-    def _gene_layer_step(self, chain, generation: int, ds: str, state: GeneInspectorState, payload: dict, gi: int):
-        """One chunk of the chunked layer creation, then the next or the finish."""
-        if getattr(self, "_gene_layer_chain", None) is not chain:
+        def finish():
+            layer = add()
+            state.layer_names.append(layer_name)
+            return layer
+
+        return finish if defer_add else finish()
+
+    def _start_gene_layer_chain(self, states, tasks, label: str, finish, on_memory_error) -> None:
+        """Create gene layers over several Qt event-loop turns.
+
+        ``tasks`` hold one callable per layer: it builds the layer's arrays
+        and napari layer without adding it and returns an ``add()`` callable.
+        Each layer takes two turns: build, then add on the next turn (where
+        napari slices it and vispy uploads and draws its points), so the two
+        costs never share one stall. ``finish()`` runs on a turn of its own
+        after the last layer. ``on_memory_error()`` handles a MemoryError
+        in any step. The chain belongs to ``states``: it stops as soon as one
+        of them is no longer the registered state of its dataset (teardown,
+        session apply or a newer build), and only then.
+        """
+        chain = object()
+        self._gene_layer_chain = chain
+        for state in states:
+            state.layer_chain = chain
+        self._begin_progress(
+            GENE_LAYERS_PROGRESS_KEY, label, total=len(tasks), status=False, unit="layers",
+        )
+        run = SimpleNamespace(chain=chain, states=tuple(states), tasks=list(tasks), finish=finish,
+                              on_memory_error=on_memory_error, add=None)
+        self._defer_gene_layer_step(lambda: self._gene_layer_step(run, 0, "build"))
+
+    def _gene_layer_chain_owned(self, run) -> bool:
+        if getattr(self, "_gene_layer_chain", None) is not run.chain:
+            return False
+        return all(
+            self._gene_inspector_states.get(state.dataset) is state and state.layer_chain is run.chain
+            for state in run.states
+        )
+
+    def _gene_layer_step(self, run, index: int, phase: str) -> None:
+        """One turn of the chunked layer creation, then the next turn or the finish."""
+        if getattr(self, "_gene_layer_chain", None) is not run.chain:
             return  # a newer build owns the progress stage
-        if (
-            generation != self._gene_build_generation
-            or self._gene_inspector_states.get(ds) is not state
-        ):
-            # Torn down or superseded mid-way: stop quietly.
+        if not self._gene_layer_chain_owned(run):
+            # Torn down or superseded mid-way: stop quietly. Staleness is
+            # decided by ownership, not by ``_gene_build_generation``:
+            # ``_cancel_dataset_background_tasks`` bumps the generation before
+            # a dataset switch that may still fail and keep this dataset, so
+            # a registered state is finished (its payload is already loaded)
+            # until a teardown or a session apply removes it.
             self._gene_layer_chain = None
             self._end_progress(GENE_LAYERS_PROGRESS_KEY)
             return
-        atera = payload.get("atera")
-        n_groups = len(state.store.group_symbols)
+        n_layers = len(run.tasks)
         t0 = time.perf_counter()
         try:
-            if gi < n_groups:
-                self._create_gene_group_layer(state, gi)
+            if phase == "build" and index < n_layers:
+                run.add = run.tasks[index]()
+                next_step = (index, "add")
+            elif phase == "add":
+                add, run.add = run.add, None
+                if add is not None:
+                    add()
+                self._report_progress(GENE_LAYERS_PROGRESS_KEY, index + 1, n_layers, unit="layers", force=True)
+                next_step = (index + 1, "build") if index + 1 < n_layers else (n_layers, "finish")
+            else:
+                next_step = None
         except MemoryError:
             self._gene_layer_chain = None
+            for state in run.states:
+                state.layer_chain = None
             self._end_progress(GENE_LAYERS_PROGRESS_KEY)
-            if atera is not None:
-                state.atera = atera
-                self._atera_layers_out_of_memory(ds, atera)
-            else:
-                self._teardown_gene_inspector(ds)
-                self._set_status(f"{ds}: out of memory while creating the transcript layers.")
-                log.error("[%s] Out of memory while creating the transcript layers.", ds)
+            run.on_memory_error()
             return
-        log.debug("[%s] Gene layer %d/%d created in %.2fs", ds, gi + 1, n_groups, time.perf_counter() - t0)
-        if gi + 1 < n_groups:
-            self._report_progress(GENE_LAYERS_PROGRESS_KEY, gi + 1, n_groups, unit="layers", force=True)
-            self._defer_gene_layer_step(
-                lambda: self._gene_layer_step(chain, generation, ds, state, payload, gi + 1)
-            )
+        log.debug("Gene layer %d/%d %s step took %.2fs", index + 1, n_layers, phase, time.perf_counter() - t0)
+        if next_step is not None:
+            self._defer_gene_layer_step(lambda: self._gene_layer_step(run, *next_step))
             return
-        self._report_progress(GENE_LAYERS_PROGRESS_KEY, n_groups, n_groups, unit="layers", force=True)
         self._gene_layer_chain = None
-        state.layer_chain = None
+        for state in run.states:
+            state.layer_chain = None
         try:
-            self._finish_gene_inspector_build(state, payload)
+            run.finish()
         finally:
             self._end_progress(GENE_LAYERS_PROGRESS_KEY)
+
+    def _single_gene_layers_out_of_memory(self, state: GeneInspectorState, payload: dict) -> None:
+        ds = state.dataset
+        atera = payload.get("atera")
+        if atera is not None:
+            state.atera = atera
+            self._atera_layers_out_of_memory(ds, atera)
+        else:
+            self._teardown_gene_inspector(ds)
+            self._set_status(f"{ds}: out of memory while creating the transcript layers.")
+            log.error("[%s] Out of memory while creating the transcript layers.", ds)
 
     def _finish_gene_inspector_build(self, state: GeneInspectorState, payload: dict) -> None:
         """After the gene layers exist: order them, install Atera, fill the widget."""
@@ -12626,8 +12722,18 @@ class ComparisonViewerController(AteraTranscriptMixin):
         sizes=None,
         shown=None,
         paired_identity: LayerIdentity | None = None,
+        defer_add: bool = False,
     ):
-        """Add a Points layer pre-populated with data + per-point colour + symbol."""
+        """Add a Points layer pre-populated with data + per-point colour + symbol.
+
+        On a real napari viewer (and for paired slots) the layer is a
+        :class:`FastPoints`, which spares napari's per-point symbol
+        loop on every draw (about 3.5 s for an 11M-point layer), and it is
+        styled before it is added, so the styling never redraws it. With
+        ``defer_add`` the layer is built but not added: a zero-argument
+        callable is returned that adds it and returns it, so a chunked build
+        can add (and draw) it on a later event-loop turn.
+        """
         size = sizes if sizes is not None else float(spot_size)
         kwargs = dict(
             name=name,
@@ -12637,27 +12743,36 @@ class ComparisonViewerController(AteraTranscriptMixin):
             symbol=str(symbol),
             shown=np.ones(len(coords), dtype=bool) if shown is None else shown,
         )
-        if paired_identity is None:
+
+        def _points(factory):
             try:
-                layer = self.viewer.add_points(
-                    coords, face_color=colors, border_color=colors, **kwargs
-                )
+                return factory(coords, face_color=colors, border_color=colors, **kwargs)
             except TypeError:
-                layer = self.viewer.add_points(
-                    coords, face_color=colors, edge_color=colors, **kwargs
-                )
+                return factory(coords, face_color=colors, edge_color=colors, **kwargs)
+
+        if paired_identity is not None or isinstance(self.viewer, ViewerModel):
+            layer = _points(FastPoints)
+            self._style_gene_points_layer(layer, symbol)
+            if defer_add:
+                # Compute (and cache) the min/max data extent on this turn,
+                # not on the add turn, where the layer list needs it.
+                layer._extent_data
+
+            def add():
+                if paired_identity is None:
+                    return self.viewer.add_layer(layer)
+                if self._paired_registry is None:
+                    raise RuntimeError("Paired layer registry is unavailable.")
+                self._paired_registry.register_layer(paired_identity, layer)
+                return layer
         else:
-            try:
-                layer = napari.layers.Points(
-                    coords, face_color=colors, border_color=colors, **kwargs
-                )
-            except TypeError:
-                layer = napari.layers.Points(
-                    coords, face_color=colors, edge_color=colors, **kwargs
-                )
-            if self._paired_registry is None:
-                raise RuntimeError("Paired layer registry is unavailable.")
-            self._paired_registry.register_layer(paired_identity, layer)
+            def add():
+                added = _points(self.viewer.add_points)
+                self._style_gene_points_layer(added, symbol)
+                return added
+        return add if defer_add else add()
+
+    def _style_gene_points_layer(self, layer, symbol) -> None:
         # Antialiasing lets sub-pixel spots contribute partial opacity so density
         # structure shows when zoomed out; the min canvas-size floor is dropped so
         # spots actually shrink with zoom instead of staying a fixed 2px blanket.
@@ -12672,7 +12787,6 @@ class ComparisonViewerController(AteraTranscriptMixin):
             layer.canvas_size_limits = (min_px, 10000.0)
         except Exception:
             pass
-        return layer
 
     def _move_gene_layers_to_bottom(self, state: GeneInspectorState):
         """Move this dataset's gene Points layers to the bottom of the layer list.
