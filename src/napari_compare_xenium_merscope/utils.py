@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from hashlib import blake2s
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -4489,11 +4489,53 @@ def build_gene_point_groups(
             slices=slices,
         )
 
-    # Stable gene visuals + integer codes over the alphabetical gene panel. When
-    # a marker reference is supplied, colours + symbols come from the broad
-    # cell-type scheme; otherwise each gene falls back to the deterministic
-    # rainbow (symbol == alphabetical index % 14), preserving legacy behaviour.
-    unique_names = list(source_genes)
+    control_genes = control_genes_from_is_gene(
+        source_genes, is_gene_flags, source=f"column {is_gene_col!r}" if is_gene_col else ""
+    )
+    return assemble_gene_point_store(
+        list(source_genes),
+        render_x,
+        render_y,
+        render_gene_codes,
+        render_background,
+        gene_visuals=gene_visuals,
+        reference=reference,
+        alpha=alpha,
+        control_genes=control_genes,
+        sampled=sampled,
+        source_gene_counts=source_gene_counts,
+        source_total_points=total_source,
+        source_status_counts=source_status_counts,
+        cell_transcript_index=cell_index,
+    )
+
+
+def assemble_gene_point_store(
+    genes: Sequence[str],
+    render_x: np.ndarray,
+    render_y: np.ndarray,
+    render_gene_codes: np.ndarray,
+    render_background: np.ndarray,
+    *,
+    gene_visuals: Mapping[str, GeneVisual] | None = None,
+    reference: Mapping[str, Any] | None = None,
+    alpha: float = 1.0,
+    control_genes: set[str] | None = None,
+    sampled: bool = False,
+    source_gene_counts: dict[str, int] | None = None,
+    source_total_points: int | None = None,
+    source_status_counts: dict[str, int] | None = None,
+    cell_transcript_index: CellTranscriptIndex | None = None,
+) -> GenePointStore:
+    """Group compact per-point arrays into a :class:`GenePointStore` (vectorised).
+
+    ``genes`` is the alphabetical panel; ``render_gene_codes`` index it.
+    ``render_background`` marks unassigned points (drawn after the assigned
+    ones of each gene).  Used by :func:`build_gene_point_groups` and by the
+    Atera whole-slide load, which streams its arrays itself.
+    """
+    unique_names = [str(g) for g in genes]
+    render_count = int(len(render_gene_codes))
     if gene_visuals is None:
         if reference is not None:
             gene_visuals = build_cell_type_gene_visuals(
@@ -4513,74 +4555,82 @@ def build_gene_point_groups(
         ],
         dtype=np.int64,
     )
-    symbol_idx_per_point = symbol_idx_by_code[render_gene_codes]
-    used_symbol_idx = np.unique(symbol_idx_per_point)
+    n_names = len(unique_names)
+    # Symbols are per gene, so group, used groups and sort keys are computed per
+    # gene code and gathered once per point.
+    if render_count:
+        code_counts = np.bincount(render_gene_codes, minlength=n_names)
+    else:
+        code_counts = np.zeros(n_names, dtype=np.int64)
+    used_symbol_idx = np.unique(symbol_idx_by_code[code_counts > 0]) if n_names else np.zeros(0, np.int64)
     sidx_to_group = np.full(len(GENE_MARKER_SYMBOLS), -1, dtype=np.int64)
     for group_index, sidx in enumerate(used_symbol_idx):
         sidx_to_group[int(sidx)] = group_index
-    group_per_point = sidx_to_group[symbol_idx_per_point]
+    group_by_code = sidx_to_group[symbol_idx_by_code] if n_names else np.zeros(0, np.int64)
     group_symbols = [GENE_MARKER_SYMBOLS[int(sidx)] for sidx in used_symbol_idx]
 
-    # Sort primary by group, then gene code, then background (foreground first).
-    bucket = (
-        group_per_point.astype(np.uint64) * np.uint64(max(1, 2 * len(unique_names)))
-        + render_gene_codes.astype(np.uint64) * np.uint64(2)
-        + render_background.astype(np.uint64)
-    )
-    order = np.argsort(bucket, kind="stable")
+    # Sort primary by group, then gene code, then background (foreground
+    # first).  The (group, code) order is a per-code rank, so the sort key is
+    # rank * 2 + background; under 2**16 it is a uint16 radix sort.
+    rank_order = np.lexsort((np.arange(n_names), group_by_code)) if n_names else np.zeros(0, np.int64)
+    rank_by_code = np.empty(n_names, dtype=np.int64)
+    rank_by_code[rank_order] = np.arange(n_names)
+    key_dtype = np.uint16 if 2 * max(1, n_names) <= np.iinfo(np.uint16).max + 1 else np.uint32
+    if render_count:
+        sort_key = rank_by_code.astype(key_dtype)[render_gene_codes]
+        sort_key *= key_dtype(2)
+        sort_key += np.asarray(render_background, dtype=bool).astype(key_dtype)
+        order = np.argsort(sort_key, kind="stable")
+        del sort_key
+    else:
+        order = np.zeros(0, dtype=np.int64)
     coords = np.empty((render_count, 2), dtype=np.float32)
     coords[:, 0] = render_y[order]
     coords[:, 1] = render_x[order]
     codes_sorted = render_gene_codes[order]
-    bg_sorted = render_background[order]
-    group_sorted = group_per_point[order]
-    del order, bucket, render_x, render_y, render_background, group_per_point, symbol_idx_per_point
+    bg_sorted = np.asarray(render_background, dtype=bool)[order]
+    del order
 
     code_to_rgba = np.array(
         [gene_visuals[name].rgba for name in unique_names], dtype=np.float32
-    )
+    ).reshape(-1, 4)
     colors_all = code_to_rgba[codes_sorted]
 
     n = coords.shape[0]
-    # Per-group coord/colour slices (views into the sorted arrays). group_sorted
-    # is non-decreasing, so np.unique gives each group's start in order.
-    _uniq_groups, group_starts = np.unique(group_sorted, return_index=True)
-    group_ends = list(group_starts[1:]) + [n]
+    # Per-group coord/colour slices (views into the sorted arrays). Groups are
+    # contiguous in rank order, so each group's start is a cumulative count.
+    group_sizes = np.zeros(len(group_symbols), dtype=np.int64)
+    if n_names and len(group_symbols):
+        np.add.at(group_sizes, group_by_code[code_counts > 0], code_counts[code_counts > 0])
+    group_starts = np.concatenate(([0], np.cumsum(group_sizes)[:-1])) if len(group_sizes) else np.zeros(0, np.int64)
     group_coords = []
     group_colors = []
     for gi in range(len(group_symbols)):
         gs = int(group_starts[gi])
-        ge = int(group_ends[gi])
+        ge = gs + int(group_sizes[gi])
         group_coords.append(coords[gs:ge])
         group_colors.append(colors_all[gs:ge])
 
-    # Per-gene contiguous ranges (relative to their group array). Each gene code
-    # is one contiguous run in ``codes_sorted`` (each code maps to one group and
-    # is code-sorted within it), but the runs are ordered by (group, code) rather
-    # than by code value, so run boundaries must come from actual value changes
-    # -- NOT from a code-sorted np.unique index.
-    if n > 0:
-        change = np.flatnonzero(np.diff(codes_sorted) != 0) + 1
-        block_starts = np.concatenate(([0], change))
-        block_ends = np.concatenate((change, [n]))
-    else:
-        block_starts = np.empty(0, dtype=np.int64)
-        block_ends = np.empty(0, dtype=np.int64)
+    # Per-gene contiguous ranges (relative to their group array), in rank order.
+    fg_counts = np.zeros(n_names, dtype=np.int64)
+    if n:
+        fg_counts = np.bincount(codes_sorted[~bg_sorted], minlength=n_names)
     gene_offsets: dict[str, tuple[int, int, int, int]] = {}
     gene_counts: dict[str, int] = {}
-    for bi in range(len(block_starts)):
-        cs = int(block_starts[bi])
-        ce = int(block_ends[bi])
-        g = int(group_sorted[cs])
+    cursor = 0
+    for code in rank_order.tolist():
+        count = int(code_counts[code])
+        if count == 0:
+            continue
+        g = int(group_by_code[code])
         gstart = int(group_starts[g])
-        fg_count = int(np.count_nonzero(~bg_sorted[cs:ce]))
-        name = unique_names[int(codes_sorted[cs])]
-        gene_offsets[name] = (g, cs - gstart, cs + fg_count - gstart, ce - gstart)
-        gene_counts[name] = ce - cs
+        name = unique_names[code]
+        cs = cursor
+        ce = cursor + count
+        gene_offsets[name] = (g, cs - gstart, cs + int(fg_counts[code]) - gstart, ce - gstart)
+        gene_counts[name] = count
+        cursor = ce
 
-    control_genes = control_genes_from_is_gene(
-        unique_names, is_gene_flags, source=f"column {is_gene_col!r}" if is_gene_col else ""
-    )
     return GenePointStore(
         group_symbols=group_symbols,
         group_coords=group_coords,
@@ -4588,14 +4638,14 @@ def build_gene_point_groups(
         gene_offsets=gene_offsets,
         gene_counts=gene_counts,
         genes=list(unique_names),
-        control_genes=control_genes,
+        control_genes=set(control_genes or ()),
         total_points=n,
         sampled=sampled,
         source_gene_counts=source_gene_counts,
-        source_total_points=total_source,
+        source_total_points=source_total_points,
         source_status_counts=source_status_counts,
         gene_visuals=dict(gene_visuals),
-        cell_transcript_index=cell_index,
+        cell_transcript_index=cell_transcript_index,
     )
 
 

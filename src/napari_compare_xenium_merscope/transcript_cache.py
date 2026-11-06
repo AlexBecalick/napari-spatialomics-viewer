@@ -1394,3 +1394,123 @@ def load_atera_overview(
     except Exception as exc:
         log.warning("Ignoring invalid Atera overview cache entry %s: %s", entry, exc)
         return None
+
+
+# ---------------------------------------------------------------------------
+# Atera whole-slide hash sample ("full" transcript mode)
+# ---------------------------------------------------------------------------
+#
+# One entry per points identity (``atera-sample-v1``): the LARGEST sample
+# saved so far.  Samples nest (every row whose sample key is below the
+# threshold), so any smaller budget is served by filtering this entry on its
+# ``key`` column, and a save never replaces a larger cached sample with a
+# smaller one.
+
+ATERA_SAMPLE_CACHE_KIND = "atera_sample"
+ATERA_SAMPLE_CACHE_VERSION = 1
+_ATERA_SAMPLE_DIR = f"atera-sample-v{ATERA_SAMPLE_CACHE_VERSION}"
+#: Larger samples are not cached (18 B/row: 400M rows is about 7 GB on disk).
+ATERA_SAMPLE_CACHE_MAX_ROWS = 400_000_000
+_SAMPLE_COLUMNS = ("x", "y", "code", "cell_id", "key")
+
+
+def _sample_address(index: Any, cache_root: str | Path | None) -> _AteraEntryAddress | None:
+    return _atera_address(index, cache_root, _ATERA_SAMPLE_DIR, ATERA_SAMPLE_CACHE_KIND, {})
+
+
+def _cached_sample_manifest(index: Any, cache_root: str | Path | None) -> tuple[Path, dict[str, Any]] | None:
+    found = _read_atera_entry(_sample_address(index, cache_root), ATERA_SAMPLE_CACHE_KIND, ATERA_SAMPLE_CACHE_VERSION)
+    if found is None:
+        return None
+    entry, raw = found
+    if int(raw.get("total_rows", -1)) != int(index.n_rows):
+        return None
+    if str(raw.get("vocabulary_digest", "")) != _digest(list(index.vocabulary)):
+        return None
+    return entry, raw
+
+
+def cached_atera_sample_threshold(index: Any, cache_root: str | Path | None = None) -> int | None:
+    """Threshold of the cached sample for ``index`` (``None`` when none is cached)."""
+    found = _cached_sample_manifest(index, cache_root)
+    return None if found is None else int(found[1].get("threshold", -1))
+
+
+def save_atera_sample(
+    index: Any,
+    sample: Any,
+    cache_root: str | Path | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+    *,
+    max_rows: int | None = None,
+) -> Path | None:
+    """Persist a :class:`SampledTranscripts` unless a larger one is already cached."""
+    limit = ATERA_SAMPLE_CACHE_MAX_ROWS if max_rows is None else int(max_rows)
+    if sample is None or int(sample.n) > limit:
+        return None
+    if int(sample.total_rows) != int(index.n_rows):
+        return None
+    existing = cached_atera_sample_threshold(index, cache_root)
+    if existing is not None and existing >= int(sample.threshold):
+        return None
+    address = _sample_address(index, cache_root)
+    if address is None:
+        return None
+    manifest = {
+        "kind": ATERA_SAMPLE_CACHE_KIND,
+        "version": ATERA_SAMPLE_CACHE_VERSION,
+        "points_key": str(index.points_key),
+        "threshold": int(sample.threshold),
+        "rows": int(sample.n),
+        "total_rows": int(sample.total_rows),
+        "vocabulary_digest": _digest(list(index.vocabulary)),
+    }
+    arrays = {name: getattr(sample, name) for name in _SAMPLE_COLUMNS}
+    return _write_atera_entry(address, manifest, arrays, cancel_check)
+
+
+def load_atera_sample(
+    index: Any,
+    threshold: int,
+    cache_root: str | Path | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> Any:
+    """The cached sample filtered to ``threshold``, or ``None`` if it cannot serve it."""
+    from .atera_transcripts import SAMPLE_KEY_SPACE, SampledTranscripts
+
+    found = _cached_sample_manifest(index, cache_root)
+    if found is None:
+        return None
+    entry, raw = found
+    cached = int(raw.get("threshold", -1))
+    threshold = int(threshold)
+    if cached < threshold:
+        return None
+    try:
+        names = raw["arrays"]
+        rows = int(raw.get("rows", -1))
+        dtypes = {
+            "x": np.float32, "y": np.float32, "code": index.code_dtype,
+            "cell_id": index.assignment_dtype, "key": np.uint32,
+        }
+        mapped = {name: _load_array(entry, str(names[name]), ndim=1, dtype=dtypes[name]) for name in _SAMPLE_COLUMNS}
+        if any(len(array) != rows for array in mapped.values()):
+            raise ValueError("cached sample columns differ in length")
+        keep = None
+        if threshold < cached and threshold < SAMPLE_KEY_SPACE:
+            parts = []
+            step = _chunk_rows(mapped["key"])
+            for start in range(0, rows, step):
+                _cancelled(cancel_check)
+                parts.append(np.flatnonzero(np.asarray(mapped["key"][start : start + step]) < np.uint32(threshold)) + start)
+            keep = np.concatenate(parts) if parts else np.zeros(0, dtype=np.int64)
+        columns: dict[str, np.ndarray] = {}
+        for name, array in mapped.items():
+            _cancelled(cancel_check)
+            columns[name] = np.array(array) if keep is None else np.asarray(array[keep])
+        return SampledTranscripts(threshold=min(threshold, cached), total_rows=int(index.n_rows), **columns)
+    except TranscriptBuildCancelled:
+        raise
+    except Exception as exc:
+        log.warning("Ignoring invalid Atera sample cache entry %s: %s", entry, exc)
+        return None

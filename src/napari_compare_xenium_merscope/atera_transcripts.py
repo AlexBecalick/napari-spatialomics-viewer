@@ -805,6 +805,8 @@ class AteraOverview:
     sample_size: int = 0
     sample_seed: int = 0
     is_gene_flags_used: bool = False
+    #: Whole-slide hash sample kept during the pass (``keep_threshold``); never cached here.
+    hash_sample: "SampledTranscripts | None" = None
 
     @property
     def density(self) -> np.ndarray:
@@ -924,6 +926,151 @@ def sample_global_positions(total: int, k: int, seed: int) -> np.ndarray:
     rng = np.random.default_rng(int(seed))
     positions = rng.choice(total, size=k, replace=False, shuffle=False)
     return np.sort(np.asarray(positions, dtype=np.int64))
+
+
+# ---------------------------------------------------------------------------
+# Whole-slide hash sample (the "full" transcript mode)
+# ---------------------------------------------------------------------------
+
+#: Sample keys are the top 32 bits of a splitmix64 hash, so a threshold in
+#: ``[0, SAMPLE_KEY_SPACE]`` selects a fraction of the rows.
+SAMPLE_KEY_SPACE = 1 << 32
+_SPLITMIX_GAMMA = np.uint64(0x9E3779B97F4A7C15)
+_SPLITMIX_M1 = np.uint64(0xBF58476D1CE4E5B9)
+_SPLITMIX_M2 = np.uint64(0x94D049BB133111EB)
+#: Bits reserved for the row index in the hashed (file, row) word.
+_ROW_BITS = 40
+
+
+def sample_threshold(budget: int, total: int) -> int:
+    """Key threshold that keeps about ``budget`` of ``total`` rows.
+
+    Every row with a key below the threshold is kept, so a smaller budget is
+    always a subset of a larger one (the samples nest), and a budget at or
+    above ``total`` keeps every row.
+    """
+    budget = int(budget)
+    total = int(total)
+    if budget <= 0 or total <= 0:
+        return 0
+    if budget >= total:
+        return SAMPLE_KEY_SPACE
+    return int((budget * SAMPLE_KEY_SPACE) // total)
+
+
+def threshold_fraction(threshold: int) -> float:
+    return min(1.0, max(0.0, float(threshold) / float(SAMPLE_KEY_SPACE)))
+
+
+def row_sample_keys(position: int, row_start: int, n: int) -> np.ndarray:
+    """``uint32`` sample keys of rows ``row_start .. row_start + n`` of file ``position``.
+
+    A splitmix64 hash of ``(file position, row index)``: stable across runs,
+    machines and budgets, and independent of the scheduling order.
+    """
+    n = int(n)
+    base = (int(position) + 1) << _ROW_BITS
+    z = np.arange(base + int(row_start), base + int(row_start) + n, dtype=np.uint64)
+    z += _SPLITMIX_GAMMA
+    z ^= z >> np.uint64(30)
+    z *= _SPLITMIX_M1
+    z ^= z >> np.uint64(27)
+    z *= _SPLITMIX_M2
+    z ^= z >> np.uint64(31)
+    return (z >> np.uint64(32)).astype(np.uint32)
+
+
+def _keep_mask(position: int, row_start: int, n: int, threshold: int) -> np.ndarray | None:
+    """Rows of a block kept by ``threshold`` (``None`` = every row)."""
+    if threshold >= SAMPLE_KEY_SPACE:
+        return None
+    if threshold <= 0:
+        return np.zeros(int(n), dtype=bool)
+    return row_sample_keys(position, row_start, n) < np.uint32(threshold)
+
+
+#: Bytes one sampled row takes in memory and in the external cache:
+#: float32 x and y, int16 code, uint32 cell id and uint32 sample key.
+SAMPLE_ROW_BYTES = 18
+
+
+@dataclass
+class SampledTranscripts:
+    """A deterministic whole-slide sample: every row whose key is below ``threshold``."""
+
+    x: np.ndarray  # float32
+    y: np.ndarray  # float32
+    code: np.ndarray  # global feature code (int16/int32)
+    cell_id: np.ndarray  # uint32/uint64, 0 = unassigned
+    key: np.ndarray  # uint32 sample key
+    threshold: int
+    total_rows: int
+
+    @property
+    def n(self) -> int:
+        return int(len(self.x))
+
+    @property
+    def complete(self) -> bool:
+        """True when every row of the store is in the sample."""
+        return self.threshold >= SAMPLE_KEY_SPACE
+
+    @property
+    def nbytes(self) -> int:
+        return int(sum(a.nbytes for a in (self.x, self.y, self.code, self.cell_id, self.key)))
+
+    def subset(self, threshold: int) -> "SampledTranscripts":
+        """The nested sample of a smaller ``threshold`` (no re-read)."""
+        threshold = int(threshold)
+        if threshold >= self.threshold:
+            if threshold > self.threshold and not self.complete:
+                raise ValueError("cannot grow a sample by filtering it")
+            return self
+        keep = np.flatnonzero(self.key < np.uint32(threshold)) if threshold > 0 else np.zeros(0, np.int64)
+        return SampledTranscripts(
+            x=self.x[keep], y=self.y[keep], code=self.code[keep], cell_id=self.cell_id[keep],
+            key=self.key[keep], threshold=threshold, total_rows=self.total_rows,
+        )
+
+
+def physical_memory_bytes() -> int | None:
+    """Physical RAM of this machine (psutil, else ``os.sysconf``), or ``None``."""
+    try:
+        import psutil  # type: ignore[import-not-found]
+
+        return int(psutil.virtual_memory().total)
+    except Exception:
+        pass
+    try:
+        return int(os.sysconf("SC_PAGE_SIZE")) * int(os.sysconf("SC_PHYS_PAGES"))
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def auto_point_budget(
+    total: int, *, bytes_per_point: float, ram_bytes: int | None, fraction: float = 0.5
+) -> int:
+    """``floor(fraction * RAM / bytes_per_point)``, capped at ``total``."""
+    total = max(0, int(total))
+    if ram_bytes is None or ram_bytes <= 0 or bytes_per_point <= 0:
+        return total
+    return int(min(total, math.floor(float(fraction) * float(ram_bytes) / float(bytes_per_point))))
+
+
+def clamp_point_budget(
+    budget: int, *, bytes_per_point: float, ram_bytes: int | None, limit_fraction: float = 0.85
+) -> tuple[int, bool]:
+    """Clamp ``budget`` so its estimated memory stays under ``limit_fraction`` of RAM.
+
+    Returns ``(budget, clamped)``.
+    """
+    budget = max(0, int(budget))
+    if ram_bytes is None or ram_bytes <= 0 or bytes_per_point <= 0:
+        return budget, False
+    limit = int(math.floor(float(limit_fraction) * float(ram_bytes) / float(bytes_per_point)))
+    if budget > limit:
+        return max(0, limit), True
+    return budget, False
 
 
 # ---------------------------------------------------------------------------
@@ -1216,6 +1363,177 @@ class AteraTranscriptEngine:
         _map_files(work, sorted(selection), cancel, lambda _p, found: parts.extend(found))
         return self._concat(parts, columns)
 
+    # -- whole-slide sample ----------------------------------------------
+
+    def _sample_block(
+        self,
+        table: pa.Table,
+        codes: np.ndarray,
+        ids: np.ndarray | None,
+        keep: np.ndarray | None,
+        position: int,
+        row_start: int,
+        has_assignment: bool,
+    ) -> dict[str, np.ndarray]:
+        """The kept rows of one row group as compact sample columns."""
+        index = self.index
+        n = len(codes)
+        rows = None if keep is None else np.flatnonzero(keep)
+        take = (lambda a: a) if rows is None else (lambda a: a[rows])
+        xs = np.asarray(table.column(X_COLUMN).to_numpy(), dtype=np.float32)
+        ys = np.asarray(table.column(Y_COLUMN).to_numpy(), dtype=np.float32)
+        if has_assignment:
+            if ids is None:
+                column = table.column(ASSIGNMENT_COLUMN)
+                if rows is not None:
+                    column = column.take(pa.array(rows))
+                picked_ids = np.asarray(pc.fill_null(column, 0).to_numpy())
+            else:
+                picked_ids = take(ids)
+        else:
+            picked_ids = np.zeros(n if rows is None else len(rows), dtype=index.assignment_dtype)
+        keys = row_sample_keys(position, row_start, n)
+        return {
+            "x": take(xs),
+            "y": take(ys),
+            "code": take(codes).astype(index.code_dtype),
+            "cell_id": np.asarray(picked_ids).astype(index.assignment_dtype, copy=False),
+            "key": take(keys),
+        }
+
+    def _merge_sample(self, parts: list[dict[str, np.ndarray]], threshold: int) -> SampledTranscripts:
+        index = self.index
+        dtypes = {
+            "x": np.float32, "y": np.float32, "code": index.code_dtype,
+            "cell_id": index.assignment_dtype, "key": np.uint32,
+        }
+        merged: dict[str, np.ndarray] = {}
+        for name, dtype in dtypes.items():
+            total = sum(len(p[name]) for p in parts)
+            out = np.empty(total, dtype=dtype)
+            cursor = 0
+            for part in parts:
+                values = part.pop(name)
+                out[cursor : cursor + len(values)] = values
+                cursor += len(values)
+            merged[name] = out
+        return SampledTranscripts(threshold=int(threshold), total_rows=index.n_rows, **merged)
+
+    def sample_rows(
+        self,
+        threshold: int,
+        cancel: Any = None,
+        progress: Callable[[int, int], None] | None = None,
+    ) -> SampledTranscripts:
+        """Stream every file and keep the rows whose sample key is below ``threshold``."""
+        index = self.index
+        has_assignment = all(_column_index(m, ASSIGNMENT_COLUMN) is not None for m in index.metadata)
+        read_columns = [X_COLUMN, Y_COLUMN, GENE_COLUMN] + ([ASSIGNMENT_COLUMN] if has_assignment else [])
+        threshold = int(threshold)
+
+        def work(position: int) -> list[dict[str, np.ndarray]]:
+            parquet_file = self._parquet(position)
+            out = []
+            row0 = 0
+            for rg in range(index.metadata[position].num_row_groups):
+                n_rg = int(index.metadata[position].row_group(rg).num_rows)
+                start = row0
+                row0 += n_rg
+                if n_rg == 0 or threshold <= 0:
+                    continue
+                table = _read_row_group(parquet_file, rg, read_columns)
+                codes = index.global_codes(position, table.column(GENE_COLUMN))
+                keep = _keep_mask(position, start, n_rg, threshold)
+                if table.column(GENE_COLUMN).null_count:
+                    valid = codes >= 0
+                    keep = valid if keep is None else (keep & valid)
+                out.append(self._sample_block(table, codes, None, keep, position, start, has_assignment))
+            return out
+
+        parts: list[dict[str, np.ndarray]] = []
+        done = 0
+        n_files = len(index.files)
+
+        def consume(_position: int, found: list[dict[str, np.ndarray]]) -> None:
+            nonlocal done
+            parts.extend(found)
+            done += 1
+            if progress is not None:
+                progress(done, n_files)
+
+        _map_files(work, range(n_files), cancel, consume)
+        return self._merge_sample(parts, threshold)
+
+    def read_window_rows(
+        self,
+        bounds_um: Sequence[float],
+        codes: Iterable[int] | None = None,
+        cancel: Any = None,
+        *,
+        exclude_below: int = 0,
+        clip: bool = True,
+    ) -> dict[str, np.ndarray] | None:
+        """Rows of ``codes`` in the window whose sample key is NOT below ``exclude_below``.
+
+        This is what a viewport adds on top of a whole-slide sample of the same
+        threshold: the rows the sample left out, never a row twice.  Returns
+        ``x``, ``y``, ``code``, ``cell_id`` and ``key``, or ``None`` without a
+        validated index.
+        """
+        if not self.window_reads_available:
+            return None
+        index = self.index
+        exclude_below = int(exclude_below)
+        if exclude_below >= SAMPLE_KEY_SPACE:
+            empty = self._merge_sample([], 0)
+            return {"x": empty.x, "y": empty.y, "code": empty.code, "cell_id": empty.cell_id, "key": empty.key}
+        positions = self.files_in_window(bounds_um)
+        rect = tuple(float(v) for v in bounds_um) if clip else None
+        wanted = None if codes is None else sorted({int(c) for c in codes})
+        plan = None if wanted is None else self.plan_gene_reads(wanted, self.code_map)
+        code_filter = None if wanted is None else np.asarray(wanted, dtype=np.int64)
+        has_assignment = all(_column_index(m, ASSIGNMENT_COLUMN) is not None for m in index.metadata)
+        read_columns = [X_COLUMN, Y_COLUMN, GENE_COLUMN] + ([ASSIGNMENT_COLUMN] if has_assignment else [])
+        if plan is not None:
+            positions = [p for p in positions if p in plan]
+
+        def work(position: int) -> list[dict[str, np.ndarray]]:
+            parquet_file = self._parquet(position)
+            metadata = index.metadata[position]
+            starts = np.concatenate([[0], np.cumsum([metadata.row_group(i).num_rows for i in range(metadata.num_row_groups)])])
+            groups = None if plan is None else plan[position]
+            row_groups = sorted(groups) if groups is not None else list(range(metadata.num_row_groups))
+            out = []
+            for rg in row_groups:
+                if rect is not None and not _row_group_meets(metadata, rg, rect):
+                    continue
+                table = _read_row_group(parquet_file, rg, read_columns)
+                runs = None if groups is None else groups[rg]
+                pieces = [(table, 0)] if runs is None else [(table.slice(s, e - s), s) for _c, s, e in runs]
+                for piece, offset in pieces:
+                    n = piece.num_rows
+                    if not n:
+                        continue
+                    codes_piece = index.global_codes(position, piece.column(GENE_COLUMN))
+                    keep = codes_piece >= 0
+                    if runs is None and code_filter is not None:
+                        keep &= np.isin(codes_piece, code_filter)
+                    if rect is not None:
+                        xs = piece.column(X_COLUMN).to_numpy()
+                        ys = piece.column(Y_COLUMN).to_numpy()
+                        keep &= (xs >= rect[0]) & (xs < rect[2]) & (ys >= rect[1]) & (ys < rect[3])
+                    if exclude_below > 0:
+                        keys = row_sample_keys(position, int(starts[rg]) + int(offset), n)
+                        keep &= keys >= np.uint32(exclude_below)
+                    if keep.any():
+                        out.append(self._sample_block(piece, codes_piece, None, keep, position, int(starts[rg]) + int(offset), has_assignment))
+            return out
+
+        parts: list[dict[str, np.ndarray]] = []
+        _map_files(work, positions, cancel, lambda _p, found: parts.extend(found))
+        sample = self._merge_sample(parts, 0)
+        return {"x": sample.x, "y": sample.y, "code": sample.code, "cell_id": sample.cell_id, "key": sample.key}
+
     # -- code map and overview --------------------------------------------
 
     def build_code_map(self, cancel: Any = None) -> CodeRangeMap | None:
@@ -1249,6 +1567,7 @@ class AteraTranscriptEngine:
         seed: int = 0,
         split_assigned: bool = False,
         progress: Callable[[int, int], None] | None = None,
+        keep_threshold: int | None = None,
     ) -> AteraOverview:
         """One pass: exact counts, assigned counts, density raster(s), code map.
 
@@ -1258,6 +1577,10 @@ class AteraTranscriptEngine:
         seeded per-file Bernoulli sample at rate ``sample_size / total`` (per
         file and row group, so it is deterministic whatever the scheduling),
         then drops controls and trims to at most ``sample_size`` rows.
+
+        ``keep_threshold`` (see :func:`sample_threshold`) also keeps, in the
+        same pass, the whole-slide hash sample of every row (controls included)
+        whose key is below it, returned as ``overview.hash_sample``.
         """
         bin_um = float(bin_um)
         if not bin_um > 0:
@@ -1284,6 +1607,7 @@ class AteraTranscriptEngine:
         if has_is_gene:
             read_columns.append(IS_GENE_COLUMN)
         null_rows = 0
+        kept_parts: list[dict[str, np.ndarray]] = []
 
         def work(position: int) -> dict[str, Any]:
             parquet_file = self._parquet(position)
@@ -1295,13 +1619,17 @@ class AteraTranscriptEngine:
             a_blocks: list[tuple[int, int, np.ndarray]] = []
             runs = []
             samples = []
+            kept: list[dict[str, np.ndarray]] = []
             nulls = 0
             metadata = index.metadata[position]
             assignment_index = _column_index(metadata, ASSIGNMENT_COLUMN)
+            row0 = 0
             for rg in range(metadata.num_row_groups):
                 table = _read_row_group(parquet_file, rg, read_columns)
                 codes = index.global_codes(position, table.column(GENE_COLUMN))
                 n = len(codes)
+                rg_row0 = row0
+                row0 += n
                 # Per-run sums replace per-row bincounts: codes come in runs.
                 run_codes, starts, ends = _code_runs(codes)
                 runs.append((int(index.rg_offsets[position] + rg), (run_codes, starts, ends)))
@@ -1349,6 +1677,11 @@ class AteraTranscriptEngine:
                     a_block = _bin_block(xs[mask], ys[mask], x0, y0, bin_um, width, height)
                     if a_block is not None:
                         a_blocks.append(a_block)
+                if keep_threshold is not None and keep_threshold > 0 and n:
+                    keep = _keep_mask(position, rg_row0, n, keep_threshold)
+                    if valid is not None:
+                        keep = valid if keep is None else (keep & valid)
+                    kept.append(self._sample_block(table, codes, ids, keep, position, rg_row0, has_assignment))
                 if rng is not None:
                     pick = rng.random(n) < rate
                     if valid is not None:
@@ -1373,6 +1706,7 @@ class AteraTranscriptEngine:
             return {
                 "counts": f_counts, "assigned": f_assigned, "not_gene": f_not_gene,
                 "blocks": blocks, "a_blocks": a_blocks, "runs": runs, "samples": samples, "nulls": nulls,
+                "kept": kept,
             }
 
         done = 0
@@ -1392,6 +1726,7 @@ class AteraTranscriptEngine:
             for global_rg, runs in result["runs"]:
                 builder.add(global_rg, *runs)
             sample_parts.extend(result["samples"])
+            kept_parts.extend(result["kept"])
             done += 1
             if progress is not None:
                 progress(done, n_files)
@@ -1426,6 +1761,10 @@ class AteraTranscriptEngine:
                 rows = rows[sample_global_positions(len(rows), sample_size, seed)]
             sample = {key: value[rows] for key, value in merged.items()}
             sample["code"] = sample["code"].astype(index.code_dtype)
+        hash_sample = None
+        if keep_threshold is not None:
+            hash_sample = self._merge_sample(kept_parts, int(keep_threshold))
+            kept_parts.clear()
         code_map = builder.finish()
         self.attach_code_map(code_map)
         if int(counts.sum()) + null_rows != total:
@@ -1446,6 +1785,7 @@ class AteraTranscriptEngine:
             sample_size=int(max(0, sample_size)),
             sample_seed=int(seed),
             is_gene_flags_used=bool(has_is_gene),
+            hash_sample=hash_sample,
         )
 
 
@@ -1484,3 +1824,75 @@ def file_stat_identity(index: AteraPointsIndex) -> list[dict[str, Any]] | None:
             return None
         out.append({"file": item.name, "size": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)})
     return out
+
+
+# ---------------------------------------------------------------------------
+# Gene point stores for the viewer
+# ---------------------------------------------------------------------------
+
+
+def overview_panel(overview: AteraOverview) -> tuple[list[str], np.ndarray, dict[str, int], set[str]]:
+    """``(genes, lut, source_counts, controls)`` of the viewer's gene panel.
+
+    ``genes`` are the observed features in alphabetical order (what
+    :func:`~.utils.build_gene_point_groups` lists), ``lut`` maps a global code
+    to its panel index (-1 for unobserved), ``source_counts`` are the exact
+    per-feature totals and ``controls`` the observed control features (from
+    ``is_gene`` when the points carry it).
+    """
+    observed = np.flatnonzero(np.asarray(overview.counts) > 0)
+    names = [str(overview.vocabulary[i]) for i in observed]
+    order = sorted(range(len(names)), key=lambda i: names[i])
+    genes = [names[i] for i in order]
+    lut = np.full(len(overview.vocabulary), -1, dtype=np.int64)
+    for panel_index, i in enumerate(order):
+        lut[int(observed[i])] = panel_index
+    counts = {str(overview.vocabulary[i]): int(overview.counts[i]) for i in observed}
+    controls = {str(overview.vocabulary[i]) for i in observed if bool(overview.is_control[i])}
+    return genes, lut, counts, controls
+
+
+def gene_point_store_from_rows(
+    overview: AteraOverview,
+    x: np.ndarray,
+    y: np.ndarray,
+    code: np.ndarray,
+    cell_id: np.ndarray,
+    *,
+    sampled: bool,
+    gene_visuals: Mapping[str, Any] | None = None,
+    reference: Mapping[str, Any] | None = None,
+    reference_resolver: Callable[[list[str]], Any] | None = None,
+    alpha: float = 1.0,
+):
+    """A :class:`~.utils.GenePointStore` over compact Atera rows (vectorised).
+
+    Every observed feature is listed with its exact count, whether or not
+    ``code`` holds rows of it; unassigned rows (``cell_id == 0``) are the
+    background.
+    """
+    from .utils import assemble_gene_point_store
+
+    genes, lut, counts, controls = overview_panel(overview)
+    if reference is None and reference_resolver is not None:
+        reference = reference_resolver(genes)
+    panel_dtype = np.uint16 if len(genes) <= np.iinfo(np.uint16).max + 1 else np.uint32
+    panel_index = lut[np.asarray(code, dtype=np.int64)] if len(code) else np.zeros(0, np.int64)
+    if len(panel_index) and int(panel_index.min()) < 0:
+        raise ValueError("rows hold features the overview never counted")
+    panel_codes = panel_index.astype(panel_dtype)
+    del panel_index
+    return assemble_gene_point_store(
+        genes,
+        np.asarray(x, dtype=np.float32),
+        np.asarray(y, dtype=np.float32),
+        panel_codes,
+        np.asarray(cell_id) == 0,
+        gene_visuals=gene_visuals,
+        reference=reference,
+        alpha=alpha,
+        control_genes=controls,
+        sampled=bool(sampled),
+        source_gene_counts=counts,
+        source_total_points=int(np.asarray(overview.counts).sum()),
+    )
