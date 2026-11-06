@@ -351,6 +351,56 @@ def test_stale_vendor_alias_displays_the_vendor_labels(qapp, store_copy):
     assert _alias_snapshot(store_copy) == before
 
 
+def _tree_snapshot(root: Path) -> dict[str, bytes]:
+    return {
+        str(path.relative_to(root)): path.read_bytes()
+        for path in sorted(root.rglob("*"))
+        if path.is_file()
+    }
+
+
+@pytest.mark.parametrize("overwrite_labels", [False, True])
+def test_missing_shape_never_writes_a_label_element(qapp, store_copy, overwrite_labels):
+    """A shape the store lacks raises before any discard or empty-element write.
+
+    Regression: an absent ``merscope_cell_boundaries`` once left a marker-less,
+    all-background ``merscope_cell_boundaries_labels`` shell (and a duplicate
+    ``ome.labels`` entry per attempt) in an Atera store.
+    """
+    ctrl = _controller(overwrite_labels=overwrite_labels)
+    _activate(ctrl, store_copy)
+    labels_dir = store_copy / "labels"
+    before = _tree_snapshot(labels_dir)
+    for _attempt in range(2):
+        with pytest.raises(KeyError, match="merscope_cell_boundaries"):
+            ctrl.ensure_label_for_shape_key("merscope_cell_boundaries")
+    assert _tree_snapshot(labels_dir) == before
+    assert not (labels_dir / "merscope_cell_boundaries_labels").exists()
+    assert "merscope_cell_boundaries_labels" not in ctrl._active_sdata.labels
+
+
+def test_shape_only_in_store_is_loaded_before_the_label_build(qapp, store_copy, monkeypatch):
+    """A shape missing from memory but present in the store still builds."""
+    ctrl = _controller()
+    _activate(ctrl, store_copy)
+    shape_key = "atera_nucleus"
+    if shape_key in ctrl._active_sdata.shapes:
+        del ctrl._active_sdata.shapes[shape_key]
+    calls = []
+    monkeypatch.setattr(ctrl, "_discard_label_cache_before_write", lambda *a: calls.append("discard"))
+    monkeypatch.setattr(ctrl, "_write_empty_label_element", lambda **k: calls.append("write"))
+    monkeypatch.setattr(ctrl, "_rasterize_label_payload", lambda **k: calls.append("raster") or 0)
+    monkeypatch.setattr(ctrl, "_mark_label_cache_complete", lambda *a: None)
+    monkeypatch.setattr(ctrl, "_label_key_for_shape_key", lambda key: "nucleus_rebuilt_labels")
+    monkeypatch.setattr(ctrl, "_refresh_label_key_from_store", lambda *a, **k: False)
+    monkeypatch.setattr(
+        ctrl, "_image_grid_for_labels", lambda: ((8, 8), (8, 8), np.eye(3), None)
+    )
+    assert ctrl.ensure_label_for_shape_key(shape_key) == "nucleus_rebuilt_labels"
+    assert shape_key in ctrl._active_sdata.shapes
+    assert calls == ["discard", "write", "raster"]
+
+
 def test_viewer_generated_label_caches_are_still_rebuilt(qapp, tmp_path):
     """A non-vendor marker keeps the existing rebuild behaviour."""
     ctrl = _controller()

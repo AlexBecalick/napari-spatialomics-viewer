@@ -9036,6 +9036,17 @@ class ComparisonViewerController:
         ):
             return label_key
 
+        # Never touch the store for a shape it does not have: the discard and the
+        # empty-element write below would otherwise leave a marker-less, all-
+        # background label shell behind (and a duplicate ome.labels entry) before
+        # rasterization notices the shape is missing.
+        if shape_key not in self._active_sdata.shapes:
+            shapes_sdata = self._read_shapes_from_store()
+            if shapes_sdata is not None and shape_key in shapes_sdata.shapes:
+                self._active_sdata.shapes[shape_key] = shapes_sdata.shapes[shape_key]
+        if shape_key not in self._active_sdata.shapes:
+            raise KeyError(f"Shape key '{shape_key}' not found in current dataset.")
+
         mem_before = memory_snapshot_gb()
         t0 = time.time()
         self._set_status(f"{self.active_dataset} building labels for {shape_key}...")
