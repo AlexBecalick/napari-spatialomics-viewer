@@ -3604,10 +3604,16 @@ class GeneInspectorWidget(QWidget):
         self._hide_bg_check = QCheckBox("Hide unassigned spots")
         self._hide_bg_check.setChecked(bool(hide_background))
         self._hide_bg_check.toggled.connect(self._on_hide_background_toggled)
-        self._colour_by_assignment_check = QCheckBox("Colour transcripts by assigned/unassigned")
+        # Short check-box texts: a QCheckBox cannot wrap, and at the panel's
+        # 240 px minimum the inspector has ~180 px beside the indicator.
+        self._colour_by_assignment_check = QCheckBox("Colour by assignment")
+        self._colour_by_assignment_check.setToolTip(
+            "Colour transcripts by whether they are assigned to a cell or unassigned."
+        )
         self._colour_by_assignment_check.setChecked(bool(colour_by_assignment))
         self._colour_by_assignment_check.toggled.connect(self._on_colour_by_assignment_toggled)
-        self._show_controls_check = QCheckBox("Show control / blank probes")
+        self._show_controls_check = QCheckBox("Show control probes")
+        self._show_controls_check.setToolTip("Show the negative-control / blank probe codewords.")
         self._show_controls_check.setChecked(bool(show_controls))
         self._show_controls_check.toggled.connect(self._on_show_controls_toggled)
 
@@ -3662,25 +3668,38 @@ class GeneInspectorWidget(QWidget):
         root.addWidget(self._close_button)
         self._build_atera_controls()
         root.addWidget(self._atera_box)
-        root.addWidget(QLabel("Transcript assignment source"))
+        assignment_label = QLabel("Transcript assignment source")
+        assignment_label.setWordWrap(True)
+        root.addWidget(assignment_label)
         root.addWidget(self._assignment_combo)
         root.addWidget(self._assignment_summary)
+        # Label and value on one row, the slider on its own full-width row:
+        # side by side at the panel's minimum width they squeezed the spin box
+        # until its "0.5 µm" clipped (napari's spin-box style eats ~60 px).
         spot_row = QHBoxLayout()
         spot_row.addWidget(QLabel("Spot size"))
-        spot_row.addWidget(self._spot_slider)
-        spot_row.addWidget(self._spot_spin)
+        self._spot_spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        spot_row.addWidget(self._spot_spin, stretch=1)
         root.addLayout(spot_row)
+        root.addWidget(self._spot_slider)
         root.addWidget(self._show_all_check)
         root.addWidget(self._hide_assigned_check)
         root.addWidget(self._hide_bg_check)
         root.addWidget(self._colour_by_assignment_check)
         root.addWidget(self._show_controls_check)
         root.addWidget(self._order_label)
-        order_row = QHBoxLayout()
+        # The order buttons wrap onto a second row on a narrow panel instead of
+        # squeezing "Broad cell type" / "Fine cell type" until they clip.
+        self._order_row = QWidget()
+        order_row = FlowLayout(self._order_row, margin=0, hspacing=6, vspacing=6)
         order_row.addWidget(self._order_coarse_btn)
         order_row.addWidget(self._order_fine_btn)
         order_row.addWidget(self._order_alpha_btn)
-        root.addLayout(order_row)
+        order_policy = self._order_row.sizePolicy()
+        order_policy.setHeightForWidth(True)
+        order_policy.setVerticalPolicy(QSizePolicy.Minimum)
+        self._order_row.setSizePolicy(order_policy)
+        root.addWidget(self._order_row)
         root.addWidget(self._filter_edit)
         root.addWidget(self._selected_label)
         root.addWidget(self._selected_view)

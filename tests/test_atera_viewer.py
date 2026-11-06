@@ -1026,8 +1026,24 @@ def _atera_controls_widget():
 
 
 def _text_fits(qapp, child) -> tuple[bool, str]:
-    from qtpy.QtWidgets import QAbstractSpinBox, QComboBox, QLabel, QPushButton, QStyle, QStyleOptionComboBox
+    from qtpy.QtWidgets import (
+        QAbstractSpinBox,
+        QCheckBox,
+        QComboBox,
+        QLabel,
+        QPushButton,
+        QStyle,
+        QStyleOptionButton,
+        QStyleOptionComboBox,
+    )
 
+    if isinstance(child, QCheckBox):
+        # The text beside the indicator (a check box never wraps).
+        option = QStyleOptionButton()
+        child.initStyleOption(option)
+        room = child.style().subElementRect(QStyle.SE_CheckBoxContents, option, child).width()
+        needed = child.fontMetrics().horizontalAdvance(child.text())
+        return needed <= room, f"check box '{child.text()}' {needed} > {room}"
     if isinstance(child, QComboBox):
         option = QStyleOptionComboBox()
         child.initStyleOption(option)
@@ -1136,18 +1152,31 @@ def test_gene_inspector_fits_the_panel_at_its_minimum_width_with_the_scrollbar_s
             return child.mapTo(viewport, QPoint(child.width() - 1, 0)).x()
 
         assert right_in_viewport(widget) < viewport.width()
+        from qtpy.QtWidgets import QWidget
+
+        # Every visible control of the inspector (not only the Atera box), plus
+        # the tab's load/unload buttons: inside the viewport, text unclipped.
         children = [panel._load_transcripts_button, panel._unload_transcripts_button]
+        children += [child for child in widget.findChildren(QWidget) if child.isVisibleTo(widget)]
         if datasets == ["ATERA"]:
-            children += [
-                widget._atera_reload_button, widget._atera_budget_spin, widget._atera_overview_spin,
-                widget._atera_viewport_spin, widget._atera_mode_combo,
-            ]
+            assert widget._atera_reload_button in children and widget._atera_mode_combo in children
+        else:
+            assert widget._atera_box not in children
+        for name in ("_colour_by_assignment_check", "_show_controls_check", "_order_coarse_btn",
+                     "_order_fine_btn", "_order_alpha_btn", "_spot_spin", "_spot_slider"):
+            assert getattr(widget, name) in children, name
         for child in children:
             assert child.isVisible()
-            assert child.mapTo(viewport, QPoint(0, 0)).x() >= 0, type(child).__name__
-            assert right_in_viewport(child) < viewport.width(), type(child).__name__
+            label = f"{type(child).__name__} {getattr(child, 'text', lambda: '')()!r}"
+            assert child.mapTo(viewport, QPoint(0, 0)).x() >= 0, label
+            assert right_in_viewport(child) < viewport.width(), label
             fits, why = _text_fits(qapp, child)
             assert fits, why
+        # The order buttons wrap rather than overlap.
+        order = [widget._order_coarse_btn, widget._order_fine_btn, widget._order_alpha_btn]
+        for i, a in enumerate(order):
+            for b in order[i + 1:]:
+                assert not a.geometry().intersects(b.geometry())
         if datasets == ["ATERA"]:
             box = widget._atera_box
             atera = [

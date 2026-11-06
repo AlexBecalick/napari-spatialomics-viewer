@@ -457,7 +457,7 @@ separate compact dictionary-encoded index. The panel offers:
 - a per-gene checkbox (with the colour/shape marker) and a **Show all genes** toggle,
 - a **Spot size** slider (world microns; spots keep a real size and scale with zoom),
 - **Hide background (unassigned) spots** to drop transcripts not assigned to a cell,
-- **Show control / blank probes** to include negative-control codewords (hidden by
+- **Show control probes** to include negative-control / blank codewords (hidden by
   default), and a filter box to search the list.
 
 ### Grouping genes by cell type
