@@ -452,6 +452,33 @@ def test_standalone_relabel_notice_survives_the_real_load(qapp, atera_store, mon
     assert statuses and not any(notice in text for text in statuses)
 
 
+def test_standalone_relabel_notice_survives_the_startup_autoload(qapp, atera_store, monkeypatch):
+    """The real startup autoload (transcripts included) must not overwrite the notice."""
+    ctrl = _controller()
+    statuses = _statuses(ctrl)
+    monkeypatch.setattr(V, "thread_worker", None)
+    monkeypatch.setattr(ctrl, "load_images_on_demand", lambda *_a, **_k: None)
+    monkeypatch.setattr(ctrl, "load_selected_labels", lambda *_a, **_k: None)
+    monkeypatch.setattr(ctrl, "_schedule_canvas_visibility_repair", lambda ds: None)
+    autoloads = []
+    original = ctrl._start_startup_autoload
+    monkeypatch.setattr(
+        ctrl, "_start_startup_autoload", lambda ds: autoloads.append(ds) or original(ds)
+    )
+
+    def forbidden(*_a, **_k):
+        raise AssertionError("the startup autoload must not open the eager gene inspector for ATERA")
+
+    monkeypatch.setattr(ctrl, "open_gene_inspector", forbidden)
+    assert not bool(getattr(ctrl.args, "skip_transcripts", False))
+    assert ctrl.load_standalone_dataset("XENIUM", atera_store) is True
+    assert autoloads == ["ATERA"]
+    notice = "Detected Atera store; opening as ATERA."
+    assert statuses[-1].startswith(notice)
+    assert "ATERA metadata loaded" in statuses[-1]
+    assert not any("lazy engine not available" in text for text in statuses)
+
+
 def test_standalone_relabel_notice_is_kept_on_a_failed_load(qapp, atera_store, monkeypatch):
     ctrl = _controller()
     statuses = _statuses(ctrl)

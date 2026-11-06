@@ -6406,7 +6406,14 @@ class ComparisonViewerController:
             self.load_selected_labels(ds, mask_keys)
 
         if not bool(getattr(self.args, "skip_transcripts", False)):
-            if self._active_store_has_points():
+            if self._uses_lazy_cell_queries(ds):
+                # No eager transcript build for lazy (Atera) stores. Log only: a
+                # status here would overwrite the 'metadata loaded' status and
+                # with it any one-shot detection notice it carries. An explicit
+                # open_gene_inspector request still reports the gate.
+                log.info("[%s] Lazy transcript store; skipping the eager transcript autoload.", ds)
+                self._publish_transcript_sources()
+            elif self._active_store_has_points():
                 self.open_gene_inspector(ds, reuse_cached=True)
             else:
                 log.info("[%s] Store has no points element; skipping transcript autoload.", ds)
