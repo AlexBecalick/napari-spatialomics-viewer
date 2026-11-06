@@ -596,3 +596,205 @@ def test_aggregate_row_and_layer_order_include_the_dynamic_layers(qapp, atera_st
     assert set(state.layer_names) <= names
     assert {AV.ATERA_DENSITY_LAYER, AV.ATERA_VIEWPORT_LAYER} <= names
     assert state.layer_names  # the per-gene groups were created
+
+
+# ---------------------------------------------------------------------------
+# Review follow-ups: runner identity, lazy MemoryError, density visibility,
+# is_gene-driven controls on a real open
+# ---------------------------------------------------------------------------
+
+
+def test_lazy_memory_error_drawing_genes_never_wedges_the_gene_reads(qapp, atera_store, monkeypatch):
+    ctrl = _controller(atera_store, monkeypatch, atera_transcript_mode="lazy")
+    ctrl.open_gene_inspector("ATERA")
+    state = _state(ctrl)
+    ctx = state.atera
+    ctx.view_timer = None
+    ctx.gene_timer = None  # flush synchronously
+    original = ctrl._create_gene_points_layer
+    calls = []
+
+    def flaky(name, *args, **kwargs):
+        if name != AV.ATERA_VIEWPORT_LAYER:
+            calls.append(name)
+            if len(calls) == 1:
+                raise MemoryError("synthetic")
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(ctrl, "_create_gene_points_layer", flaky)
+    first, second = _real_genes(state)[:2]
+    ctrl.set_gene_visible("ATERA", first, True)
+    # The runner finished, the gene that did not fit was unticked (its rows
+    # stay in the LRU), no partial layer is left and the status says why.
+    assert not ctx.gene_runner.busy
+    assert first not in state.enabled_genes and first not in state.slot_allocator
+    assert first in ctx.loaded and ctx.store_genes == frozenset()
+    assert state.store.total_points == 0 and state.layer_names == []
+    fixed = {AV.ATERA_DENSITY_LAYER, AV.ATERA_VIEWPORT_LAYER}
+    assert not any(
+        str(layer.name).startswith("Genes | ") and str(layer.name) not in fixed for layer in ctrl.viewer.layers
+    )
+    assert "out of memory" in ctrl.statuses[-1] and "Tick fewer genes" in ctrl.statuses[-1]
+    # A later tick still loads.
+    ctrl.set_gene_visible("ATERA", second, True)
+    assert not ctx.gene_runner.busy
+    assert ctx.store_genes == frozenset({second})
+    assert state.store.gene_counts[second] == state.store.source_gene_counts[second]
+    assert all(_layer(ctrl, n) is not None for n in state.layer_names)
+
+
+def test_restored_payload_ignores_the_torn_down_installs_reads(qapp, atera_store, monkeypatch):
+    total = _total_rows(atera_store)
+    ctrl = _controller(atera_store, monkeypatch, gene_max_render_points=total // 3)
+    ctrl._dataset_sessions["ATERA"] = SimpleNamespace(gene_payload=None, last_used=0)
+    monkeypatch.setattr(ctrl, "_evict_dataset_sessions", lambda *a, **k: None)
+    ctrl.open_gene_inspector("ATERA")
+    state = _state(ctrl)
+    ctx = state.atera
+    ctx.view_timer = None
+    jobs = []
+    monkeypatch.setattr(ctrl, "_atera_run", lambda compute, done, failed: jobs.append((compute, done, failed)))
+    genes = _real_genes(state)
+    ctrl.set_gene_visible("ATERA", genes[0], True)
+    old_compute, old_done, old_failed = jobs[-1]
+    old_runner = ctx.view_runner
+    old_cancel = old_runner.cancel_event
+    # Re-activating the dataset restores the cached payload: same context,
+    # fresh runners whose generations restart.
+    ctrl._open_atera_gene_inspector("ATERA", reuse_cached=True, announce=False)
+    restored = _state(ctrl)
+    assert restored.atera is ctx and ctx.view_runner is not old_runner
+    ctx.view_timer = None
+    ctrl.set_gene_visible("ATERA", genes[1], True)
+    assert ctx.view_runner.busy
+    new_generation = ctx.view_runner.running
+    # The old job ends, cancelled or not: the new runner stays single-flight.
+    old_failed(AV.TranscriptBuildCancelled("cancelled"))
+    assert ctx.view_runner.busy and ctx.view_runner.running == new_generation
+    rendered = ctx.viewport_cache
+    old_cancel.clear()  # a read that completed just as the restore cancelled it
+    old_done(old_compute())
+    assert ctx.view_runner.busy and ctx.viewport_cache is rendered
+    # The new job still lands normally.
+    compute, done, _failed = jobs[-1]
+    done(compute())
+    assert not ctx.view_runner.busy and ctx.viewport_cache is not None
+
+
+def test_restored_payload_ignores_the_torn_down_installs_gene_reads(qapp, atera_store, monkeypatch):
+    ctrl = _controller(atera_store, monkeypatch, atera_transcript_mode="lazy")
+    ctrl._dataset_sessions["ATERA"] = SimpleNamespace(gene_payload=None, last_used=0)
+    monkeypatch.setattr(ctrl, "_evict_dataset_sessions", lambda *a, **k: None)
+    ctrl.open_gene_inspector("ATERA")
+    state = _state(ctrl)
+    ctx = state.atera
+    ctx.view_timer = None
+    ctx.gene_timer = None
+    jobs = []
+    monkeypatch.setattr(ctrl, "_atera_run", lambda compute, done, failed: jobs.append((compute, done, failed)))
+    genes = _real_genes(state)
+    ctrl.set_gene_visible("ATERA", genes[0], True)
+    old_compute, old_done, _old_failed = jobs[-1]
+    old_cancel = ctx.gene_runner.cancel_event
+    ctrl._open_atera_gene_inspector("ATERA", reuse_cached=True, announce=False)
+    restored = _state(ctrl)
+    assert restored.atera is ctx
+    ctx.view_timer = None
+    ctx.gene_timer = None
+    ctrl.set_gene_visible("ATERA", genes[1], True)
+    assert ctx.gene_runner.busy
+    # The old install's gene store (built for genes[0] only) never lands.
+    old_cancel.clear()  # a read that completed just as the restore cancelled it
+    old_done(old_compute())
+    assert ctx.gene_runner.busy and ctx.store_genes == frozenset()
+    compute, done, _failed = jobs[-1]
+    done(compute())
+    assert not ctx.gene_runner.busy
+    assert set(ctx.store_genes) == {g for g in restored.enabled_genes if g in ctx.loaded}
+    assert genes[1] in ctx.store_genes
+
+
+def test_lazy_density_follows_the_overview_switch_not_gene_ticks(qapp, atera_store, monkeypatch):
+    ctrl = _controller(atera_store, monkeypatch, atera_transcript_mode="lazy")
+    ctrl.open_gene_inspector("ATERA")
+    state = _state(ctrl)
+    ctx = state.atera
+    ctx.view_timer = None
+    ctx.gene_timer = None
+    density = _layer(ctrl, AV.ATERA_DENSITY_LAYER)
+    assert density.visible  # the lazy whole-slide view before anything is ticked
+    ctrl.set_gene_overview("ATERA", True)
+    assert density.visible
+    ctrl.set_gene_overview("ATERA", False)
+    assert not density.visible
+    genes = _real_genes(state)
+    ctrl.set_gene_visible("ATERA", genes[0], True)
+    ctrl.set_genes_visible("ATERA", genes[1:3], True)
+    assert not density.visible  # ticks never re-show it
+    ctrl.set_gene_overview("ATERA", True)
+    assert density.visible
+    density.visible = False  # hidden from the layer list
+    ctrl.set_gene_visible("ATERA", genes[0], False)
+    ctrl.set_gene_visible("ATERA", genes[3], True)
+    assert not density.visible
+
+
+def _store_with_is_gene_disagreeing(src: Path, dst: Path, gene: str, control: str) -> Path:
+    """Copy ``src`` with ``gene`` flagged is_gene=False and ``control`` flagged True."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    shutil.copytree(src, dst)
+    files = sorted((dst / "points").rglob("*.parquet"))
+    files = [f for f in files if f.is_file()]
+    assert files
+    for path in files:
+        table = pq.read_table(path)
+        if "is_gene" not in table.column_names:
+            continue
+        names = np.asarray(table.column("feature_name").to_pylist(), dtype=object)
+        flags = np.asarray(table.column("is_gene").to_pylist(), dtype=bool)
+        flags[names == gene] = False
+        flags[names == control] = True
+        table = table.set_column(table.schema.get_field_index("is_gene"), "is_gene", pa.array(flags))
+        pq.write_table(table, path)
+    return dst
+
+
+def test_lazy_open_files_an_is_gene_false_feature_under_the_control_heading(qapp, atera_store, monkeypatch, tmp_path):
+    fake_gene = "ACTB"  # gene-like name, flagged as a control
+    named_control = "NegControlProbe_00002"  # control-like name, flagged as a gene
+    store = _store_with_is_gene_disagreeing(atera_store, tmp_path / "flags.zarr", fake_gene, named_control)
+    for mode in ("lazy", "full"):
+        ctrl = _controller(store, monkeypatch, atera_transcript_mode=mode, gene_max_render_points=0)
+        widget = V.GeneInspectorWidget(
+            close_callback=lambda *_a: None,
+            set_gene_visible_callback=ctrl.set_gene_visible,
+            set_all_genes_callback=ctrl.set_all_genes_visible,
+            set_spot_size_callback=ctrl.set_gene_spot_size,
+            set_hide_background_callback=ctrl.set_gene_hide_background,
+            set_show_controls_callback=ctrl.set_gene_show_controls,
+            reload_atera_callback=ctrl.reload_atera_transcripts,
+            set_atera_viewport_cap_callback=ctrl.set_atera_viewport_cap,
+        )
+        ctrl._gene_inspector_widget = widget
+        ctrl.open_gene_inspector("ATERA")
+        state = _state(ctrl)
+        assert state.atera.overview.is_gene_flags_used
+        assert fake_gene in state.store.genes and named_control in state.store.genes
+        assert fake_gene in state.store.control_genes, mode
+        assert named_control not in state.store.control_genes, mode
+        model = widget._model
+        group_of = {
+            model.genes[int(gi)]: model.header_titles[int(group)]
+            for group, members in enumerate(model.group_genes)
+            for gi in members
+        }
+        # Genes listed before any heading (A-Z ordering) have no group.
+        assert fake_gene in model.genes and named_control in model.genes
+        assert group_of.get(fake_gene) == V.CONTROL_GROUP_TITLE, mode
+        assert group_of.get(named_control) != V.CONTROL_GROUP_TITLE, mode
+        assert bool(model.is_control[model.gene_index[fake_gene]])
+        assert not bool(model.is_control[model.gene_index[named_control]])
+        widget.clear()
+        ctrl._teardown_gene_inspector("ATERA")

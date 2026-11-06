@@ -14326,6 +14326,7 @@ class ComparisonViewerController(AteraTranscriptMixin):
         widget = self._gene_inspector_widget
         if widget is not None and hasattr(widget, "set_overview_checked"):
             widget.set_overview_checked(any(getattr(state, "overview_visible", False) for state in states))
+        self._atera_overview_changed(dataset_name)
         self._atera_selection_changed(dataset_name)
 
     def set_gene_spot_size(self, dataset_name: str, size: float):

@@ -689,12 +689,19 @@ class AteraTranscriptMixin:
         if ctx.mode == ATERA_MODE_LAZY:
             ctx.loaded = {}
             ctx.store_genes = frozenset()
-        ctx.gene_runner = LatestWinsRunner(
-            lambda request, gen, cancel, d=ds: self._atera_start_gene_read(d, request, gen, cancel)
+        # Each install gets fresh runners, and every job is bound to the runner
+        # that launched it.  A cached payload restore reuses this context, so
+        # the jobs of the torn-down install still hold it: binding them to
+        # their own (cancelled) runner keeps them from finishing - and so
+        # un-busying - the new one, whose generations restart at 0.
+        gene_runner = LatestWinsRunner(
+            lambda request, gen, cancel, d=ds: self._atera_start_gene_read(d, request, gen, cancel, gene_runner)
         )
-        ctx.view_runner = LatestWinsRunner(
-            lambda request, gen, cancel, d=ds: self._atera_start_view_read(d, request, gen, cancel)
+        view_runner = LatestWinsRunner(
+            lambda request, gen, cancel, d=ds: self._atera_start_view_read(d, request, gen, cancel, view_runner)
         )
+        ctx.gene_runner = gene_runner
+        ctx.view_runner = view_runner
         ctx.view_timer = _qtimer(ATERA_VIEWPORT_DEBOUNCE_MS, lambda d=ds: self._atera_request_viewport(d))
         ctx.gene_timer = _qtimer(ATERA_GENE_DEBOUNCE_MS, lambda d=ds: self._atera_flush_gene_reads(d))
         if ctx.mode == ATERA_MODE_LAZY:
@@ -936,13 +943,24 @@ class AteraTranscriptMixin:
         for state in self._atera_states(dataset_name):
             ctx = state.atera
             if ctx.mode == ATERA_MODE_LAZY:
-                self._atera_set_density_visible(state, True)
+                # Gene ticks never touch the density image: only the
+                # All-transcript overview switch does (_atera_overview_changed).
                 if self._atera_missing_genes(state) or self._atera_store_stale(state):
                     if ctx.gene_timer is not None:
                         ctx.gene_timer.start()
                     else:
                         self._atera_flush_gene_reads(state.dataset)
             self._atera_schedule_viewport(state.dataset)
+
+    def _atera_overview_changed(self, dataset_name: str) -> None:
+        """The All-transcript overview switch moved: the lazy density image follows it.
+
+        The image opens visible (it is the lazy mode's whole-slide view before
+        anything is ticked); from then on only this switch shows or hides it.
+        """
+        for state in self._atera_states(dataset_name):
+            if state.atera.mode == ATERA_MODE_LAZY:
+                self._atera_set_density_visible(state, bool(getattr(state, "overview_visible", False)))
 
     def _atera_display_changed(self, dataset_name: str) -> None:
         """Colours, filters, spot size or highlights changed: re-render the viewport rows."""
@@ -989,14 +1007,20 @@ class AteraTranscriptMixin:
         # while one runs are merged rather than lost (never superseded).
         ctx.gene_runner.submit("genes", supersede=False)
 
-    def _atera_start_gene_read(self, ds: str, _request, generation: int, cancel: Event) -> None:
+    def _atera_start_gene_read(
+        self, ds: str, _request, generation: int, cancel: Event, runner: LatestWinsRunner | None = None
+    ) -> None:
         state = self._gene_inspector_states.get(str(ds).upper())
         ctx = None if state is None else getattr(state, "atera", None)
-        if ctx is None:
+        if runner is None and ctx is not None:
+            runner = ctx.gene_runner
+        if ctx is None or ctx.gene_runner is not runner:
+            if runner is not None:  # a torn-down install's runner: never read for it
+                runner.finish(generation)
             return
         wanted = self._atera_missing_genes(state)
         if not wanted and not self._atera_store_stale(state):
-            ctx.gene_runner.finish(generation)
+            runner.finish(generation)
             return
         enabled = set(state.enabled_genes)
         loaded = dict(ctx.loaded)
@@ -1017,10 +1041,10 @@ class AteraTranscriptMixin:
             return merged, store, frozenset(shown)
 
         def done(result, gen=generation):
-            self._atera_gene_read_done(ds, ctx, gen, result)
+            self._atera_gene_read_done(ds, ctx, gen, result, runner)
 
         def failed(exc, gen=generation):
-            ctx.gene_runner.finish(gen)
+            runner.finish(gen)
             message = exc[1] if isinstance(exc, tuple) and len(exc) > 1 else exc
             if not isinstance(message, TranscriptBuildCancelled):
                 self._set_status(f"{ds}: gene read failed: {message}")
@@ -1028,21 +1052,73 @@ class AteraTranscriptMixin:
 
         self._atera_run(compute, done, failed)
 
-    def _atera_gene_read_done(self, ds: str, ctx, generation: int, result) -> None:
+    def _atera_gene_read_done(self, ds: str, ctx, generation: int, result, runner=None) -> None:
+        runner = ctx.gene_runner if runner is None else runner
         state = self._gene_inspector_states.get(str(ds).upper())
-        if state is None or getattr(state, "atera", None) is not ctx:
+        if state is None or getattr(state, "atera", None) is not ctx or ctx.gene_runner is not runner:
+            runner.finish(generation)
             return
         merged, store, shown = result
+        try:
+            self._atera_swap_store(state, store)
+        except MemoryError:
+            # Free the partial layers before anything else allocates, then keep
+            # the scheduler usable: the runner must always finish its job.
+            runner.finish(generation)
+            self._atera_gene_layers_out_of_memory(state, merged, shown, store)
+            return
+        except Exception:
+            runner.finish(generation)
+            raise
         ctx.loaded = merged
         ctx.store_genes = frozenset(shown)
-        self._atera_swap_store(state, store)
-        ctx.gene_runner.finish(generation)
-        if (self._atera_missing_genes(state) or self._atera_store_stale(state)) and not ctx.gene_runner.busy:
+        runner.finish(generation)
+        if (self._atera_missing_genes(state) or self._atera_store_stale(state)) and not runner.busy:
             self._atera_flush_gene_reads(ds)
         self._atera_schedule_viewport(ds)
         self._set_status(
             f"{ds}: {len(shown)} gene(s) at full resolution ({store.total_points / 1e6:,.2f}M points)."
         )
+
+    def _atera_gene_layers_out_of_memory(self, state, merged: dict, shown, store) -> None:
+        """Lazy: building the ticked genes' layers ran out of memory.
+
+        The partial layers go, the genes that were being drawn are unticked
+        (their rows stay in the LRU, so a later re-tick needs no read) and the
+        status says to tick fewer genes.  The point store is emptied and kept
+        in sync with that, so the next tick schedules a fresh build.
+        """
+        ds = state.dataset
+        ctx = state.atera
+        for name in list(state.layer_names):
+            self._remove_layer_by_name(name)
+        state.layer_names = []
+        state.pending_groups = set()
+        del store
+        gc.collect()
+        dropped = sorted(set(shown))
+        ctx.loaded = merged
+        ctx.store_genes = frozenset()
+        visuals = dict(state.gene_visuals or {})
+        try:
+            empty = gene_point_store_from_rows(
+                ctx.overview, *_concat_gene_rows(ctx.engine, {}), sampled=False, gene_visuals=visuals,
+            )
+            self._atera_swap_store(state, empty)
+        except Exception as exc:  # pragma: no cover - an empty store allocates nothing
+            log.warning("[%s] Could not reset the gene layers: %s", ds, exc)
+        if dropped:
+            # The regular untick path: frees their colour slots and highlights.
+            self.set_genes_visible(ds, dropped, False)
+        widget = getattr(self, "_gene_inspector_widget", None)
+        if widget is not None and hasattr(widget, "sync_checked_genes"):
+            widget.sync_checked_genes(state.enabled_genes)
+        message = (
+            f"{ds}: out of memory while drawing {len(dropped)} gene(s) at full resolution; "
+            "they were unticked. Tick fewer genes at a time."
+        )
+        log.error("[%s] %s", ds, message)
+        self._set_status(message)
 
     def _atera_swap_store(self, state, store) -> None:
         """Replace the state's point store and its group layers (lazy mode)."""
@@ -1152,10 +1228,16 @@ class AteraTranscriptMixin:
         ctx.view_request = {"bounds": padded, "codes": code_set, "exclude": exclude}
         ctx.view_runner.submit(ctx.view_request)
 
-    def _atera_start_view_read(self, ds: str, request: dict, generation: int, cancel: Event) -> None:
+    def _atera_start_view_read(
+        self, ds: str, request: dict, generation: int, cancel: Event, runner: LatestWinsRunner | None = None
+    ) -> None:
         state = self._gene_inspector_states.get(str(ds).upper())
         ctx = None if state is None else getattr(state, "atera", None)
-        if ctx is None:
+        if runner is None and ctx is not None:
+            runner = ctx.view_runner
+        if ctx is None or ctx.view_runner is not runner:
+            if runner is not None:  # a torn-down install's runner: never read for it
+                runner.finish(generation)
             return
         cap = int(ctx.viewport_cap)
 
@@ -1171,20 +1253,27 @@ class AteraTranscriptMixin:
             return rows
 
         def done(rows, gen=generation):
-            self._atera_view_read_done(ds, ctx, gen, request, rows)
+            self._atera_view_read_done(ds, ctx, gen, request, rows, runner)
 
         def failed(exc, gen=generation):
-            ctx.view_runner.finish(gen)
+            runner.finish(gen)
             message = exc[1] if isinstance(exc, tuple) and len(exc) > 1 else exc
             if not isinstance(message, TranscriptBuildCancelled):
                 log.warning("[%s] Atera viewport read failed: %s", ds, message)
 
         self._atera_run(compute, done, failed)
 
-    def _atera_view_read_done(self, ds: str, ctx, generation: int, request: dict, rows) -> None:
-        current = ctx.view_runner.finish(generation)
+    def _atera_view_read_done(self, ds: str, ctx, generation: int, request: dict, rows, runner=None) -> None:
+        runner = ctx.view_runner if runner is None else runner
+        current = runner.finish(generation)
         state = self._gene_inspector_states.get(str(ds).upper())
-        if not current or state is None or getattr(state, "atera", None) is not ctx or rows is None:
+        if (
+            not current
+            or ctx.view_runner is not runner
+            or state is None
+            or getattr(state, "atera", None) is not ctx
+            or rows is None
+        ):
             return
         ctx.viewport_cache = {**request, "rows": rows}
         self._atera_render_viewport(state)
