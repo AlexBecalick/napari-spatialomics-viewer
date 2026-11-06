@@ -23,7 +23,7 @@ from napari_compare_xenium_merscope import atera_transcripts as T
 from napari_compare_xenium_merscope import progress as P
 from napari_compare_xenium_merscope import transcript_cache as TC
 from napari_compare_xenium_merscope import viewer as V
-from napari_compare_xenium_merscope.utils import build_gene_point_groups
+from napari_compare_xenium_merscope.utils import MarkerReferenceResolution, build_gene_point_groups
 
 import test_atera_viewer as ATV
 import test_gene_inspector as GI
@@ -385,6 +385,92 @@ def test_a_generation_bump_mid_chain_still_finishes_the_registered_build(qapp, m
     assert ctrl._gene_inspector_states == {} and ctrl.viewer.layers == []
 
 
+def _switch_pending_controller(monkeypatch):
+    store = GI._demo_store()
+    steps, polls = [], []
+    ctrl, stages, values = _chunked_controller(store, monkeypatch, steps)
+    monkeypatch.setattr(ctrl, "_defer_gene_layer_finish", polls.append)
+    statuses, finished, installed, raised = [], [], [], []
+    ctrl.set_status_callback(statuses.append)
+    original = ctrl._finish_gene_inspector_build
+    monkeypatch.setattr(ctrl, "_finish_gene_inspector_build", lambda *a: (finished.append(a), original(*a)))
+    monkeypatch.setattr(ctrl, "_evict_dataset_sessions", lambda: installed.append("evict"))
+    ctrl._gene_inspector_widget = SimpleNamespace(
+        dataset=None, show=lambda: None, raise_=lambda: raised.append(True), clear=lambda: None,
+    )
+    monkeypatch.setattr(ctrl, "_populate_gene_inspector", lambda state: raised.append("populate"))
+    _apply(ctrl, store)
+    steps.pop(0)()
+    steps.pop(0)()
+    assert len(ctrl.viewer.layers) == 1
+    # What load_dataset(other) does before its metadata worker runs.
+    ctrl._cancel_background_tasks()
+    ctrl._reset_progress()
+    ctrl._dataset_load_worker = object()
+    ctrl._set_status("Loading OTHER metadata…")
+    return ctrl, store, steps, polls, stages, values, statuses, finished, installed, raised
+
+
+def test_a_chain_finishing_during_a_pending_switch_waits_and_a_successful_switch_drops_it(qapp, monkeypatch):
+    (ctrl, store, steps, polls, stages, values, statuses,
+     finished, installed, raised) = _switch_pending_controller(monkeypatch)
+    key = V.GENE_LAYERS_PROGRESS_KEY
+    n_values, n_stages = len(values), len(stages)
+    while steps:
+        steps.pop(0)()
+    # The layers are all built, but nothing user-facing of the outgoing dataset ran.
+    assert len(ctrl.viewer.layers) == len(store.group_symbols)
+    assert finished == [] and installed == [] and raised == []
+    assert statuses[-1] == "Loading OTHER metadata…"
+    assert len(values) == n_values and len(stages) == n_stages  # no reports into a reset stage
+    assert len(polls) == 1
+    polls.pop(0)()  # still loading: wait again
+    assert len(polls) == 1 and finished == []
+    # The switch succeeds: the session apply tears the outgoing states down.
+    ctrl._dataset_load_worker = None
+    ctrl._clear_layers()
+    polls.pop(0)()
+    assert polls == [] and finished == [] and installed == []
+    assert statuses[-1] == "Loading OTHER metadata…"
+    assert ctrl._gene_inspector_states == {} and ctrl._gene_layer_chain is None
+    assert not any(s[0] == key and s[2] for s in stages[n_stages:])
+
+
+def test_a_failed_switch_resumes_the_chain_with_its_bar_and_then_finishes(qapp, monkeypatch):
+    (ctrl, store, steps, polls, stages, values, statuses,
+     finished, installed, raised) = _switch_pending_controller(monkeypatch)
+    key = V.GENE_LAYERS_PROGRESS_KEY
+    n = len(store.group_symbols)
+    steps.pop(0)()  # builds group 1 while the switch is loading
+    # The metadata load fails: the dataset stays.
+    ctrl._dataset_load_generation = 5
+    ctrl._handle_dataset_load_error(5, "OTHER", RuntimeError("boom"))
+    assert ctrl._dataset_load_worker is None
+    n_stages = len(stages)
+    while steps:
+        steps.pop(0)()
+    # The bar comes back (begun afresh at the layers already added) and moves on.
+    assert (key, "TEST: creating the transcript layers…", True) == stages[n_stages]
+    counts = [v[1:3] for v in values if v[0] == key]
+    assert counts[-3:] == [(1, n), (2, n), (3, n)]
+    assert polls == []
+    assert len(finished) == 1 and installed == ["evict"] and "populate" in raised
+    assert statuses[-1] == "Click on any transcript to highlight that gene"
+    assert stages[-1] == (key, "", False)
+    state = ctrl._gene_inspector_states["TEST"]
+    assert len(state.layer_names) == n and ctrl._gene_layer_chain is None
+
+
+def test_a_pending_registration_load_also_counts_as_a_switch(qapp, monkeypatch):
+    ctrl = V.ComparisonViewerController(GI._FakeViewer(), {}, SimpleNamespace())
+    assert not ctrl._dataset_switch_pending()
+    ctrl._registration_worker_tokens["registration_load"] = threading.Event()
+    assert ctrl._dataset_switch_pending()
+    ctrl._registration_worker_tokens.clear()
+    ctrl._dataset_load_worker = object()
+    assert ctrl._dataset_switch_pending()
+
+
 class _FakePairedRegistry:
     def __init__(self, viewer):
         self.viewer = viewer
@@ -622,3 +708,142 @@ def test_wide_viewport_reads_show_progress_and_narrow_ones_do_not(qapp, atera_st
     assert (key, "", False) in stages and any(s[0] == key and s[2] for s in stages)
     counts = [v[1:3] for v in values if v[0] == key]
     assert counts and counts[-1][0] == counts[-1][1] and counts[-1][1] <= n_files
+
+
+# ---------------------------------------------------------------------------
+# Controller wiring: Xenium/MERSCOPE eager and paired builds, masks, images
+# ---------------------------------------------------------------------------
+
+
+def _dask_points(npartitions=3, offset=0.0):
+    rows = [(f"G{i % 4}", offset + float(i), float(i % 5), i % 3 == 0, i % 7) for i in range(60)]
+    frame = pd.DataFrame(rows, columns=["gene", "x", "y", "background", "cell_id"])
+    return dd.from_pandas(frame, npartitions=npartitions)
+
+
+def _wired_controller(monkeypatch, tmp_path, **args):
+    monkeypatch.setattr(V, "thread_worker", None)
+    monkeypatch.setattr(V, "make_transcript_cache_request", lambda **_kw: None)
+    monkeypatch.setattr(
+        V, "resolve_cell_type_marker_reference",
+        lambda *_a: MarkerReferenceResolution(reference=None),
+    )
+    base = dict(
+        gene_spot_size=2.0, gene_max_render_points=0, gene_hide_background=False,
+        gene_show_controls=False, random_state=42, gene_layer_chunk_min_points=0,
+    )
+    base.update(args)
+    ctrl = V.ComparisonViewerController(GI._FakeViewer(), {}, SimpleNamespace(**base))
+    ctrl._gene_inspector_widget = None
+    monkeypatch.setattr(ctrl, "_schedule_canvas_visibility_repair", lambda *_a: None)
+    stages, values = [], []
+    ctrl.set_progress_callback(lambda key, text, active: stages.append((key, text, active)))
+    ctrl.set_progress_value_callback(lambda *a: values.append(a))
+    return ctrl, stages, values
+
+
+def test_xenium_eager_build_reports_partition_reads_and_ends_its_stage(qapp, monkeypatch, tmp_path):
+    ctrl, stages, values = _wired_controller(monkeypatch, tmp_path)
+    points = _dask_points()
+    ctrl.datasets = {"XENIUM": SimpleNamespace(zarr_path=tmp_path / "xenium.zarr", platform="XENIUM")}
+    ctrl.active_dataset = "XENIUM"
+    ctrl._active_sdata = SimpleNamespace(points={"transcripts": points}, shapes={})
+    ctrl.open_gene_inspector("XENIUM")
+    n = points.npartitions
+    reads = [v for v in values if v[0] == "transcripts"]
+    assert reads and all(v[4] == "partition reads" for v in reads)
+    assert all(v[3] == "XENIUM: streaming transcripts for transcripts" for v in reads)
+    assert reads[-1][1:3] == (2 * n, 2 * n)
+    done = [v[1] for v in reads]
+    assert done == sorted(done) and all(v[2] == 2 * n for v in reads)
+    began = stages.index(("transcripts", "XENIUM: loading per-gene transcripts for transcripts...", True))
+    assert ("transcripts", "", False) in stages[began:]
+    assert "XENIUM" in ctrl._gene_inspector_states
+
+
+def test_paired_build_reports_both_platform_phases_and_ends_its_stage(qapp, monkeypatch, tmp_path):
+    ctrl, stages, values = _wired_controller(monkeypatch, tmp_path)
+    configs = {
+        ds: SimpleNamespace(zarr_path=tmp_path / f"{ds}.zarr", platform=ds) for ds in ("MERSCOPE", "XENIUM")
+    }
+    sdata = {
+        "MERSCOPE": SimpleNamespace(points={"transcripts": _dask_points(2)}, shapes={}),
+        "XENIUM": SimpleNamespace(points={"transcripts": _dask_points(3, offset=500.0)}, shapes={}),
+    }
+    ctrl.datasets = dict(configs)
+    ctrl.active_dataset = "PAIRED"
+    ctrl._paired_session = SimpleNamespace(
+        contract=SimpleNamespace(
+            pair_id="pair", mappings={},
+            profile=lambda ds: SimpleNamespace(points_key="transcripts", segmentations=()),
+        ),
+        configs=configs,
+        sdata=sdata,
+    )
+    ctrl._paired_registry = _FakePairedRegistry(ctrl.viewer)
+    monkeypatch.setattr(ctrl, "_remove_paired_anchor", lambda: None)
+    assert ctrl._open_paired_gene_inspector()
+    reads = [v for v in values if v[0] == "transcripts" and v[4] == "partition reads"]
+    phases = {}
+    for v in reads:
+        phases.setdefault(v[3], []).append(v[1:3])
+    first, second = (
+        next(t for t in phases if t.endswith(f"({k} of 2)")) for k in (1, 2)
+    )
+    assert list(phases) == [first, second]
+    for text, counts in phases.items():
+        n = sdata[text.split(":")[0]].points["transcripts"].npartitions
+        assert counts[-1] == (2 * n, 2 * n)
+        assert [d for d, _t in counts] == sorted(d for d, _t in counts)
+    began = [i for i, s in enumerate(stages) if s[0] == "transcripts" and s[2]]
+    assert began and ("transcripts", "", False) in stages[began[-1]:]
+    assert set(ctrl._gene_inspector_states) == {"MERSCOPE", "XENIUM"}
+
+
+def test_several_segmentations_report_k_of_n_and_end_their_stage(qapp, monkeypatch, tmp_path):
+    ctrl, stages, values = _wired_controller(monkeypatch, tmp_path)
+    ctrl.datasets = {"XENIUM": SimpleNamespace(zarr_path=tmp_path / "xenium.zarr", platform="XENIUM")}
+    ctrl.active_dataset = "XENIUM"
+    keys = ["cell_boundaries", "nucleus_boundaries", "proseg"]
+    ctrl._active_sdata = SimpleNamespace(points={}, shapes={k: [0, 1] for k in keys}, labels={})
+    monkeypatch.setattr(ctrl, "_ensure_dataset_is_active", lambda _ds: True)
+    monkeypatch.setattr(ctrl, "_segmentation_source", lambda: "shapes")
+    monkeypatch.setattr(ctrl, "ensure_label_for_shape_key", lambda key, **_kw: f"{key}_labels")
+    monkeypatch.setattr(ctrl, "_prepare_label_outline_display", lambda key, **_kw: {"key": key})
+    finished = []
+    monkeypatch.setattr(ctrl, "_finish_label_layer", lambda ds, key, prepared: finished.append(key) or 1)
+    ctrl.load_selected_labels("XENIUM", keys)
+    counts = [v[1:3] + (v[4],) for v in values if v[0] == "masks"]
+    # Throttled in between; the first and the final count always pass.
+    assert counts[0] == (1, len(keys), "segmentations") and counts[-1] == (len(keys), len(keys), "segmentations")
+    assert [c[0] for c in counts] == sorted({c[0] for c in counts})
+    assert finished == [f"{k}_labels" for k in keys]
+    began = [i for i, s in enumerate(stages) if s[0] == "masks" and s[2]]
+    assert began and ("masks", "", False) in stages[began[-1]:]
+    # One segmentation: a busy bar, no count.
+    values.clear()
+    ctrl._dataset_sessions.clear()
+    ctrl.load_selected_labels("XENIUM", ["other"])
+    assert not [v for v in values if v[0] == "masks"]
+
+
+def test_several_images_report_k_of_n_and_end_their_stage(qapp, monkeypatch, tmp_path):
+    ctrl, stages, values = _wired_controller(monkeypatch, tmp_path)
+    ctrl.datasets = {"XENIUM": SimpleNamespace(zarr_path=tmp_path / "xenium.zarr", platform="XENIUM")}
+    ctrl.active_dataset = "XENIUM"
+    image_keys = ["morphology_focus", "morphology_mip"]
+    images = SimpleNamespace(images={k: object() for k in image_keys})
+    ctrl._active_sdata = ctrl._active_images_sdata = images
+    ctrl._x_transform = ctrl._y_transform = object()
+    monkeypatch.setattr(ctrl, "_ensure_dataset_is_active", lambda _ds: True)
+    monkeypatch.setattr(ctrl, "_ensure_images_loaded", lambda _ds: None)
+    monkeypatch.setattr(ctrl, "_add_image_layers", lambda *_a, **_kw: {"layers": 2, "failed_keys": 0})
+    monkeypatch.setattr(V, "image_scale_dataarrays", lambda _elem: [object()])  # single-scale
+    primed = []
+    monkeypatch.setattr(ctrl, "_ensure_image_pyramid_cache", lambda key, *_a, **_kw: primed.append(key) or [])
+    ctrl.load_images_on_demand("XENIUM")
+    assert primed == image_keys
+    counts = [v[1:3] + (v[4],) for v in values if v[0] == "images"]
+    assert counts[0] == (1, 2, "images") and counts[-1] == (2, 2, "images")
+    began = [i for i, s in enumerate(stages) if s[0] == "images" and s[2]]
+    assert began and ("images", "", False) in stages[began[-1]:]

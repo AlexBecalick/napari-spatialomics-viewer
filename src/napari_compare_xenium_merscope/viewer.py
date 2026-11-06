@@ -724,6 +724,8 @@ GENE_LAYERS_PROGRESS_KEY = "gene_layers"
 #: turn (0 disables chunking).  Below it the build is fast enough to stay atomic.
 GENE_LAYER_CHUNK_MIN_POINTS = 5_000_000
 GENE_LAYER_CHUNK_DELAY_MS = 15
+# How often a finished gene-layer chain re-checks a pending dataset switch.
+GENE_LAYER_SWITCH_POLL_MS = 100
 REGISTRATION_IMAGES_STATUS = (
     "Channels of a registration session are in the layer list; show or hide them there."
 )
@@ -12473,6 +12475,10 @@ class ComparisonViewerController(AteraTranscriptMixin):
         """
         QTimer.singleShot(GENE_LAYER_CHUNK_DELAY_MS, step)
 
+    def _defer_gene_layer_finish(self, step) -> None:
+        """Re-check a chain's finish later while a dataset switch loads (tests swap this out)."""
+        QTimer.singleShot(GENE_LAYER_SWITCH_POLL_MS, step)
+
     def _create_gene_group_layer(self, state: GeneInspectorState, gi: int, defer_add: bool = False):
         """Create group ``gi``'s layer; with ``defer_add`` return a callable that adds it."""
         symbol = state.store.group_symbols[gi]
@@ -12501,7 +12507,11 @@ class ComparisonViewerController(AteraTranscriptMixin):
         after the last layer. ``on_memory_error()`` handles a MemoryError
         in any step. The chain belongs to ``states``: it stops as soon as one
         of them is no longer the registered state of its dataset (teardown,
-        session apply or a newer build), and only then.
+        session apply or a newer build), and only then. While a dataset
+        switch is loading it keeps adding layers without reporting (the
+        switch reset the stages) and holds ``finish()`` back until the switch
+        fails (the dataset stays: bar restored, finish runs) or succeeds
+        (the apply tears the states down and the chain stops).
         """
         chain = object()
         self._gene_layer_chain = chain
@@ -12511,8 +12521,37 @@ class ComparisonViewerController(AteraTranscriptMixin):
             GENE_LAYERS_PROGRESS_KEY, label, total=len(tasks), status=False, unit="layers",
         )
         run = SimpleNamespace(chain=chain, states=tuple(states), tasks=list(tasks), finish=finish,
-                              on_memory_error=on_memory_error, add=None)
+                              on_memory_error=on_memory_error, add=None, label=str(label),
+                              done=0, progress_suspended=False)
         self._defer_gene_layer_step(lambda: self._gene_layer_step(run, 0, "build"))
+
+    def _dataset_switch_pending(self) -> bool:
+        """True while a requested dataset switch (standalone, paired or registration) is loading.
+
+        The outgoing dataset stays active until the new session is applied
+        (which tears its gene states down) or the load fails (which keeps it).
+        """
+        if getattr(self, "_dataset_load_worker", None) is not None:
+            return True
+        return "registration_load" in getattr(self, "_registration_worker_tokens", {})
+
+    def _sync_gene_layer_chain_progress(self, run) -> bool:
+        """Suspend the chain's bar while a switch is pending; restore it after a failed one.
+
+        A switch request resets every progress stage, so reports would go
+        nowhere. Returns True when the chain may report progress.
+        """
+        if self._dataset_switch_pending():
+            run.progress_suspended = True
+            return False
+        if run.progress_suspended:
+            run.progress_suspended = False
+            self._begin_progress(
+                GENE_LAYERS_PROGRESS_KEY, run.label, total=len(run.tasks), status=False, unit="layers",
+            )
+            if run.done:
+                self._report_progress(GENE_LAYERS_PROGRESS_KEY, run.done, len(run.tasks), unit="layers", force=True)
+        return True
 
     def _gene_layer_chain_owned(self, run) -> bool:
         if getattr(self, "_gene_layer_chain", None) is not run.chain:
@@ -12537,6 +12576,14 @@ class ComparisonViewerController(AteraTranscriptMixin):
             self._end_progress(GENE_LAYERS_PROGRESS_KEY)
             return
         n_layers = len(run.tasks)
+        reporting = self._sync_gene_layer_chain_progress(run)
+        if phase == "finish" and not reporting:
+            # A dataset switch is loading: the finish (status text, inspector
+            # population, Atera install, session eviction) belongs to this
+            # dataset only if the switch fails, so wait. A successful switch
+            # tears the states down and the ownership check above stops here.
+            self._defer_gene_layer_finish(lambda: self._gene_layer_step(run, index, "finish"))
+            return
         t0 = time.perf_counter()
         try:
             if phase == "build" and index < n_layers:
@@ -12546,7 +12593,9 @@ class ComparisonViewerController(AteraTranscriptMixin):
                 add, run.add = run.add, None
                 if add is not None:
                     add()
-                self._report_progress(GENE_LAYERS_PROGRESS_KEY, index + 1, n_layers, unit="layers", force=True)
+                run.done = index + 1
+                if reporting:
+                    self._report_progress(GENE_LAYERS_PROGRESS_KEY, index + 1, n_layers, unit="layers", force=True)
                 next_step = (index + 1, "build") if index + 1 < n_layers else (n_layers, "finish")
             else:
                 next_step = None
