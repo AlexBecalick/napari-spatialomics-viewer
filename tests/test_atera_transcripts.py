@@ -172,6 +172,54 @@ def test_index_validation_returns_none_and_the_engine_falls_back(store_copy, bre
         assert int(overview.counts.sum()) == len(truth)
 
 
+@pytest.mark.parametrize(
+    "malformed",
+    [
+        "format_version_null",
+        "format_version_text",
+        "points_list",
+        "n_rows_text",
+        "n_rows_null",
+        "n_row_groups_text",
+        "bbox_text",
+        "id_range_text",
+        "id_range_null",
+    ],
+)
+def test_malformed_index_fields_return_none_and_the_engine_falls_back(store_copy, malformed):
+    truth = _truth(store_copy)
+    index_path = store_copy / T.ATERA_POINTS_INDEX_JSON
+    raw = json.loads(index_path.read_text(encoding="utf-8"))
+    element = raw["points"]["transcripts"]
+    entry = element["files"][1]
+    if malformed == "format_version_null":
+        raw["format_version"] = None
+    elif malformed == "format_version_text":
+        raw["format_version"] = "x"
+    elif malformed == "points_list":
+        raw["points"] = [element]
+    elif malformed == "n_rows_text":
+        entry["n_rows"] = "x"
+    elif malformed == "n_rows_null":
+        entry["n_rows"] = None
+    elif malformed == "n_row_groups_text":
+        entry["n_row_groups"] = "x"
+    elif malformed == "bbox_text":
+        entry["bbox_um"] = ["a", "b", "c", "d"]
+    elif malformed == "id_range_text":
+        entry["transcript_id_range"] = ["a", "b"]
+    elif malformed == "id_range_null":
+        entry["transcript_id_range"] = [None, 5]
+    index_path.write_text(json.dumps(raw), encoding="utf-8")
+
+    assert T.AteraPointsIndex.load(store_copy) is None
+    engine = T.AteraTranscriptEngine.open(store_copy)
+    assert engine is not None and not engine.index.validated
+    assert not engine.window_reads_available
+    got = engine.read_genes(["GFAP"], COLUMNS)["GFAP"]
+    _assert_rows_equal(got, truth[truth["name"] == "GFAP"])
+
+
 def test_stale_index_fixture_is_rejected(tmp_path):
     store = A.build_atera_latest_store(tmp_path, stale_index=True)
     assert T.AteraPointsIndex.load(store) is None

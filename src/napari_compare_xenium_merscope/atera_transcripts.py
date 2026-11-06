@@ -303,7 +303,9 @@ class AteraPointsIndex:
             return None
         try:
             return cls._from_payload(store, str(points_key), index_path, raw)
-        except _IndexMismatch as exc:
+        except (_IndexMismatch, TypeError, ValueError, AttributeError, KeyError) as exc:
+            # A parseable but malformed payload (null or non-numeric counts,
+            # non-float bbox values, a non-dict ``points``) is a mismatch too.
             log.warning("[ATERA] Points index %s does not match the files (%s); using the fallback reader.", index_path, exc)
             return None
 
