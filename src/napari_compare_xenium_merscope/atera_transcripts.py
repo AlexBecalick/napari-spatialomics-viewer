@@ -224,6 +224,22 @@ def _first_dictionary(parquet_file: pq.ParquetFile) -> pa.Array | None:
     return None
 
 
+def _plain_feature_names(parquet_file: pq.ParquetFile) -> list[str]:
+    """Distinct non-null ``feature_name`` values of a file stored as plain strings.
+
+    Only the index-less fallback needs this (MerXen writes a dictionary); it
+    reads the one column batch by batch, in first-seen order.
+    """
+    seen: dict[str, None] = {}
+    for batch in parquet_file.iter_batches(columns=[GENE_COLUMN], use_threads=False):
+        column = batch.column(0)
+        if pa.types.is_dictionary(column.type):
+            column = column.dictionary_decode()
+        for name in pc.unique(column.drop_null()).to_pylist():
+            seen.setdefault(str(name), None)
+    return list(seen)
+
+
 def _assignment_dtype(metadatas: Sequence[pq.FileMetaData]) -> np.dtype:
     """uint32 when the footer statistics prove every id is below 2**32."""
     maximum = 0
@@ -431,13 +447,18 @@ class AteraPointsIndex:
         fingerprint: dict[str, int],
     ) -> "AteraPointsIndex":
         dictionaries: list[pa.Array | None] = [None] * len(files)
+        plain_names: list[list[str]] = [[] for _ in files]
 
-        def first_dictionary(position: int) -> pa.Array | None:
+        def first_dictionary(position: int) -> tuple[pa.Array | None, list[str]]:
             parquet_file = pq.ParquetFile(files[position].path, metadata=metadatas[position])
-            return _first_dictionary(parquet_file)
+            dictionary = _first_dictionary(parquet_file)
+            if dictionary is None and metadatas[position].num_rows > 0:
+                # Plain strings: the vocabulary must come from the values.
+                return None, _plain_feature_names(parquet_file)
+            return dictionary, []
 
-        def keep(position: int, value: pa.Array | None) -> None:
-            dictionaries[position] = value
+        def keep(position: int, value: tuple[pa.Array | None, list[str]]) -> None:
+            dictionaries[position], plain_names[position] = value
 
         try:
             _map_files(first_dictionary, range(len(files)), None, keep)
@@ -463,7 +484,17 @@ class AteraPointsIndex:
                     lookup[name] = code
                 lut[local] = code
             luts.append(lut)
-        if not shared:
+        plain = [names for names in plain_names if names]
+        if plain:
+            # Plain-string files are resolved through the vocabulary lookup.
+            shared = False
+            for names in plain:
+                for name in names:
+                    if name not in lookup:
+                        lookup[name] = len(vocabulary)
+                        vocabulary.append(name)
+            log.info("[ATERA] Some points files store feature_name as plain strings; codes come from the name lookup.")
+        if not shared and not plain:
             log.info("[ATERA] Points files do not share one feature dictionary; remapping codes per file.")
         rg_counts = np.array([m.num_row_groups for m in metadatas], dtype=np.int64)
         rg_offsets = np.concatenate([[0], np.cumsum(rg_counts)]).astype(np.int64)
@@ -607,6 +638,9 @@ class AteraPointsIndex:
     def locate_row_group(self, global_rg: int) -> tuple[int, int]:
         position = int(np.searchsorted(self.rg_offsets, global_rg, side="right") - 1)
         return position, int(global_rg - self.rg_offsets[position])
+
+
+_CURRENT_MAP = object()  # plan_gene_reads sentinel: use the attached map
 
 
 class _IndexMismatch(ValueError):
@@ -981,12 +1015,21 @@ class AteraTranscriptEngine:
                 selected.append(rg)
         return selected
 
-    def plan_gene_reads(self, codes: Sequence[int]) -> dict[int, dict[int, list[tuple[int, int, int]] | None]]:
-        """``file -> row group -> [(code, start, end)]`` (``None`` = filter by code)."""
+    def plan_gene_reads(
+        self, codes: Sequence[int], code_map: CodeRangeMap | None | object = _CURRENT_MAP
+    ) -> dict[int, dict[int, list[tuple[int, int, int]] | None]]:
+        """``file -> row group -> [(code, start, end)]`` (``None`` = filter by code).
+
+        ``code_map`` defaults to the attached map; callers that act on the plan
+        pass their own snapshot so a map attached by another thread mid-call
+        cannot make the plan and the read disagree.
+        """
+        if code_map is _CURRENT_MAP:
+            code_map = self.code_map
         plan: dict[int, dict[int, list[tuple[int, int, int]] | None]] = {}
-        if self.code_map is not None:
+        if code_map is not None:
             for code in codes:
-                rgs, starts, ends = self.code_map.runs(int(code))
+                rgs, starts, ends = code_map.runs(int(code))  # type: ignore[union-attr]
                 for g, s, e in zip(rgs.tolist(), starts.tolist(), ends.tolist()):
                     position, local = self.index.locate_row_group(g)
                     runs = plan.setdefault(position, {}).setdefault(local, [])
@@ -1018,9 +1061,12 @@ class AteraTranscriptEngine:
         columns = self._columns(columns)
         codes = {name: self.index.code_of(name) for name in names}
         wanted = sorted({c for c in codes.values() if c is not None})
-        plan = self.plan_gene_reads(wanted)
-        use_map = self.code_map is not None
-        read_columns = columns if use_map or GENE_COLUMN in columns else [*columns, GENE_COLUMN]
+        # One snapshot: build_overview may attach a map from another thread.
+        plan = self.plan_gene_reads(wanted, self.code_map)
+        # Decide from the plan itself: any row group without runs is filtered
+        # by code, so it needs the gene column.
+        needs_codes = any(runs is None for groups in plan.values() for runs in groups.values())
+        read_columns = [*columns, GENE_COLUMN] if needs_codes and GENE_COLUMN not in columns else list(columns)
         wanted_set = set(wanted)
 
         def work(position: int) -> dict[int, list[dict[str, np.ndarray]]]:
@@ -1113,7 +1159,7 @@ class AteraTranscriptEngine:
         selection: dict[int, dict[int, list[tuple[int, int, int]] | None] | None]
         if genes is not None:
             codes = sorted({c for c in (self.index.code_of(g) for g in genes) if c is not None})
-            plan = self.plan_gene_reads(codes)
+            plan = self.plan_gene_reads(codes, self.code_map)
             selection = {p: plan[p] for p in positions if p in plan}
         else:
             selection = {p: None for p in positions}

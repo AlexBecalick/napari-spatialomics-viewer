@@ -407,6 +407,118 @@ def test_ids_below_2_pow_32_are_uint32(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Concurrency and plain-string fallback
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("columns", [("x", "y"), COLUMNS])
+def test_read_genes_survives_a_map_attached_between_planning_and_reading(atera_store, monkeypatch, columns):
+    # build_overview attaches its map at the end, possibly from a worker
+    # thread while a gene read is in flight.
+    index = T.AteraPointsIndex.load(atera_store)
+    code_map = T.AteraTranscriptEngine(index).build_code_map()
+    engine = T.AteraTranscriptEngine(index)
+    assert engine.code_map is None
+    original = T.AteraTranscriptEngine.plan_gene_reads
+
+    def plan_then_attach(self, codes, *args):
+        plan = original(self, codes, *args)
+        self.attach_code_map(code_map)
+        return plan
+
+    monkeypatch.setattr(T.AteraTranscriptEngine, "plan_gene_reads", plan_then_attach)
+    truth = _truth(atera_store)
+    result = engine.read_genes(["GFAP", "MBP"], columns)
+    assert engine.code_map is code_map
+    for gene in ("GFAP", "MBP"):
+        _assert_rows_equal(result[gene], truth[truth["name"] == gene])
+    engine.attach_code_map(None)
+    window = engine.read_window((0.0, 0.0, 40.0, 40.0), genes=["GFAP"], columns=columns)
+    expected = _inside(truth[truth["name"] == "GFAP"], (0.0, 0.0, 40.0, 40.0))
+    assert len(window.columns["x"]) == len(expected)
+
+
+def _plain_string_store(root: Path) -> Path:
+    store = root / "plain.zarr"
+    directory = store / "points" / "transcripts" / "points.parquet"
+    directory.mkdir(parents=True)
+    files = [
+        (["A", "A", "B", None], [0.5, 1.5, 2.5, 3.5]),
+        (["C", "B", "NegControlProbe_1"], [0.5, 1.5, 2.5]),
+    ]
+    for position, (names, xs) in enumerate(files):
+        n = len(names)
+        pq.write_table(
+            pa.table(
+                {
+                    "x": pa.array(np.asarray(xs, dtype=np.float32)),
+                    "y": pa.array(np.full(n, 0.5, dtype=np.float32)),
+                    "feature_name": pa.array(names, type=pa.string()),
+                    "original_assignment": pa.array([1] * n, type=pa.uint64()),
+                }
+            ),
+            directory / f"part.{position}.parquet",
+        )
+    return store
+
+
+def test_scan_fallback_builds_the_vocabulary_from_plain_string_feature_names(tmp_path):
+    store = _plain_string_store(tmp_path)
+    index = T.AteraPointsIndex.scan(store)
+    assert index is not None and not index.validated
+    assert index.vocabulary == ("A", "B", "C", "NegControlProbe_1")
+    for build_map in (False, True):
+        engine = T.AteraTranscriptEngine(index)
+        if build_map:
+            assert engine.build_code_map() is not None
+        result = engine.read_genes(["A", "B", "C", "NegControlProbe_1"], ("x", "y"))
+        assert {name: len(rows["x"]) for name, rows in result.items()} == {
+            "A": 2, "B": 2, "C": 1, "NegControlProbe_1": 1,
+        }
+        np.testing.assert_array_equal(result["B"]["x"], np.asarray([2.5, 1.5], dtype=np.float32))
+    overview = T.AteraTranscriptEngine(index).build_overview(bin_um=1.0)
+    assert overview.counts.tolist() == [2, 2, 1, 1]
+    assert overview.control_names() == {"NegControlProbe_1"}
+    # The null name is neither counted nor binned; the control is counted only.
+    assert int(overview.density_counts.sum()) == 5
+    assert overview.code_map is not None and overview.code_map.rows_for([1]) == 2
+
+
+def _flag_store(root: Path) -> Path:
+    """One file whose ``is_gene`` flags disagree with the control-name rule."""
+    store = _mini_store(root, [1, 2, 3, 4, 5, 6])
+    path = store / "points" / "transcripts" / "points.parquet" / "part.0.parquet"
+    dictionary = ["GENE_A", "FAKEGENE1", "NegControlProbe_X"]
+    # GENE_A (gene, flagged gene), FAKEGENE1 (gene-like, flagged control),
+    # NegControlProbe_X (control-like, flagged gene).
+    codes = [0, 0, 1, 1, 1, 2]
+    flags = [True, True, False, False, False, True]
+    table = pq.read_table(path)
+    table = table.set_column(
+        table.schema.get_field_index("feature_name"),
+        "feature_name",
+        pa.DictionaryArray.from_arrays(pa.array(codes, type=pa.int16()), pa.array(dictionary)),
+    )
+    table = table.set_column(table.schema.get_field_index("is_gene"), "is_gene", pa.array(flags))
+    pq.write_table(table, path)
+    return store
+
+
+def test_overview_controls_follow_is_gene_flags_not_names(tmp_path):
+    store = _flag_store(tmp_path)
+    engine = T.AteraTranscriptEngine.open(store)
+    assert engine.index.vocabulary == ("GENE_A", "FAKEGENE1", "NegControlProbe_X")
+    overview = engine.build_overview(bin_um=1.0)
+    assert overview.is_gene_flags_used
+    assert overview.is_control.tolist() == [False, True, False]
+    assert overview.control_names() == {"FAKEGENE1"}
+    assert "NegControlProbe_X" in overview.gene_names() and "FAKEGENE1" not in overview.gene_names()
+    # Counts include every feature; the density keeps only is_gene=True rows.
+    assert overview.counts.tolist() == [2, 3, 1]
+    assert int(overview.density_counts.sum()) == 3
+
+
+# ---------------------------------------------------------------------------
 # Overview
 # ---------------------------------------------------------------------------
 
