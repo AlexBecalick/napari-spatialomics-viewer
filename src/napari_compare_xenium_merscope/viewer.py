@@ -1417,6 +1417,55 @@ class ResponsiveTabStack(QStackedWidget):
         return current.sizeHint() if current is not None else QSize(300, 400)
 
 
+class _WrappingFormBox(QWidget):
+    """A widget whose QFormLayout puts every label above its field when the
+    widest label plus the widest field's minimum does not fit beside it.
+
+    QFormLayout.WrapLongRows decides row by row and, with napari's stylesheet,
+    can keep a row side by side while squeezing its field below its minimum
+    (the field then runs past the box's right edge).  Wrapping all rows or
+    none is decided here from the current size hints on every resize.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._form = None
+
+    def set_form(self, form) -> None:
+        self._form = form
+        self._update_wrap(self.width())
+
+    def _side_by_side_width(self) -> int:
+        form = self._form
+        widest_label = widest_field = 0
+        for row in range(form.rowCount()):
+            label = form.itemAt(row, QFormLayout.LabelRole)
+            field = form.itemAt(row, QFormLayout.FieldRole)
+            if label is not None and label.widget() is not None:
+                widest_label = max(widest_label, label.widget().sizeHint().width())
+            if field is not None and field.widget() is not None:
+                widget = field.widget()
+                widest_field = max(widest_field, widget.minimumSizeHint().width(), widget.minimumWidth())
+        margins = form.contentsMargins()
+        return widest_label + max(form.horizontalSpacing(), 0) + widest_field + margins.left() + margins.right()
+
+    def _update_wrap(self, width: int) -> None:
+        if self._form is None:
+            return
+        policy = QFormLayout.DontWrapRows if width >= self._side_by_side_width() else QFormLayout.WrapAllRows
+        if self._form.rowWrapPolicy() != policy:
+            self._form.setRowWrapPolicy(policy)
+
+    def resizeEvent(self, event):  # noqa: N802 (Qt override)
+        self._update_wrap(event.size().width())
+        super().resizeEvent(event)
+
+    def changeEvent(self, event):  # noqa: N802 (Qt override)
+        if event.type() in (QEvent.StyleChange, QEvent.FontChange):
+            self._update_wrap(self.width())
+        super().changeEvent(event)
+
+
 class ViewerControlPanel(QWidget):
     """Right-dock control panel: tabbed controls with a shared progress bar.
 
@@ -1761,12 +1810,25 @@ class ViewerControlPanel(QWidget):
 
     def _build_genes_tab(self) -> QWidget:
         layout = QVBoxLayout()
-        layout.setContentsMargins(6, 6, 6, 6)
+        # No side margins: the inspector brings its own, and every pixel counts
+        # once the vertical scrollbar takes its share of a narrow dock.
+        layout.setContentsMargins(0, 6, 0, 6)
         layout.setSpacing(6)
-        row = QHBoxLayout()
+        # The load/unload buttons wrap onto two rows on a narrow dock instead of
+        # forcing the tab wider than the panel (side by side they need ~370 px).
+        self._transcript_buttons_row = QWidget()
+        row = FlowLayout(self._transcript_buttons_row, margin=0, hspacing=6, vspacing=6)
+        # Lined up with the inspector's contents; with napari's stylesheet
+        # "Load / reload transcripts" alone is ~200 px of the tab's ~215 px.
+        side = GeneInspectorWidget.SIDE_MARGIN
+        row.setContentsMargins(side, 0, side, 0)
         row.addWidget(self._load_transcripts_button)
         row.addWidget(self._unload_transcripts_button)
-        layout.addLayout(row)
+        row_policy = self._transcript_buttons_row.sizePolicy()
+        row_policy.setHeightForWidth(True)
+        row_policy.setVerticalPolicy(QSizePolicy.Minimum)
+        self._transcript_buttons_row.setSizePolicy(row_policy)
+        layout.addWidget(self._transcript_buttons_row)
         # The gene inspector widget provides the per-gene list + spot controls.
         if self._gene_inspector_widget is not None:
             layout.addWidget(self._gene_inspector_widget, stretch=1)
@@ -1774,13 +1836,12 @@ class ViewerControlPanel(QWidget):
             layout.addStretch(1)
         # Scrollable like the other tabs: in a short window the inspector keeps
         # every control at its minimum height (and scrolls) instead of being
-        # squashed until rows overlap.  Its width follows the dock.
-        tab = self._scrollable(layout)
-        tab.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        # Only the height scrolls: an explicit (tiny) minimum width lets the
-        # content follow the dock's width as it did before.
-        tab.widget().setMinimumWidth(1)
-        return tab
+        # squashed until rows overlap.  Its width follows the dock: the
+        # inspector's minimum width fits the viewport of the narrowest panel
+        # even with the vertical scrollbar showing, and the content keeps that
+        # minimum (a horizontal scrollbar, never a silent clip, if a dock is
+        # ever narrower still).
+        return self._scrollable(layout)
 
     def _build_cell_type_tab(self) -> QWidget:
         layout = QVBoxLayout()
@@ -3592,7 +3653,10 @@ class GeneInspectorWidget(QWidget):
         self._gene_view.clicked.connect(self._on_view_clicked)
 
         root = QVBoxLayout()
-        root.setContentsMargins(8, 8, 8, 8)
+        # Thin side margins: in the 240 px panel, with napari's stylesheet and
+        # the Genes tab's vertical scrollbar, the inspector gets ~215 px and the
+        # Atera "Whole-slide sample" combo alone needs ~201 of them.
+        root.setContentsMargins(self.SIDE_MARGIN, 8, self.SIDE_MARGIN, 8)
         root.setSpacing(6)
         root.addWidget(self._title)
         root.addWidget(self._close_button)
@@ -3623,7 +3687,14 @@ class GeneInspectorWidget(QWidget):
         root.addWidget(self._gene_view, stretch=1)
         root.addWidget(self._status_label)
         self.setLayout(root)
-        self.setMinimumWidth(240)
+        self.setMinimumWidth(self.MINIMUM_WIDTH)
+
+    #: Narrower than the control panel's own 240 px minimum: inside the
+    #: scrollable Gene inspector tab the vertical scrollbar takes up to ~20 px
+    #: of the panel, and the inspector must still fit the rest unclipped.
+    MINIMUM_WIDTH = 200
+    #: Left/right margin of the inspector's contents (the Genes tab adds none).
+    SIDE_MARGIN = 4
 
     # -- Atera transcript controls -------------------------------------------
     #: mode -> (short item text, item tooltip).  The texts stay short so the
@@ -3660,7 +3731,7 @@ class GeneInspectorWidget(QWidget):
         button on a full-width row under them and a word-wrapped summary, so
         nothing overlaps or clips at the panel's 240 px minimum width.
         """
-        self._atera_box = QWidget()
+        self._atera_box = _WrappingFormBox()
         self._atera_title = QLabel("<b>Atera transcripts</b>")
         self._atera_mode_combo = QComboBox()
         for index, (mode, (label, tooltip)) in enumerate(self._ATERA_MODE_LABELS.items()):
@@ -3705,8 +3776,10 @@ class GeneInspectorWidget(QWidget):
         form.setHorizontalSpacing(6)
         form.setVerticalSpacing(4)
         form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
-        form.setRowWrapPolicy(QFormLayout.WrapLongRows)
         form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        # Labels beside the fields when every row fits, above all of them
+        # otherwise (set on each resize by the box).
+        self._atera_box.set_form(form)
         self._atera_form_labels = {}
         for key, text, field in (
             ("mode", "Mode", self._atera_mode_combo),

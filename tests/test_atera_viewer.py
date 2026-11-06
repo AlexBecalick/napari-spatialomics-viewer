@@ -1100,6 +1100,105 @@ def test_atera_controls_neither_overlap_nor_clip(qapp, panel_width):
         widget.close()
 
 
+@pytest.mark.parametrize("napari_style", [False, True])
+@pytest.mark.parametrize("datasets", [["ATERA"], ["XENIUM", "MERSCOPE"]])
+def test_gene_inspector_fits_the_panel_at_its_minimum_width_with_the_scrollbar_showing(qapp, datasets, napari_style):
+    """Inside the real panel (not the bare widget): at the panel's minimum width,
+    in a window short enough that the Genes tab scrolls vertically, the
+    scrollbar's width must not push the inspector's right edge out of view."""
+    from qtpy.QtCore import QPoint
+
+    from test_manual_registration_hooks import _panel
+
+    widget = _atera_controls_widget()
+    if datasets != ["ATERA"]:
+        widget.set_atera_controls(False)
+    panel = _panel(datasets, gene_inspector_widget=widget)
+    if napari_style:
+        # The real dock inherits napari's stylesheet: wider button padding and
+        # a fixed 13 px scrollbar inside a bordered scroll area.
+        from napari.qt import get_stylesheet
+
+        panel.setStyleSheet(get_stylesheet("dark"))
+    page = panel._tab_stack.widget(0)
+    assert page.isAncestorOf(widget)
+    panel._tab_stack.setCurrentWidget(page)
+    panel.show()
+    try:
+        panel.resize(panel.minimumWidth(), 500)
+        qapp.processEvents()
+        assert panel.width() == panel.minimumWidth() == 240
+        assert page.verticalScrollBar().isVisible()
+        assert not page.horizontalScrollBar().isVisible()
+        viewport = page.viewport()
+
+        def right_in_viewport(child):
+            return child.mapTo(viewport, QPoint(child.width() - 1, 0)).x()
+
+        assert right_in_viewport(widget) < viewport.width()
+        children = [panel._load_transcripts_button, panel._unload_transcripts_button]
+        if datasets == ["ATERA"]:
+            children += [
+                widget._atera_reload_button, widget._atera_budget_spin, widget._atera_overview_spin,
+                widget._atera_viewport_spin, widget._atera_mode_combo,
+            ]
+        for child in children:
+            assert child.isVisible()
+            assert child.mapTo(viewport, QPoint(0, 0)).x() >= 0, type(child).__name__
+            assert right_in_viewport(child) < viewport.width(), type(child).__name__
+            fits, why = _text_fits(qapp, child)
+            assert fits, why
+        if datasets == ["ATERA"]:
+            box = widget._atera_box
+            atera = [
+                widget._atera_title, *widget._atera_form_labels.values(), widget._atera_mode_combo,
+                widget._atera_budget_spin, widget._atera_overview_spin, widget._atera_viewport_spin,
+                widget._atera_reload_button, widget._atera_note,
+            ]
+            for child in atera:
+                assert child.geometry().left() >= 0 and child.geometry().right() < box.width(), type(child).__name__
+                assert child.width() >= min(child.minimumSizeHint().width(), box.width()), type(child).__name__
+            for i, a in enumerate(atera):
+                for b in atera[i + 1:]:
+                    assert not a.geometry().intersects(b.geometry()), (type(a).__name__, type(b).__name__)
+        # The load/unload buttons wrap rather than overlap.
+        assert not panel._load_transcripts_button.geometry().intersects(
+            panel._unload_transcripts_button.geometry()
+        )
+        # A wider panel still gives the inspector the whole viewport width.
+        panel.resize(400, 500)
+        qapp.processEvents()
+        assert widget.width() == viewport.width()
+    finally:
+        panel.close()
+
+
+def test_atera_form_puts_labels_beside_fields_only_when_every_row_fits(qapp):
+    from qtpy.QtWidgets import QFormLayout
+
+    widget = _atera_controls_widget()
+    form = widget._atera_box._form
+    widget.show()
+    try:
+        widget.resize(700, 1200)
+        qapp.processEvents()
+        assert form.rowWrapPolicy() == QFormLayout.DontWrapRows
+        for key, label in widget._atera_form_labels.items():
+            field = label.buddy()
+            assert field.geometry().left() > label.geometry().right()
+            assert abs(field.geometry().center().y() - label.geometry().center().y()) <= 4
+        widget.resize(widget.minimumWidth(), 1200)
+        qapp.processEvents()
+        assert form.rowWrapPolicy() == QFormLayout.WrapAllRows
+        for key, label in widget._atera_form_labels.items():
+            field = label.buddy()
+            assert field.geometry().top() > label.geometry().bottom()
+            assert field.width() >= field.minimumSizeHint().width()
+            assert field.geometry().right() < widget._atera_box.width()
+    finally:
+        widget.close()
+
+
 def test_atera_mode_items_are_short_with_the_description_in_the_tooltip(qapp):
     widget = _atera_controls_widget()
     combo = widget._atera_mode_combo
@@ -1126,7 +1225,9 @@ def test_short_genes_tab_scrolls_instead_of_squashing_the_atera_controls(qapp):
         if panel._tab_stack.widget(i).isAncestorOf(widget)
     )
     assert isinstance(page, QScrollArea)
-    assert page.horizontalScrollBarPolicy() == Qt.ScrollBarAlwaysOff
+    # The horizontal bar is only a last resort (AsNeeded) for a dock narrower
+    # than the panel's minimum; at any real panel width only the height scrolls.
+    assert page.horizontalScrollBarPolicy() == Qt.ScrollBarAsNeeded
     panel._tab_stack.setCurrentWidget(page)
     # A window far too short for the whole inspector (the real viewer's
     # 848 px window leaves the tab about 500 px).
@@ -1138,6 +1239,8 @@ def test_short_genes_tab_scrolls_instead_of_squashing_the_atera_controls(qapp):
         assert box.height() >= box.minimumSizeHint().height()
         assert widget.height() >= widget.minimumSizeHint().height()
         assert page.verticalScrollBar().maximum() > 0
+        assert not page.horizontalScrollBar().isVisible()
+        assert page.horizontalScrollBar().maximum() == 0
         assert widget.width() <= page.viewport().width()
     finally:
         panel.close()
