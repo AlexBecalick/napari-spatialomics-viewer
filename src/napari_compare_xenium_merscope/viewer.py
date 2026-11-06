@@ -14039,7 +14039,14 @@ class ComparisonViewerController(AteraTranscriptMixin):
         """Summary label of the cell whose stored means are shown.
 
         ``Cellpose cell`` for the MOSAIK Cellpose table (and every paired
-        view); a vendor-mask quantification (Atera) names the platform's cells.
+        view). Otherwise it names the mask the means were measured on, which
+        is the same rule :meth:`_inspection_intensities` uses to pick the
+        table: a standalone store without the Cellpose table but with another
+        ``mask_image_quantification`` (Atera, or a Xenium/MERSCOPE store
+        quantified only on its vendor mask) has its means read from that
+        table, so they are labelled ``<Platform> cell`` rather than claiming
+        a Cellpose match. Deliberately platform-agnostic: gating it on the
+        platform would mislabel those vendor-mask means as Cellpose.
         """
         if self._paired_session is None:
             quantification = self._dataset_quantification(ds)

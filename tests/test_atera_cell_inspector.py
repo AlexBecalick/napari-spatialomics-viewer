@@ -729,3 +729,71 @@ def test_an_overview_cached_without_the_map_gets_it_once(atera_store, tmp_path, 
     monkeypatch.setattr(T.AteraTranscriptEngine, "build_cell_tile_map", lambda *_a, **_k: pytest.fail("rebuilt"))
     second = restore(None, "ATERA", engine, Event(), report)
     assert np.array_equal(second.cell_ids, first.cell_ids)
+
+
+# ---------------------------------------------------------------------------
+# Intensity-cell label on every platform (controller level)
+# ---------------------------------------------------------------------------
+
+
+_VENDOR_QUANT = U.MaskQuantification(
+    table_key="vendor_mask_stats", shape_key="cell_boundaries", label_key="cell_labels")
+
+
+def _label_controller(monkeypatch, platform, quantification, *, paired=False):
+    ctrl = object.__new__(V.ComparisonViewerController)
+    ctrl.datasets = {platform: SimpleNamespace(platform=platform, zarr_path=f"/fake/{platform}.zarr")}
+    ctrl._dataset_sessions = {}
+    ctrl._paired_session = SimpleNamespace(configs={}) if paired else None
+    seen = []
+
+    def discover(path):
+        seen.append(path)
+        return quantification
+
+    monkeypatch.setattr(V, "discover_mask_quantification", discover)
+    return ctrl, seen
+
+
+@pytest.mark.parametrize("platform", ["XENIUM", "MERSCOPE"])
+def test_xenium_and_merscope_cellpose_means_say_cellpose_cell(monkeypatch, platform):
+    ctrl, seen = _label_controller(monkeypatch, platform, U.CELLPOSE_MASK_QUANTIFICATION)
+    assert ctrl._intensity_cell_label(platform) == "Cellpose cell"
+    assert seen == [f"/fake/{platform}.zarr"]
+
+
+@pytest.mark.parametrize("platform", ["XENIUM", "MERSCOPE"])
+def test_xenium_and_merscope_without_a_quantification_say_cellpose_cell(monkeypatch, platform):
+    ctrl, _ = _label_controller(monkeypatch, platform, None)
+    assert ctrl._intensity_cell_label(platform) == "Cellpose cell"
+
+
+@pytest.mark.parametrize("platform", ["XENIUM", "MERSCOPE", "ATERA"])
+@pytest.mark.parametrize("quantification", [None, U.CELLPOSE_MASK_QUANTIFICATION, _VENDOR_QUANT])
+def test_a_paired_session_always_says_cellpose_cell(monkeypatch, platform, quantification):
+    ctrl, seen = _label_controller(monkeypatch, platform, quantification, paired=True)
+    assert ctrl._intensity_cell_label(platform) == "Cellpose cell"
+    assert seen == []
+
+
+@pytest.mark.parametrize("platform, name", [("XENIUM", "Xenium"), ("MERSCOPE", "MERSCOPE")])
+def test_a_vendor_mask_quantification_names_the_mask_its_means_came_from(monkeypatch, platform, name):
+    """Pinned: a Xenium/MERSCOPE store quantified only on its vendor mask.
+
+    ``_inspection_intensities`` reads that table's means, so the label names
+    the platform's cell instead of claiming a Cellpose match.
+    """
+    ctrl, _ = _label_controller(monkeypatch, platform, _VENDOR_QUANT)
+    assert ctrl._intensity_cell_label(platform) == f"{name} cell"
+    calls = []
+    monkeypatch.setattr(ctrl, "_inspection_sdata", lambda ds: SimpleNamespace(shapes={}), raising=False)
+    monkeypatch.setattr(
+        ctrl, "_stored_mask_intensities",
+        lambda ds, cell_id, geometry, q: calls.append(q) or ([("DAPI", 1.0)], 5), raising=False)
+    assert ctrl._inspection_intensities(platform, 5, None, []) == ([("DAPI", 1.0)], 5)
+    assert calls == [_VENDOR_QUANT]
+
+
+def test_an_unknown_platform_vendor_mask_falls_back_to_the_shape_key(monkeypatch):
+    ctrl, _ = _label_controller(monkeypatch, "OTHER", _VENDOR_QUANT)
+    assert ctrl._intensity_cell_label("OTHER") == "cell_boundaries cell"
