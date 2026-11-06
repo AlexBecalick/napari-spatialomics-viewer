@@ -363,6 +363,7 @@ def test_cell_click_paints_table_counts_then_the_indexed_transcripts(qapp, atera
     ctrl._add_cell_selection("ATERA", cell_id, geometry)
 
     assert [p["transcript_source"] for p in applied] == ["table", "indexed"]
+    assert all(p["wta_caps"] is True for p in applied)
     table, indexed = applied
     table_counts = U.table_cell_gene_counts(atera_store, "table_original", 3)
     assert [(r["gene"], r["count"]) for r in table["gene_rows"]] == table_counts.ranked()
@@ -420,6 +421,7 @@ def test_without_an_exact_read_the_table_counts_stay(qapp, tmp_path, monkeypatch
     cell_id, geometry = ctrl._shape_for_cell_id(gdf, 2)
     payload = ctrl._cell_selection_display("ATERA", cell_id, geometry, "#ffffff")
     assert payload["transcript_source"] == "table" and not payload["transcripts_loading"]
+    assert payload["wta_caps"] is True
     assert payload["gene_rows"] and "unavailable" in payload["transcript_note"]
 
 
@@ -445,7 +447,7 @@ def test_a_failed_exact_read_keeps_the_table_counts(qapp, atera_store, monkeypat
     entry = ctrl._selected_cells["ATERA"][0]
     table_counts = U.table_cell_gene_counts(atera_store, "table_original", 3)
     assert [(r["gene"], r["count"]) for r in entry["gene_rows"]] == table_counts.ranked()
-    assert entry["transcript_source"] == "table"
+    assert entry["transcript_source"] == "table" and entry["wta_caps"] is True
     assert not entry.get("inspection_error")
     assert entry["transcripts_loading"] is False and entry["intensities_loading"] is False
     assert "could not be read" in entry["transcript_note"]
@@ -484,28 +486,57 @@ def _rows(n):
 
 def test_a_wta_cell_is_capped_in_the_pie_list_and_links(qapp):
     rows = _rows(6_000)
-    slices = V._cell_pie_slices(rows)
+    slices = V._cell_pie_slices(rows, V.CELL_PIE_MAX_SLICES)
     assert len(slices) == V.CELL_PIE_MAX_SLICES + 1
     other = slices[-1]
     assert other["rgba"] == V.CELL_OTHER_SLICE_RGBA and other["other_genes"] == 6_000 - V.CELL_PIE_MAX_SLICES
     assert sum(s["count"] for s in slices) == sum(r["count"] for r in rows)
 
-    html = V._cell_gene_list_html({"gene_rows": rows})
+    html = V._cell_gene_list_html({"gene_rows": rows, "wta_caps": True})
     assert html.count("<b>G") == V.CELL_GENE_LIST_MAX_ROWS
     assert f"{6_000 - V.CELL_GENE_LIST_MAX_ROWS:,} more genes" in html
 
     coords = np.column_stack([np.arange(17_202.0), np.arange(17_202.0)])
-    entry = {"centroid_yx": (1.0, 2.0), "coords_yx": coords}
+    entry = {"centroid_yx": (1.0, 2.0), "coords_yx": coords, "wta_caps": True}
     segments = V.ComparisonViewerController._cell_link_segments(entry)
     assert segments.shape == (V.CELL_LINKS_MAX_PER_CELL, 2, 2)
     assert np.array_equal(segments, V.ComparisonViewerController._cell_link_segments(entry))
     assert segments[0, 0].tolist() == [0.0, 0.0] and segments[-1, 0].tolist() == [17_201.0, 17_201.0]
     assert np.all(segments[:, 1] == [1.0, 2.0])
-    summary = V._cell_summary_html({"total": 17_202, "coords_yx": coords})
+    summary = V._cell_summary_html({"total": 17_202, "coords_yx": coords, "wta_caps": True})
     assert "Links drawn: 2,000 of 17,202" in summary
 
-    panel = V._CellPanel({"cell_id": 1, "gene_rows": rows, "coords_yx": coords})
+    panel = V._CellPanel({"cell_id": 1, "gene_rows": rows, "coords_yx": coords, "wta_caps": True})
     assert len(panel._pie._slices) == V.CELL_PIE_MAX_SLICES + 1
+
+
+def test_a_large_non_lazy_cell_keeps_every_slice_row_and_link(qapp):
+    """MERSCOPE/XENIUM cells (no ``wta_caps``) render as before the caps:
+    one pie slice per gene, every gene row and one link per transcript."""
+    n_genes = V.CELL_PIE_MAX_SLICES + 164  # P7513 MERSCOPE max is 188 genes
+    rows = _rows(n_genes)
+    big_rows = _rows(V.CELL_GENE_LIST_MAX_ROWS + 50)
+    n_links = V.CELL_LINKS_MAX_PER_CELL + 421  # P7513 MERSCOPE max is 2,421
+    coords = np.column_stack([np.arange(float(n_links)), np.arange(float(n_links))])
+    cell = {"cell_id": 7, "gene_rows": rows, "coords_yx": coords,
+            "centroid_yx": (1.0, 2.0), "total": n_links}
+
+    expected = [
+        {"count": r["count"], "glyph": r["glyph"], "rgba": U.darken_rgba(r["rgba"], V.CELL_PIE_SLICE_DARKEN)}
+        for r in rows
+    ]
+    assert V._cell_pie_slices(rows) == expected
+    panel = V._CellPanel(cell)
+    assert panel._pie._slices == expected
+    assert all(s["rgba"] != V.CELL_OTHER_SLICE_RGBA for s in panel._pie._slices)
+
+    html = V._cell_gene_list_html({"gene_rows": big_rows})
+    assert html.count("<b>G") == len(big_rows) and "more genes" not in html
+
+    segments = V.ComparisonViewerController._cell_link_segments(cell)
+    assert segments.shape == (n_links, 2, 2)
+    assert np.array_equal(segments[:, 0], coords)
+    assert "Links drawn" not in V._cell_summary_html(cell)
 
 
 def test_a_small_cell_renders_exactly_as_before(qapp):

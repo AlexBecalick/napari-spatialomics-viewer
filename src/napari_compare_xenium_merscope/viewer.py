@@ -4725,7 +4725,7 @@ def _cell_summary_html(cell: dict) -> str:
         lines.append(f"<i>{html.escape(str(cell['transcript_note']))}</i>")
     coords = cell.get("coords_yx")
     n_links = 0 if coords is None else len(coords)
-    if n_links > CELL_LINKS_MAX_PER_CELL:
+    if cell.get("wta_caps") and n_links > CELL_LINKS_MAX_PER_CELL:
         lines.append(f"<i>Links drawn: {CELL_LINKS_MAX_PER_CELL:,} of {n_links:,} (evenly spaced)</i>")
     if cell.get("annotation_method") == "pciseq":
         probability = cell.get("pciseq_probability")
@@ -4751,9 +4751,17 @@ def _cell_summary_html(cell: dict) -> str:
     return "<br>".join(lines)
 
 
-def _cell_pie_slices(rows: list[dict], max_slices: int = CELL_PIE_MAX_SLICES) -> list[dict]:
-    """Pie slices of ``rows`` (highest count first): every gene up to
-    ``max_slices``, else the top ``max_slices`` plus one neutral 'Other' slice."""
+def _cell_wta_capped(cell: dict) -> bool:
+    """WTA-scale caps apply only to cells a lazy-transcript platform (ATERA)
+    produced; MERSCOPE/XENIUM cells keep one slice per gene and every link."""
+    return bool(cell.get("wta_caps"))
+
+
+def _cell_pie_slices(rows: list[dict], max_slices: int | None = None) -> list[dict]:
+    """Pie slices of ``rows`` (highest count first): one per gene, or with
+    ``max_slices`` the top ``max_slices`` plus one neutral 'Other' slice."""
+    if max_slices is None:
+        max_slices = len(rows)
     slices = [
         {"count": row.get("count", 0), "glyph": row.get("glyph", ""),
          "rgba": darken_rgba(row.get("rgba", (.6, .6, .6, 1.)), CELL_PIE_SLICE_DARKEN)}
@@ -4770,13 +4778,15 @@ def _cell_pie_slices(rows: list[dict], max_slices: int = CELL_PIE_MAX_SLICES) ->
     return slices
 
 
-def _cell_gene_list_html(cell: dict, max_rows: int = CELL_GENE_LIST_MAX_ROWS) -> str:
+def _cell_gene_list_html(cell: dict, max_rows: int | None = None) -> str:
     if cell.get("inspection_error"):
         return "<i>Transcript data could not be loaded</i>"
     if cell.get("loading"):
         return "<i>Loading…</i>"
     lines = []
     rows = list(cell.get("gene_rows", []))
+    if max_rows is None:
+        max_rows = CELL_GENE_LIST_MAX_ROWS if _cell_wta_capped(cell) else len(rows)
     hidden = rows[max_rows:]
     rows = rows[:max_rows]
     for row in rows:
@@ -4887,7 +4897,9 @@ class _CellPanel(QWidget):
                     min(280, self._broad.sizeHint().width()),
                     min(280, self._fine.sizeHint().width()) if not pciseq else 0)
         self._statistics.setFixedWidth(int(min(310, max(170, width + 8))))
-        self._pie.set_slices(_cell_pie_slices(list(cell.get("gene_rows", []))))
+        self._pie.set_slices(_cell_pie_slices(
+            list(cell.get("gene_rows", [])),
+            CELL_PIE_MAX_SLICES if _cell_wta_capped(cell) else None))
         self._gene_list.setText(_cell_gene_list_html(cell))
         self._gene_list.ensurePolished()
         document.setDefaultFont(self._gene_list.font())
@@ -13230,6 +13242,7 @@ class ComparisonViewerController(AteraTranscriptMixin):
             coords_yx=np.empty((0, 2), dtype=float),
             transcripts_loading=True,
             transcript_source="table",
+            wta_caps=True,
         )
         if counts is None:
             payload["transcript_note"] = "This cell has no row in the count table."
@@ -13312,6 +13325,7 @@ class ComparisonViewerController(AteraTranscriptMixin):
             intensities_loading=False,
             transcript_source="indexed",
             transcript_note="",
+            wta_caps=True,
         )
         return payload
 
@@ -13936,14 +13950,17 @@ class ComparisonViewerController(AteraTranscriptMixin):
             log.debug("Could not draw cell boundary highlight: %s", exc)
 
     @staticmethod
-    def _cell_link_segments(entry: dict, cap: int = CELL_LINKS_MAX_PER_CELL) -> np.ndarray:
-        """``(n, 2, 2)`` link segments of one cell, at most ``cap`` (evenly spaced, deterministic)."""
+    def _cell_link_segments(entry: dict, cap: int | None = None) -> np.ndarray:
+        """``(n, 2, 2)`` link segments of one cell: every transcript, or for a
+        WTA-capped (lazy-platform) cell at most ``cap`` (evenly spaced, deterministic)."""
+        if cap is None:
+            cap = CELL_LINKS_MAX_PER_CELL if _cell_wta_capped(entry) else None
         centroid_yx = entry.get("centroid_yx")
         coords = entry.get("coords_yx")
         if centroid_yx is None or coords is None or len(coords) == 0:
             return np.empty((0, 2, 2), dtype=float)
         coords = np.asarray(coords, dtype=float).reshape(-1, 2)
-        if len(coords) > cap:
+        if cap is not None and len(coords) > cap:
             coords = coords[np.linspace(0, len(coords) - 1, cap).round().astype(np.int64)]
         segments = np.empty((len(coords), 2, 2), dtype=float)
         segments[:, 0, :] = coords
