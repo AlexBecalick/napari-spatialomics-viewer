@@ -1333,6 +1333,44 @@ def outline_coverage_colormap(
     )
 
 
+class PanelScrollArea(QScrollArea):
+    """A control-panel tab's scroll area that keeps its content clear of the scrollbar.
+
+    Where the style's scrollbars are transient (macOS), Qt lays the vertical
+    scrollbar *over* the viewport's right edge instead of beside it, and with
+    napari's stylesheet that bar stays drawn: the right ~13 px of every control
+    (a spin box's "+", a combo's arrow) sat under it.  While the content
+    scrolls vertically on such a style, reserve the bar's width as a right
+    viewport margin, so the content lays out beside the bar as it does on
+    styles without overlay scrollbars (where nothing changes).
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._overlay_margin = 0
+        self.verticalScrollBar().rangeChanged.connect(lambda *_a: self._sync_overlay_margin())
+
+    def overlay_scrollbars(self) -> bool:
+        bar = self.verticalScrollBar()
+        return bool(self.style().styleHint(QStyle.SH_ScrollBar_Transient, None, bar))
+
+    def _sync_overlay_margin(self) -> None:
+        bar = self.verticalScrollBar()
+        scrolls = (
+            self.verticalScrollBarPolicy() != Qt.ScrollBarAlwaysOff and bar.maximum() > bar.minimum()
+        )
+        want = 0
+        if scrolls and self.overlay_scrollbars():
+            want = max(bar.sizeHint().width(), bar.width() if bar.isVisible() else 0)
+        if want != self._overlay_margin:
+            self._overlay_margin = want
+            self.setViewportMargins(0, 0, want, 0)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._sync_overlay_margin()
+
+
 class FlowLayout(QLayout):
     """A layout that lays widgets left-to-right and wraps to new rows as needed.
 
@@ -1802,7 +1840,7 @@ class ViewerControlPanel(QWidget):
     def _scrollable(self, layout) -> QScrollArea:
         content = QWidget()
         content.setLayout(layout)
-        scroll = QScrollArea()
+        scroll = PanelScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.NoFrame)
         scroll.setWidget(content)

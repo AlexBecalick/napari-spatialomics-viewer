@@ -1273,3 +1273,51 @@ def test_short_genes_tab_scrolls_instead_of_squashing_the_atera_controls(qapp):
         assert widget.width() <= page.viewport().width()
     finally:
         panel.close()
+
+
+@pytest.mark.parametrize("transient", [False, True])
+def test_genes_tab_keeps_content_clear_of_an_overlay_scrollbar(qapp, transient):
+    """macOS lays transient scrollbars over the viewport's right edge: the
+    panel's scroll areas then reserve the bar's width so no control sits under it."""
+    from qtpy.QtCore import QPoint
+    from qtpy.QtWidgets import QProxyStyle, QStyle
+
+    from test_manual_registration_hooks import _panel
+
+    class Overlay(QProxyStyle):
+        def styleHint(self, hint, option=None, widget=None, returnData=None):
+            if hint == QStyle.SH_ScrollBar_Transient:
+                return int(transient)
+            return super().styleHint(hint, option, widget, returnData)
+
+    widget = _atera_controls_widget()
+    panel = _panel(["ATERA"], gene_inspector_widget=widget)
+    page = panel._tab_stack.widget(0)
+    assert isinstance(page, V.PanelScrollArea)
+    style = Overlay()
+    style.setParent(page)
+    page.setStyle(style)
+    panel._tab_stack.setCurrentWidget(page)
+    panel.show()
+    try:
+        panel.resize(panel.minimumWidth(), 500)
+        qapp.processEvents()
+        bar = page.verticalScrollBar()
+        assert bar.isVisible() and page.overlay_scrollbars() is transient
+        viewport = page.viewport()
+        right = widget.mapTo(page, QPoint(widget.width() - 1, 0)).x()
+        bar_left = bar.mapTo(page, QPoint(0, 0)).x()
+        assert right < bar_left
+        # The reserved right margin is the bar's width exactly when bars overlay.
+        assert page._overlay_margin == (bar.sizeHint().width() if transient else 0)
+        if transient:
+            assert viewport.geometry().right() < page.width() - bar.sizeHint().width() + 1
+        for child in (widget._atera_budget_spin, widget._atera_mode_combo, widget._spot_spin):
+            assert child.mapTo(page, QPoint(child.width() - 1, 0)).x() < bar_left
+        # Short of scrolling, the margin goes away and the content takes the full width.
+        panel.resize(panel.minimumWidth(), 4000)
+        qapp.processEvents()
+        if not page.verticalScrollBar().maximum():
+            assert page._overlay_margin == 0 and viewport.width() == page.width()
+    finally:
+        panel.close()
