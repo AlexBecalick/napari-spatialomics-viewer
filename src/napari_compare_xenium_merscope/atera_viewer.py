@@ -682,7 +682,7 @@ class AteraTranscriptMixin:
                     budget.note + "; " + memory_note,
                 )
                 threshold = sample_threshold(halved, total)
-                if sample is not None and sample.threshold >= threshold:
+                if sample is not None and sample.aligned and sample.threshold >= threshold:
                     sample = sample.subset(threshold)
                 else:
                     sample = None

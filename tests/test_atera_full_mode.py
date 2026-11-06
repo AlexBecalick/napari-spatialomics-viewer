@@ -285,6 +285,60 @@ def test_partition_by_key_leads_with_the_nested_sub_sample(atera_store):
     np.testing.assert_array_equal(sample.key, keys)
 
 
+class _FancyIndexOOM(np.ndarray):
+    """A column whose full-length fancy indexing (a permutation) runs out of memory."""
+
+    def __getitem__(self, idx):
+        if isinstance(idx, np.ndarray) and idx.dtype.kind == "i" and len(idx) == len(self):
+            raise MemoryError("simulated")
+        return np.asarray(self)[idx]
+
+
+def _oom_sample(n=64):
+    rng = np.random.default_rng(3)
+    x = np.arange(n, dtype=np.float32)
+    return T.SampledTranscripts(
+        x=x, y=x.copy(), code=np.arange(n, dtype=np.int32), cell_id=np.arange(n, dtype=np.uint32),
+        key=rng.integers(0, 1000, n).astype(np.uint32), threshold=1000, total_rows=n,
+    )
+
+
+@pytest.mark.parametrize("failing", ["y", "code", "cell_id", "key"])
+def test_partition_by_key_out_of_memory_part_way_keeps_rows_aligned(failing):
+    sample = _oom_sample()
+    before = {name: np.asarray(getattr(sample, name)).copy() for name in ("x", "y", "code", "cell_id", "key")}
+    setattr(sample, failing, getattr(sample, failing).view(_FancyIndexOOM))
+    with pytest.raises(MemoryError):
+        sample.partition_by_key(500)
+    # Rolled back: every column is back in its original order.
+    assert sample.aligned
+    for name, values in before.items():
+        np.testing.assert_array_equal(np.asarray(getattr(sample, name)), values)
+    # The OOM retry path filters it by key: x, y, code and cell id still match per row.
+    sub = sample.subset(800)
+    np.testing.assert_array_equal(sub.x, np.asarray(sub.y))
+    np.testing.assert_array_equal(sub.x.astype(np.int64), np.asarray(sub.code).astype(np.int64))
+    np.testing.assert_array_equal(sub.x.astype(np.int64), np.asarray(sub.cell_id).astype(np.int64))
+    np.testing.assert_array_equal(np.asarray(sub.key), before["key"][before["key"] < 800])
+
+
+def test_partition_by_key_marks_the_sample_unaligned_when_the_rollback_also_fails(monkeypatch):
+    sample = _oom_sample()
+    sample.code = sample.code.view(_FancyIndexOOM)
+    real_empty_like = np.empty_like
+
+    def no_memory(*args, **kwargs):
+        raise MemoryError("simulated rollback")
+
+    monkeypatch.setattr(T.np, "empty_like", no_memory)
+    with pytest.raises(MemoryError):
+        sample.partition_by_key(500)
+    monkeypatch.setattr(T.np, "empty_like", real_empty_like)
+    assert not sample.aligned
+    with pytest.raises(ValueError):
+        sample.subset(800)
+
+
 def test_store_records_the_capped_overview_prefix_of_every_run(atera_store):
     engine = _engine(atera_store)
     total = engine.index.n_rows

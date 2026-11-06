@@ -1151,6 +1151,11 @@ class SampledTranscripts:
     key: np.ndarray  # uint32 sample key
     threshold: int
     total_rows: int
+    #: False only when :meth:`partition_by_key` ran out of memory part-way and
+    #: could not roll back: the columns are then no longer row-aligned.
+    aligned: bool = True
+
+    _COLUMNS = ("x", "y", "code", "cell_id", "key")
 
     @property
     def n(self) -> int:
@@ -1168,6 +1173,8 @@ class SampledTranscripts:
     def subset(self, threshold: int) -> "SampledTranscripts":
         """The nested sample of a smaller ``threshold`` (no re-read)."""
         threshold = int(threshold)
+        if not self.aligned:
+            raise ValueError("sample columns are not row-aligned; re-read it")
         if threshold >= self.threshold:
             if threshold > self.threshold and not self.complete:
                 raise ValueError("cannot grow a sample by filtering it")
@@ -1198,8 +1205,27 @@ class SampledTranscripts:
         order[:lead] = np.flatnonzero(member)
         order[lead:] = np.flatnonzero(~member)
         del member
-        for name in ("x", "y", "code", "cell_id", "key"):
-            setattr(self, name, getattr(self, name)[order])
+        # One column copy at a time keeps the peak at one extra column, but a
+        # MemoryError part-way would leave the columns permuted differently.
+        # Roll the permuted ones back (each rollback needs only one column, and
+        # the column it replaced has just been freed); if even that fails, mark
+        # the sample unaligned so nobody builds points from it.
+        permuted: list[str] = []
+        try:
+            for name in self._COLUMNS:
+                setattr(self, name, getattr(self, name)[order])
+                permuted.append(name)
+        except MemoryError:
+            try:
+                for name in reversed(permuted):
+                    column = getattr(self, name)
+                    restored = np.empty_like(column)
+                    restored[order] = column
+                    setattr(self, name, restored)
+                    permuted.pop()
+            except MemoryError:
+                self.aligned = False
+            raise
         return lead
 
 
