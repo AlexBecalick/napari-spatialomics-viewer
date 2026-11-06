@@ -23,6 +23,7 @@ dependencies = [
   "pandas",
   "psutil",
   "py2app; sys_platform == 'darwin'",
+  "pyarrow>=15",
   "pyobjc-framework-Cocoa; sys_platform == 'darwin'",
   "qtpy",
   "shapely",

@@ -162,3 +162,44 @@ for a larger stress run:
 python scripts/benchmark_transcript_store.py --points 1000000
 python scripts/benchmark_transcript_store.py --points 10000000 --render-cap 2000000
 ```
+
+## Atera lazy transcript engine
+
+Atera stores hold about 1.4e9 transcripts in ~400 per-tile parquet files, cut
+by gene within each tile and sorted by feature code. They are never loaded as
+one table. `atera_transcripts.py` (pure numpy/pyarrow, no Qt) validates
+MerXen's `merxen_atera_points_index.json` against the parquet footers. It then
+serves batched gene reads (each row group is read once per call), whole-tile
+and window reads, and a one-pass overview: exact per-feature totals and
+assigned counts, a 5 um density raster over real genes, and the exact
+code-range map (`code -> (row group, row_start, row_end)`).
+
+The overview and the code-range map are cached outside the store, under
+`atera-overview-v1/` and `atera-codemap-v1/` in the transcript cache
+directory. They are keyed by the index JSON content and by each file's size
+and mtime. ctime is not part of the key, because MerXen's hardlink churn
+changes it. Until a code-range map exists, gene reads prune row groups with
+the `feature_name` string statistics, which over-read because control probes
+sort among the gene names.
+
+Measured on the real store: 409 files, 1,409,601,228 rows, 24,677-entry
+shared dictionary. Warm OS page cache, 16-core Mac, pyarrow 24, 4-thread
+pool, `use_threads=False` per read.
+
+| Operation | Time | Notes |
+| --- | --- | --- |
+| Index load and validation | 0.20 s | footers plus one dictionary batch per file |
+| Code-range map build | 1.4 s | 599,029 runs (about 6 MB) |
+| GFAP, string statistics | 0.20 s | 61 row groups, 41.8M rows decoded, 1.24M kept |
+| GFAP, code-range map | 0.09 s | 32 row groups, 27.9M decoded |
+| 24 random genes, code-range map | 1.5 s | 477 distinct row groups, 456M decoded |
+| Largest tile (2,1) | 0.5 s | 87.2M rows |
+| 1 mm2 window | 0.36 s | 70M decoded, 20M kept |
+| Overview pass (5 um bins) | 8.5-9.4 s | 2610 x 1810 raster, about 1.2 GB peak RSS |
+| Overview cache save / load | 0.17 s / 0.32 s | load includes index validation |
+
+With `use_threads=True` on each read, the overview pass takes 6.8 s; with an
+8-thread pool it takes 5.9 s. Both are left off, so lazy reads stay bounded
+next to the viewer's image and label loaders. Cold-cache timings are not
+measured yet: dropping the page cache needs `sudo purge`, and the overview
+reads about 9-10 GB of column chunks.
