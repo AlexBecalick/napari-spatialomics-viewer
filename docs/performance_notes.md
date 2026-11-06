@@ -200,6 +200,30 @@ pool, `use_threads=False` per read.
 
 With `use_threads=True` on each read, the overview pass takes 6.8 s; with an
 8-thread pool it takes 5.9 s. Both are left off, so lazy reads stay bounded
-next to the viewer's image and label loaders. Cold-cache timings are not
-measured yet: dropping the page cache needs `sudo purge`, and the overview
-reads about 9-10 GB of column chunks.
+next to the viewer's image and label loaders.
+
+Cold-cache timings were taken without `sudo purge`. For each operation the
+points parquet (24.1 GB) was copied with `ditto --nocache` to a fresh scratch
+directory on the same internal SSD. `mincore` confirmed that only 0.007 GB of
+the copy was resident before each run. Each run is a new process: it loads the
+index, then does one operation. The gene reads use a code-range map built on
+another cold copy. The "Read" column is how much of the copy was resident
+afterwards, so it is about what the operation read from disk.
+
+| Operation (cold) | Time | Read | Warm |
+| --- | --- | --- | --- |
+| Index load and validation | 0.50-1.02 s | footers | 0.20 s |
+| Code-range map build | 1.56 s | 0.27 GB | 1.4 s |
+| GFAP, string statistics | 0.24 s | 0.45 GB | 0.20 s |
+| GFAP, code-range map | 0.12 s | 0.32 GB | 0.09 s |
+| 24 random genes, code-range map | 1.67 s | 3.9 GB | 1.5 s |
+| Largest tile (2,1) | 0.47 s | 0.86 GB | 0.5 s |
+| 1 mm2 window | 0.39 s | 0.70 GB | 0.36 s |
+| Overview pass (5 um bins) | 8.8 s | 9.9 GB | 8.5-9.4 s |
+
+On this internal NVMe SSD, about 1.1 GB/s or more, the passes are bound by
+decoding rather than I/O. A cold first open costs only the index footers,
+about 0.5-0.8 s more than a warm one. A store on a slower external or network
+drive will be I/O bound: the overview reads about 10 GB, so at 100-200 MB/s
+it would take about 1-2 minutes. That is why the overview runs in a
+background worker and is cached outside the store.
