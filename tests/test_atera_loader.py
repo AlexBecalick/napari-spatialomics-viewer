@@ -660,3 +660,69 @@ def test_merscope_label_cache_gate_follows_the_pixel_transform(qapp, atera_store
     for name in ("ATERA", "XENIUM", None):
         ctrl.active_dataset = name
         assert not ctrl._active_pixel_transform_is_merscope_affine()
+
+
+def _instance_key_points_sdata():
+    import pandas as pd
+
+    frame = pd.DataFrame({
+        "x": [1.0, 2.0],
+        "y": [3.0, 4.0],
+        "feature_name": ["A", "B"],
+        "original_assignment": [7, 0],
+    })
+    return SimpleNamespace(points={"transcripts": frame})
+
+
+def _resolve_active_points(ctrl, ds, monkeypatch):
+    ctrl.active_dataset = ds
+    ctrl._active_sdata = _instance_key_points_sdata()
+    monkeypatch.setattr(ctrl, "_transcript_source_metadata", lambda *_a, **_k: None)
+    monkeypatch.setattr(ctrl, "_transcript_source_key", lambda *_a, **_k: "native")
+    return ctrl._resolve_points_columns()
+
+
+@pytest.mark.parametrize("ds", ["XENIUM", "MERSCOPE"])
+def test_canonical_points_with_only_original_assignment_keep_no_assignment_column(qapp, ds, monkeypatch, tmp_path):
+    import pandas as pd
+
+    from napari_compare_xenium_merscope.transcript_cache import make_transcript_cache_request
+
+    ctrl = _controller()
+    ctrl.datasets = {ds: V.DatasetConfig(name=ds, zarr_path=tmp_path / "store.zarr")}
+    _key, _points, x_col, y_col, assignment_col = _resolve_active_points(ctrl, ds, monkeypatch)
+    assert assignment_col is None
+    assert V.ComparisonViewerController._resolve_points_columns_for(
+        _instance_key_points_sdata(), "transcripts"
+    )[4] is None
+    assert not ctrl._eager_cell_index_wanted(ds, assignment_col)
+
+    # The cache family identity is the one a build without any assignment
+    # column always had.
+    points_dir = tmp_path / "store.zarr" / "points" / "transcripts" / "points.parquet"
+    points_dir.mkdir(parents=True)
+    pd.DataFrame({"x": [1.0]}).to_parquet(points_dir / "part.0.parquet")
+    kwargs = dict(zarr_path=tmp_path / "store.zarr", points_key="transcripts", x_col=x_col,
+                  y_col=y_col, gene_col="feature_name", cache_dir=tmp_path / "cache")
+    resolved = make_transcript_cache_request(
+        **kwargs, assignment_col=assignment_col,
+        build_cell_index=ctrl._eager_cell_index_wanted(ds, assignment_col),
+    )
+    legacy = make_transcript_cache_request(**kwargs, assignment_col=None, build_cell_index=False)
+    assert resolved is not None and legacy is not None
+    assert resolved.family_digest == legacy.family_digest
+    assert resolved.digest == legacy.digest
+
+
+def test_atera_points_fall_back_to_the_instance_key_without_a_cell_index(qapp, atera_store, monkeypatch):
+    ctrl = _controller()
+    ctrl.datasets = {"ATERA": ctrl._build_dataset_config("ATERA", atera_store)}
+    _key, _points, _x, _y, assignment_col = _resolve_active_points(ctrl, "ATERA", monkeypatch)
+    assert assignment_col == "original_assignment"
+    assert V.ComparisonViewerController._resolve_points_columns_for(
+        _instance_key_points_sdata(), "transcripts", instance_key_fallback=True
+    )[4] == "original_assignment"
+    # Atera cells are served by exact per-cell reads, never an eager index.
+    assert not ctrl._eager_cell_index_wanted("ATERA", assignment_col)
+    ctrl.datasets["XENIUM"] = V.DatasetConfig(name="XENIUM", zarr_path=Path("/x.zarr"))
+    assert ctrl._eager_cell_index_wanted("XENIUM", "assignment")

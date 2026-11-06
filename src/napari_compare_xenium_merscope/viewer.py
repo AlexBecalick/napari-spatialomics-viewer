@@ -6896,6 +6896,14 @@ class ComparisonViewerController(AteraTranscriptMixin):
         spec = self._dataset_platform_spec(ds)
         return bool(spec is not None and spec.lazy_transcripts)
 
+    def _eager_cell_index_wanted(self, ds: str | None, assignment_col: str | None) -> bool:
+        """Whether an eager transcript build of ``ds`` also builds the per-cell index.
+
+        Only with an assignment column, and never for a lazy platform (Atera),
+        whose cells are served by exact per-cell reads instead.
+        """
+        return assignment_col is not None and not self._uses_lazy_cell_queries(ds)
+
     def _resolve_optional_transform_paths(self, ds: str, cfg: DatasetConfig) -> tuple[Path | None, Path | None]:
         """Resolve optional transform/spec paths from explicit args or common defaults.
 
@@ -10318,17 +10326,31 @@ class ComparisonViewerController(AteraTranscriptMixin):
                             if not str(key).startswith("transcripts_pciseq_")), ""))
         if self._transcript_source_key(ds) != "native" and metadata is None:
             raise KeyError(f"Selected transcript assignment source is unavailable for {ds}")
-        return self._resolve_points_columns_for(self._active_sdata, points_key)
+        spec = self._dataset_platform_spec(ds)
+        return self._resolve_points_columns_for(
+            self._active_sdata,
+            points_key,
+            instance_key_fallback=bool(spec is not None and spec.assignment_instance_key_fallback),
+        )
 
     @staticmethod
-    def _resolve_points_columns_for(sdata_obj, points_key: str):
-        """Resolve columns from one exact points element rather than collection order."""
+    def _resolve_points_columns_for(sdata_obj, points_key: str, *, instance_key_fallback: bool = False):
+        """Resolve columns from one exact points element rather than collection order.
+
+        ``original_assignment`` (the vendor instance key) stands in for a missing
+        assignment column only when ``instance_key_fallback`` is set, i.e. for a
+        platform whose spec opts in (Atera).  Canonical MerXen Xenium/MERSCOPE
+        points that carry only ``original_assignment`` keep ``assignment_col``
+        ``None``, so their cell index and transcript-cache identity are unchanged.
+        """
         if points_key not in getattr(sdata_obj, "points", {}):
             raise KeyError(f"points[{points_key}] is missing")
         points_obj = sdata_obj.points[points_key]
         x_col = first_existing_col(points_obj, ["x", "x_micron", "global_x", "x_location", "observed_x"])
         y_col = first_existing_col(points_obj, ["y", "y_micron", "global_y", "y_location", "observed_y"])
         assignment_col = first_existing_col(points_obj, ["assignment", "cell", "cell_id"])
+        if assignment_col is None and instance_key_fallback:
+            assignment_col = first_existing_col(points_obj, ["original_assignment"])
 
         if x_col is None or y_col is None:
             raise KeyError(f"Could not resolve x/y columns in points[{points_key}]")
@@ -11247,6 +11269,10 @@ class ComparisonViewerController(AteraTranscriptMixin):
         max_points = self._gene_max_render_points()
         random_state = int(getattr(self.args, "random_state", 42))
         pair_id = session.contract.pair_id
+        cell_index_wanted = {
+            platform: self._eager_cell_index_wanted(platform, entry[4])
+            for platform, entry in inputs.items()
+        }
 
         def compute():
             payloads: dict[str, dict] = {}
@@ -11294,7 +11320,7 @@ class ComparisonViewerController(AteraTranscriptMixin):
                         background_col=background_col,
                         max_points=max_points if max_points > 0 else None,
                         random_state=seed,
-                        build_cell_index=assignment_col is not None,
+                        build_cell_index=cell_index_wanted[platform],
                         assignment_source=source_key,
                         analysis_id=analysis_id,
                         status_col=status_col,
@@ -11336,7 +11362,7 @@ class ComparisonViewerController(AteraTranscriptMixin):
                                 reference_resolver=resolve_reference,
                                 max_points=max_points if max_points > 0 else None,
                                 random_state=seed,
-                                build_cell_index=assignment_col is not None,
+                                build_cell_index=cell_index_wanted[platform],
                                 cancel_check=cancel_token.is_set,
                                 status_col=status_col,
                             )
@@ -11858,6 +11884,7 @@ class ComparisonViewerController(AteraTranscriptMixin):
         if cancel_token is None:
             self._set_status(f"{ds}: transcript build is already running.")
             return
+        build_cell_index = self._eager_cell_index_wanted(ds, assignment_col)
         self._begin_progress(
             "transcripts",
             f"{ds}: loading per-gene transcripts for {points_key}...",
@@ -11887,7 +11914,7 @@ class ComparisonViewerController(AteraTranscriptMixin):
                     background_col=background_col,
                     max_points=max_points if max_points > 0 else None,
                     random_state=random_state,
-                    build_cell_index=assignment_col is not None,
+                    build_cell_index=build_cell_index,
                     assignment_source=source_key,
                     analysis_id=analysis_id,
                     status_col=status_col,
@@ -11911,7 +11938,7 @@ class ComparisonViewerController(AteraTranscriptMixin):
                         reference_resolver=resolve_reference,
                         max_points=max_points if max_points > 0 else None,
                         random_state=random_state,
-                        build_cell_index=assignment_col is not None,
+                        build_cell_index=build_cell_index,
                         cancel_check=cancel_token.is_set,
                         status_col=status_col,
                     )

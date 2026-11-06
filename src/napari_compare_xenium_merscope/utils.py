@@ -2391,13 +2391,58 @@ def resolve_dataset_mask_affine(
     raise ValueError(f"Unknown dataset: {dataset_name}")
 
 
-def _iter_point_partitions(points_obj, cols: list[str]):
+#: Partitions read ahead of the one being processed by the eager build.
+_POINT_PARTITION_READ_AHEAD = 1
+
+
+def _iter_point_partitions(
+    points_obj,
+    cols: list[str],
+    *,
+    cancel_check: Callable[[], bool] | None = None,
+    read_ahead: int | None = None,
+):
+    """Yield the non-empty pandas partitions of ``points_obj[cols]`` in order.
+
+    A dask frame's next ``read_ahead`` partitions are computed on one helper
+    thread while the caller processes the current one, so reading overlaps the
+    (vectorised) processing; at most ``read_ahead + 1`` partitions are held.
+    ``cancel_check`` is polled before each partition is handed out, and
+    closing the generator cancels the queued reads.
+    """
     work = points_obj[cols]
     if hasattr(work, "to_delayed"):
-        for part in work.to_delayed():
-            pdf = part.compute()
-            if len(pdf) > 0:
-                yield pdf
+        parts = list(work.to_delayed())
+        depth = _POINT_PARTITION_READ_AHEAD if read_ahead is None else max(0, int(read_ahead))
+        if depth == 0 or len(parts) <= 1:
+            for part in parts:
+                _check_transcript_cancelled(cancel_check)
+                pdf = part.compute()
+                if len(pdf) > 0:
+                    yield pdf
+            return
+        from collections import deque
+        from concurrent.futures import ThreadPoolExecutor
+
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="points-read-ahead")
+        pending: deque = deque()
+        next_part = 0
+        try:
+            while next_part < len(parts) and len(pending) <= depth:
+                pending.append(executor.submit(parts[next_part].compute))
+                next_part += 1
+            while pending:
+                _check_transcript_cancelled(cancel_check)
+                pdf = pending.popleft().result()
+                if next_part < len(parts) and len(pending) < depth:
+                    pending.append(executor.submit(parts[next_part].compute))
+                    next_part += 1
+                if len(pdf) > 0:
+                    yield pdf
+        finally:
+            for future in pending:
+                future.cancel()
+            executor.shutdown(wait=True, cancel_futures=True)
         return
 
     pdf = to_pandas(work)
@@ -4096,6 +4141,10 @@ class CellTranscriptIndex:
     gene_codes: np.ndarray
     gene_names: tuple[str, ...]
     slices: dict[str, tuple[int, int]]
+    #: ``gene_names`` as one object array, built on first use and reused by
+    #: every :meth:`transcripts_for` call (never serialised: the transcript
+    #: cache stores the fields above as ``.npy``).
+    _gene_name_array: np.ndarray | None = field(default=None, init=False, repr=False, compare=False)
 
     @classmethod
     def empty(cls) -> "CellTranscriptIndex":
@@ -4115,7 +4164,10 @@ class CellTranscriptIndex:
                 np.empty((0,), dtype=object),
             )
         start, end = span
-        names = np.asarray(self.gene_names, dtype=object)
+        names = self._gene_name_array
+        if names is None or len(names) != len(self.gene_names):
+            names = np.asarray(self.gene_names, dtype=object)
+            self._gene_name_array = names
         return self.coords_yx[start:end], names[self.gene_codes[start:end]]
 
 
@@ -4216,6 +4268,170 @@ def _check_transcript_cancelled(cancel_check: Callable[[], bool] | None) -> None
         raise TranscriptBuildCancelled("Transcript build cancelled")
 
 
+#: numpy's ``Generator.hypergeometric`` refuses ``ngood`` or ``nbad`` at or
+#: above this population size.
+_HYPERGEOMETRIC_LIMIT = 10**9
+
+
+def _exact_factorize(series: pd.Series) -> tuple[np.ndarray, pd.Series] | None:
+    """Dense codes for ``series`` whose uniques map exactly like its rows.
+
+    Returns ``(codes, uniques)``: ``codes`` is int64 with ``-1`` for missing
+    values and ``uniques`` is a Series of the column's own dtype, so any
+    elementwise conversion (``astype("string")``, :func:`normalize_cell_key`)
+    applied to ``uniques`` and gathered by ``codes`` equals that conversion
+    applied row by row.  That holds only where values that hash equal also
+    convert equal, so mixed object columns (``1`` vs ``True``), decimals and
+    other unusual dtypes return ``None`` and the caller converts per row.
+    Floats are factorised on their bit patterns, keeping ``0.0`` and ``-0.0``
+    apart.
+    """
+    dtype = series.dtype
+    if isinstance(dtype, pd.CategoricalDtype):
+        codes = series.cat.codes.to_numpy(dtype=np.int64)
+        return codes, pd.Series(dtype.categories)
+    if isinstance(dtype, np.dtype) and dtype.kind == "f":
+        values = series.to_numpy()
+        missing = np.isnan(values)
+        bits = values.view(np.int64 if values.dtype.itemsize == 8 else np.int32 if values.dtype.itemsize == 4 else np.int16)
+        codes = np.full(len(values), -1, dtype=np.int64)
+        present = np.flatnonzero(~missing)
+        if len(present):
+            sub_codes, first = _first_occurrence_codes(bits[present])
+            codes[present] = sub_codes
+            uniques = values[present[first]]
+        else:
+            uniques = values[:0]
+        return codes, pd.Series(uniques, dtype=dtype)
+    exact = (
+        isinstance(dtype, pd.StringDtype)
+        or (isinstance(dtype, np.dtype) and dtype.kind in "iub")
+        or (isinstance(dtype, pd.api.extensions.ExtensionDtype)
+            and getattr(dtype, "kind", "") in "iub" and not isinstance(dtype, np.dtype))
+    )
+    if not exact and isinstance(dtype, pd.ArrowDtype):
+        exact = pd.api.types.is_string_dtype(dtype) or pd.api.types.is_integer_dtype(dtype)
+    if not exact and dtype == object:
+        exact = pd.api.types.infer_dtype(series, skipna=True) in {"string", "integer", "empty"}
+    if not exact:
+        return None
+    codes, uniques = pd.factorize(series, use_na_sentinel=True)
+    return np.asarray(codes, dtype=np.int64), pd.Series(uniques, dtype=dtype)
+
+
+def _first_occurrence_codes(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Codes in first-occurrence order and each unique's first row."""
+    codes, uniques = pd.factorize(values)
+    first = np.full(len(uniques), len(values), dtype=np.int64)
+    np.minimum.at(first, codes, np.arange(len(values), dtype=np.int64))
+    return np.asarray(codes, dtype=np.int64), first
+
+
+@dataclass
+class _PartitionArrays:
+    """One partition's valid rows, with genes and cells as small local vocabularies."""
+
+    x: np.ndarray                    # float32, valid rows
+    y: np.ndarray                    # float32, valid rows
+    gene_codes: np.ndarray           # int64 into ``gene_vocab``
+    gene_vocab: np.ndarray           # sorted unique ``str`` gene names (numpy U)
+    background: np.ndarray           # bool, valid rows
+    #: int64 into ``cell_vocab`` for assigned rows with a non-empty key, else
+    #: -1; ``None`` without an assignment column.
+    cell_codes: np.ndarray | None
+    cell_vocab: np.ndarray | None    # object array of normalised cell keys
+
+
+def _sorted_string_vocab(series: pd.Series) -> tuple[np.ndarray, np.ndarray]:
+    """``(codes, vocab)``: rows coded into the sorted ``str`` names (-1 = NA).
+
+    ``vocab`` equals ``np.unique`` of ``series.astype("string")`` rows cast to
+    ``str``, without converting every row.
+    """
+    factorized = _exact_factorize(series)
+    if factorized is None:
+        raw_codes, uniques = pd.factorize(series.astype("string"), use_na_sentinel=True)
+        raw_codes = np.asarray(raw_codes, dtype=np.int64)
+        uniques = pd.Series(uniques, dtype="string")
+    else:
+        raw_codes, uniques = factorized
+    text = uniques.astype("string").to_numpy(dtype=object)
+    if len(text) == 0:
+        return raw_codes, np.zeros(0, dtype=str)
+    vocab, lut = np.unique(text.astype(str), return_inverse=True)
+    codes = np.where(raw_codes >= 0, lut.reshape(-1)[np.maximum(raw_codes, 0)], -1)
+    return codes.astype(np.int64, copy=False), vocab
+
+
+def _assignment_codes(series: pd.Series) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``(codes, vocab, assigned)`` for an assignment column.
+
+    ``assigned`` is :func:`assignment_mask` per row; ``codes`` index the
+    normalised cell keys ``vocab`` for assigned rows whose
+    :func:`normalize_cell_key` is non-empty, else -1.  Both are computed on the
+    column's distinct values.
+    """
+    numeric = pd.api.types.is_numeric_dtype(series)
+    factorized = _exact_factorize(series)
+    if factorized is None:
+        assigned = assignment_mask(series).to_numpy(dtype=bool, copy=False)
+        values = series.to_numpy(dtype=object)
+        keys = np.full(len(series), "", dtype=object)
+        positions = np.flatnonzero(assigned)
+        keys[positions] = [normalize_cell_key(value) for value in values[positions]]
+        raw_codes, uniques = pd.factorize(keys)
+        vocab = np.asarray(uniques, dtype=object)
+        codes = np.asarray(raw_codes, dtype=np.int64)
+        empty = np.flatnonzero(vocab == "")
+        if len(empty):
+            codes[codes == int(empty[0])] = -1
+        return codes, vocab, assigned
+    raw_codes, uniques = factorized
+    if numeric:
+        assigned_rows = assignment_mask(series).to_numpy(dtype=bool, copy=False)
+        assigned_unique = None
+    else:
+        as_str = uniques.astype("string")
+        bad_values = {"", "0", "-1", "nan", "None", "<NA>"}
+        assigned_unique = (as_str.notna() & ~as_str.isin(bad_values)).to_numpy(dtype=bool)
+        assigned_rows = None
+    unique_values = uniques.to_numpy(dtype=object)
+    keys = np.asarray([normalize_cell_key(value) for value in unique_values], dtype=object)
+    if len(keys):
+        key_codes, vocab = pd.factorize(keys)
+        key_codes = np.asarray(key_codes, dtype=np.int64)
+        vocab = np.asarray(vocab, dtype=object)
+        empty = np.flatnonzero(vocab == "")
+        if len(empty):
+            key_codes[key_codes == int(empty[0])] = -1
+        if assigned_unique is not None:
+            key_codes[~assigned_unique] = -1
+        codes = np.where(raw_codes >= 0, key_codes[np.maximum(raw_codes, 0)], -1)
+    else:
+        vocab = np.zeros(0, dtype=object)
+        codes = np.full(len(series), -1, dtype=np.int64)
+    if assigned_rows is not None:
+        codes = np.where(assigned_rows, codes, -1)
+    else:
+        assigned_rows = np.zeros(len(raw_codes), dtype=bool)
+        present = raw_codes >= 0
+        assigned_rows[present] = assigned_unique[raw_codes[present]]
+    return codes.astype(np.int64, copy=False), vocab, assigned_rows
+
+
+def _status_unassigned(series: pd.Series) -> np.ndarray:
+    """``series.astype("string").fillna("unknown") != "assigned"`` per row."""
+    factorized = _exact_factorize(series)
+    if factorized is None:
+        return (series.astype("string").fillna("unknown") != "assigned").to_numpy(dtype=bool)
+    codes, uniques = factorized
+    other = (uniques.astype("string").fillna("unknown") != "assigned").to_numpy(dtype=bool)
+    out = np.ones(len(codes), dtype=bool)  # missing -> "unknown" -> not assigned
+    present = codes >= 0
+    out[present] = other[codes[present]]
+    return out
+
+
 def _point_partition_arrays(
     pdf: pd.DataFrame,
     *,
@@ -4225,40 +4441,137 @@ def _point_partition_arrays(
     assignment_col: str | None,
     background_col: str | None,
     status_col: str | None = None,
-):
-    """Return compact valid arrays for one transcript partition."""
+    gene_coding: tuple[np.ndarray, np.ndarray] | None = None,
+) -> _PartitionArrays | None:
+    """Return compact valid arrays for one transcript partition.
+
+    Genes and cell ids are converted once per distinct value, never per row.
+    ``gene_coding`` reuses a ``_sorted_string_vocab`` of ``pdf[gene_col]``.
+    """
     x_all = pdf[x_col].to_numpy(dtype=np.float32, copy=False)
     y_all = pdf[y_col].to_numpy(dtype=np.float32, copy=False)
-    gene_all = pdf[gene_col].astype("string").to_numpy(dtype=object)
-    good = np.isfinite(x_all) & np.isfinite(y_all) & pd.notna(gene_all)
+    gene_codes_all, gene_vocab = (
+        gene_coding if gene_coding is not None else _sorted_string_vocab(pdf[gene_col])
+    )
+    good = np.isfinite(x_all) & np.isfinite(y_all) & (gene_codes_all >= 0)
     if not np.any(good):
         return None
 
+    has_assignment = assignment_col is not None and assignment_col in pdf.columns
+    cell_codes_all = cell_vocab = assigned_all = None
+    if has_assignment:
+        cell_codes_all, cell_vocab, assigned_all = _assignment_codes(pdf[assignment_col])
+
     if background_col is not None and background_col in pdf.columns:
         background_all = pdf[background_col].to_numpy(dtype=bool, copy=False)
-    elif assignment_col is not None and assignment_col in pdf.columns:
-        background_all = ~assignment_mask(pdf[assignment_col]).to_numpy(dtype=bool, copy=False)
+    elif has_assignment:
+        background_all = ~assigned_all
     else:
         background_all = np.zeros(len(pdf), dtype=bool)
     if status_col is not None:
         # Rendering's unassigned group includes excluded transcripts. Their
         # scientific background flag remains false in the original points.
-        background_all = background_all | (pdf[status_col].astype("string").fillna("unknown") != "assigned").to_numpy(dtype=bool)
+        background_all = background_all | _status_unassigned(pdf[status_col])
 
-    assignment_all = None
-    assigned_all = None
-    if assignment_col is not None and assignment_col in pdf.columns:
-        assignment_all = pdf[assignment_col].to_numpy(dtype=object)
-        assigned_all = assignment_mask(pdf[assignment_col]).to_numpy(dtype=bool, copy=False)
-
-    return (
-        np.ascontiguousarray(x_all[good]),
-        np.ascontiguousarray(y_all[good]),
-        gene_all[good].astype(str),
-        np.ascontiguousarray(background_all[good]),
-        None if assignment_all is None else assignment_all[good],
-        None if assigned_all is None else np.ascontiguousarray(assigned_all[good]),
+    return _PartitionArrays(
+        x=np.ascontiguousarray(x_all[good]),
+        y=np.ascontiguousarray(y_all[good]),
+        gene_codes=gene_codes_all[good],
+        gene_vocab=gene_vocab,
+        background=np.ascontiguousarray(background_all[good]),
+        cell_codes=None if cell_codes_all is None else cell_codes_all[good],
+        cell_vocab=cell_vocab,
     )
+
+
+class _StreamingSampler:
+    """Exact uniform ``render_count``-of-``total`` sample, partition by partition.
+
+    While numpy accepts every sequential hypergeometric draw (each partition's
+    ``ngood`` and ``nbad`` below 1e9) this replays the historical sampler draw
+    for draw, so the output is unchanged.  Otherwise (``total`` minus the first
+    partition at or above 1e9, which made numpy raise) positions are drawn once
+    over the whole stream and split by partition offsets.
+    """
+
+    def __init__(self, partition_counts: Sequence[int], render_count: int, random_state: int):
+        counts = [int(c) for c in partition_counts]
+        self.total = int(sum(counts))
+        self.render_count = int(render_count)
+        self.random_state = int(random_state)
+        self.uses_hypergeometric = self.hypergeometric_accepts(counts)
+        self._rng = np.random.default_rng(self.random_state)
+        self._remaining_source = self.total
+        self._remaining_sample = self.render_count
+        self._offset = 0
+        self._positions: np.ndarray | None = None
+        if not self.uses_hypergeometric and 0 < self.render_count < self.total:
+            from .atera_transcripts import sample_global_positions
+
+            self._positions = sample_global_positions(self.total, self.render_count, self.random_state)
+
+    @staticmethod
+    def hypergeometric_accepts(partition_counts: Sequence[int]) -> bool:
+        """Whether every sequential draw stays inside numpy's limits."""
+        remaining = int(sum(int(c) for c in partition_counts))
+        for count in partition_counts:
+            count = int(count)
+            if count >= _HYPERGEOMETRIC_LIMIT or remaining - count >= _HYPERGEOMETRIC_LIMIT:
+                return False
+            remaining -= count
+        return True
+
+    def take(self, part_count: int) -> np.ndarray:
+        """Sorted kept row positions within the next partition of ``part_count`` rows."""
+        part_count = int(part_count)
+        if self._remaining_sample == self._remaining_source:
+            keep = np.arange(part_count, dtype=np.int64)
+        elif self._remaining_sample <= 0:
+            keep = np.empty((0,), dtype=np.int64)
+        elif self._positions is not None:
+            lo = int(np.searchsorted(self._positions, self._offset, side="left"))
+            hi = int(np.searchsorted(self._positions, self._offset + part_count, side="left"))
+            keep = self._positions[lo:hi] - self._offset
+        else:
+            rng = self._rng
+            take = int(
+                rng.hypergeometric(
+                    ngood=part_count,
+                    nbad=max(0, self._remaining_source - part_count),
+                    nsample=self._remaining_sample,
+                )
+            )
+            keep = (
+                np.sort(rng.choice(part_count, size=take, replace=False))
+                if take > 0
+                else np.empty((0,), dtype=np.int64)
+            )
+        self._offset += part_count
+        self._remaining_source -= part_count
+        self._remaining_sample -= int(len(keep))
+        return keep
+
+
+def _scatter_cell_rows(
+    codes: np.ndarray,
+    positions: np.ndarray,
+    cell_write: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Destination slots for rows grouped by cell code, stable in row order.
+
+    Advances ``cell_write`` (each cell's next free slot) in place and returns
+    ``(dest, src)`` index arrays.
+    """
+    order = np.argsort(codes, kind="stable")
+    codes_sorted = codes[order]
+    src = positions[order]
+    n = len(codes_sorted)
+    starts = np.flatnonzero(np.r_[True, codes_sorted[1:] != codes_sorted[:-1]])
+    sizes = np.diff(np.r_[starts, n])
+    rank = np.arange(n, dtype=np.int64) - np.repeat(starts, sizes)
+    dest = cell_write[codes_sorted] + rank
+    cell_write[codes_sorted[starts]] += sizes
+    return dest, src
 
 
 def build_gene_point_groups(
@@ -4289,6 +4602,10 @@ def build_gene_point_groups(
     ``is_gene_col`` (Atera's ``is_gene``) makes the store's ``control_genes`` the
     features flagged not-a-gene, cross-checked against the name rule by
     :func:`control_genes_from_is_gene`.  Without it controls are name-only.
+
+    Both streaming passes are vectorised: genes and cell ids are converted
+    once per distinct value per partition and mapped to global codes through
+    small lookup tables, so no Python runs per transcript.
     """
     cols = [x_col, y_col, gene_col]
     if is_gene_col is not None and is_gene_col not in cols:
@@ -4301,27 +4618,8 @@ def build_gene_point_groups(
     if status_col is not None and status_col not in cols:
         cols.append(status_col)
 
-    # Pass 1 retains only small aggregate dictionaries.  In particular, it does
-    # not keep a Python string object for every transcript and it lets us size
-    # all output arrays exactly before the second streaming pass.
-    source_gene_counts: dict[str, int] = {}
-    source_status_counts: dict[str, int] | None = {} if status_col else None
-    cell_counts: dict[str, int] = {}
-    total_source = 0
-    for pdf in _iter_point_partitions(points_obj, cols):
-        _check_transcript_cancelled(cancel_check)
-        if is_gene_flags is not None:
-            # Raw rows, before coordinate filtering: the flag is per feature.
-            accumulate_is_gene_flags(
-                is_gene_flags, pdf[gene_col].astype("string").to_numpy(dtype=object), pdf[is_gene_col]
-            )
-        if status_col is not None:
-            # Status totals describe the complete source, independent of the
-            # render cap and coordinate filtering used for the point layers.
-            for status, count in pdf[status_col].value_counts(dropna=False).items():
-                key = str(status) if pd.notna(status) else "unknown"
-                source_status_counts[key] = source_status_counts.get(key, 0) + int(count)
-        arrays = _point_partition_arrays(
+    def partition_arrays(pdf, gene_coding=None):
+        return _point_partition_arrays(
             pdf,
             x_col=x_col,
             y_col=y_col,
@@ -4329,27 +4627,58 @@ def build_gene_point_groups(
             assignment_col=assignment_col,
             background_col=background_col,
             status_col=status_col,
+            gene_coding=gene_coding,
         )
+
+    # Pass 1 retains only small aggregate dictionaries.  In particular, it does
+    # not keep a Python string object for every transcript and it lets us size
+    # all output arrays exactly before the second streaming pass.
+    source_gene_counts: dict[str, int] = {}
+    source_status_counts: dict[str, int] | None = {} if status_col else None
+    cell_counts: dict[str, int] = {}
+    partition_counts: list[int] = []
+    total_source = 0
+    for pdf in _iter_point_partitions(points_obj, cols, cancel_check=cancel_check):
+        _check_transcript_cancelled(cancel_check)
+        gene_coding = _sorted_string_vocab(pdf[gene_col])
+        if is_gene_flags is not None:
+            # Raw rows, before coordinate filtering: the flag is per feature.
+            codes_all, vocab = gene_coding
+            flags = pd.Series(pdf[is_gene_col]).astype("boolean").fillna(False).to_numpy(dtype=bool)
+            present = codes_all >= 0
+            if np.any(present):
+                gene_all = np.ones(len(vocab), dtype=bool)
+                np.logical_and.at(gene_all, codes_all[present], flags[present])
+                seen = np.bincount(codes_all[present], minlength=len(vocab)) > 0
+                for name, flag in zip(vocab[seen].tolist(), gene_all[seen].tolist(), strict=True):
+                    text = str(name)
+                    is_gene_flags[text] = bool(is_gene_flags.get(text, True) and flag)
+        if status_col is not None:
+            # Status totals describe the complete source, independent of the
+            # render cap and coordinate filtering used for the point layers.
+            for status, count in pdf[status_col].value_counts(dropna=False).items():
+                key = str(status) if pd.notna(status) else "unknown"
+                source_status_counts[key] = source_status_counts.get(key, 0) + int(count)
+        arrays = partition_arrays(pdf, gene_coding)
         if arrays is None:
             continue
-        _x, _y, genes_part, _bg, assignment_part, assigned_part = arrays
-        total_source += int(len(genes_part))
-        names, counts = np.unique(genes_part, return_counts=True)
-        for name, count in zip(names.tolist(), counts.tolist(), strict=True):
+        part_count = int(len(arrays.gene_codes))
+        partition_counts.append(part_count)
+        total_source += part_count
+        counts = np.bincount(arrays.gene_codes, minlength=len(arrays.gene_vocab))
+        present = np.flatnonzero(counts)
+        for name, count in zip(arrays.gene_vocab[present].tolist(), counts[present].tolist(), strict=True):
             text = str(name)
             source_gene_counts[text] = source_gene_counts.get(text, 0) + int(count)
 
-        if build_cell_index and assignment_part is not None and assigned_part is not None:
-            assigned_values = assignment_part[assigned_part]
-            keys = np.fromiter(
-                (normalize_cell_key(value) for value in assigned_values),
-                dtype=object,
-                count=int(len(assigned_values)),
-            )
-            keys = keys[keys != ""]
-            if len(keys):
-                unique_keys, key_counts = np.unique(keys, return_counts=True)
-                for key, count in zip(unique_keys.tolist(), key_counts.tolist(), strict=True):
+        if build_cell_index and arrays.cell_codes is not None:
+            cell_local = arrays.cell_codes[arrays.cell_codes >= 0]
+            if len(cell_local):
+                local_counts = np.bincount(cell_local, minlength=len(arrays.cell_vocab))
+                used = np.flatnonzero(local_counts)
+                keys = arrays.cell_vocab[used]
+                order = np.argsort(keys.astype(str), kind="stable")
+                for key, count in zip(keys[order].tolist(), local_counts[used][order].tolist(), strict=True):
                     text = str(key)
                     cell_counts[text] = cell_counts.get(text, 0) + int(count)
 
@@ -4390,93 +4719,51 @@ def build_gene_point_groups(
 
     # Pass 2 fills fixed-size outputs.  Sequential hypergeometric allocation
     # selects an exact uniform sample without ever materialising the uncapped
-    # coordinate set in memory.
-    rng = np.random.default_rng(int(random_state))
-    remaining_source = int(total_source)
-    remaining_sample = int(render_count)
+    # coordinate set in memory (a global position draw above numpy's limit).
+    sampler = _StreamingSampler(partition_counts, render_count, random_state)
     render_cursor = 0
-    for pdf in _iter_point_partitions(points_obj, cols):
+    for pdf in _iter_point_partitions(points_obj, cols, cancel_check=cancel_check):
         _check_transcript_cancelled(cancel_check)
-        arrays = _point_partition_arrays(
-            pdf,
-            x_col=x_col,
-            y_col=y_col,
-            gene_col=gene_col,
-            assignment_col=assignment_col,
-            background_col=background_col,
-            status_col=status_col,
-        )
+        arrays = partition_arrays(pdf)
         if arrays is None:
             continue
-        x_part, y_part, genes_part, bg_part, assignment_part, assigned_part = arrays
-        part_count = int(len(genes_part))
-        part_gene_codes = np.fromiter(
-            (gene_to_code[str(name)] for name in genes_part),
-            dtype=gene_code_dtype,
-            count=part_count,
+        part_count = int(len(arrays.gene_codes))
+        gene_lut = np.fromiter(
+            (gene_to_code.get(str(name), 0) for name in arrays.gene_vocab.tolist()),
+            dtype=np.int64,
+            count=len(arrays.gene_vocab),
         )
+        part_gene_codes = gene_lut[arrays.gene_codes].astype(gene_code_dtype, copy=False)
 
-        if remaining_sample == remaining_source:
-            keep = np.arange(part_count, dtype=np.int64)
-        elif remaining_sample <= 0:
-            keep = np.empty((0,), dtype=np.int64)
-        else:
-            take = int(
-                rng.hypergeometric(
-                    ngood=part_count,
-                    nbad=max(0, remaining_source - part_count),
-                    nsample=remaining_sample,
-                )
-            )
-            keep = (
-                np.sort(rng.choice(part_count, size=take, replace=False))
-                if take > 0
-                else np.empty((0,), dtype=np.int64)
-            )
+        keep = sampler.take(part_count)
         take = int(len(keep))
         if take:
             end = render_cursor + take
-            render_x[render_cursor:end] = x_part[keep]
-            render_y[render_cursor:end] = y_part[keep]
-            render_gene_codes[render_cursor:end] = part_gene_codes[keep]
-            render_background[render_cursor:end] = bg_part[keep]
+            if take == part_count:
+                render_x[render_cursor:end] = arrays.x
+                render_y[render_cursor:end] = arrays.y
+                render_gene_codes[render_cursor:end] = part_gene_codes
+                render_background[render_cursor:end] = arrays.background
+            else:
+                render_x[render_cursor:end] = arrays.x[keep]
+                render_y[render_cursor:end] = arrays.y[keep]
+                render_gene_codes[render_cursor:end] = part_gene_codes[keep]
+                render_background[render_cursor:end] = arrays.background[keep]
             render_cursor = end
-        remaining_source -= part_count
-        remaining_sample -= take
 
-        if build_cell_index and assignment_part is not None and assigned_part is not None and cell_keys:
-            assigned_positions = np.flatnonzero(assigned_part)
+        if build_cell_index and arrays.cell_codes is not None and cell_keys:
+            assigned_positions = np.flatnonzero(arrays.cell_codes >= 0)
             if len(assigned_positions):
-                normalized = np.fromiter(
-                    (normalize_cell_key(assignment_part[pos]) for pos in assigned_positions),
-                    dtype=object,
-                    count=int(len(assigned_positions)),
+                cell_lut = np.fromiter(
+                    (cell_code_by_key.get(str(key), -1) for key in arrays.cell_vocab.tolist()),
+                    dtype=np.int64,
+                    count=len(arrays.cell_vocab),
                 )
-                valid_keys = normalized != ""
-                assigned_positions = assigned_positions[valid_keys]
-                normalized = normalized[valid_keys]
-                if len(assigned_positions):
-                    codes = np.fromiter(
-                        (cell_code_by_key[str(key)] for key in normalized),
-                        dtype=np.int64,
-                        count=int(len(normalized)),
-                    )
-                    order = np.argsort(codes, kind="stable")
-                    codes_sorted = codes[order]
-                    positions_sorted = assigned_positions[order]
-                    starts = np.concatenate(
-                        ([0], np.flatnonzero(np.diff(codes_sorted) != 0) + 1)
-                    )
-                    ends = np.concatenate((starts[1:], [len(codes_sorted)]))
-                    for start, end in zip(starts.tolist(), ends.tolist(), strict=True):
-                        code = int(codes_sorted[start])
-                        count = int(end - start)
-                        dest = int(cell_write[code])
-                        src = positions_sorted[start:end]
-                        cell_coords[dest:dest + count, 0] = y_part[src]
-                        cell_coords[dest:dest + count, 1] = x_part[src]
-                        cell_gene_codes[dest:dest + count] = part_gene_codes[src]
-                        cell_write[code] += count
+                codes = cell_lut[arrays.cell_codes[assigned_positions]]
+                dest, src = _scatter_cell_rows(codes, assigned_positions, cell_write)
+                cell_coords[dest, 0] = arrays.y[src]
+                cell_coords[dest, 1] = arrays.x[src]
+                cell_gene_codes[dest] = part_gene_codes[src]
 
     if render_cursor != render_count:
         raise RuntimeError(

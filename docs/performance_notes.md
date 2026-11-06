@@ -384,3 +384,61 @@ Not in this effort: vendor Azimuth as a second cell-type/UMAP source
 (`vendor_azimuth_*`, `X_umap_vendor`). Also not done: reusing the viewport's
 rows for a cell inside it, because the sample drops cell ids and the per-cell
 read is already about 0.3 s.
+
+## Vectorised eager transcript build (M4, Xenium/MERSCOPE)
+
+`build_gene_point_groups` (the eager two-pass build Xenium and MERSCOPE use;
+Atera never does) no longer runs Python per transcript:
+
+- Gene and cell-id columns are factorised once per partition (categorical
+  codes, or `pd.factorize` on columns where equal values always convert
+  alike). `astype("string")` and `normalize_cell_key` run on the distinct
+  values only and reach the rows through small lookup tables. Mixed object
+  columns (such as `1` next to `True`) fall back to converting row by row.
+  Floats are factorised on their bit patterns, so `0.0` and `-0.0` stay apart.
+- Pass 1 uses `np.bincount` over the codes. Pass 2 maps codes to global codes
+  through lookup tables and scatters the cell index with one stable argsort per
+  partition.
+- The status column and the assignment mask are evaluated per distinct value.
+- The next dask partition is read on one helper thread while the current one is
+  processed (`_POINT_PARTITION_READ_AHEAD = 1`, so at most two partitions are
+  held). Cancellation is checked before each partition.
+- The sampler replays the historical sequential hypergeometric draws whenever
+  numpy accepts every one of them, which needs each `ngood` and `nbad` below
+  1e9. So the output is unchanged even for totals of 1e9 and more. Only when
+  `total - first partition` reaches 1e9 (where numpy raised before) does it
+  draw global positions once with `sample_global_positions` and split them
+  across the partitions.
+- `CellTranscriptIndex.transcripts_for` reuses one object array of gene names.
+
+The outputs are bit-identical to the previous implementation. A frozen copy of
+it lives in `tests/_frozen_gene_point_groups.py`, and
+`tests/test_gene_point_build_equivalence.py` compares every store field, dtype,
+dict order and cell slice across:
+
+- gene dtypes: object, string, pyarrow, arrow dictionary, categorical, int,
+  float and mixed;
+- assignment dtypes: uint32, negative int64, float with NaN/inf/2**60,
+  strings with blank, NA and alias spellings, 19-digit strings, uint64 up to
+  2**64-1, nullable UInt64/Int64 with NA, categorical, pyarrow int and mixed;
+- render sampling and multi-partition dask frames with read-ahead depths of 0
+  to 3.
+
+Measured on this Mac (both passes, warm):
+
+| input | before | after |
+|---|---|---|
+| synthetic 3.7M rows, 500 categorical genes, no cell index | 1.62 s | 0.23 s |
+| the same with 200k string cell ids, cell index, 1M cap | 7.2 s | 1.25 s |
+| P7513 Xenium, 2 partitions (8.4M rows, UInt64 ids, cell index) | 10.8 s | 1.8 s |
+| P7513 MERSCOPE, 2 partitions (14.7M rows, cell index) | 18.2 s | 2.8 s |
+
+The P7513 rows include the dask/zarr reads. The real-store outputs matched the
+frozen build exactly, both uncapped and with a 500k cap.
+
+The `original_assignment` instance-key fallback in
+`_resolve_points_columns_for` applies only to a platform spec with
+`assignment_instance_key_fallback` (Atera). Canonical MerXen Xenium/MERSCOPE
+points that carry only `original_assignment` keep `assignment_col=None`, so
+their cache identity is unchanged. `build_cell_index` is also off for every
+lazy platform.
