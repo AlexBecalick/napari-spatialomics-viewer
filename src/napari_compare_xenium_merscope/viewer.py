@@ -5203,11 +5203,17 @@ def _cell_gene_list_html(cell: dict, max_rows: int | None = None) -> str:
             f"<span style='color:#9aa4b2;'>{count:,}</span></div>"
         )
     if hidden:
-        lines.append(
-            f"<div style='margin:4px 0; color:#9aa4b2;'><i>{len(hidden):,} more genes "
-            f"({sum(int(r.get('count', 0)) for r in hidden):,} transcripts)</i></div>"
-        )
+        lines.append(_cell_gene_list_footer_html(hidden))
     return "".join(lines) or "<i>No transcripts assigned</i>"
+
+
+def _cell_gene_list_footer_html(hidden: list[dict]) -> str:
+    """The capped (WTA) list's 'N more genes' footer, on two short lines so it
+    fits the gene column's width instead of forcing a horizontal scrollbar."""
+    return (
+        f"<div style='margin:4px 0; color:#9aa4b2;'><i>{len(hidden):,} more genes<br>"
+        f"({sum(int(r.get('count', 0)) for r in hidden):,} transcripts)</i></div>"
+    )
 
 
 def _rgba_css_color(rgba, fallback: str = "#9aa4b2") -> str:
@@ -5318,7 +5324,13 @@ class _CellPanel(QWidget):
         # Measure the rows initially in view. A long rare gene farther down
         # remains scrollable without reserving blank width beside the top genes.
         visible_rows = {**cell, "gene_rows": cell.get("gene_rows", [])[:8]}
-        document.setHtml(_cell_gene_list_html(visible_rows))
+        visible_html = _cell_gene_list_html(visible_rows, max_rows=8)
+        all_rows = list(cell.get("gene_rows", []))
+        if _cell_wta_capped(cell) and len(all_rows) > CELL_GENE_LIST_MAX_ROWS:
+            # The capped list ends in a 'N more genes' footer; size for it too,
+            # or it alone would raise a horizontal scrollbar over the rows.
+            visible_html += _cell_gene_list_footer_html(all_rows[CELL_GENE_LIST_MAX_ROWS:])
+        document.setHtml(visible_html)
         natural = int(document.idealWidth()) + self._gene_scroll.verticalScrollBar().sizeHint().width() + 8
         # A rare long gene name must not widen the entire cell panel. Keep its
         # full text available via the gene list's own horizontal scrollbar.
@@ -14325,6 +14337,9 @@ class ComparisonViewerController(AteraTranscriptMixin):
         intensities, cellpose_id = intensity_result
 
         annotation = self._cell_type_annotation_for_cell(key, cell_id, load=True)
+        # Same source rule as the lazy path: a vendor-mask-only quantification
+        # had its means read from that table, so the summary names that cell.
+        source_label = self._intensity_cell_label(key) if cellpose_id is not None else None
         return {
             "cell_id": cell_id,
             "geometry": geometry,
@@ -14337,6 +14352,7 @@ class ComparisonViewerController(AteraTranscriptMixin):
             "area": area_um2,
             "intensities": intensities,
             "cellpose_cell_id": cellpose_id,
+            "intensity_cell_label": source_label,
             "loading": False,
             **annotation,
         }

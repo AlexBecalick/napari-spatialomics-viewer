@@ -797,3 +797,86 @@ def test_a_vendor_mask_quantification_names_the_mask_its_means_came_from(monkeyp
 def test_an_unknown_platform_vendor_mask_falls_back_to_the_shape_key(monkeypatch):
     ctrl, _ = _label_controller(monkeypatch, "OTHER", _VENDOR_QUANT)
     assert ctrl._intensity_cell_label("OTHER") == "cell_boundaries cell"
+
+
+def _eager_controller(monkeypatch, platform, quantification, means):
+    """A Xenium/MERSCOPE controller whose eager selection path runs for real."""
+    from shapely.geometry import box
+
+    ctrl, _ = _label_controller(monkeypatch, platform, quantification)
+    ctrl._cell_intensity_cache = {}
+    index = V.CellTranscriptIndex.empty()
+    monkeypatch.setattr(ctrl, "_get_cell_transcript_index", lambda ds: index, raising=False)
+    monkeypatch.setattr(ctrl, "_inspection_transcript_index", lambda *a: index, raising=False)
+    monkeypatch.setattr(ctrl, "_cell_image_specs", lambda: [], raising=False)
+    monkeypatch.setattr(ctrl, "_inspection_identity", lambda ds: ("native", ""), raising=False)
+    monkeypatch.setattr(ctrl, "_inspection_intensities", lambda *a: means, raising=False)
+    monkeypatch.setattr(ctrl, "_cell_type_annotation_for_cell", lambda *a, **k: {}, raising=False)
+    return ctrl, box(0, 0, 4, 4)
+
+
+@pytest.mark.parametrize("platform, name", [("XENIUM", "Xenium"), ("MERSCOPE", "MERSCOPE")])
+def test_the_eager_summary_names_the_vendor_cell_its_means_came_from(monkeypatch, platform, name):
+    ctrl, geometry = _eager_controller(monkeypatch, platform, _VENDOR_QUANT, ([("DAPI", 12.0)], 5))
+    assert not ctrl._uses_lazy_cell_queries(platform)
+    payload = ctrl._cell_selection_display(platform, 5, geometry, "#ffffff")
+    assert payload["intensity_cell_label"] == f"{name} cell"
+    summary = V._cell_summary_html(payload)
+    assert f"{name} cell: 5" in summary and "Cellpose cell" not in summary
+
+
+@pytest.mark.parametrize("platform", ["XENIUM", "MERSCOPE"])
+@pytest.mark.parametrize("quantification", [None, U.CELLPOSE_MASK_QUANTIFICATION])
+def test_the_eager_summary_says_cellpose_cell_for_cellpose_means(monkeypatch, platform, quantification):
+    ctrl, geometry = _eager_controller(monkeypatch, platform, quantification, ([("DAPI", 12.0)], 77))
+    payload = ctrl._cell_selection_display(platform, 5, geometry, "#ffffff")
+    assert "Cellpose cell: 77" in V._cell_summary_html(payload)
+
+
+def test_the_eager_summary_without_a_matched_cell_has_no_source_line(monkeypatch):
+    ctrl, geometry = _eager_controller(monkeypatch, "XENIUM", _VENDOR_QUANT, ([("DAPI", 12.0)], None))
+    payload = ctrl._cell_selection_display("XENIUM", 5, geometry, "#ffffff")
+    assert payload["intensity_cell_label"] is None
+    summary = V._cell_summary_html(payload)
+    assert " cell: " not in summary and "DAPI: 12.0" in summary
+
+
+# ---------------------------------------------------------------------------
+# WTA panel geometry: legend, pie and gene list sit side by side, unclipped
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("n_genes", [6_000, 5_930 + V.CELL_GENE_LIST_MAX_ROWS, 30])
+def test_a_wta_panel_lays_out_without_overlap_or_a_gene_list_hscrollbar(qapp, n_genes):
+    rows = [
+        # Real Atera cell 1001 shape: a few hundred top counts, a long tail of 1-3.
+        {"gene": gene, "count": max(1, 182 - 3 * i) if i < 60 else 1 + i % 3,
+         "rgba": (0.2, 0.4, 0.6, 1.0), "glyph": "●"}
+        for i, gene in enumerate(["NRGN", "OLFM1", "CPLX2", "NCDN", "NPTXR", "CAMK2N1",
+                                  "PTK2B", "YWHAG", "DKK3", "ADRA1A"] + [f"G{i:05d}" for i in range(n_genes - 10)])
+    ]
+    cell = {"cell_id": 1001, "gene_rows": rows, "wta_caps": True, "area": 127.9,
+            "total": sum(r["count"] for r in rows), "total_label": "Gene transcripts (table)",
+            "intensities": [("DAPI", 965.8)], "cellpose_cell_id": 1001, "intensity_cell_label": "Atera cell"}
+    panel = V._CellPanel(cell)
+    panel.resize(panel.sizeHint())
+    panel.show()
+    qapp.processEvents()
+    try:
+        scroll = panel._gene_scroll
+        assert scroll.horizontalScrollBar().maximum() == 0
+        assert not scroll.horizontalScrollBar().isVisible()
+        boxes = [panel._statistics.geometry(), panel._pie.geometry(),
+                 panel._pie_legend.geometry(), scroll.geometry()]
+        assert not panel._pie_legend.isHidden()
+        assert all(b.width() > 0 for b in boxes)
+        for left, right in zip(boxes, boxes[1:]):
+            assert left.right() < right.left()
+        assert boxes[-1].right() <= panel.rect().right()
+        # A plain (non-WTA) cell keeps its existing gene-list width rule.
+        plain = V._CellPanel({**cell, "wta_caps": False, "gene_rows": rows[:12]})
+        assert plain._pie_legend.isHidden() and plain._gene_scroll.width() <= 190
+        plain.deleteLater()
+    finally:
+        panel.close()
+        panel.deleteLater()
