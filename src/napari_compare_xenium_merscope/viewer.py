@@ -128,6 +128,7 @@ try:
         QComboBox,
         QDoubleSpinBox,
         QFileDialog,
+        QFormLayout,
         QFrame,
         QHBoxLayout,
         QLabel,
@@ -175,6 +176,7 @@ from .atera_viewer import (
     ATERA_MODE_FULL,
     ATERA_MODE_LAZY,
     ATERA_TRANSCRIPT_MODES,
+    DEFAULT_ATERA_OVERVIEW_MAX_POINTS,
     DEFAULT_ATERA_TRANSCRIPT_MODE,
     DEFAULT_ATERA_VIEWPORT_MAX_POINTS,
     AteraTranscriptMixin,
@@ -1770,8 +1772,14 @@ class ViewerControlPanel(QWidget):
             layout.addWidget(self._gene_inspector_widget, stretch=1)
         else:
             layout.addStretch(1)
-        tab = QWidget()
-        tab.setLayout(layout)
+        # Scrollable like the other tabs: in a short window the inspector keeps
+        # every control at its minimum height (and scrolls) instead of being
+        # squashed until rows overlap.  Its width follows the dock.
+        tab = self._scrollable(layout)
+        tab.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # Only the height scrolls: an explicit (tiny) minimum width lets the
+        # content follow the dock's width as it did before.
+        tab.widget().setMinimumWidth(1)
         return tab
 
     def _build_cell_type_tab(self) -> QWidget:
@@ -3618,60 +3626,105 @@ class GeneInspectorWidget(QWidget):
         self.setMinimumWidth(240)
 
     # -- Atera transcript controls -------------------------------------------
+    #: mode -> (short item text, item tooltip).  The texts stay short so the
+    #: combo never clips at the panel's minimum width.
     _ATERA_MODE_LABELS = {
-        ATERA_MODE_FULL: "Whole-slide sample (all genes)",
-        ATERA_MODE_LAZY: "Lazy (density + ticked genes)",
+        ATERA_MODE_FULL: (
+            "Whole-slide sample",
+            "Stream every file once and keep a nested whole-slide sample of the point budget, "
+            "drawn as ordinary per-gene layers (all genes available).",
+        ),
+        ATERA_MODE_LAZY: (
+            "Lazy (density)",
+            "A 5 um density image of every gene; only the ticked genes load at full resolution.",
+        ),
     }
 
+    @staticmethod
+    def _atera_millions_spin(minimum: float, step: float, tooltip: str) -> QDoubleSpinBox:
+        spin = QDoubleSpinBox()
+        spin.setDecimals(1)
+        spin.setRange(float(minimum), 100000.0)
+        spin.setSingleStep(float(step))
+        spin.setSuffix(" M")
+        spin.setKeyboardTracking(False)
+        spin.setAccelerated(True)
+        spin.setToolTip(tooltip)
+        spin.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        return spin
+
     def _build_atera_controls(self) -> None:
-        """Mode, point budget and viewport cap for Atera stores (hidden otherwise)."""
+        """Mode, point budget, all-genes cap and viewport cap for Atera stores (hidden otherwise).
+
+        A form: labels in their own column, fields that grow, the Reload
+        button on a full-width row under them and a word-wrapped summary, so
+        nothing overlaps or clips at the panel's 240 px minimum width.
+        """
         self._atera_box = QWidget()
-        layout = QVBoxLayout()
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
+        self._atera_title = QLabel("<b>Atera transcripts</b>")
         self._atera_mode_combo = QComboBox()
-        for mode, label in self._ATERA_MODE_LABELS.items():
+        for index, (mode, (label, tooltip)) in enumerate(self._ATERA_MODE_LABELS.items()):
             self._atera_mode_combo.addItem(label, mode)
-        self._atera_budget_spin = QDoubleSpinBox()
-        self._atera_budget_spin.setDecimals(1)
-        self._atera_budget_spin.setRange(0.0, 100000.0)
-        self._atera_budget_spin.setSingleStep(10.0)
-        self._atera_budget_spin.setSuffix(" M points")
-        self._atera_budget_spin.setSpecialValueText("Auto")
-        self._atera_budget_spin.setKeyboardTracking(False)
-        self._atera_budget_spin.setToolTip(
+            self._atera_mode_combo.setItemData(index, tooltip, Qt.ToolTipRole)
+        self._atera_mode_combo.setSizeAdjustPolicy(QComboBox.AdjustToContents)
+        self._atera_mode_combo.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._atera_mode_combo.setToolTip(
+            "Whole-slide sample: every gene from a nested sample of the point budget. "
+            "Lazy: a density image plus the ticked genes at full resolution. Applied by Reload."
+        )
+        self._atera_budget_tooltip = (
             "Whole-slide sample size in millions of transcripts. Auto = half the RAM over the "
             "measured bytes per point; a value at or above the store total loads every transcript. "
             "The memory guard clamps any budget. Applied by Reload."
         )
-        self._atera_viewport_spin = QDoubleSpinBox()
-        self._atera_viewport_spin.setDecimals(1)
-        self._atera_viewport_spin.setRange(0.1, 100000.0)
-        self._atera_viewport_spin.setSingleStep(5.0)
-        self._atera_viewport_spin.setSuffix(" M points")
-        self._atera_viewport_spin.setKeyboardTracking(False)
-        self._atera_viewport_spin.setValue(DEFAULT_ATERA_VIEWPORT_MAX_POINTS / 1e6)
-        self._atera_viewport_spin.setToolTip(
-            "Cap on the transcripts streamed for the visible field at full density (applies at once)."
+        self._atera_budget_spin = self._atera_millions_spin(0.0, 10.0, self._atera_budget_tooltip)
+        self._atera_budget_spin.setSpecialValueText("Auto")
+        self._atera_overview_spin = self._atera_millions_spin(
+            0.0,
+            5.0,
+            "Most points the All-transcript overview draws: a nested sub-sample of the loaded "
+            "sample, so the all-genes view stays smooth. Ticked genes always draw the whole "
+            "sample. Off = draw every loaded point. Applied by Reload.",
         )
+        self._atera_overview_spin.setSpecialValueText("Off")
+        self._atera_overview_spin.setValue(DEFAULT_ATERA_OVERVIEW_MAX_POINTS / 1e6)
+        self._atera_viewport_spin = self._atera_millions_spin(
+            0.1, 5.0, "Cap on the transcripts streamed for the visible field at full density (applies at once)."
+        )
+        self._atera_viewport_spin.setValue(DEFAULT_ATERA_VIEWPORT_MAX_POINTS / 1e6)
         self._atera_viewport_spin.valueChanged.connect(self._on_atera_viewport_changed)
         self._atera_reload_button = QPushButton("Reload transcripts")
+        self._atera_reload_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self._atera_reload_button.setToolTip("Apply the mode, point budget and all-genes cap.")
         self._atera_reload_button.clicked.connect(self._on_atera_reload_clicked)
         self._atera_note = QLabel("")
         self._atera_note.setWordWrap(True)
-        mode_row = QHBoxLayout()
-        mode_row.addWidget(QLabel("Atera transcripts"))
-        mode_row.addWidget(self._atera_mode_combo, 1)
-        budget_row = QHBoxLayout()
-        budget_row.addWidget(QLabel("Point budget"))
-        budget_row.addWidget(self._atera_budget_spin, 1)
-        budget_row.addWidget(self._atera_reload_button)
-        viewport_row = QHBoxLayout()
-        viewport_row.addWidget(QLabel("Viewport cap"))
-        viewport_row.addWidget(self._atera_viewport_spin, 1)
-        layout.addLayout(mode_row)
-        layout.addLayout(budget_row)
-        layout.addLayout(viewport_row)
+        self._atera_note.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        form = QFormLayout()
+        form.setContentsMargins(0, 0, 0, 0)
+        form.setHorizontalSpacing(6)
+        form.setVerticalSpacing(4)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        form.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self._atera_form_labels = {}
+        for key, text, field in (
+            ("mode", "Mode", self._atera_mode_combo),
+            ("budget", "Point budget", self._atera_budget_spin),
+            ("overview", "All-genes cap", self._atera_overview_spin),
+            ("viewport", "Viewport cap", self._atera_viewport_spin),
+        ):
+            label = QLabel(text)
+            label.setToolTip(field.toolTip())
+            label.setBuddy(field)
+            self._atera_form_labels[key] = label
+            form.addRow(label, field)
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        layout.addWidget(self._atera_title)
+        layout.addLayout(form)
+        layout.addWidget(self._atera_reload_button)
         layout.addWidget(self._atera_note)
         self._atera_box.setLayout(layout)
         self._atera_box.setVisible(False)
@@ -3688,6 +3741,8 @@ class GeneInspectorWidget(QWidget):
         total: int = 0,
         loaded: int = 0,
         viewport_cap: int = DEFAULT_ATERA_VIEWPORT_MAX_POINTS,
+        overview_cap: int = DEFAULT_ATERA_OVERVIEW_MAX_POINTS,
+        overview_points: int | None = None,
         note: str = "",
     ) -> None:
         """Show (with values) or hide the Atera transcript controls."""
@@ -3696,7 +3751,8 @@ class GeneInspectorWidget(QWidget):
             self._atera_dataset = None
             return
         self._atera_dataset = dataset
-        for widget in (self._atera_mode_combo, self._atera_budget_spin, self._atera_viewport_spin):
+        spins = (self._atera_budget_spin, self._atera_overview_spin, self._atera_viewport_spin)
+        for widget in (self._atera_mode_combo, *spins):
             widget.blockSignals(True)
         try:
             index = self._atera_mode_combo.findData(mode)
@@ -3708,17 +3764,30 @@ class GeneInspectorWidget(QWidget):
                 self._atera_budget_spin.setValue(round(total / 1e6 + 0.05, 1))
             else:
                 self._atera_budget_spin.setValue(round(int(budget) / 1e6, 1))
-            self._atera_budget_spin.setSpecialValueText(f"Auto ({auto_budget / 1e6:,.1f} M)")
+            # "Auto" stays short inside the box; its value is in the tooltip
+            # and the summary line.
+            auto_text = f"Auto = {auto_budget / 1e6:,.1f} M (half the RAM over the bytes per point)."
+            self._atera_budget_spin.setToolTip(f"{self._atera_budget_tooltip}\n{auto_text}")
+            self._atera_form_labels["budget"].setToolTip(self._atera_budget_spin.toolTip())
+            self._atera_overview_spin.setValue(max(0.0, round(int(overview_cap) / 1e6, 1)))
             self._atera_viewport_spin.setValue(max(0.1, viewport_cap / 1e6))
         finally:
-            for widget in (self._atera_mode_combo, self._atera_budget_spin, self._atera_viewport_spin):
+            for widget in (self._atera_mode_combo, *spins):
                 widget.blockSignals(False)
-        loaded_text = (
-            f"{loaded / 1e6:,.1f} M of {total / 1e6:,.1f} M transcripts as points."
-            if mode == ATERA_MODE_FULL
-            else f"{total / 1e6:,.1f} M transcripts; density overview plus ticked genes."
-        )
-        self._atera_note.setText(f"{loaded_text} {note}".strip())
+        if mode == ATERA_MODE_FULL:
+            parts = [f"{loaded / 1e6:,.1f} M of {total / 1e6:,.1f} M transcripts as points"]
+            if overview_points is not None and int(overview_points) < int(loaded):
+                parts.append(f"all-genes view {int(overview_points) / 1e6:,.1f} M")
+        else:
+            parts = [f"{total / 1e6:,.1f} M transcripts; density overview plus ticked genes"]
+        parts.append(f"Auto {auto_budget / 1e6:,.1f} M")
+        summary = "; ".join(parts) + "."
+        # The summary stays a line or two; the budget's derivation lives in
+        # the tooltip (and the status bar).  A clamp or out-of-memory note is
+        # a warning, so it stays visible.
+        warn = any(word in note.lower() for word in ("clamp", "out of memory"))
+        self._atera_note.setText(f"{summary} {note}".strip() if warn else summary)
+        self._atera_note.setToolTip(note or summary)
 
     def atera_requested_budget(self) -> int | None:
         """The budget the spin box asks for (``None`` = Auto)."""
@@ -3726,6 +3795,10 @@ class GeneInspectorWidget(QWidget):
         if value <= 0.0:
             return None
         return int(round(value * 1e6))
+
+    def atera_requested_overview_cap(self) -> int:
+        """The all-genes cap the spin box asks for (0 = Off, draw every loaded point)."""
+        return max(0, int(round(float(self._atera_overview_spin.value()) * 1e6)))
 
     def _on_atera_reload_clicked(self) -> None:
         if self._reload_atera_callback is None or self._atera_dataset is None:
@@ -3735,6 +3808,7 @@ class GeneInspectorWidget(QWidget):
             str(self._atera_mode_combo.currentData()),
             self.atera_requested_budget(),
             int(round(float(self._atera_viewport_spin.value()) * 1e6)),
+            overview_cap=self.atera_requested_overview_cap(),
         )
 
     def _on_atera_viewport_changed(self, value: float) -> None:
@@ -12198,19 +12272,27 @@ class ComparisonViewerController(AteraTranscriptMixin):
         shown = state.group_shown_masks[gi]
         shown.fill(False)
         overview = bool(getattr(state, "overview_visible", False))
+        # A capped all-genes view (Atera) draws only the leading nested
+        # sub-sample of the genes the overview alone shows; ticked genes
+        # always draw their whole runs.
+        capped = getattr(store, "overview_offsets", None) if overview else None
         for gene in store.genes:
             entry = store.gene_offsets.get(gene)
             if entry is None or int(entry[0]) != int(gi):
                 continue
-            if gene not in state.enabled_genes and not (
+            ticked = gene in state.enabled_genes
+            if not ticked and not (
                 overview and gene not in store.control_genes
             ):
                 continue
             _group, fg_start, fg_end, bg_end = entry
+            fg_stop, bg_stop = fg_end, bg_end
+            if capped is not None and not ticked:
+                fg_stop, bg_stop = capped.get(gene, (fg_end, bg_end))
             if not state.hide_assigned:
-                shown[int(fg_start):int(fg_end)] = True
+                shown[int(fg_start):int(fg_stop)] = True
             if not state.hide_background:
-                shown[int(fg_end):int(bg_end)] = True
+                shown[int(fg_end):int(bg_stop)] = True
         return shown
 
     def _gene_group_size_array(self, state: GeneInspectorState, n_points: int, ranges: list[tuple[int, int, str]]):
@@ -18143,6 +18225,16 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_ATERA_VIEWPORT_MAX_POINTS,
         type=int,
         help="Atera: cap on the transcripts streamed for the visible field at full density",
+    )
+    parser.add_argument(
+        "--atera-overview-max-points",
+        default=DEFAULT_ATERA_OVERVIEW_MAX_POINTS,
+        type=int,
+        help=(
+            "Atera full mode: most points the All-transcript overview draws, a nested "
+            "sub-sample of the loaded sample so the all-genes view stays smooth; ticked genes "
+            "keep the whole sample (0 = draw every loaded point)"
+        ),
     )
     parser.add_argument(
         "--gene-hide-assigned",

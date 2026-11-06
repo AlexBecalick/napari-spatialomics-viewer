@@ -256,3 +256,68 @@ def test_window_rows_for_many_genes_filter_by_a_code_table(atera_store, monkeypa
     key = lambda rows: sorted(zip(rows["x"].tolist(), rows["y"].tolist(), rows["code"].astype(int).tolist()))  # noqa: E731
     assert key(planned) == key(tabled)
     assert set(tabled["code"].astype(int).tolist()) <= set(codes)
+
+
+# ---------------------------------------------------------------------------
+# All-genes display cap (M10a): a nested sub-sample leads every gene run
+# ---------------------------------------------------------------------------
+
+
+def test_partition_by_key_leads_with_the_nested_sub_sample(atera_store):
+    engine = _engine(atera_store)
+    total = engine.index.n_rows
+    sample = engine.sample_rows(T.sample_threshold(total // 2, total))
+    before = {name: getattr(sample, name).copy() for name in ("x", "y", "code", "cell_id", "key")}
+    cap_threshold = T.sample_threshold(total // 6, total)
+    member = before["key"] < np.uint32(cap_threshold)
+    lead = sample.partition_by_key(cap_threshold)
+    assert 0 < lead < sample.n and lead == int(member.sum())
+    # Members lead, non-members follow, each side in its original order.
+    for name, values in before.items():
+        np.testing.assert_array_equal(getattr(sample, name)[:lead], values[member])
+        np.testing.assert_array_equal(getattr(sample, name)[lead:], values[~member])
+    # The leading rows are exactly a fresh read at the smaller threshold.
+    assert _rows(sample.subset(cap_threshold)) == _rows(engine.sample_rows(cap_threshold))
+    # A cap at or above the sample is a no-op.
+    keys = sample.key.copy()
+    assert sample.partition_by_key(sample.threshold) == sample.n
+    assert sample.partition_by_key(T.SAMPLE_KEY_SPACE) == sample.n
+    np.testing.assert_array_equal(sample.key, keys)
+
+
+def test_store_records_the_capped_overview_prefix_of_every_run(atera_store):
+    engine = _engine(atera_store)
+    total = engine.index.n_rows
+    threshold = T.sample_threshold(total // 2, total)
+    overview = engine.build_overview(5.0, keep_threshold=threshold)
+    sample = overview.hash_sample
+    cap_threshold = T.sample_threshold(total // 6, total)
+    lead = sample.partition_by_key(cap_threshold)
+    store = T.gene_point_store_from_rows(
+        overview, sample.x, sample.y, sample.code, sample.cell_id, sampled=True, overview_prefix=lead
+    )
+    assert store.overview_offsets is not None
+    # Map each store point back to its sample key through its coordinates.
+    key_of = {(float(y), float(x)): int(k) for x, y, k in zip(sample.x, sample.y, sample.key)}
+    drawn = 0
+    for gene, (gi, fg0, fg1, bg1) in store.gene_offsets.items():
+        fg_stop, bg_stop = store.overview_offsets[gene]
+        assert fg0 <= fg_stop <= fg1 <= bg_stop <= bg1
+        coords = store.group_coords[gi]
+        keys = np.array([key_of[(float(y), float(x))] for y, x in coords[fg0:bg1]], dtype=np.int64)
+        in_cap = keys < cap_threshold
+        prefix = np.zeros(bg1 - fg0, dtype=bool)
+        prefix[: fg_stop - fg0] = True
+        prefix[fg1 - fg0 : bg_stop - fg0] = True
+        np.testing.assert_array_equal(prefix, in_cap)
+        drawn += int(prefix.sum())
+    assert drawn == lead
+    # Without a prefix (Xenium/MERSCOPE, or an uncapped sample) nothing is recorded.
+    plain = T.gene_point_store_from_rows(
+        overview, sample.x, sample.y, sample.code, sample.cell_id, sampled=True
+    )
+    assert plain.overview_offsets is None
+    assert U.assemble_gene_point_store(
+        ["A", "B"], np.zeros(3, np.float32), np.zeros(3, np.float32),
+        np.array([0, 1, 1], np.uint16), np.array([False, True, False]), overview_prefix=3,
+    ).overview_offsets is None

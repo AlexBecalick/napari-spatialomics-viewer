@@ -1178,6 +1178,30 @@ class SampledTranscripts:
             key=self.key[keep], threshold=threshold, total_rows=self.total_rows,
         )
 
+    def partition_by_key(self, threshold: int) -> int:
+        """Move the rows of the nested sub-sample ``key < threshold`` to the front.
+
+        Reorders the columns in place (stable on both sides, one column copy
+        at a time) and returns how many rows lead: every row when the
+        sub-sample is this whole sample.  ``subset`` still works afterwards,
+        since it filters by key, not by position.
+        """
+        threshold = int(threshold)
+        n = self.n
+        if threshold >= self.threshold or threshold >= SAMPLE_KEY_SPACE:
+            return n
+        member = self.key < np.uint32(max(0, threshold)) if threshold > 0 else np.zeros(n, dtype=bool)
+        lead = int(np.count_nonzero(member))
+        if lead in (0, n):
+            return lead
+        order = np.empty(n, dtype=np.int32 if n < np.iinfo(np.int32).max else np.int64)
+        order[:lead] = np.flatnonzero(member)
+        order[lead:] = np.flatnonzero(~member)
+        del member
+        for name in ("x", "y", "code", "cell_id", "key"):
+            setattr(self, name, getattr(self, name)[order])
+        return lead
+
 
 def physical_memory_bytes() -> int | None:
     """Physical RAM of this machine (psutil, else ``os.sysconf``), or ``None``."""
@@ -2237,12 +2261,14 @@ def gene_point_store_from_rows(
     reference: Mapping[str, Any] | None = None,
     reference_resolver: Callable[[list[str]], Any] | None = None,
     alpha: float = 1.0,
+    overview_prefix: int | None = None,
 ):
     """A :class:`~.utils.GenePointStore` over compact Atera rows (vectorised).
 
     Every observed feature is listed with its exact count, whether or not
     ``code`` holds rows of it; unassigned rows (``cell_id == 0``) are the
-    background.
+    background.  ``overview_prefix``: the first that many rows are the capped
+    all-genes view's sub-sample (see :meth:`SampledTranscripts.partition_by_key`).
     """
     from .utils import assemble_gene_point_store
 
@@ -2268,4 +2294,5 @@ def gene_point_store_from_rows(
         sampled=bool(sampled),
         source_gene_counts=counts,
         source_total_points=int(np.asarray(overview.counts).sum()),
+        overview_prefix=overview_prefix,
     )

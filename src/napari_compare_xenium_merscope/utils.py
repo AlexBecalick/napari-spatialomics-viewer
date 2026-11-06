@@ -4207,6 +4207,12 @@ class GenePointStore:
     #: passes as the renderer.  It is intentionally independent of render
     #: sampling so cell summaries remain exact when the point view is capped.
     cell_transcript_index: CellTranscriptIndex | None = None
+    #: Capped all-genes view (Atera): gene -> (fg_cap_end, bg_cap_end), group
+    #: relative.  Each of a gene's foreground and background runs starts with
+    #: the rows of a nested sub-sample, so the overview draws the prefixes
+    #: ``fg_start:fg_cap_end`` and ``fg_end:bg_cap_end``.  ``None``: the
+    #: overview draws whole runs (Xenium/MERSCOPE, or an uncapped sample).
+    overview_offsets: dict[str, tuple[int, int]] | None = None
 
     def gene_symbol(self, gene: str) -> str | None:
         entry = self.gene_offsets.get(str(gene))
@@ -4819,6 +4825,7 @@ def assemble_gene_point_store(
     source_total_points: int | None = None,
     source_status_counts: dict[str, int] | None = None,
     cell_transcript_index: CellTranscriptIndex | None = None,
+    overview_prefix: int | None = None,
 ) -> GenePointStore:
     """Group compact per-point arrays into a :class:`GenePointStore` (vectorised).
 
@@ -4826,9 +4833,22 @@ def assemble_gene_point_store(
     ``render_background`` marks unassigned points (drawn after the assigned
     ones of each gene).  Used by :func:`build_gene_point_groups` and by the
     Atera whole-slide load, which streams its arrays itself.
+
+    ``overview_prefix``: the first that many input rows form the capped
+    all-genes view's sub-sample.  The sort is stable, so they lead each
+    gene's foreground and background runs; their ends are recorded in
+    ``overview_offsets``.  ``None`` (or every row) records nothing.
     """
     unique_names = [str(g) for g in genes]
     render_count = int(len(render_gene_codes))
+    lead_fg = lead_bg = None
+    if overview_prefix is not None and 0 <= int(overview_prefix) < render_count:
+        lead = int(overview_prefix)
+        lead_codes = np.asarray(render_gene_codes[:lead])
+        lead_background = np.asarray(render_background[:lead], dtype=bool)
+        lead_fg = np.bincount(lead_codes[~lead_background], minlength=len(unique_names))
+        lead_bg = np.bincount(lead_codes[lead_background], minlength=len(unique_names))
+        del lead_codes, lead_background
     if gene_visuals is None:
         if reference is not None:
             gene_visuals = build_cell_type_gene_visuals(
@@ -4910,6 +4930,7 @@ def assemble_gene_point_store(
         fg_counts = np.bincount(codes_sorted[~bg_sorted], minlength=n_names)
     gene_offsets: dict[str, tuple[int, int, int, int]] = {}
     gene_counts: dict[str, int] = {}
+    overview_offsets: dict[str, tuple[int, int]] | None = None if lead_fg is None else {}
     cursor = 0
     for code in rank_order.tolist():
         count = int(code_counts[code])
@@ -4922,6 +4943,10 @@ def assemble_gene_point_store(
         ce = cursor + count
         gene_offsets[name] = (g, cs - gstart, cs + int(fg_counts[code]) - gstart, ce - gstart)
         gene_counts[name] = count
+        if overview_offsets is not None:
+            fg_start_rel = cs - gstart
+            fg_end_rel = fg_start_rel + int(fg_counts[code])
+            overview_offsets[name] = (fg_start_rel + int(lead_fg[code]), fg_end_rel + int(lead_bg[code]))
         cursor = ce
 
     return GenePointStore(
@@ -4939,6 +4964,7 @@ def assemble_gene_point_store(
         source_status_counts=source_status_counts,
         gene_visuals=dict(gene_visuals),
         cell_transcript_index=cell_transcript_index,
+        overview_offsets=overview_offsets,
     )
 
 

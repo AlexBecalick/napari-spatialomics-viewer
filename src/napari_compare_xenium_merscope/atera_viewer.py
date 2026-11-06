@@ -68,6 +68,10 @@ ATERA_TRANSCRIPT_MODES = (ATERA_MODE_FULL, ATERA_MODE_LAZY)
 DEFAULT_ATERA_TRANSCRIPT_MODE = ATERA_MODE_FULL
 #: Cap of the viewport top-up layer (rows streamed for the visible field).
 DEFAULT_ATERA_VIEWPORT_MAX_POINTS = 20_000_000
+#: Full mode: the All-transcript overview draws at most this many points, the
+#: nested sub-sample ``key < cap / total`` of the loaded sample (0 = no cap).
+#: Ticked genes always draw the whole sample.
+DEFAULT_ATERA_OVERVIEW_MAX_POINTS = 40_000_000
 #: Estimated memory per loaded point: the GenePointStore (coords + RGBA, 24 B),
 #: the napari Points layer (~110 B: data, face/border colours, sizes, shown)
 #: and the GPU vertex buffer (~56 B) - calibrated on the real store (M7 notes).
@@ -304,17 +308,28 @@ class AteraTranscriptContext:
     view_request: dict | None = None
     #: _atera_render_key of what the viewport layer currently shows.
     rendered_key: tuple | None = None
+    #: Full mode: the requested all-genes display cap (0 = none) and its
+    #: sample-key threshold (``SAMPLE_KEY_SPACE`` = uncapped).
+    overview_cap: int = DEFAULT_ATERA_OVERVIEW_MAX_POINTS
+    overview_threshold: int = SAMPLE_KEY_SPACE
 
     @property
     def complete(self) -> bool:
         return self.mode == ATERA_MODE_FULL and self.threshold >= SAMPLE_KEY_SPACE
 
     @property
+    def overview_capped(self) -> bool:
+        """The All-transcript overview draws a nested sub-sample of the loaded points."""
+        return self.mode == ATERA_MODE_FULL and self.overview_threshold < self.threshold
+
+    @property
     def viewport_enabled(self) -> bool:
-        return bool(getattr(self.engine, "window_reads_available", False)) and not self.complete
+        return bool(getattr(self.engine, "window_reads_available", False)) and (
+            not self.complete or self.overview_capped
+        )
 
     def options_key(self) -> tuple:
-        return (self.mode, self.requested_budget)
+        return (self.mode, self.requested_budget, self.overview_cap)
 
 
 def _empty_rows(engine) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
@@ -421,6 +436,16 @@ class AteraTranscriptMixin:
             cap = getattr(self.args, "atera_viewport_max_points", None) or DEFAULT_ATERA_VIEWPORT_MAX_POINTS
         return mode, (None if budget is None else int(budget)), int(cap)
 
+    def _atera_overview_cap(self, ds: str) -> int:
+        """The all-genes display cap for ``ds`` (0 = draw every loaded point)."""
+        opts = self._atera_options_store().get(str(ds).upper(), {})
+        cap = opts.get("overview_cap")
+        if cap is None:
+            cap = getattr(self.args, "atera_overview_max_points", None)
+        if cap is None:
+            cap = DEFAULT_ATERA_OVERVIEW_MAX_POINTS
+        return max(0, int(cap))
+
     # -- open / build -----------------------------------------------------
 
     def _atera_points_key(self) -> str:
@@ -436,13 +461,14 @@ class AteraTranscriptMixin:
     def _open_atera_gene_inspector(self, ds: str, reuse_cached: bool = False, announce: bool = True):
         ds = str(ds).upper()
         mode, requested, cap = self._atera_requested_options(ds)
+        overview_cap = self._atera_overview_cap(ds)
         session = self._dataset_sessions.get(ds)
         cached = None if session is None else session.gene_payload
         if (
             reuse_cached
             and cached is not None
             and cached.get("atera") is not None
-            and cached["atera"].options_key() == (mode, requested)
+            and cached["atera"].options_key() == (mode, requested, overview_cap)
             and self._transcript_payload_is_current(ds, cached)
         ):
             self._teardown_gene_inspector(ds)
@@ -464,7 +490,7 @@ class AteraTranscriptMixin:
         gc.collect()
         self._gene_build_generation += 1
         generation = self._gene_build_generation
-        task_key = (ds, "atera", str(zarr_path), points_key, mode, requested)
+        task_key = (ds, "atera", str(zarr_path), points_key, mode, requested, overview_cap)
         cancel_token = self._begin_task_token("transcripts", task_key)
         if cancel_token is None:
             self._set_status(f"{ds}: transcript load is already running.")
@@ -487,7 +513,8 @@ class AteraTranscriptMixin:
 
         def compute():
             payload = self._atera_compute_payload(
-                ds, str(zarr_path), points_key, mode, requested, cap, cancel_token, progress
+                ds, str(zarr_path), points_key, mode, requested, cap, cancel_token, progress,
+                overview_cap=overview_cap,
             )
             if carried_note:
                 ctx = payload["atera"]
@@ -548,8 +575,14 @@ class AteraTranscriptMixin:
         viewport_cap: int,
         cancel_token: Event,
         progress: dict,
+        overview_cap: int = 0,
     ) -> dict:
-        """Worker thread: engine, overview, (full) sample and the point store."""
+        """Worker thread: engine, overview, (full) sample and the point store.
+
+        With an all-genes display cap below the loaded sample, the sample's
+        rows of the nested sub-sample ``key < cap / total`` are moved to the
+        front, so the store's gene runs lead with them (no store read).
+        """
         t0 = time.time()
         engine = AteraTranscriptEngine.open(zarr_path, points_key)
         if engine is None:
@@ -617,6 +650,12 @@ class AteraTranscriptMixin:
                     overview.cell_tiles = self._atera_restore_cell_tiles(ds, engine, cancel_token, report)
                 if cancel():
                     raise TranscriptBuildCancelled("Atera transcript load cancelled")
+                overview_threshold = (
+                    sample_threshold(overview_cap, total) if overview_cap > 0 else SAMPLE_KEY_SPACE
+                )
+                overview_prefix = None
+                if sample is not None and overview_threshold < threshold:
+                    overview_prefix = sample.partition_by_key(overview_threshold)
                 rows = (
                     (sample.x, sample.y, sample.code, sample.cell_id)
                     if sample is not None
@@ -626,6 +665,7 @@ class AteraTranscriptMixin:
                     overview, *rows,
                     sampled=bool(mode == ATERA_MODE_FULL and threshold < SAMPLE_KEY_SPACE),
                     reference_resolver=resolve_reference,
+                    overview_prefix=overview_prefix,
                 )
                 break
             except MemoryError:
@@ -662,7 +702,16 @@ class AteraTranscriptMixin:
             requested_budget=requested,
             viewport_cap=int(viewport_cap),
             memory_note=memory_note,
+            overview_cap=int(overview_cap),
+            overview_threshold=int(
+                min(overview_threshold, threshold) if mode == ATERA_MODE_FULL else SAMPLE_KEY_SPACE
+            ),
         )
+        if context.overview_capped:
+            log.info(
+                "[%s] Atera all-genes view capped at %d points (key threshold %d/%d)",
+                ds, int(overview_prefix or 0), int(overview_threshold), SAMPLE_KEY_SPACE,
+            )
         seconds = time.time() - t0
         log.info(
             "[%s] Atera transcripts (%s): %d of %d rows as points in %.1fs (cache %s)",
@@ -910,8 +959,27 @@ class AteraTranscriptMixin:
             total=int(ctx.total_rows),
             loaded=int(state.store.total_points),
             viewport_cap=int(ctx.viewport_cap),
+            overview_cap=int(ctx.overview_cap),
+            overview_points=self._atera_overview_points(state),
             note=note,
         )
+
+    @staticmethod
+    def _atera_overview_points(state) -> int:
+        """Points the All-transcript overview draws at most (real genes, both runs)."""
+        store = state.store
+        offsets = getattr(store, "overview_offsets", None)
+        controls = store.control_genes
+        total = 0
+        for gene, (_g, fg_start, fg_end, bg_end) in store.gene_offsets.items():
+            if gene in controls:
+                continue
+            if offsets is not None and gene in offsets:
+                fg_stop, bg_stop = offsets[gene]
+                total += (int(fg_stop) - int(fg_start)) + (int(bg_stop) - int(fg_end))
+            else:
+                total += int(bg_end) - int(fg_start)
+        return total
 
     def _atera_status_text(self, state, payload: dict) -> str:
         ctx = state.atera
@@ -922,6 +990,11 @@ class AteraTranscriptMixin:
                 f"{state.dataset}: {state.store.total_points / 1e6:,.1f}M of {ctx.total_rows / 1e6:,.1f}M "
                 f"transcripts loaded ({ctx.budget.note if ctx.budget else ''}) - {source} in {seconds:.1f}s."
             )
+            if ctx.overview_capped:
+                text += (
+                    f" The All-transcript overview draws a nested "
+                    f"{self._atera_overview_points(state) / 1e6:,.1f}M of them (all-genes cap)."
+                )
         else:
             text = (
                 f"{state.dataset}: density overview of {ctx.total_rows / 1e6:,.1f}M transcripts {source} in "
@@ -933,8 +1006,15 @@ class AteraTranscriptMixin:
 
     # -- user options -----------------------------------------------------
 
-    def reload_atera_transcripts(self, dataset_name: str, mode: str, budget: int | None, viewport_cap: int | None = None):
-        """Reload with a new mode/budget (one reload per call; nested samples reuse the cache)."""
+    def reload_atera_transcripts(
+        self,
+        dataset_name: str,
+        mode: str,
+        budget: int | None,
+        viewport_cap: int | None = None,
+        overview_cap: int | None = None,
+    ):
+        """Reload with a new mode/budget/all-genes cap (one reload per call; nested samples reuse the cache)."""
         ds = str(dataset_name).upper()
         opts = self._atera_options_store().setdefault(ds, {})
         if mode in ATERA_TRANSCRIPT_MODES:
@@ -942,6 +1022,8 @@ class AteraTranscriptMixin:
         opts["budget"] = None if budget is None else int(budget)
         if viewport_cap is not None and int(viewport_cap) > 0:
             opts["viewport_cap"] = int(viewport_cap)
+        if overview_cap is not None:
+            opts["overview_cap"] = max(0, int(overview_cap))
         self.open_gene_inspector(ds)
 
     def set_atera_viewport_cap(self, dataset_name: str, cap: int) -> None:
@@ -1204,6 +1286,24 @@ class AteraTranscriptMixin:
         codes = sorted(vocab_codes[n] for n in names if n in vocab_codes)
         return np.asarray(codes, dtype=np.int64)
 
+    def _atera_view_exclude(self, state, codes) -> int:
+        """Sample keys below this are not read for the viewport.
+
+        Full mode reads the rows the sample left out (``key >= threshold``).
+        Under a capped All-transcript overview the genes it alone shows draw
+        only ``key < overview_threshold`` from the store, so the window reads
+        from there (the render drops the rows ticked genes already draw).
+        """
+        ctx = state.atera
+        if ctx.mode != ATERA_MODE_FULL:
+            return 0
+        if ctx.overview_capped and getattr(state, "overview_visible", False):
+            vocabulary = ctx.overview.vocabulary
+            enabled = set(state.enabled_genes)
+            if any(str(vocabulary[int(c)]) not in enabled for c in codes):
+                return int(ctx.overview_threshold)
+        return int(ctx.threshold)
+
     def _atera_request_viewport(self, ds: str) -> None:
         state = self._gene_inspector_states.get(str(ds).upper())
         ctx = None if state is None else getattr(state, "atera", None)
@@ -1215,7 +1315,7 @@ class AteraTranscriptMixin:
             ctx.viewport_cache = None
             self._atera_render_viewport(state)
             return
-        exclude = int(ctx.threshold) if ctx.mode == ATERA_MODE_FULL else 0
+        exclude = self._atera_view_exclude(state, codes)
         cache = ctx.viewport_cache
         code_set = frozenset(int(c) for c in codes)
         if (
@@ -1328,6 +1428,7 @@ class AteraTranscriptMixin:
             bool(state.hide_assigned), bool(state.hide_background), bool(state.colour_by_assignment),
             float(state.spot_size), tuple(state.highlighted_genes or ()), state.color_kind,
             tuple(getattr(allocator, "genes", ()) or ()),
+            frozenset(state.enabled_genes) if ctx.overview_capped else None,
         )
 
     def _atera_render_viewport(self, state) -> None:
@@ -1346,6 +1447,16 @@ class AteraTranscriptMixin:
         else:
             rows = cache["rows"]
             keep = np.isin(rows["code"], codes)
+            if ctx.mode == ATERA_MODE_FULL and int(cache.get("exclude", ctx.threshold)) < int(ctx.threshold):
+                # A capped overview's window: ticked genes already draw their
+                # sampled rows from the store, so only their skipped rows stay.
+                vocab_codes = {name: i for i, name in enumerate(ctx.overview.vocabulary)}
+                ticked = [vocab_codes[g] for g in state.enabled_genes if g in vocab_codes]
+                if ticked:
+                    in_store = np.isin(rows["code"], ticked)
+                    if int(ctx.threshold) < SAMPLE_KEY_SPACE:
+                        in_store &= rows["key"] < np.uint32(ctx.threshold)
+                    keep &= ~in_store
             assigned = rows["cell_id"] != 0
             if state.hide_assigned:
                 keep &= ~assigned

@@ -798,3 +798,346 @@ def test_lazy_open_files_an_is_gene_false_feature_under_the_control_heading(qapp
         assert not bool(model.is_control[model.gene_index[named_control]])
         widget.clear()
         ctrl._teardown_gene_inspector("ATERA")
+
+
+# ---------------------------------------------------------------------------
+# M10(a): all-genes display cap - a nested sub-sample of the loaded sample
+# ---------------------------------------------------------------------------
+
+
+def _shown_points(ctrl, state) -> int:
+    return int(sum(int(np.count_nonzero(_layer(ctrl, name).shown)) for name in state.layer_names))
+
+
+def _shown_keys(ctrl, state, sample) -> list[int]:
+    key_of = {(float(y), float(x)): int(k) for x, y, k in zip(sample.x, sample.y, sample.key)}
+    keys = []
+    for name in state.layer_names:
+        layer = _layer(ctrl, name)
+        for y, x in np.asarray(layer.data)[np.asarray(layer.shown, dtype=bool)]:
+            keys.append(key_of[(float(y), float(x))])
+    return keys
+
+
+def _widget(ctrl):
+    widget = V.GeneInspectorWidget(
+        close_callback=lambda *_a: None,
+        set_gene_visible_callback=ctrl.set_gene_visible,
+        set_all_genes_callback=ctrl.set_all_genes_visible,
+        set_spot_size_callback=ctrl.set_gene_spot_size,
+        set_hide_background_callback=ctrl.set_gene_hide_background,
+        set_show_controls_callback=ctrl.set_gene_show_controls,
+        reload_atera_callback=ctrl.reload_atera_transcripts,
+        set_atera_viewport_cap_callback=ctrl.set_atera_viewport_cap,
+    )
+    ctrl._gene_inspector_widget = widget
+    return widget
+
+
+def test_overview_cap_draws_a_nested_sub_sample_and_ticked_genes_draw_everything(qapp, atera_store, monkeypatch):
+    total = _total_rows(atera_store)
+    budget, cap = total // 2, total // 6
+    ctrl = _controller(atera_store, monkeypatch, gene_max_render_points=budget, atera_overview_max_points=cap)
+    ctrl.open_gene_inspector("ATERA")
+    state = _state(ctrl)
+    ctx = state.atera
+    ctx.view_timer = None
+    assert ctx.overview_capped and ctx.overview_cap == cap
+    assert ctx.overview_threshold == T.sample_threshold(cap, total) < ctx.threshold
+    assert state.store.overview_offsets is not None
+    assert "All-transcript overview draws a nested" in ctrl.statuses[-1]
+    engine = T.AteraTranscriptEngine.open(atera_store)
+    full_sample = engine.sample_rows(ctx.threshold)
+    real = set(_real_genes(state))
+    real_code = np.isin(
+        np.asarray(ctx.overview.vocabulary, dtype=object)[full_sample.code.astype(int)], sorted(real)
+    )
+    # Overview on: exactly the real-gene rows with key < cap threshold.
+    ctrl.set_gene_overview("ATERA", True)
+    keys = _shown_keys(ctrl, state, full_sample)
+    expected = int(np.count_nonzero(real_code & (full_sample.key < np.uint32(ctx.overview_threshold))))
+    assert len(keys) == expected > 0
+    assert max(keys) < ctx.overview_threshold
+    capped_count = len(keys)
+    # A ticked gene draws its whole sampled run on top of the capped overview.
+    gene = _real_genes(state)[0]
+    ctrl.set_gene_visible("ATERA", gene, True)
+    ctrl._flush_gene_group_rebuild("ATERA")  # gene ticks rebuild on a debounce timer
+    _g, fg0, fg1, bg1 = state.store.gene_offsets[gene]
+    fg_stop, bg_stop = state.store.overview_offsets[gene]
+    extra = (fg1 - fg_stop) + (bg1 - bg_stop)
+    assert _shown_points(ctrl, state) == capped_count + extra
+    # Overview off: only the ticked gene, whole.
+    ctrl.set_gene_overview("ATERA", False)
+    assert _shown_points(ctrl, state) == bg1 - fg0
+    # The panel's summary names the all-genes view size.
+    assert AV.AteraTranscriptMixin._atera_overview_points(state) == expected
+
+
+def test_overview_cap_at_or_above_the_budget_changes_nothing(qapp, atera_store, monkeypatch):
+    total = _total_rows(atera_store)
+    for cap in (total // 2, total, 0):
+        ctrl = _controller(atera_store, monkeypatch, gene_max_render_points=total // 2, atera_overview_max_points=cap)
+        ctrl.open_gene_inspector("ATERA")
+        state = _state(ctrl)
+        assert not state.atera.overview_capped
+        assert state.store.overview_offsets is None
+        ctrl.set_gene_overview("ATERA", True)
+        real_points = sum(state.store.gene_counts[g] for g in _real_genes(state) if g in state.store.gene_counts)
+        assert _shown_points(ctrl, state) == real_points
+        ctrl._teardown_gene_inspector("ATERA")
+
+
+def test_overview_cap_reload_reuses_the_cached_sample(qapp, atera_store, monkeypatch):
+    total = _total_rows(atera_store)
+    ctrl = _controller(atera_store, monkeypatch, gene_max_render_points=total // 2)
+    ctrl.open_gene_inspector("ATERA")
+    # The synthetic store is far below the 40M default: uncapped.
+    assert ctrl._atera_overview_cap("ATERA") == AV.DEFAULT_ATERA_OVERVIEW_MAX_POINTS
+    assert not _state(ctrl).atera.overview_capped
+    loaded = _state(ctrl).store.total_points
+
+    def forbidden(*_a, **_k):
+        raise AssertionError("an all-genes cap change must not stream the store")
+
+    monkeypatch.setattr(T.AteraTranscriptEngine, "build_overview", forbidden)
+    monkeypatch.setattr(T.AteraTranscriptEngine, "sample_rows", forbidden)
+    ctrl.reload_atera_transcripts("ATERA", "full", total // 2, overview_cap=total // 6)
+    state = _state(ctrl)
+    assert ctrl._atera_transcript_options["ATERA"]["overview_cap"] == total // 6
+    assert state.store.total_points == loaded  # ticked genes keep the whole sample
+    assert state.atera.overview_capped and state.atera.options_key()[2] == total // 6
+    # A reload without a cap keeps the chosen one; 0 draws every loaded point.
+    ctrl.reload_atera_transcripts("ATERA", "full", total // 2)
+    assert _state(ctrl).atera.overview_capped
+    ctrl.reload_atera_transcripts("ATERA", "full", total // 2, overview_cap=0)
+    assert not _state(ctrl).atera.overview_capped
+    assert _state(ctrl).store.overview_offsets is None
+
+
+def test_overview_cap_field_is_applied_by_one_reload(qapp):
+    calls = []
+    widget = V.GeneInspectorWidget(
+        close_callback=lambda *_a: None,
+        set_gene_visible_callback=lambda *_a: None,
+        set_all_genes_callback=lambda *_a: None,
+        set_spot_size_callback=lambda *_a: None,
+        set_hide_background_callback=lambda *_a: None,
+        set_show_controls_callback=lambda *_a: None,
+        reload_atera_callback=lambda *a, **k: calls.append((a, k)),
+        set_atera_viewport_cap_callback=lambda *_a: None,
+    )
+    widget.set_atera_controls(
+        True, dataset="ATERA", budget=None, auto_budget=171_800_000, total=1_409_600_000,
+        loaded=171_800_000, overview_cap=40_000_000, overview_points=40_000_000,
+    )
+    assert widget._atera_overview_spin.value() == 40.0
+    assert "all-genes view 40.0 M" in widget._atera_note.text()
+    assert "Auto 171.8 M" in widget._atera_note.text()
+    # The AUTO derivation sits in the tooltip; a clamp warning stays visible.
+    assert "AUTO" not in widget._atera_note.text()
+    widget.set_atera_controls(
+        True, dataset="ATERA", budget=None, auto_budget=171_800_000, total=1_409_600_000,
+        loaded=100_000_000, note="budget 300.0M requested; clamped to 100.0M",
+    )
+    assert "clamped to 100.0M" in widget._atera_note.text()
+    assert "clamped" in widget._atera_note.toolTip()
+    widget.set_atera_controls(
+        True, dataset="ATERA", budget=None, auto_budget=171_800_000, total=1_409_600_000,
+        loaded=171_800_000, overview_cap=40_000_000, overview_points=40_000_000,
+        note="AUTO budget 171.8M = 0.5 x 64 GB RAM / 200 B per point",
+    )
+    assert "AUTO budget" in widget._atera_note.toolTip()
+    assert "171.8" in widget._atera_budget_spin.toolTip()
+    assert widget._atera_budget_spin.text() == "Auto"
+    widget._atera_overview_spin.setValue(12.5)  # editing alone never reloads
+    assert calls == []
+    widget._atera_reload_button.click()
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[:3] == ("ATERA", "full", None) and kwargs == {"overview_cap": 12_500_000}
+    widget._atera_overview_spin.setValue(0.0)
+    assert widget._atera_overview_spin.text() == "Off"
+    assert widget.atera_requested_overview_cap() == 0
+
+
+def test_viewport_under_a_capped_overview_fills_in_without_duplicates(qapp, atera_store, monkeypatch):
+    total = _total_rows(atera_store)
+    ctrl = _controller(
+        atera_store, monkeypatch, gene_max_render_points=total // 2, atera_overview_max_points=total // 6
+    )
+    ctrl.open_gene_inspector("ATERA")
+    state = _state(ctrl)
+    ctx = state.atera
+    ctx.view_timer = None
+    gene = _real_genes(state)[0]
+    ctrl.set_gene_visible("ATERA", gene, True)
+    ctrl._flush_gene_group_rebuild("ATERA")
+    ctrl.set_gene_overview("ATERA", True)
+    assert ctx.viewport_cache is not None
+    assert ctx.viewport_cache["exclude"] == ctx.overview_threshold
+    viewport = _layer(ctrl, AV.ATERA_VIEWPORT_LAYER)
+    real = _real_genes(state)
+    codes = [ctx.overview.vocabulary.index(g) for g in real]
+    everything = ctx.engine.read_window_rows((-1e9, -1e9, 1e9, 1e9), codes)
+    # Whole slide in view: store (capped overview + whole ticked gene) plus the
+    # viewport is every real-gene row exactly once.
+    assert _shown_points(ctrl, state) + len(viewport.data) == len(everything["x"])
+    # Overview off: back to the ticked gene's skipped rows only.
+    ctrl.set_gene_overview("ATERA", False)
+    assert ctx.viewport_cache["exclude"] == ctx.threshold
+    gene_rows = ctx.engine.read_window_rows((-1e9, -1e9, 1e9, 1e9), [ctx.overview.vocabulary.index(gene)])
+    assert _shown_points(ctrl, state) + len(viewport.data) == len(gene_rows["x"])
+
+
+def test_overview_cap_cli_default_is_40m(monkeypatch):
+    monkeypatch.setattr("sys.argv", ["napari-compare"])
+    try:
+        args = V.parse_args()
+    except SystemExit:
+        pytest.skip("parse_args needs a dataset path")
+    assert args.atera_overview_max_points == 40_000_000 == AV.DEFAULT_ATERA_OVERVIEW_MAX_POINTS
+
+
+# ---------------------------------------------------------------------------
+# M10(c): the Atera controls neither overlap nor clip at the panel's minimum width
+# ---------------------------------------------------------------------------
+
+
+def _atera_controls_widget():
+    widget = V.GeneInspectorWidget(
+        close_callback=lambda *_a: None,
+        set_gene_visible_callback=lambda *_a: None,
+        set_all_genes_callback=lambda *_a: None,
+        set_spot_size_callback=lambda *_a: None,
+        set_hide_background_callback=lambda *_a: None,
+        set_show_controls_callback=lambda *_a: None,
+        reload_atera_callback=lambda *_a, **_k: None,
+        set_atera_viewport_cap_callback=lambda *_a: None,
+    )
+    # Real-store numbers: the longest texts the fields will hold.
+    widget.set_atera_controls(
+        True, dataset="ATERA", mode="full", budget=None, auto_budget=171_798_691,
+        total=1_409_601_228, loaded=171_798_691, viewport_cap=20_000_000,
+        overview_cap=40_000_000, overview_points=40_012_345,
+        note="AUTO budget 171.8M = 0.5 x 64 GB RAM / 200 B per point",
+    )
+    return widget
+
+
+def _text_fits(qapp, child) -> tuple[bool, str]:
+    from qtpy.QtWidgets import QAbstractSpinBox, QComboBox, QLabel, QPushButton, QStyle, QStyleOptionComboBox
+
+    if isinstance(child, QComboBox):
+        option = QStyleOptionComboBox()
+        child.initStyleOption(option)
+        field = child.style().subControlRect(QStyle.CC_ComboBox, option, QStyle.SC_ComboBoxEditField, child)
+        widest = max(child.fontMetrics().horizontalAdvance(child.itemText(i)) for i in range(child.count()))
+        return widest <= field.width(), f"combo {widest} > {field.width()}"
+    if isinstance(child, QAbstractSpinBox):
+        edit = child.lineEdit()
+        needed = edit.fontMetrics().horizontalAdvance(edit.text())
+        return needed <= edit.contentsRect().width(), f"spin '{edit.text()}' {needed} > {edit.contentsRect().width()}"
+    if isinstance(child, QPushButton):
+        needed = child.fontMetrics().horizontalAdvance(child.text())
+        return needed <= child.contentsRect().width(), f"button {needed} > {child.width()}"
+    if isinstance(child, QLabel) and not child.wordWrap():
+        from qtpy.QtGui import QTextDocument
+
+        doc = QTextDocument()
+        doc.setDefaultFont(child.font())
+        doc.setHtml(child.text())
+        needed = int(doc.idealWidth()) - 2 * int(doc.documentMargin())
+        return needed <= child.contentsRect().width(), f"label '{child.text()}' {needed} > {child.width()}"
+    return True, ""
+
+
+@pytest.mark.parametrize("panel_width", [240, 280, 320])
+def test_atera_controls_neither_overlap_nor_clip(qapp, panel_width):
+    widget = _atera_controls_widget()
+    widget.resize(panel_width, 1200)
+    widget.show()
+    qapp.processEvents()
+    try:
+        assert widget.width() == panel_width
+        box = widget._atera_box
+        assert box.isVisible()
+        children = [
+            widget._atera_title, *widget._atera_form_labels.values(), widget._atera_mode_combo,
+            widget._atera_budget_spin, widget._atera_overview_spin, widget._atera_viewport_spin,
+            widget._atera_reload_button, widget._atera_note,
+        ]
+        rects = []
+        for child in children:
+            assert child.isVisible()
+            rect = child.geometry()
+            assert child.parentWidget() is box
+            assert rect.left() >= 0 and rect.right() < box.width(), (type(child).__name__, rect)
+            fits, why = _text_fits(qapp, child)
+            assert fits, why
+            rects.append((child, rect))
+        for i, (a, ra) in enumerate(rects):
+            for b, rb in rects[i + 1:]:
+                assert not ra.intersects(rb), (type(a).__name__, ra, type(b).__name__, rb)
+        # Each label sits beside or above its own field, never beside another's.
+        form_fields = {
+            "mode": widget._atera_mode_combo, "budget": widget._atera_budget_spin,
+            "overview": widget._atera_overview_spin, "viewport": widget._atera_viewport_spin,
+        }
+        for key, label in widget._atera_form_labels.items():
+            assert label.buddy() is form_fields[key]
+            field = form_fields[key].geometry()
+            assert label.geometry().top() <= field.top() <= label.geometry().bottom() + 8
+        # The Reload button spans the box on its own row under every field.
+        button = widget._atera_reload_button.geometry()
+        assert button.width() == box.width()
+        assert all(button.top() > f.geometry().bottom() for f in form_fields.values())
+        # The note wraps inside the box instead of widening it.
+        note = widget._atera_note
+        assert note.wordWrap() and note.geometry().right() < box.width()
+        assert "Auto 171.8 M" in note.text()
+    finally:
+        widget.close()
+
+
+def test_atera_mode_items_are_short_with_the_description_in_the_tooltip(qapp):
+    widget = _atera_controls_widget()
+    combo = widget._atera_mode_combo
+    from qtpy.QtCore import Qt
+
+    assert [combo.itemText(i) for i in range(combo.count())] == ["Whole-slide sample", "Lazy (density)"]
+    assert [combo.itemData(i) for i in range(combo.count())] == ["full", "lazy"]
+    for i in range(combo.count()):
+        assert len(str(combo.itemData(i, Qt.ToolTipRole))) > len(combo.itemText(i))
+    assert widget._atera_budget_spin.suffix() == " M"
+    assert widget._atera_budget_spin.specialValueText() == "Auto"
+
+
+def test_short_genes_tab_scrolls_instead_of_squashing_the_atera_controls(qapp):
+    from qtpy.QtCore import Qt
+    from qtpy.QtWidgets import QScrollArea
+    from test_manual_registration_hooks import _panel
+
+    widget = _atera_controls_widget()
+    panel = _panel([], gene_inspector_widget=widget)
+    page = next(
+        panel._tab_stack.widget(i)
+        for i in range(panel._tab_stack.count())
+        if panel._tab_stack.widget(i).isAncestorOf(widget)
+    )
+    assert isinstance(page, QScrollArea)
+    assert page.horizontalScrollBarPolicy() == Qt.ScrollBarAlwaysOff
+    panel._tab_stack.setCurrentWidget(page)
+    # A window far too short for the whole inspector (the real viewer's
+    # 848 px window leaves the tab about 500 px).
+    panel.resize(300, 420)
+    panel.show()
+    qapp.processEvents()
+    try:
+        box = widget._atera_box
+        assert box.height() >= box.minimumSizeHint().height()
+        assert widget.height() >= widget.minimumSizeHint().height()
+        assert page.verticalScrollBar().maximum() > 0
+        assert widget.width() <= page.viewport().width()
+    finally:
+        panel.close()
