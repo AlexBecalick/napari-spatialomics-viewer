@@ -557,8 +557,11 @@ Unset, it is AUTO: half the RAM over about 200 B per point. `0` means every
 transcript, and a memory guard clamps any budget to 85% of RAM.
 `--atera-transcript-mode lazy` instead shows a density overview and loads only
 the ticked genes, and `--atera-viewport-max-points` (default 20M) caps the
-full-density top-up of the visible field. The Gene inspector has the same
-controls, with a Reload button. See `docs/performance_notes.md` for timings.
+full-density top-up of the visible field. `--atera-overview-max-points`
+(default 40M, `0` = off) caps what the All-transcript overview draws: a nested
+sub-sample of the loaded sample, so the all-genes view stays smooth while
+ticked genes keep the whole budget. The Gene inspector has the same controls
+(Mode, Point budget, All-genes cap, Viewport cap), with a Reload button. See `docs/performance_notes.md` for timings.
 
 Loading jobs are cancellable and duplicate requests are coalesced. These optional
 limits tune reuse and storage concurrency:

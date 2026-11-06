@@ -129,6 +129,9 @@ at 8 GiB; inactive sessions are evicted first.
   loads only the ticked genes.
 - `--atera-viewport-max-points INT` (default 20,000,000): cap on the
   transcripts streamed for the visible field at full density.
+- `--atera-overview-max-points INT` (default 40,000,000; 0 = off): the most
+  points the All-transcript overview draws in `full` mode, a nested
+  sub-sample of the loaded sample. Ticked genes keep the whole sample.
 
 ## Environment / GPU
 
@@ -194,6 +197,8 @@ The budgets and caps are constants and flags:
   per point. A memory guard clamps any budget to 85% of RAM.
 - Viewport cap (`--atera-viewport-max-points`, default 20M): the most
   transcripts streamed for the visible field at full density.
+- All-genes cap (`--atera-overview-max-points`, default 40M): the most points
+  the All-transcript overview draws in `full` mode.
 - Gene panel: selection mode with at most 32 ticked genes. It applies to
   Atera and to any panel above 2,000 features.
 - Cell inspector: at most 24 pie slices, 200 gene rows and 2,000 links per
@@ -270,8 +275,8 @@ background worker and is cached outside the store.
 ## Atera transcripts in the viewer (M7)
 
 An Atera store opens in one of two transcript modes; both are set from the
-CLI and from the Gene inspector ("Atera transcripts" mode, "Point budget" with
-a Reload button, "Viewport cap" applied at once).
+CLI and from the Gene inspector (Mode, Point budget and All-genes cap, applied
+by Reload; Viewport cap, applied at once).
 
 `full` (default) streams every parquet file once, in a background worker on
 the engine's 4-thread pool, and keeps a deterministic hash sample: every row
@@ -339,10 +344,9 @@ What this means in practice:
   at AUTO, during which the window does not respond. The read, sample and
   store build stay in the background. This, and the 1 fps All-transcript
   overview at AUTO, are open against the M7 acceptance ("nothing blocks image
-  or mask loads", "a pan storm stays responsive"); the queued M10 splits the
-  layer creation into per-group chunks on a QTimer chain with a determinate
-  progress bar, and caps the All-transcript overview at a nested 40M
-  sub-sample. Until then, a 40M budget or the lazy mode avoids both.
+  or mask loads", "a pan storm stays responsive"). M10 caps the
+  All-transcript overview at a nested 40M sub-sample (next section); the
+  per-group, progress-reporting layer creation is still queued.
 - A MemoryError while creating the layers (not only while sampling) tears the
   partial layers down and reloads at half the budget, saying so in the
   status bar.
@@ -356,6 +360,58 @@ What this means in practice:
 
 Not measured: a store on a slower or external drive (the cold pass is about
 10 GB of reads), and GPUs other than this Apple M4 Max.
+
+## All-genes display cap (M10)
+
+The point budget decides how many transcripts are loaded; the all-genes cap
+decides how many of them the All-transcript overview draws. With the cap
+below the loaded sample, the worker moves the sample's rows whose splitmix key
+is below `cap / total` to the front before the point store is built (about
+1 s at AUTO, no store read). The store's stable sort keeps them at the head of
+every gene's foreground and background runs, and `GenePointStore.overview_offsets`
+records where they end. A gene the overview alone shows draws those prefixes;
+a ticked gene draws its whole run. So the overview is a nested sub-sample of
+the loaded sample (a smaller cap is a subset of a larger one), and ticked
+genes keep the whole budget. Changing the cap re-sorts from the cached sample
+on Reload. When zoomed in, the viewport layer reads from the cap threshold
+for the overview genes, so the field still reaches full density, and it
+drops the rows ticked genes already draw. With the budget at or below the
+cap nothing changes, and Xenium/MERSCOPE stores never carry offsets.
+
+Re-measured at AUTO in the same visible 1500x848 window as the M7 table
+(warm transcript cache, images skipped, cell outlines loaded; two runs, the
+second in brackets):
+
+| AUTO 171.8M | Before (M7, no cap) | 40M all-genes cap |
+| --- | --- | --- |
+| Load to layers ready | 25.2 s | 25.2 s (25.2 s) |
+| Points the overview draws | 171.8M | 40.0M |
+| All-transcript overview on | 29.5 s | 8.5 s (9.4 s) |
+| Pan, overview on (median / p90) | 921 / 1209 ms | 96 / 216 ms (113 / 188 ms) |
+| Pan, 3 genes ticked | 21 / 35 ms | 20 / 29 ms (20 / 32 ms) |
+| 250 um field at full density | 3.9 s, 6.6M points | 2.9 s, 7.4M points |
+| Pan in that field | 313 / 492 ms | 51 / 129 ms (52 / 131 ms) |
+| All-transcript overview off | 3.8 s | 1.7 s |
+| Peak RSS | 35.1 GB | 33.9 GB (33.7 GB) |
+
+The overview now pans at about 9-10 fps at AUTO, as the 40M budget did in
+M7, while ticked genes still come from the 171.8M sample. Turning it on still
+costs about 9 s: napari recomputes the `shown` mask and slices over all
+171.8M points of the layers, not just the 40M drawn. The 250 um field holds
+more viewport points than before because the viewport now also supplies the
+overview genes' rows between the cap and the budget.
+
+The Atera controls in the Gene inspector are a form: Mode, Point budget,
+All-genes cap and Viewport cap each have a label column entry and a growing
+field, the Reload button has its own full-width row, and a one- or two-line
+summary sits under it (the AUTO derivation is in its tooltip; clamp and
+out-of-memory notes stay visible). The mode items are short ("Whole-slide
+sample", "Lazy (density)") with the long descriptions as item tooltips, and
+the spin boxes show "Auto" / "Off" / "40.0 M" instead of long special texts.
+At 240 px the Mode combo moves under its label rather than clip. The Gene
+inspector tab now scrolls vertically like the other tabs, so a short window
+no longer squashes its rows on top of each other (in the 848 px window it did,
+for every platform).
 
 ## Atera cell inspector (M8)
 
