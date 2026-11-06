@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "napari-compare-xenium-merscope"
 version = "0.4.0"
-description = "Standalone Napari viewer for comparing Xenium and MERSCOPE SpatialData outputs"
+description = "Standalone Napari viewer for comparing Xenium and MERSCOPE SpatialData outputs, and for viewing Atera stores"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

@@ -2,7 +2,9 @@
 
 Napari-based viewer for visualising MERSCOPE and Xenium SpatialData `.zarr`
 outputs, either as one standalone dataset or as a simultaneously displayed,
-pre-aligned pair.
+pre-aligned pair. MerXen 10x Atera (whole-transcriptome) stores open as
+standalone datasets; paired viewing is MERSCOPE + Xenium only (see
+[Atera stores](#atera-stores)).
 
 The viewer opens a single Napari window with a tabbed control panel (tabs across
 the top of the right-hand dock): **Gene inspector**, **Cell segmentation**,
@@ -58,8 +60,9 @@ napari-compare-xenium-merscope-install-macos-app
 
 Launching the `.app` from Finder, the Dock, or Sidebar opens with no dataset
 loaded and selects the **Dataset loader** tab. Choose one of the two paired
-layouts or open a standalone store there by selecting each dataset's
-`spatialdata.zarr` folder. The empty canvas points toward these controls and
+layouts or open a standalone store there (**Load new standalone MERSCOPE /
+Xenium / Atera dataset**) by selecting each dataset's `spatialdata.zarr`
+folder. The empty canvas points toward these controls and
 keeps napari's rotating **Did you know?** tip. The loader retains the ten most
 recently opened entries: a standalone store is one entry, while a MERSCOPE and
 Xenium pair is saved as one logical entry together with its view mode. Select an
@@ -139,7 +142,13 @@ You can also open just one dataset:
 ```bash
 napari-compare-xenium-merscope --merscope-zarr /path/to/merscope.zarr
 napari-compare-xenium-merscope --xenium-zarr /path/to/xenium.zarr
+napari-compare-xenium-merscope --atera-zarr /path/to/atera.zarr
 ```
+
+`--atera-spec-path /path/to/experiment.spatial` overrides the Atera pixel-size
+sidecar, like `--xenium-spec-path` does for Xenium. `--atera-zarr` always opens
+standalone: combining it with `--merscope-zarr`, `--xenium-zarr` or
+`--paired-view` is an error.
 
 Open a MerXen manual-registration store (to place landmarks or inspect a result)
 with:
@@ -148,8 +157,8 @@ with:
 napari-compare-xenium-merscope --registration-store /path/to/<id>_prepared.zarr
 ```
 
-`--registration-store` cannot be combined with `--merscope-zarr` or
-`--xenium-zarr`.
+`--registration-store` cannot be combined with `--merscope-zarr`,
+`--xenium-zarr` or `--atera-zarr`.
 
 ### Paired viewing
 
@@ -178,6 +187,11 @@ unavailable while a pair is active because those tools currently have
 single-dataset semantics. The UMAP view works with pairs; see
 [Paired UMAPs](#paired-umaps).
 
+Paired viewing supports MERSCOPE + Xenium only. A store whose MerXen metadata
+says it is an Atera store (or the other platform of the pair) is refused before
+anything is unloaded, with a status-bar message; open Atera stores with the
+standalone Atera loader instead.
+
 Paired viewing is deliberately a strict, read-only consumer of MerXen v2
 materialized data. The moving MERSCOPE store must contain a complete version-2
 `merxen_alignment` manifest, and the fixed Xenium store must contain its matching
@@ -188,6 +202,52 @@ registration, rasterize shapes, generate image/label pyramids or outlines, or
 write either store in paired mode. If validation reports that a pair is missing,
 incomplete, stale, or mismatched, rerun the upstream MerXen materialization and
 then reopen both stores.
+
+### Atera stores
+
+MerXen Atera stores (10x whole-transcriptome: about 1.4 billion transcripts,
+18k genes and 6.6k control features in one section) open standalone, from
+`--atera-zarr`, the **Load new standalone Atera dataset** button, or the recent
+list. Images, the vendor cell and nucleus masks, MerXen cell types, the UMAP,
+per-cell image statistics and the cell inspector work as for the other
+platforms. What differs:
+
+- **Platform detection.** The loader buttons say which platform you expect. A
+  store is re-labelled only when its own MerXen metadata says otherwise (see
+  [Atera store metadata](#atera-store-metadata)); the status bar then says, for
+  example, *Detected Atera store; opening as ATERA.* No dialog is shown, and
+  the recent list records the detected platform.
+- **Segmentation.** The vendor cell outlines (`atera_cell_boundaries`) load at
+  startup. The nucleus mask is listed once, as **Nucleus**, off by default.
+  Clicking a nucleus selects the cell named by its `cell_instance_id`, not the
+  cell it overlaps most; a nucleus without a cell selects nothing.
+- **Transcripts** are never loaded as one table. `--atera-transcript-mode full`
+  (default) streams every parquet file once into a nested whole-slide sample of
+  `--gene-max-render-points` points (AUTO sizes it from RAM) and tops the
+  visible field up to full density when zoomed in. `--atera-transcript-mode
+  lazy` shows a 5 um density image of every real gene (control features are
+  left out of the image but counted) and reads only the ticked genes at full
+  resolution. The overview and its caches are built in a background worker and
+  cached outside the store.
+- **Gene inspector** opens in selection mode: the list starts empty, you search
+  and tick up to 32 genes (each gets its own colour slot), and the 6.6k control
+  features fold under one **Control / blank probes** heading with their counts.
+  **Show all genes** becomes the **All-transcript overview** switch. Any panel
+  above 2,000 features uses the same mode.
+- **Cell inspector** shows the cell's table counts at once, then its exact
+  assigned transcripts. A cell with thousands of genes shows the top 24 genes
+  in the pie plus an "Other" slice, 200 gene rows and at most 2,000 transcript
+  links.
+- **Not available for Atera:** cortical-depth and distance-from-object
+  annotations, and pciSeq sources (their MerXen exports are defined for MERSCOPE
+  and Xenium); the disabled controls say why in their tooltips. The bundled
+  cell-type marker references cover no whole-transcriptome panel, so the gene
+  list is ordered A-Z unless the store embeds a reference. The vendor Azimuth
+  annotations and UMAP (`vendor_azimuth_*`, `X_umap_vendor`) are not offered
+  yet; the cell types and UMAP come from MerXen.
+
+See [docs/performance_notes.md](docs/performance_notes.md#atera-at-a-glance)
+for timings, budgets and memory use.
 
 ### Default startup and low-RAM flags
 
@@ -318,9 +378,13 @@ napari-compare-xenium-merscope ... --label-contour-width 2
 ## Transcripts (Gene inspector)
 
 Transcripts render as real points coloured by gene — not a density raster or a
-viewport-sampled subset — because a typical section (~10-20M transcripts) fits in
-memory as points. The **Gene inspector** tab loads the full gene panel for the
-current dataset alphabetically and gives every gene a unique **colour + marker
+viewport-sampled subset — because a typical MERSCOPE or Xenium section (~10-20M
+transcripts) fits in memory as points. An Atera section (~1.4 billion
+transcripts) does not, so it uses a whole-slide sample or a density overview
+instead (see [Atera stores](#atera-stores)).
+
+The **Gene inspector** tab loads the full gene panel for the current dataset
+alphabetically and gives every gene a unique **colour + marker
 shape** shown as a large icon beside its name. Assigned and unassigned transcripts
 are shown by default; control/blank probes are hidden. Use **Load / reload
 transcripts** to restore or build the panel and **Unload transcripts** to free the
@@ -416,7 +480,8 @@ group the list. **Order genes by** offers three modes:
 
 Marker shapes are stable across all three modes, so only the colours change when
 switching — the same transcript keeps its shape. Without a reference the panel
-falls back to the flat alphabetical rainbow (only **A–Z** is available).
+falls back to the flat alphabetical rainbow (only **A–Z** is available). The
+bundled catalogue has no whole-transcriptome (Atera) reference.
 
 Reference discovery is panel-based rather than sample-name-based. The viewer
 checks, in order, an embedded `cell_type_marker_reference` table, JSON/CSV
@@ -722,6 +787,47 @@ infer equivalent elements: it requires the exact common coordinate system,
 fixed grid, and materialized artifact mappings declared by a valid MerXen v2
 pair.
 
+### Atera store metadata
+
+**Platform detection.** Only two sources are authoritative, in this order: the
+root `zarr.json` attribute `merxen_schema.platform`, then `platform` in
+`merxen_native_latest.json`. They may re-label a store opened through another
+platform's button, a recent entry or the CLI. Weaker clues inside the store
+(the `merxen_atera` root attribute, `atera/experiment.spatial`,
+`experiment.xenium`, the MERSCOPE transform CSV, the platforms' original
+`shapes/*_cell_boundaries`) are used only when nothing authoritative names a
+platform, and never override the platform you chose. Files beside the store are
+never detection evidence. A manual-registration store is recognised first.
+
+**Pixel size**, first usable of:
+
+1. `--atera-spec-path`, when it exists and has a `pixel_size` (a missing or
+   unreadable file is logged and skipped);
+2. `atera/experiment_override.spatial`, then `atera/experiment.spatial`, then
+   `experiment.spatial`, inside the zarr directory and then beside it;
+3. `merxen_atera.experiment.pixel_size` in the root attributes (with a
+   warning);
+4. the `global` scale of `shapes/atera_cell_boundaries` (with a warning).
+
+With none of these the store is refused rather than guessed. A Xenium spec path
+never scales an Atera store.
+
+**What the viewer writes.** The vendor masks and MerXen's label aliases
+(`atera_cell_boundaries_labels`, `atera_nucleus_labels`, hard links to the
+vendor `cell_labels` / `nucleus_labels`) and every payload element are never
+modified or replaced; a label-cache rebuild that would touch them is refused.
+As for other standalone stores, the viewer may add its own derived image
+pyramids, label pyramids and outlines (`_napari_compare_*` elements). The
+transcript sample, density overview, code-range map and cell-to-tile map live
+in the external transcript cache, never in the store.
+
+**Transcripts and ids.** Transcripts are read directly from the per-tile
+parquet files with `pyarrow`, guided by MerXen's
+`merxen_atera_points_index.json` (validated against the parquet footers before
+use). Cells are keyed by their `instance_id` (`original_assignment` on the
+transcripts); nuclei are joined to cells through `cell_instance_id`, never by
+their own ids.
+
 ### Manual-registration stores
 
 A manual-registration store is image-only SpatialData written by MerXen. The viewer
@@ -819,6 +925,14 @@ platform-prefixed columns such as `xenium_pial_boundary_geojson`,
 
 ```bash
 pytest
+```
+
+The Atera tests use a small synthetic store (`tests/atera_stores.py`). A few
+read-only checks against a real MerXen Atera store run only when
+`NAPARI_COMPARE_ATERA_STORE` points at one:
+
+```bash
+NAPARI_COMPARE_ATERA_STORE=/path/to/atera/latest_spatialdata.zarr pytest tests/test_atera_real_store.py
 ```
 
 ### Saved dataset rotation

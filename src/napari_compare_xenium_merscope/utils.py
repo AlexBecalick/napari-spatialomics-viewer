@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Utility helpers for the Xenium/MERSCOPE Napari comparison viewer."""
+"""Utility helpers for the Xenium/MERSCOPE/Atera Napari comparison viewer."""
 
 from __future__ import annotations
 

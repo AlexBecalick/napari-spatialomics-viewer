@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=Napari Compare Xenium MERSCOPE
-Comment=Interactive viewer for Xenium and MERSCOPE SpatialData
+Comment=Interactive viewer for Xenium, MERSCOPE and Atera SpatialData
 Exec=/usr/bin/napari-compare-xenium-merscope
 TryExec=/usr/bin/napari-compare-xenium-merscope
 Icon=napari-compare-xenium-merscope

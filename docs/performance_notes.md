@@ -173,6 +173,35 @@ python scripts/benchmark_transcript_store.py --points 1000000
 python scripts/benchmark_transcript_store.py --points 10000000 --render-cap 2000000
 ```
 
+## Atera at a glance
+
+Atera (10x whole-transcriptome) stores are about 100 times larger than a
+Xenium or MERSCOPE section: 1.41e9 transcripts, 18,049 genes and 6,628
+control features. The Xenium/MERSCOPE code paths do not scale to that, so
+Atera has its own lazy paths. Before and after, on the real store (warm
+cache, 64 GB / 16-core M4 Max):
+
+| Step | Before (Xenium/MERSCOPE path) | Atera path |
+| --- | --- | --- |
+| Gene panel populate, 24,699 rows | 224.5 s (one widget per row) | about 0.035 s (virtualised model, selection mode) |
+| Transcript load | about 20 min of eager build, then a crash: numpy's hypergeometric sampler refuses totals of 1e9 or more | `full` 15-19 s cold, 1.8-6.6 s warm (40M-200M sample, headless); `lazy` 5.1 s to a usable viewer |
+| One gene at full resolution | 3.41 s (`pyarrow.dataset` filter) | 0.09 s with the code-range map, 0.20 s before it exists |
+| Cell click | two dask passes of about 15 s each, and a whole-store cell index of about 6.4 GB | table counts in 0.2-0.4 s, exact rows in about 0.8 s, no index |
+
+The budgets and caps are constants and flags:
+
+- Point budget (`--gene-max-render-points`): AUTO is half the RAM over 200 B
+  per point. A memory guard clamps any budget to 85% of RAM.
+- Viewport cap (`--atera-viewport-max-points`, default 20M): the most
+  transcripts streamed for the visible field at full density.
+- Gene panel: selection mode with at most 32 ticked genes. It applies to
+  Atera and to any panel above 2,000 features.
+- Cell inspector: at most 24 pie slices, 200 gene rows and 2,000 links per
+  cell (Atera cells only).
+- Lazy-mode gene LRU: 1 GiB.
+
+The sections below give the measurements behind each row.
+
 ## Atera lazy transcript engine
 
 Atera stores hold about 1.4e9 transcripts in ~400 per-tile parquet files, cut
