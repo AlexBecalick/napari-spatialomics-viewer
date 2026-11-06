@@ -182,7 +182,7 @@ def test_sample_cache_does_not_disturb_the_overview_or_v1_entries(store_copy, tm
     assert TC.save_atera_sample(engine.index, engine.sample_rows(T.sample_threshold(total // 2, total)), cache_root=cache)
     assert TC.load_atera_overview(engine.index, bin_um=5.0, cache_root=cache) is not None
     kinds = sorted(p.name for p in cache.iterdir())
-    assert kinds == ["atera-codemap-v1", "atera-overview-v1", "atera-sample-v1"]
+    assert kinds == ["atera-celltiles-v1", "atera-codemap-v1", "atera-overview-v1", "atera-sample-v1"]
 
 
 def _reference_store_order(genes, codes, background, visuals):

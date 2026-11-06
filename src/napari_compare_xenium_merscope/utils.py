@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import re
+import threading
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from hashlib import blake2s
@@ -3796,6 +3797,11 @@ def cell_ids_as_int64(values: Iterable[Any]) -> tuple[np.ndarray, np.ndarray]:
     The historical name is retained for callers. Small ids use int64; unsigned
     ids above its maximum use uint64. A mixture of negative and large unsigned
     ids uses Python integers rather than overflowing either numpy dtype.
+
+    The cell-type and UMAP joins that go through this function are only
+    exercised with ids below ``2**63`` (Atera ids are 1..91,431); the full
+    uint64 exactness guarantee for transcript assignments is scoped to
+    :class:`CellTranscriptIndex` and the lazy Atera engine.
     """
     arr = np.asarray(values, dtype=object)
     parsed = [0] * len(arr)
@@ -4847,6 +4853,189 @@ def build_cell_transcript_index(
         build_cell_index=True,
     )
     return store.cell_transcript_index or CellTranscriptIndex.empty()
+
+
+def cell_transcript_index_from_arrays(
+    cell_ids,
+    x,
+    y,
+    codes,
+    names: Sequence[str],
+) -> CellTranscriptIndex:
+    """A :class:`CellTranscriptIndex` from compact per-row arrays.
+
+    ``codes`` index ``names`` (negative codes are dropped); only the names
+    that occur are kept, re-coded densely.  Rows are grouped by cell id
+    (stable, so each cell keeps its read order).  Cell ids keep every digit of
+    the uint64 range.
+    """
+    cell_ids = np.asarray(cell_ids)
+    codes = np.asarray(codes, dtype=np.int64)
+    x = np.asarray(x, dtype=np.float32)
+    y = np.asarray(y, dtype=np.float32)
+    if not (len(cell_ids) == len(codes) == len(x) == len(y)):
+        raise ValueError("cell_ids, x, y and codes must have one entry per row")
+    valid = codes >= 0
+    if not valid.all():
+        cell_ids, codes, x, y = cell_ids[valid], codes[valid], x[valid], y[valid]
+    if len(codes) == 0:
+        return CellTranscriptIndex.empty()
+    used, dense = np.unique(codes, return_inverse=True)
+    gene_names = tuple(str(names[int(i)]) for i in used)
+    n_names = len(gene_names)
+    dtype = np.uint8 if n_names <= 2**8 else np.uint16 if n_names <= 2**16 else np.uint32
+    order = np.argsort(cell_ids, kind="stable")
+    sorted_ids = cell_ids[order]
+    starts = np.flatnonzero(np.r_[True, sorted_ids[1:] != sorted_ids[:-1]])
+    ends = np.r_[starts[1:], len(sorted_ids)]
+    slices = {
+        normalize_cell_key(int(sorted_ids[s]) if np.issubdtype(sorted_ids.dtype, np.integer) else sorted_ids[s]):
+            (int(s), int(e))
+        for s, e in zip(starts, ends)
+    }
+    return CellTranscriptIndex(
+        coords_yx=np.column_stack([y[order], x[order]]).astype(np.float32, copy=False),
+        gene_codes=dense[order].astype(dtype),
+        gene_names=gene_names,
+        slices=slices,
+    )
+
+
+@dataclass(frozen=True)
+class TableCellCounts:
+    """One cell's row of a table's count matrix (genes only, highest first)."""
+
+    instance_id: int
+    genes: tuple[str, ...]
+    counts: tuple[int, ...]
+
+    @property
+    def total(self) -> int:
+        return int(sum(self.counts))
+
+    def ranked(self) -> list[tuple[str, int]]:
+        return list(zip(self.genes, self.counts))
+
+
+@dataclass
+class _TableRowLookup:
+    stamp: tuple
+    var_names: np.ndarray  # object
+    sorted_ids: np.ndarray
+    sorted_rows: np.ndarray
+    sparse: bool
+    #: ``X`` (dense) or ``(indptr, indices, data)`` zarr arrays, opened once.
+    matrix: Any = None
+
+
+_TABLE_LOOKUPS: dict[tuple[str, str], _TableRowLookup] = {}
+_TABLE_LOOKUPS_LOCK = threading.Lock()
+
+
+def _table_stamp(table_dir: Path) -> tuple:
+    stamp = []
+    for part in ("zarr.json", "obs/zarr.json", "var/zarr.json", "X/zarr.json"):
+        try:
+            st = os.stat(table_dir / part)
+            stamp.append((part, st.st_size, st.st_mtime_ns))
+        except OSError:
+            stamp.append((part, None, None))
+    return tuple(stamp)
+
+
+def _table_row_lookup(zarr_path: str | Path, table_key: str) -> _TableRowLookup:
+    key = (str(Path(zarr_path).resolve()), str(table_key))
+    stamp = _table_stamp(Path(zarr_path) / "tables" / str(table_key))
+    with _TABLE_LOOKUPS_LOCK:
+        cached = _TABLE_LOOKUPS.get(key)
+    if cached is not None and cached.stamp == stamp:
+        return cached
+    table = open_zarr_group_unconsolidated(zarr_path)["tables"][str(table_key)]
+    attrs = dict(table.attrs)
+    spatial = attrs.get("spatialdata_attrs") if isinstance(attrs.get("spatialdata_attrs"), Mapping) else {}
+    instance_key = str(attrs.get("instance_key") or spatial.get("instance_key") or "instance_id")
+    obs = table["obs"]
+    if instance_key in obs:
+        raw_ids = obs[instance_key]
+        if isinstance(raw_ids, zarr.Group):  # categorical
+            categories = np.asarray(raw_ids["categories"][:])
+            codes = np.asarray(raw_ids["codes"][:], dtype=np.int64)
+            raw = np.where(codes >= 0, categories[np.clip(codes, 0, None)], None)
+        else:
+            raw = np.asarray(raw_ids[:])
+    else:
+        index_name = str(dict(obs.attrs).get("_index", "_index"))
+        raw = np.asarray(obs[index_name][:])
+    ids, valid = cell_ids_as_int64(raw) if raw.dtype.kind not in "iu" else (raw, np.ones(len(raw), dtype=bool))
+    rows = np.flatnonzero(valid)
+    ids = np.asarray(ids)[rows]
+    order = np.argsort(ids, kind="stable")
+    var = table["var"]
+    var_index = str(dict(var.attrs).get("_index", "_index"))
+    var_names = np.asarray(_read_zarr_string_list(var[var_index]), dtype=object)
+    x_node = table["X"]
+    encoding = str(dict(x_node.attrs).get("encoding-type", "array"))
+    sparse = encoding == "csr_matrix"
+    lookup = _TableRowLookup(
+        stamp=stamp,
+        var_names=var_names,
+        sorted_ids=ids[order],
+        sorted_rows=rows[order],
+        sparse=sparse,
+        matrix=(x_node["indptr"], x_node["indices"], x_node["data"]) if sparse else x_node,
+    )
+    with _TABLE_LOOKUPS_LOCK:
+        _TABLE_LOOKUPS[key] = lookup
+    return lookup
+
+
+def table_cell_gene_counts(
+    zarr_path: str | Path, table_key: str, instance_id: Any
+) -> TableCellCounts | None:
+    """One cell's gene counts from ``tables/<table_key>/X``, reading one row.
+
+    The var names and an ``instance_id -> row`` lookup are cached per table
+    (invalidated when its metadata changes); a CSR matrix is read through
+    ``indptr`` so only that row's slice of ``data`` / ``indices`` is decoded.
+    Control features (by the name rule) are dropped; Atera's ``X`` holds
+    genes only, so these are gene transcripts.  ``None`` when the cell is not
+    in the table.
+    """
+    target = cell_id_to_int(instance_id)
+    if target is None:
+        return None
+    lookup = _table_row_lookup(zarr_path, table_key)
+    ids = lookup.sorted_ids
+    if ids.dtype.kind == "u" and target < 0:
+        return None
+    try:
+        probe = np.asarray([target], dtype=ids.dtype)[0] if ids.dtype != object else target
+    except OverflowError:
+        return None
+    pos = int(np.searchsorted(ids, probe))
+    if pos >= len(ids) or ids[pos] != probe:
+        return None
+    row = int(lookup.sorted_rows[pos])
+    if lookup.sparse:
+        indptr, indices, data = lookup.matrix
+        start, end = (int(v) for v in np.asarray(indptr[row : row + 2]))
+        columns = np.asarray(indices[start:end], dtype=np.int64)
+        values = np.asarray(data[start:end])
+    else:
+        dense = np.asarray(lookup.matrix[row, :]).ravel()
+        columns = np.flatnonzero(dense)
+        values = dense[columns]
+    counts = np.rint(np.asarray(values, dtype=np.float64)).astype(np.int64)
+    keep = counts > 0
+    columns, counts = columns[keep], counts[keep]
+    names = lookup.var_names[columns]
+    pairs = [(str(n), int(c)) for n, c in zip(names, counts) if not is_control_gene(str(n))]
+    pairs.sort(key=lambda item: (-item[1], item[0]))
+    return TableCellCounts(
+        instance_id=int(target),
+        genes=tuple(p[0] for p in pairs),
+        counts=tuple(p[1] for p in pairs),
+    )
 
 
 def ranked_gene_counts(genes) -> list[tuple[str, int]]:

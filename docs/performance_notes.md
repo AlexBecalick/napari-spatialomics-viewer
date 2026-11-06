@@ -327,3 +327,60 @@ What this means in practice:
 
 Not measured: a store on a slower or external drive (the cold pass is about
 10 GB of reads), and GPUs other than this Apple M4 Max.
+
+## Atera cell inspector (M8)
+
+A cell click on an Atera store never builds a whole-store transcript index
+(about 6.4 GB) and never runs a dask scan. It paints in two phases:
+
+1. One row of `tables/table_original/X`, read through `indptr` (the var names
+   and the `instance_id -> row` lookup are cached per table). These are gene
+   transcripts: `X` holds no control features.
+2. The cell's exact assigned transcripts. Each of the cell's files is read
+   in two steps. First only `original_assignment` is decoded and the matching
+   rows are found. Then `x`, `y` and `feature_name` are read for just the row
+   groups with hits, and only those rows are kept. The image statistics and
+   the stored annotation arrive with this phase. Control features are counted
+   separately from the genes.
+
+The read covers only the tiles holding the cell's transcripts, so the first
+question was whether cells span tiles. Measured over all 409 files:
+
+- 91,429 cells have assigned transcripts.
+- 907 of them (about 1%) have them in more than one tile, at most 4.
+- Choosing tiles by the cell's bounding box would still have found all of
+  them (0 misses), because tile boxes are tile-wide.
+
+To be safe, the overview pass builds an exact cell -> tile map
+(`CellTileMap`). It is cached inside the overview entry and as a
+`atera-celltiles-v1/` sidecar. An overview cached before M8 gets the map once,
+from an assignment-only pass: 3.2 s warm, then 0.03 s from the sidecar.
+Collecting the ids adds about 1.5-2 s to a warm overview pass (8.2 s
+without, 9.7-10.3 s with). A read that cannot be exact returns nothing, and
+the inspector keeps the table counts with a note. That happens when the index
+is not validated, or when a file's size or mtime changed since the engine
+opened.
+
+Real store, warm unless noted:
+
+| Step | Cell 1001 | Others |
+| --- | --- | --- |
+| Table row | 17,199 transcripts, 5,940 genes; 37 ms for the first call (lookup build), then 8-10 ms | 7-10 ms |
+| Exact read | 17,202 rows (3 controls), 22 files, 85 row groups, 0.30-0.35 s | 0.26-0.35 s |
+| Exact read, cold | 0.38 s (1.3 GB of files copied with `ditto --nocache`) | cell 45000: 0.32 s |
+| Real viewer, click to table paint | 0.40 s (0.30 s of it is the first overlay build) | cell 177: 0.18 s |
+| Real viewer, click to exact rows | 0.85 s | 0.77 s |
+
+Cell 177 straddles two tiles.
+
+Presentation is capped at WTA scale. Below the caps the output is unchanged:
+
+- The pie shows the top 24 genes plus one neutral "Other" slice.
+- The gene list shows 200 rows plus an "N more genes" footer.
+- Each cell draws at most 2,000 transcript links, evenly spaced and
+  deterministic. The summary says when links are capped.
+
+Not in this effort: vendor Azimuth as a second cell-type/UMAP source
+(`vendor_azimuth_*`, `X_umap_vendor`). Also not done: reusing the viewport's
+rows for a cell inside it, because the sample drops cell ids and the per-cell
+read is already about 0.3 s.

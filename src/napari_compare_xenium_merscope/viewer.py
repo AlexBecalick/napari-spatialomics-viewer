@@ -165,6 +165,8 @@ except Exception:  # pragma: no cover - depends on the installed napari runtime
     thread_worker = None
 
 from .manual_registration_controller import REGISTRATION_DATASET, ManualRegistrationController
+from .atera_transcripts import AteraTranscriptEngine, indexed_cell_transcripts
+from .transcript_cache import load_atera_cell_tiles
 from .atera_viewer import (
     ATERA_MODE_FULL,
     ATERA_MODE_LAZY,
@@ -277,6 +279,9 @@ from .utils import (
     load_cell_type_assignments,
     resolve_cell_type_marker_reference,
     build_cell_transcript_index,
+    is_control_gene,
+    open_zarr_group_unconsolidated,
+    table_cell_gene_counts,
     darken_rgba,
     mean_intensity_in_polygon,
     normalize_cell_key,
@@ -811,6 +816,13 @@ ROI_CELL_CONTOUR_PX = 3
 CELL_LINK_COLOR = (1.0, 1.0, 1.0, 0.35)
 CELL_LINK_WIDTH = 0.25
 CELL_PIE_SLICE_DARKEN = 0.6
+#: WTA-scale caps of the cell inspector.  Below them the output is unchanged:
+#: a cell with more genes gets the top genes plus one neutral 'Other' slice,
+#: a list footer, and an evenly spaced subset of links.
+CELL_PIE_MAX_SLICES = 24
+CELL_GENE_LIST_MAX_ROWS = 200
+CELL_LINKS_MAX_PER_CELL = 2_000
+CELL_OTHER_SLICE_RGBA = (0.42, 0.45, 0.50, 1.0)
 #: Maximum canvas movement still treated as an inspection click. Hit-testing
 #: transcripts and cell polygons is deferred until release; moving farther than
 #: this makes the gesture a pure napari pan with no synchronous pick work.
@@ -4697,10 +4709,24 @@ class CellInfoPieChart(QWidget):
 def _cell_summary_html(cell: dict) -> str:
     area_um2 = cell.get("area")
     area_text = f"{area_um2:,.1f} µm²" if area_um2 is not None else "n/a"
+    total_label = str(cell.get("total_label") or "Total transcripts")
     lines = [
-        f"<b>Total transcripts:</b> {int(cell.get('total', 0)):,}",
+        f"<b>{html.escape(total_label)}:</b> {int(cell.get('total', 0)):,}",
         f"<b>Area:</b> {area_text}",
     ]
+    if cell.get("control_total") is not None:
+        lines.append(
+            f"<b>Control features:</b> {int(cell['control_total']):,}"
+            f" ({int(cell.get('control_features', 0)):,} features)"
+        )
+    if cell.get("transcripts_loading"):
+        lines.append("<i>Reading the assigned transcripts…</i>")
+    elif cell.get("transcript_note"):
+        lines.append(f"<i>{html.escape(str(cell['transcript_note']))}</i>")
+    coords = cell.get("coords_yx")
+    n_links = 0 if coords is None else len(coords)
+    if n_links > CELL_LINKS_MAX_PER_CELL:
+        lines.append(f"<i>Links drawn: {CELL_LINKS_MAX_PER_CELL:,} of {n_links:,} (evenly spaced)</i>")
     if cell.get("annotation_method") == "pciseq":
         probability = cell.get("pciseq_probability")
         if probability is not None and np.isfinite(probability):
@@ -4711,7 +4737,9 @@ def _cell_summary_html(cell: dict) -> str:
         lines.append("<i>Loading transcript and image statistics…</i>")
         return "<br>".join(lines)
     intensity_rows = cell.get("intensities") or []
-    if intensity_rows:
+    if cell.get("intensities_loading"):
+        lines.append("<i>Loading image statistics…</i>")
+    elif intensity_rows:
         lines.append("<b>Mean intensity:</b>")
         if cell.get("cellpose_cell_id") is not None:
             lines.append(f"Cellpose cell: {html.escape(str(cell['cellpose_cell_id']))}")
@@ -4723,13 +4751,35 @@ def _cell_summary_html(cell: dict) -> str:
     return "<br>".join(lines)
 
 
-def _cell_gene_list_html(cell: dict) -> str:
+def _cell_pie_slices(rows: list[dict], max_slices: int = CELL_PIE_MAX_SLICES) -> list[dict]:
+    """Pie slices of ``rows`` (highest count first): every gene up to
+    ``max_slices``, else the top ``max_slices`` plus one neutral 'Other' slice."""
+    slices = [
+        {"count": row.get("count", 0), "glyph": row.get("glyph", ""),
+         "rgba": darken_rgba(row.get("rgba", (.6, .6, .6, 1.)), CELL_PIE_SLICE_DARKEN)}
+        for row in rows[:max_slices]
+    ]
+    rest = rows[max_slices:]
+    if rest:
+        slices.append({
+            "count": int(sum(int(row.get("count", 0)) for row in rest)),
+            "glyph": "",
+            "rgba": CELL_OTHER_SLICE_RGBA,
+            "other_genes": len(rest),
+        })
+    return slices
+
+
+def _cell_gene_list_html(cell: dict, max_rows: int = CELL_GENE_LIST_MAX_ROWS) -> str:
     if cell.get("inspection_error"):
         return "<i>Transcript data could not be loaded</i>"
     if cell.get("loading"):
         return "<i>Loading…</i>"
     lines = []
-    for row in cell.get("gene_rows", []):
+    rows = list(cell.get("gene_rows", []))
+    hidden = rows[max_rows:]
+    rows = rows[:max_rows]
+    for row in rows:
         rgba = row.get("rgba", (1.0, 1.0, 1.0, 1.0))
         rgb = tuple(max(0, min(255, int(round(float(v) * 255)))) for v in rgba[:3])
         color = f"rgb({rgb[0]},{rgb[1]},{rgb[2]})"
@@ -4741,6 +4791,11 @@ def _cell_gene_list_html(cell: dict) -> str:
             f"<span style='color:{color}; font-size:13pt;'>{glyph}</span> "
             f"<b>{gene}</b> "
             f"<span style='color:#9aa4b2;'>{count:,}</span></div>"
+        )
+    if hidden:
+        lines.append(
+            f"<div style='margin:4px 0; color:#9aa4b2;'><i>{len(hidden):,} more genes "
+            f"({sum(int(r.get('count', 0)) for r in hidden):,} transcripts)</i></div>"
         )
     return "".join(lines) or "<i>No transcripts assigned</i>"
 
@@ -4832,10 +4887,7 @@ class _CellPanel(QWidget):
                     min(280, self._broad.sizeHint().width()),
                     min(280, self._fine.sizeHint().width()) if not pciseq else 0)
         self._statistics.setFixedWidth(int(min(310, max(170, width + 8))))
-        self._pie.set_slices([
-            {"count": row.get("count", 0), "glyph": row.get("glyph", ""),
-             "rgba": darken_rgba(row.get("rgba", (.6, .6, .6, 1.)), CELL_PIE_SLICE_DARKEN)}
-            for row in cell.get("gene_rows", [])])
+        self._pie.set_slices(_cell_pie_slices(list(cell.get("gene_rows", []))))
         self._gene_list.setText(_cell_gene_list_html(cell))
         self._gene_list.ensurePolished()
         document.setDefaultFont(self._gene_list.font())
@@ -13041,6 +13093,228 @@ class ComparisonViewerController(AteraTranscriptMixin):
             log.debug("Mask correspondence failed: %s", exc)
             return None
 
+    # -- lazy-platform (ATERA) cell queries -----------------------------
+
+    def _lazy_cell_reader(self, ds: str):
+        """``(engine, cell_tiles)`` for per-cell reads of a lazy platform.
+
+        The gene inspector's engine and overview map when transcripts are
+        loaded; otherwise an engine opened once per store (its index and
+        footers only) with the cached cell -> tile map, if any.
+        """
+        key = str(ds).upper()
+        state = getattr(self, "_gene_inspector_states", {}).get(key)
+        ctx = getattr(state, "atera", None) if state is not None else None
+        if ctx is not None and getattr(ctx, "engine", None) is not None:
+            return ctx.engine, getattr(getattr(ctx, "overview", None), "cell_tiles", None)
+        cfg = (getattr(self, "datasets", None) or {}).get(key)
+        path = getattr(cfg, "zarr_path", None)
+        if path is None:
+            return None, None
+        engines = self.__dict__.setdefault("_lazy_cell_engines", {})
+        cached = engines.get(key)
+        if cached is None or cached[0] != str(path):
+            engine = AteraTranscriptEngine.open(path, self._atera_points_key())
+            cell_tiles = load_atera_cell_tiles(engine.index) if engine is not None else None
+            cached = (str(path), engine, cell_tiles)
+            engines[key] = cached
+        return cached[1], cached[2]
+
+    def _lazy_cell_counts_table(self, ds: str) -> str | None:
+        """The table whose ``X`` holds the original cells' gene counts."""
+        spec = self._dataset_platform_spec(ds)
+        shape = getattr(spec, "original_cell_shape_key", None)
+        cfg = (getattr(self, "datasets", None) or {}).get(str(ds).upper())
+        path = getattr(cfg, "zarr_path", None)
+        if path is None:
+            return None
+        cache = self.__dict__.setdefault("_lazy_cell_count_tables", {})
+        key = (str(ds).upper(), str(path))
+        if key in cache:
+            return cache[key]
+        table = None
+        try:
+            root = open_zarr_group_unconsolidated(path)
+            schema = dict(root.attrs).get("merxen_schema") or {}
+            for entry in (schema.get("segmentations") or {}).values():
+                if isinstance(entry, dict) and entry.get("shape") == shape and entry.get("table"):
+                    table = str(entry["table"])
+                    break
+            tables = root["tables"] if "tables" in root else None
+            if table is not None and (tables is None or table not in tables):
+                table = None
+            if table is None and tables is not None:
+                for name in sorted(tables.group_keys()):
+                    attrs = dict(tables[name].attrs)
+                    if attrs.get("region") == shape and "X" in tables[name]:
+                        table = str(name)
+                        break
+        except Exception as exc:
+            log.debug("[%s] No per-cell count table: %s", ds, exc)
+            table = None
+        cache[key] = table
+        return table
+
+    def _lazy_cell_table_counts(self, ds: str, cell_id):
+        """One cell's gene counts from the count table (about 10 ms), or ``None``."""
+        table = self._lazy_cell_counts_table(ds)
+        cfg = (getattr(self, "datasets", None) or {}).get(str(ds).upper())
+        if table is None or getattr(cfg, "zarr_path", None) is None:
+            return None
+        try:
+            return table_cell_gene_counts(cfg.zarr_path, table, cell_id)
+        except Exception as exc:
+            log.warning("[%s] Could not read cell %s from %s: %s", ds, cell_id, table, exc)
+            return None
+
+    def _lazy_cell_transcript_index(self, ds: str, cell_id, geometry) -> CellTranscriptIndex | None:
+        """The cell's assigned transcripts, exactly, without a store scan.
+
+        ``None`` when the exact read is unavailable (no validated points index,
+        no cell -> tile map and no geometry, or the files changed on disk).
+        """
+        cache_key = (str(ds).upper(), "original", "", normalize_cell_key(cell_id))
+        if not hasattr(self, "_inspection_indexes"):
+            self._inspection_indexes = {}
+        if cache_key in self._inspection_indexes:
+            return self._inspection_indexes[cache_key]
+        engine, cell_tiles = self._lazy_cell_reader(ds)
+        if engine is None:
+            return None
+        bounds = None
+        if geometry is not None:
+            try:
+                bounds = tuple(float(v) for v in geometry.bounds)
+            except Exception:
+                bounds = None
+        index = indexed_cell_transcripts(engine, cell_id, bounds, cell_tiles=cell_tiles)
+        if index is not None:
+            self._inspection_indexes[cache_key] = index
+        return index
+
+    @staticmethod
+    def _cell_gene_row(gene: str, count: int, gene_visuals) -> dict:
+        visual = gene_visuals.get(gene) if gene_visuals else None
+        if visual is not None:
+            rgba = tuple(visual.rgba)
+            symbol = str(visual.symbol)
+        else:
+            rgba, symbol = (0.6, 0.6, 0.6, 1.0), "disc"
+        return {
+            "gene": gene,
+            "count": int(count),
+            "rgba": rgba,
+            "glyph": GENE_STATUS_SYMBOL_GLYPHS.get(symbol, "●"),
+        }
+
+    def _lazy_cell_table_display(
+        self, ds: str, cell_id, geometry, color: str, *, gene_visuals=None, image_specs=None,
+    ) -> dict:
+        """Worker: the first paint of a lazy-platform cell from its table counts.
+
+        Only the count-table row is read (about 10 ms warm); the image
+        statistics and the stored annotation follow with the exact read.
+        """
+        key = str(ds).upper()
+        counts = self._lazy_cell_table_counts(key, cell_id)
+        ranked = counts.ranked() if counts is not None else []
+        if gene_visuals is None:
+            gene_visuals = assign_gene_visuals(sorted(g for g, _c in ranked))
+        payload = self._cell_selection_placeholder(key, cell_id, geometry, color)
+        payload.update(
+            loading=False,
+            intensities_loading=True,
+            gene_rows=[self._cell_gene_row(g, c, gene_visuals) for g, c in ranked],
+            total=0 if counts is None else counts.total,
+            total_label="Gene transcripts (table)",
+            coords_yx=np.empty((0, 2), dtype=float),
+            transcripts_loading=True,
+            transcript_source="table",
+        )
+        if counts is None:
+            payload["transcript_note"] = "This cell has no row in the count table."
+        return payload
+
+    def _cell_selection_common(self, ds: str, cell_id, geometry, color: str, image_specs) -> dict:
+        key = str(ds).upper()
+        try:
+            centroid = geometry.centroid
+            centroid_yx = (float(centroid.y), float(centroid.x))
+        except Exception:
+            centroid_yx = None
+        try:
+            area_um2 = float(geometry.area)
+        except Exception:
+            area_um2 = None
+        specs = self._cell_image_specs() if image_specs is None else list(image_specs)
+        cache_key = self._cell_intensity_cache_key(key, cell_id, specs)
+        cache_key = (*cache_key, *self._inspection_identity(ds))
+        intensity_result = self._cell_intensity_cache.get(cache_key)
+        if intensity_result is None:
+            intensity_result = self._inspection_intensities(ds, cell_id, geometry, specs)
+            self._cell_intensity_cache[cache_key] = intensity_result
+        intensities, cellpose_id = intensity_result
+        annotation = self._cell_type_annotation_for_cell(key, cell_id, load=True)
+        return {
+            "cell_id": cell_id,
+            "geometry": geometry,
+            "color": str(color),
+            "paths": self._polygon_to_napari_paths(geometry),
+            "centroid_yx": centroid_yx,
+            "area": area_um2,
+            "intensities": intensities,
+            "cellpose_cell_id": cellpose_id,
+            "loading": False,
+            **annotation,
+        }
+
+    def _lazy_cell_selection_display(
+        self, ds: str, cell_id, geometry, color: str, *, gene_visuals=None, image_specs=None,
+        control_genes=None,
+    ) -> dict:
+        """Worker: a lazy-platform cell from its exact assigned transcripts.
+
+        Control features are counted apart from the genes; without an exact
+        read the table counts stay (with a note).
+        """
+        key = str(ds).upper()
+        index = self._lazy_cell_transcript_index(key, cell_id, geometry)
+        if index is None:
+            payload = self._lazy_cell_table_display(
+                key, cell_id, geometry, color, gene_visuals=gene_visuals, image_specs=image_specs)
+            payload.update(self._cell_selection_common(key, cell_id, geometry, color, image_specs))
+            payload.update(
+                intensities_loading=False,
+                transcripts_loading=False,
+                transcript_note="Assigned transcripts are unavailable (no validated points index); "
+                                "showing the table counts.",
+            )
+            return payload
+        coords_yx, genes = index.transcripts_for(cell_id)
+        genes = np.asarray(genes, dtype=object)
+        known = set(control_genes or ())
+        is_control = np.fromiter(
+            (str(g) in known or is_control_gene(g) for g in genes), dtype=bool, count=len(genes))
+        ranked = ranked_gene_counts(genes[~is_control])
+        controls = ranked_gene_counts(genes[is_control])
+        if gene_visuals is None:
+            gene_visuals = assign_gene_visuals(sorted(g for g, _c in ranked))
+        payload = self._cell_selection_common(key, cell_id, geometry, color, image_specs)
+        payload.update(
+            gene_rows=[self._cell_gene_row(g, c, gene_visuals) for g, c in ranked],
+            total=int(np.count_nonzero(~is_control)),
+            total_label="Gene transcripts",
+            control_total=int(np.count_nonzero(is_control)),
+            control_features=len(controls),
+            control_rows=[{"gene": g, "count": int(c)} for g, c in controls],
+            coords_yx=np.asarray(coords_yx, dtype=float),
+            transcripts_loading=False,
+            intensities_loading=False,
+            transcript_source="indexed",
+            transcript_note="",
+        )
+        return payload
+
     def _inspection_transcript_index(self, ds, cell_id, geometry, native_index):
         """Use source assignments when provided, otherwise the selected polygon.
 
@@ -13048,12 +13322,13 @@ class ComparisonViewerController(AteraTranscriptMixin):
         transcripts are the measured points inside that mask, including points
         assigned elsewhere by ProSeg.
 
-        Lazy-transcript platforms (ATERA) get an empty index: both the
-        assignment filter and the polygon fallback would scan every transcript
-        row of the store.
+        Lazy-transcript platforms (ATERA) never scan the store: the cell's
+        assigned transcripts come from a two-phase read of only its tiles
+        (:meth:`_lazy_cell_transcript_index`), empty when that is unavailable.
         """
         if self._uses_lazy_cell_queries(ds):
-            return self._empty_cell_transcript_index()
+            index = self._lazy_cell_transcript_index(ds, cell_id, geometry)
+            return index if index is not None else self._empty_cell_transcript_index()
         source, analysis = self._inspection_identity(ds)
         cache_key = (str(ds).upper(), source, analysis, normalize_cell_key(cell_id))
         if not hasattr(self, "_inspection_indexes"):
@@ -13213,6 +13488,9 @@ class ComparisonViewerController(AteraTranscriptMixin):
     ) -> dict:
         """Compute panel data; intended to run in a worker thread."""
         key = str(ds).upper()
+        if self._uses_lazy_cell_queries(key):
+            return self._lazy_cell_selection_display(
+                key, cell_id, geometry, color, gene_visuals=gene_visuals, image_specs=image_specs)
         if index is None:
             index = self._get_cell_transcript_index(ds)
         index = self._inspection_transcript_index(ds, cell_id, geometry, index)
@@ -13319,6 +13597,9 @@ class ComparisonViewerController(AteraTranscriptMixin):
         worker_key = (ds_key, norm, *self._transcript_source_identity(ds_key))
         if worker_key in self._cell_inspection_workers:
             return
+        if self._uses_lazy_cell_queries(ds_key) and self._paired_session is None:
+            self._start_lazy_cell_selection_build(ds_key, cell_id, geometry, color, worker_key)
+            return
         generation = self._cell_inspection_generation
         index = self._cell_transcript_index.get(ds_key)
         if getattr(self, "_cell_transcript_index_sources", {}).get(ds_key, ("native", "")) != self._transcript_source_identity(ds_key):
@@ -13370,12 +13651,76 @@ class ComparisonViewerController(AteraTranscriptMixin):
         self._cell_inspection_workers[worker_key] = worker
         worker.start()
 
+    def _start_lazy_cell_selection_build(self, ds: str, cell_id, geometry, color: str, worker_key):
+        """Two phases for a lazy platform: table counts first, then the exact read.
+
+        Phase 1 (one count-table row, intensities, annotation) paints at once;
+        phase 2 reads the cell's assigned transcripts from its tiles and
+        replaces the rows, adding controls and links.  Neither builds an eager
+        gene index nor scans the store.
+        """
+        generation = self._cell_inspection_generation
+        state = self._gene_inspector_states.get(ds)
+        visuals = dict(state.gene_visuals) if state is not None else None
+        store = getattr(state, "store", None) if state is not None else None
+        controls = set(getattr(store, "control_genes", ()) or ())
+        image_specs = self._cell_image_specs()
+
+        def table_phase():
+            with self._store_io_slots:
+                return self._lazy_cell_table_display(
+                    ds, cell_id, geometry, color, gene_visuals=visuals, image_specs=image_specs)
+
+        def indexed_phase():
+            # The engine's own bounded reader pool does the I/O.
+            return self._lazy_cell_selection_display(
+                ds, cell_id, geometry, color, gene_visuals=visuals, image_specs=image_specs,
+                control_genes=controls)
+
+        def run(compute, on_done):
+            if thread_worker is None:
+                try:
+                    result = compute()
+                except Exception as exc:
+                    self._handle_cell_selection_error(generation, worker_key, exc)
+                    return
+                on_done(result)
+                return
+            worker = thread_worker(compute)()
+            worker.returned.connect(on_done)
+            worker.errored.connect(
+                lambda exc, gen=generation, wk=worker_key: self._handle_cell_selection_error(gen, wk, exc))
+            self._cell_inspection_workers[worker_key] = worker
+            worker.start()
+
+        empty = self._empty_cell_transcript_index()
+
+        def table_done(payload):
+            if generation != self._cell_inspection_generation:
+                return
+            self._apply_cell_selection_payload(
+                generation, worker_key, payload, empty,
+                status=f"{ds}: cell {cell_id} table counts shown; reading its assigned transcripts…")
+            if self._cell_selection_entry(ds, worker_key[1]) is None:
+                return
+            run(indexed_phase, lambda payload: self._apply_cell_selection_payload(
+                generation, worker_key, payload, empty))
+
+        run(table_phase, table_done)
+
+    def _cell_selection_entry(self, ds: str, norm: str) -> dict | None:
+        for entry in self._selected_cells.get(str(ds).upper(), []):
+            if normalize_cell_key(entry.get("cell_id")) == norm:
+                return entry
+        return None
+
     def _apply_cell_selection_payload(
         self,
         generation: int,
         worker_key: tuple[str, str],
         payload: dict,
         index: CellTranscriptIndex,
+        status: str | None = None,
     ):
         if generation != self._cell_inspection_generation:
             return
@@ -13397,7 +13742,7 @@ class ComparisonViewerController(AteraTranscriptMixin):
                 entry.update(payload)
                 break
         self._rebuild_cell_highlights(ds)
-        self._set_status(f"{ds}: cell {payload.get('cell_id')} statistics ready.")
+        self._set_status(status or f"{ds}: cell {payload.get('cell_id')} statistics ready.")
 
     def _handle_cell_selection_error(
         self, generation: int, worker_key: tuple[str, str], exc
@@ -13558,16 +13903,26 @@ class ComparisonViewerController(AteraTranscriptMixin):
         except Exception as exc:
             log.debug("Could not draw cell boundary highlight: %s", exc)
 
+    @staticmethod
+    def _cell_link_segments(entry: dict, cap: int = CELL_LINKS_MAX_PER_CELL) -> np.ndarray:
+        """``(n, 2, 2)`` link segments of one cell, at most ``cap`` (evenly spaced, deterministic)."""
+        centroid_yx = entry.get("centroid_yx")
+        coords = entry.get("coords_yx")
+        if centroid_yx is None or coords is None or len(coords) == 0:
+            return np.empty((0, 2, 2), dtype=float)
+        coords = np.asarray(coords, dtype=float).reshape(-1, 2)
+        if len(coords) > cap:
+            coords = coords[np.linspace(0, len(coords) - 1, cap).round().astype(np.int64)]
+        segments = np.empty((len(coords), 2, 2), dtype=float)
+        segments[:, 0, :] = coords
+        segments[:, 1, 0] = float(centroid_yx[0])
+        segments[:, 1, 1] = float(centroid_yx[1])
+        return segments
+
     def _update_cell_links_layer(self, entries: list[dict]):
         lines: list[np.ndarray] = []
         for entry in entries:
-            centroid_yx = entry.get("centroid_yx")
-            coords = entry.get("coords_yx")
-            if centroid_yx is None or coords is None or len(coords) == 0:
-                continue
-            cy, cx = float(centroid_yx[0]), float(centroid_yx[1])
-            for y, x in np.asarray(coords, dtype=float):
-                lines.append(np.array([[float(y), float(x)], [cy, cx]], dtype=float))
+            lines.extend(self._cell_link_segments(entry))
         existing = self._get_layer_by_name(CELL_INSPECTOR_LINKS_LAYER)
         if not lines:
             if existing is not None:

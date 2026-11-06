@@ -50,9 +50,11 @@ from .atera_transcripts import (
     threshold_fraction,
 )
 from .transcript_cache import (
+    load_atera_cell_tiles,
     load_atera_code_map,
     load_atera_overview,
     load_atera_sample,
+    save_atera_cell_tiles,
     save_atera_overview,
     save_atera_sample,
 )
@@ -611,6 +613,8 @@ class AteraTranscriptMixin:
                         save_atera_sample(index, sample, cancel_check=cancel)
                 if overview.code_map is not None and engine.code_map is None:
                     engine.attach_code_map(overview.code_map)
+                if overview.cell_tiles is None:
+                    overview.cell_tiles = self._atera_restore_cell_tiles(ds, engine, cancel_token, report)
                 if cancel():
                     raise TranscriptBuildCancelled("Atera transcript load cancelled")
                 rows = (
@@ -675,6 +679,28 @@ class AteraTranscriptMixin:
             "analysis_id": "",
             "atera": context,
         }
+
+    def _atera_restore_cell_tiles(self, ds: str, engine, cancel_token, report):
+        """Worker thread: the cell -> tile map for an overview restored without one.
+
+        The sidecar first; else an assignment-only pass (about 3 s warm on the
+        real store), persisted for next time.  ``None`` without a validated
+        index (cell reads then use the cell's bounding box).
+        """
+        index = engine.index
+        cell_tiles = load_atera_cell_tiles(index)
+        if cell_tiles is not None or not getattr(index, "validated", False):
+            return cell_tiles
+        t0 = time.time()
+        cell_tiles = engine.build_cell_tile_map(cancel_token, progress=report("indexing cells"))
+        if cell_tiles is not None:
+            log.info(
+                "[%s] Atera cell -> tile map: %d cells, %d in more than one tile (%.1fs)",
+                ds, cell_tiles.n_cells, cell_tiles.n_straddling, time.time() - t0,
+            )
+            if not cancel_token.is_set():
+                save_atera_cell_tiles(index, cell_tiles, cancel_check=cancel_token.is_set)
+        return cell_tiles
 
     # -- install / teardown ---------------------------------------------
 

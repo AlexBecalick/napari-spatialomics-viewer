@@ -1010,6 +1010,10 @@ ATERA_CODE_MAP_CACHE_KIND = "atera_code_map"
 ATERA_CODE_MAP_CACHE_VERSION = 1
 _ATERA_OVERVIEW_DIR = f"atera-overview-v{ATERA_OVERVIEW_CACHE_VERSION}"
 _ATERA_CODE_MAP_DIR = f"atera-codemap-v{ATERA_CODE_MAP_CACHE_VERSION}"
+ATERA_CELL_TILES_CACHE_KIND = "atera_cell_tiles"
+ATERA_CELL_TILES_CACHE_VERSION = 1
+_ATERA_CELL_TILES_DIR = f"atera-celltiles-v{ATERA_CELL_TILES_CACHE_VERSION}"
+_CELL_TILE_ARRAYS = (("cell_ids", np.uint64), ("cell_ptr", np.int64), ("tile_index", np.int32))
 _CODE_MAP_ARRAYS = (
     ("code_ptr", np.int64),
     ("row_group", np.int32),
@@ -1241,6 +1245,73 @@ def load_atera_code_map(index: Any, cache_root: str | Path | None = None) -> Any
         return None
 
 
+def _cell_tile_arrays(cell_tiles: Any, prefix: str = "") -> dict[str, np.ndarray]:
+    return {
+        f"{prefix}{name}": np.asarray(getattr(cell_tiles, name), dtype=dtype)
+        for name, dtype in _CELL_TILE_ARRAYS
+    }
+
+
+def _restore_cell_tiles(
+    entry: Path, names: Mapping[str, Any], raw: Mapping[str, Any], index: Any, prefix: str = ""
+) -> Any:
+    from .atera_transcripts import CellTileMap
+
+    values = {
+        name: np.array(_load_array(entry, str(names[f"{prefix}{name}"]), ndim=1, dtype=dtype))
+        for name, dtype in _CELL_TILE_ARRAYS
+    }
+    cell_tiles = CellTileMap(
+        tiles=tuple(str(t) for t in raw.get(f"{prefix}tiles", ())),
+        fingerprint={str(k): int(v) for k, v in dict(raw.get(f"{prefix}fingerprint") or {}).items()},
+        **values,
+    )
+    if not cell_tiles.validate(index):
+        raise ValueError("cached cell -> tile map does not fit the points index")
+    return cell_tiles
+
+
+def _cell_tiles_address(index: Any, cache_root: str | Path | None) -> _AteraEntryAddress | None:
+    return _atera_address(index, cache_root, _ATERA_CELL_TILES_DIR, ATERA_CELL_TILES_CACHE_KIND, {})
+
+
+def save_atera_cell_tiles(
+    index: Any,
+    cell_tiles: Any,
+    cache_root: str | Path | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> Path | None:
+    """Persist a :class:`CellTileMap` as a small sidecar keyed by the points identity."""
+    if cell_tiles is None or not cell_tiles.validate(index):
+        return None
+    address = _cell_tiles_address(index, cache_root)
+    if address is None:
+        return None
+    manifest = {
+        "kind": ATERA_CELL_TILES_CACHE_KIND,
+        "version": ATERA_CELL_TILES_CACHE_VERSION,
+        "points_key": str(index.points_key),
+        "tiles": [str(t) for t in cell_tiles.tiles],
+        "fingerprint": {str(k): int(v) for k, v in dict(cell_tiles.fingerprint).items()},
+    }
+    return _write_atera_entry(address, manifest, _cell_tile_arrays(cell_tiles), cancel_check)
+
+
+def load_atera_cell_tiles(index: Any, cache_root: str | Path | None = None) -> Any:
+    """Restore the cell -> tile map sidecar for ``index``, or ``None``."""
+    found = _read_atera_entry(
+        _cell_tiles_address(index, cache_root), ATERA_CELL_TILES_CACHE_KIND, ATERA_CELL_TILES_CACHE_VERSION
+    )
+    if found is None:
+        return None
+    entry, raw = found
+    try:
+        return _restore_cell_tiles(entry, raw["arrays"], raw, index)
+    except Exception as exc:
+        log.warning("Ignoring invalid Atera cell -> tile map %s: %s", entry, exc)
+        return None
+
+
 def _overview_options(bin_um: float, sample_size: int, sample_seed: int, split_assigned: bool) -> dict[str, Any]:
     return {
         "bin_um": float(bin_um),
@@ -1297,6 +1368,11 @@ def save_atera_overview(
     if overview.sample is not None:
         for key, value in overview.sample.items():
             arrays[f"sample_{key}"] = np.asarray(value)
+    cell_tiles = getattr(overview, "cell_tiles", None)
+    if cell_tiles is not None and not cell_tiles.validate(index):
+        cell_tiles = None
+    if cell_tiles is not None:
+        arrays.update(_cell_tile_arrays(cell_tiles, prefix="cell_tiles_"))
     manifest = {
         "kind": ATERA_OVERVIEW_CACHE_KIND,
         "version": ATERA_OVERVIEW_CACHE_VERSION,
@@ -1312,10 +1388,16 @@ def save_atera_overview(
         "sample_keys": None if overview.sample is None else sorted(str(k) for k in overview.sample),
         "has_code_map": overview.code_map is not None,
         "is_gene_flags_used": bool(overview.is_gene_flags_used),
+        "has_cell_tiles": cell_tiles is not None,
     }
+    if cell_tiles is not None:
+        manifest["cell_tiles_tiles"] = [str(t) for t in cell_tiles.tiles]
+        manifest["cell_tiles_fingerprint"] = {str(k): int(v) for k, v in dict(cell_tiles.fingerprint).items()}
     path = _write_atera_entry(address, manifest, arrays, cancel_check)
     if path is not None and overview.code_map is not None:
         save_atera_code_map(index, overview.code_map, cache_root=cache_root, cancel_check=cancel_check)
+    if path is not None and cell_tiles is not None:
+        save_atera_cell_tiles(index, cell_tiles, cache_root=cache_root, cancel_check=cancel_check)
     return path
 
 
@@ -1366,6 +1448,12 @@ def load_atera_overview(
         code_map = None
         if raw.get("has_code_map"):
             code_map = _restore_code_map(entry, names, index, prefix="code_map_")
+        cell_tiles = None
+        if raw.get("has_cell_tiles"):
+            try:
+                cell_tiles = _restore_cell_tiles(entry, names, raw, index, prefix="cell_tiles_")
+            except Exception as exc:  # optional: per-cell reads fall back to boxes
+                log.warning("Ignoring the cell -> tile map of %s: %s", entry, exc)
         sample = None
         keys = raw.get("sample_keys")
         if keys is not None:
@@ -1390,6 +1478,7 @@ def load_atera_overview(
             sample_size=int(raw.get("sample_size", 0)),
             sample_seed=int(raw.get("sample_seed", 0)),
             is_gene_flags_used=bool(raw.get("is_gene_flags_used", False)),
+            cell_tiles=cell_tiles,
         )
     except Exception as exc:
         log.warning("Ignoring invalid Atera overview cache entry %s: %s", entry, exc)

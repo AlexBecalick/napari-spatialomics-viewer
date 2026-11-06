@@ -782,6 +782,148 @@ class _CodeMapBuilder:
 
 
 # ---------------------------------------------------------------------------
+# Cell -> tile map (per-cell reads)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class CellTileMap:
+    """Exact ``cell id -> tiles holding its assigned transcripts``.
+
+    On the real store about 1% of cells (907 of 91,429) have assigned
+    transcripts in more than one tile (at most 4), so a per-cell read must not
+    assume one tile.  The map is built in the overview pass (or by an
+    assignment-only pass) and lets a cell click read exactly those tiles; a
+    cell absent from the map has no assigned transcripts at all.
+    """
+
+    tiles: tuple[str, ...]
+    cell_ids: np.ndarray  # uint64, sorted, unique
+    cell_ptr: np.ndarray  # int64, n_cells + 1
+    tile_index: np.ndarray  # int32 into ``tiles``
+    fingerprint: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def n_cells(self) -> int:
+        return int(len(self.cell_ids))
+
+    @property
+    def tiles_per_cell(self) -> np.ndarray:
+        return np.diff(self.cell_ptr)
+
+    @property
+    def n_straddling(self) -> int:
+        """Cells with assigned transcripts in more than one tile."""
+        return int(np.count_nonzero(self.tiles_per_cell > 1))
+
+    def tiles_for(self, cell_id: int) -> tuple[str, ...]:
+        """Tiles holding ``cell_id``'s assigned transcripts (``()``: none)."""
+        try:
+            key = np.uint64(int(cell_id))
+        except (OverflowError, TypeError, ValueError):
+            return ()
+        pos = int(np.searchsorted(self.cell_ids, key))
+        if pos >= len(self.cell_ids) or self.cell_ids[pos] != key:
+            return ()
+        lo, hi = int(self.cell_ptr[pos]), int(self.cell_ptr[pos + 1])
+        return tuple(self.tiles[int(i)] for i in self.tile_index[lo:hi])
+
+    def validate(self, index: "AteraPointsIndex") -> bool:
+        """True when the map was built from ``index``'s files and is well formed."""
+        try:
+            if dict(self.fingerprint) != dict(index.fingerprint):
+                return False
+            if not set(self.tiles) <= set(index.tiles):
+                return False
+            if len(self.cell_ptr) != len(self.cell_ids) + 1 or self.cell_ptr[0] != 0:
+                return False
+            if self.cell_ptr[-1] != len(self.tile_index) or np.any(np.diff(self.cell_ptr) <= 0):
+                return False
+            if len(self.cell_ids) > 1 and np.any(np.diff(self.cell_ids.astype(np.uint64)) == 0):
+                return False
+            if len(self.cell_ids) > 1 and np.any(self.cell_ids[1:] < self.cell_ids[:-1]):
+                return False
+            if len(self.tile_index) and (self.tile_index.min() < 0 or self.tile_index.max() >= len(self.tiles)):
+                return False
+            return True
+        except (TypeError, ValueError, IndexError):
+            return False
+
+
+def _file_cell_ids(column: pa.ChunkedArray | pa.Array) -> np.ndarray:
+    """Distinct non-null, non-zero assignment ids of one column as uint64."""
+    unique = pc.unique(pc.drop_null(column))
+    if isinstance(unique, pa.ChunkedArray):
+        unique = unique.combine_chunks()
+    ids = np.asarray(unique.to_numpy(zero_copy_only=False)).astype(np.uint64, copy=False)
+    return ids[ids != 0]
+
+
+class _CellTileBuilder:
+    def __init__(self, index: "AteraPointsIndex") -> None:
+        self.index = index
+        self.tiles = index.tiles
+        self._tile_of = {name: i for i, name in enumerate(self.tiles)}
+        self.parts: list[tuple[np.ndarray, np.ndarray]] = []
+        self.enabled = bool(index.validated) and all(
+            f.tile is not None for f in index.files if f.n_rows > 0
+        )
+
+    def add(self, position: int, ids: np.ndarray | None) -> None:
+        if not self.enabled or ids is None or not len(ids):
+            return
+        tile = self._tile_of[self.index.files[position].tile]
+        ids = np.unique(np.asarray(ids, dtype=np.uint64))
+        self.parts.append((ids, np.full(len(ids), tile, dtype=np.int32)))
+
+    def finish(self) -> CellTileMap | None:
+        if not self.enabled:
+            return None
+        if self.parts:
+            ids = np.concatenate([p[0] for p in self.parts]).astype(np.uint64)
+            tiles = np.concatenate([p[1] for p in self.parts])
+        else:
+            ids = np.zeros(0, dtype=np.uint64)
+            tiles = np.zeros(0, dtype=np.int32)
+        self.parts.clear()
+        order = np.lexsort((tiles, ids))
+        ids, tiles = ids[order], tiles[order]
+        if len(ids):
+            keep = np.ones(len(ids), dtype=bool)
+            keep[1:] = (ids[1:] != ids[:-1]) | (tiles[1:] != tiles[:-1])
+            ids, tiles = ids[keep], tiles[keep]
+        starts = np.flatnonzero(np.r_[True, ids[1:] != ids[:-1]]) if len(ids) else np.zeros(0, dtype=np.int64)
+        cell_ids = ids[starts]
+        cell_ptr = np.r_[starts, len(ids)].astype(np.int64)
+        return CellTileMap(
+            tiles=tuple(self.tiles),
+            cell_ids=cell_ids.astype(np.uint64),
+            cell_ptr=cell_ptr,
+            tile_index=tiles.astype(np.int32),
+            fingerprint=dict(self.index.fingerprint),
+        )
+
+
+@dataclass
+class CellRows:
+    """The assigned transcripts of one cell (exact) and what reading them cost."""
+
+    cell_id: int
+    x: np.ndarray  # float32
+    y: np.ndarray  # float32
+    code: np.ndarray  # global codes
+    tiles: tuple[str, ...]
+    files_read: int = 0
+    row_groups_scanned: int = 0
+    row_groups_read: int = 0
+    used_cell_tiles: bool = False
+
+    @property
+    def n(self) -> int:
+        return int(len(self.x))
+
+
+# ---------------------------------------------------------------------------
 # Overview
 # ---------------------------------------------------------------------------
 
@@ -809,6 +951,8 @@ class AteraOverview:
     is_gene_flags_used: bool = False
     #: Whole-slide hash sample kept during the pass (``keep_threshold``); never cached here.
     hash_sample: "SampledTranscripts | None" = None
+    #: Cell -> tiles of its assigned transcripts (``None``: not built / no tiles).
+    cell_tiles: CellTileMap | None = None
 
     @property
     def density(self) -> np.ndarray:
@@ -1095,6 +1239,10 @@ class AteraTranscriptEngine:
     def __init__(self, index: AteraPointsIndex, code_map: CodeRangeMap | None = None) -> None:
         self.index = index
         self.code_map: CodeRangeMap | None = None
+        #: ``(size, mtime_ns)`` per file when the engine opened (stale-read guard).
+        self._file_stats: dict[int, tuple[int, int] | None] = {}
+        for item in index.files:
+            self._file_stats[item.position] = _stat_identity(item.path)
         if code_map is not None:
             self.attach_code_map(code_map)
 
@@ -1612,9 +1760,11 @@ class AteraTranscriptEngine:
         total = index.n_rows
         rate = 0.0 if sample_size <= 0 or total == 0 else min(1.0, float(sample_size) / float(total))
         builder = _CodeMapBuilder(index)
+        cell_builder = _CellTileBuilder(index)
         sample_parts: list[dict[str, np.ndarray]] = []
         has_is_gene = all(_column_index(m, IS_GENE_COLUMN) is not None for m in index.metadata) and bool(index.metadata)
         has_assignment = all(_column_index(m, ASSIGNMENT_COLUMN) is not None for m in index.metadata)
+        track_cells = has_assignment and cell_builder.enabled
         read_columns = [X_COLUMN, Y_COLUMN, GENE_COLUMN]
         if has_assignment:
             read_columns.append(ASSIGNMENT_COLUMN)
@@ -1634,6 +1784,7 @@ class AteraTranscriptEngine:
             runs = []
             samples = []
             kept: list[dict[str, np.ndarray]] = []
+            cell_ids: list[np.ndarray] = []
             nulls = 0
             metadata = index.metadata[position]
             assignment_index = _column_index(metadata, ASSIGNMENT_COLUMN)
@@ -1661,6 +1812,8 @@ class AteraTranscriptEngine:
                         ids = np.asarray(pc.fill_null(column, 0).to_numpy())
                         is_assigned &= ids != 0
                     np.add.at(f_assigned, run_codes, _run_sums(is_assigned, starts, ends, contiguous=valid is None))
+                    if track_cells:
+                        cell_ids.append(_file_cell_ids(column))
                 real = None
                 if has_is_gene:
                     flags = np.asarray(
@@ -1721,6 +1874,7 @@ class AteraTranscriptEngine:
                 "counts": f_counts, "assigned": f_assigned, "not_gene": f_not_gene,
                 "blocks": blocks, "a_blocks": a_blocks, "runs": runs, "samples": samples, "nulls": nulls,
                 "kept": kept,
+                "cell_ids": np.unique(np.concatenate(cell_ids)) if cell_ids else None,
             }
 
         done = 0
@@ -1741,6 +1895,7 @@ class AteraTranscriptEngine:
                 builder.add(global_rg, *runs)
             sample_parts.extend(result["samples"])
             kept_parts.extend(result["kept"])
+            cell_builder.add(_position, result["cell_ids"])
             done += 1
             if progress is not None:
                 progress(done, n_files)
@@ -1781,6 +1936,7 @@ class AteraTranscriptEngine:
             kept_parts.clear()
         code_map = builder.finish()
         self.attach_code_map(code_map)
+        cell_tiles = cell_builder.finish() if track_cells else None
         if int(counts.sum()) + null_rows != total:
             log.warning("[ATERA] Overview counted %d rows; the footers say %d.", int(counts.sum()) + null_rows, total)
         return AteraOverview(
@@ -1800,7 +1956,210 @@ class AteraTranscriptEngine:
             sample_seed=int(seed),
             is_gene_flags_used=bool(has_is_gene),
             hash_sample=hash_sample,
+            cell_tiles=cell_tiles,
         )
+
+
+    # -- per-cell reads ----------------------------------------------------
+
+    def files_changed(self, positions: Iterable[int]) -> bool:
+        """True when any of these files changed on disk since the engine opened."""
+        for position in positions:
+            if _stat_identity(self.index.files[position].path) != self._file_stats.get(position):
+                return True
+        return False
+
+    def build_cell_tile_map(
+        self, cancel: Any = None, progress: Callable[[int, int], None] | None = None
+    ) -> CellTileMap | None:
+        """An assignment-only pass building the :class:`CellTileMap` (or ``None``).
+
+        Used when a cached overview predates the map; it decodes one column
+        (about 2 s warm on the real store with the shared pool).
+        """
+        builder = _CellTileBuilder(self.index)
+        has_assignment = all(_column_index(m, ASSIGNMENT_COLUMN) is not None for m in self.index.metadata)
+        if not builder.enabled or not has_assignment:
+            return None
+
+        def work(position: int) -> np.ndarray | None:
+            parquet_file = self._parquet(position)
+            found = []
+            for rg in range(self.index.metadata[position].num_row_groups):
+                table = _read_row_group(parquet_file, rg, [ASSIGNMENT_COLUMN])
+                found.append(_file_cell_ids(table.column(0)))
+            return np.unique(np.concatenate(found)) if found else None
+
+        done = 0
+        n_files = len(self.index.files)
+
+        def consume(position: int, ids: np.ndarray | None) -> None:
+            nonlocal done
+            builder.add(position, ids)
+            done += 1
+            if progress is not None:
+                progress(done, n_files)
+
+        _map_files(work, range(n_files), cancel, consume)
+        return builder.finish()
+
+    def read_cell(
+        self,
+        cell_id: Any,
+        bounds_um: Sequence[float] | None = None,
+        *,
+        cell_tiles: CellTileMap | None = None,
+        cancel: Any = None,
+    ) -> CellRows | None:
+        """Every transcript assigned to ``cell_id``, in two phases per file.
+
+        Phase 1 decodes only ``original_assignment`` of the cell's files and
+        finds the matching rows; phase 2 reads ``x``, ``y`` and
+        ``feature_name`` of just the row groups with hits and takes those rows.
+        The files are the tiles of a valid ``cell_tiles`` map (exact), else
+        the tiles whose box meets ``bounds_um = (xmin, ymin, xmax, ymax)``.
+
+        ``None`` when the read cannot be exact: no validated index, no
+        assignment column, neither a map nor bounds, or a file changed on disk
+        since the engine opened (a stale index).
+        """
+        index = self.index
+        if not index.validated:
+            return None
+        if not all(_column_index(m, ASSIGNMENT_COLUMN) is not None for m in index.metadata):
+            return None
+        try:
+            cid = int(cell_id)
+        except (TypeError, ValueError, OverflowError):
+            try:
+                cid = int(float(str(cell_id)))
+            except (TypeError, ValueError, OverflowError):
+                return None
+        used_map = False
+        if cell_tiles is not None and cell_tiles.validate(index):
+            used_map = True
+            tiles = cell_tiles.tiles_for(cid)
+            wanted = set(tiles)
+            positions = [f.position for f in index.files if f.n_rows > 0 and f.tile in wanted]
+        else:
+            if cell_tiles is not None:
+                log.warning("[ATERA] Ignoring a cell -> tile map that does not fit the points index.")
+            if bounds_um is None:
+                return None
+            positions = self.files_in_window(bounds_um)
+            tiles = tuple(dict.fromkeys(
+                index.files[p].tile for p in positions if index.files[p].tile is not None
+            ))
+        if self.files_changed(positions):
+            log.warning("[ATERA] Points files changed since the store was opened; not reading cell %s.", cid)
+            return None
+        empty = CellRows(
+            cell_id=cid,
+            x=np.zeros(0, dtype=np.float32),
+            y=np.zeros(0, dtype=np.float32),
+            code=np.zeros(0, dtype=index.code_dtype),
+            tiles=tuple(tiles),
+            used_cell_tiles=used_map,
+        )
+        if cid <= 0 or cid > np.iinfo(np.uint64).max or not positions:
+            return empty
+
+        def work(position: int) -> tuple[list[dict[str, np.ndarray]], int, int]:
+            parquet_file = self._parquet(position)
+            metadata = index.metadata[position]
+            column_index = _column_index(metadata, ASSIGNMENT_COLUMN)
+            hits: list[tuple[int, np.ndarray]] = []
+            scanned = 0
+            for rg in range(metadata.num_row_groups):
+                group = metadata.row_group(rg)
+                if group.num_rows == 0:
+                    continue
+                stats = group.column(column_index).statistics if column_index is not None else None
+                if stats is not None and stats.has_min_max:
+                    try:
+                        if cid < int(stats.min) or cid > int(stats.max):
+                            continue
+                    except (TypeError, ValueError):
+                        pass
+                scanned += 1
+                column = _read_row_group(parquet_file, rg, [ASSIGNMENT_COLUMN]).column(0)
+                try:
+                    target = pa.scalar(cid, type=column.type)
+                except (OverflowError, pa.ArrowInvalid, pa.ArrowTypeError):
+                    continue
+                mask = pc.fill_null(pc.equal(column, target), False)
+                rows = np.flatnonzero(np.asarray(mask.to_numpy(zero_copy_only=False), dtype=bool))
+                if len(rows):
+                    hits.append((rg, rows))
+            out = []
+            for rg, rows in hits:
+                table = _read_row_group(parquet_file, rg, [X_COLUMN, Y_COLUMN, GENE_COLUMN]).take(pa.array(rows))
+                codes = index.global_codes(position, table.column(GENE_COLUMN))
+                keep = codes >= 0
+                out.append({
+                    "x": np.asarray(table.column(X_COLUMN).to_numpy(), dtype=np.float32)[keep],
+                    "y": np.asarray(table.column(Y_COLUMN).to_numpy(), dtype=np.float32)[keep],
+                    "code": codes[keep].astype(index.code_dtype),
+                })
+            return out, scanned, len(hits)
+
+        parts: list[dict[str, np.ndarray]] = []
+        totals = [0, 0]
+
+        def consume(_position: int, result) -> None:
+            found, scanned, read = result
+            parts.extend(found)
+            totals[0] += scanned
+            totals[1] += read
+
+        try:
+            _map_files(work, positions, cancel, consume)
+        except (OSError, pa.ArrowException) as exc:
+            log.warning("[ATERA] Reading cell %s failed (stale points?): %s", cid, exc)
+            return None
+        if parts:
+            empty.x = np.concatenate([p["x"] for p in parts])
+            empty.y = np.concatenate([p["y"] for p in parts])
+            empty.code = np.concatenate([p["code"] for p in parts])
+        empty.files_read = len(positions)
+        empty.row_groups_scanned = totals[0]
+        empty.row_groups_read = totals[1]
+        return empty
+
+
+def _stat_identity(path: Path) -> tuple[int, int] | None:
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return int(stat.st_size), int(stat.st_mtime_ns)
+
+
+def indexed_cell_transcripts(
+    engine: AteraTranscriptEngine,
+    cell_id: Any,
+    bounds_um: Sequence[float] | None = None,
+    *,
+    cell_tiles: CellTileMap | None = None,
+    cancel: Any = None,
+):
+    """A one-cell :class:`~.utils.CellTranscriptIndex` from :meth:`AteraTranscriptEngine.read_cell`.
+
+    ``None`` when the exact read is unavailable (see ``read_cell``); the
+    caller then shows the table counts only.
+    """
+    from .utils import cell_transcript_index_from_arrays
+
+    rows = engine.read_cell(cell_id, bounds_um, cell_tiles=cell_tiles, cancel=cancel)
+    if rows is None:
+        return None
+    return cell_transcript_index_from_arrays(
+        np.full(rows.n, rows.cell_id, dtype=np.uint64),
+        rows.x,
+        rows.y,
+        rows.code,
+        engine.index.vocabulary,
+    )
 
 
 def _row_group_meets(metadata: pq.FileMetaData, rg: int, rect: Sequence[float]) -> bool:
