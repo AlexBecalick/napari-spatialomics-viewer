@@ -407,6 +407,8 @@ def test_registration_mode_toggles_panel_tools(qapp):
         panel._load_registration_button,
         panel._load_paired_side_button,
         panel._load_standalone_merscope_button,
+        panel._load_standalone_xenium_button,
+        panel._load_standalone_atera_button,
     ):
         assert button.isEnabled()
     assert sentinel.isEnabled()
@@ -524,6 +526,7 @@ def test_standalone_loader_ignores_pending_result(qapp, tmp_path, monkeypatch):
     monkeypatch.setattr(panel, "_browse_zarr", lambda _title: str(tmp_path / "s.zarr"))
     panel._load_standalone_merscope_button.click()
     panel._load_standalone_xenium_button.click()
+    panel._load_standalone_atera_button.click()
     assert panel.recent_datasets == []
 
 
@@ -551,6 +554,18 @@ def test_standalone_load_redirects_registration_store(qapp, tmp_path, monkeypatc
     monkeypatch.setattr(ctrl, "_replace_datasets", lambda *_a, **_k: True)
     assert ctrl.load_standalone_dataset("MERSCOPE", plain) is True
     assert recorded == [store]
+
+    # ATERA requests redirect too, and the redirect runs before platform detection:
+    # a registration store that also says merxen_schema.platform=ATERA still redirects.
+    monkeypatch.setattr(ctrl, "_replace_datasets", forbidden)
+    assert ctrl.load_standalone_dataset("ATERA", store) is None
+    assert recorded == [store, store]
+    tagged = _registration_store_dir(tmp_path / "tagged")
+    meta = json.loads((tagged / "zarr.json").read_text())
+    meta["attributes"]["merxen_schema"] = {"platform": "ATERA"}
+    (tagged / "zarr.json").write_text(json.dumps(meta))
+    assert ctrl.load_standalone_dataset("XENIUM", tagged) is None
+    assert recorded == [store, store, tagged]
 
 
 def test_standalone_load_keeps_unsaved_registration_session(qapp, tmp_path, monkeypatch):
@@ -989,6 +1004,11 @@ def test_parse_args_registration_store(monkeypatch):
     assert V.parse_args().registration_store is None
     monkeypatch.setattr(
         sys, "argv", ["prog", "--registration-store", "s.zarr", "--merscope-zarr", "m.zarr"]
+    )
+    with pytest.raises(SystemExit):
+        V.parse_args()
+    monkeypatch.setattr(
+        sys, "argv", ["prog", "--registration-store", "s.zarr", "--atera-zarr", "a.zarr"]
     )
     with pytest.raises(SystemExit):
         V.parse_args()

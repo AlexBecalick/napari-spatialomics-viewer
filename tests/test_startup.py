@@ -64,6 +64,7 @@ def test_parse_args_allows_launch_without_dataset(monkeypatch):
 
     assert args.merscope_zarr is None
     assert args.xenium_zarr is None
+    assert args.atera_zarr is None
     assert args.background_io_workers == 2
     assert args.session_cache_gb is None
     assert args.disable_async_slicing is False

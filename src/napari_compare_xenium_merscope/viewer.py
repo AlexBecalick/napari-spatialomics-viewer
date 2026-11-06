@@ -159,7 +159,19 @@ except Exception:  # pragma: no cover - depends on the installed napari runtime
 
 from .manual_registration_controller import REGISTRATION_DATASET, ManualRegistrationController
 from .manual_registration_model import LAYER_METADATA_KEY, STORE_ATTR
-from .platforms import find_platform_spec
+from .platforms import (
+    ATERA,
+    MERSCOPE,
+    PAIRED_PLATFORMS,
+    PIXEL_TRANSFORM_MERSCOPE_AFFINE,
+    PIXEL_TRANSFORM_SPEC_FILE,
+    XENIUM,
+    detect_store_platform,
+    find_platform_spec,
+    find_spec_path,
+    standalone_platforms,
+    supported_platforms,
+)
 from .manual_registration_store import (
     StoreBusyError,
     read_root_attrs,
@@ -313,10 +325,80 @@ logging.getLogger("ome_zarr.reader").addFilter(_OmeZarrLabelParentWarningFilter(
 
 @dataclass(frozen=True)
 class DatasetConfig:
+    """One dataset the viewer can open.
+
+    ``name`` is the presentation/dataset key (a platform name for every store the
+    loader opens). ``platform`` names the registry platform when it differs from
+    or is not implied by ``name``. ``spec_path`` is the pixel-size sidecar for
+    spec-file platforms; ``xenium_spec_path`` stays as the XENIUM compatibility
+    alias and feeds ``spec_path`` for XENIUM.
+    """
+
     name: str
     zarr_path: Path
     merscope_transform_path: Path | None = None
     xenium_spec_path: Path | None = None
+    platform: str | None = None
+    spec_path: Path | None = None
+
+    @property
+    def effective_platform(self) -> str:
+        """The registry platform this dataset is opened as (``platform``, else ``name``)."""
+        return str(self.platform or self.name).upper()
+
+
+def dataset_config_for(platform: str, zarr_path: Path, args=None) -> DatasetConfig:
+    """Build a :class:`DatasetConfig` applying only ``platform``'s own CLI overrides.
+
+    ``--merscope-transform-path`` applies to MERSCOPE, ``--xenium-spec-path`` to
+    XENIUM and ``--atera-spec-path`` to ATERA, so a Xenium spec never scales an
+    Atera store.
+    """
+    platform = str(platform).upper()
+    zarr_path = Path(zarr_path)
+    merscope_transform_path = getattr(args, "merscope_transform_path", None)
+    xenium_spec_path = getattr(args, "xenium_spec_path", None)
+    atera_spec_path = getattr(args, "atera_spec_path", None)
+    if platform == MERSCOPE:
+        return DatasetConfig(
+            name=platform,
+            zarr_path=zarr_path,
+            merscope_transform_path=merscope_transform_path,
+            platform=platform,
+        )
+    if platform == XENIUM:
+        return DatasetConfig(
+            name=platform,
+            zarr_path=zarr_path,
+            xenium_spec_path=xenium_spec_path,
+            platform=platform,
+            spec_path=xenium_spec_path,
+        )
+    if platform == ATERA:
+        return DatasetConfig(
+            name=platform,
+            zarr_path=zarr_path,
+            platform=platform,
+            spec_path=atera_spec_path,
+        )
+    return DatasetConfig(
+        name=platform,
+        zarr_path=zarr_path,
+        merscope_transform_path=merscope_transform_path,
+        xenium_spec_path=xenium_spec_path,
+    )
+
+
+def platform_display_name(platform: str) -> str:
+    """Registry display name for ``platform`` (the name itself when unknown)."""
+    spec = find_platform_spec(platform)
+    return spec.display_name if spec is not None else str(platform)
+
+
+def uses_lazy_transcripts(platform: object) -> bool:
+    """Whether ``platform`` must never build the eager whole-store transcript index."""
+    spec = find_platform_spec(platform)
+    return bool(spec is not None and spec.lazy_transcripts)
 
 
 @dataclass
@@ -1326,8 +1408,12 @@ class ViewerControlPanel(QWidget):
         umap_widget=None,
         load_registration_callback=None,
         registration_widget=None,
+        standalone_platform_callback=None,
     ):
         super().__init__()
+        # Returns the effective platform of the last standalone load (the controller
+        # re-labels a store on authoritative detection); recents record that one.
+        self._standalone_platform_callback = standalone_platform_callback
         self._gene_inspector_widget = gene_inspector_widget
         self._cell_type_widget = cell_type_widget
         self._umap_widget = umap_widget
@@ -1409,10 +1495,19 @@ class ViewerControlPanel(QWidget):
                 ViewMode.STACKED_OVERLAY
             )
         )
-        self._load_standalone_merscope_button = QPushButton("Load new standalone MERSCOPE dataset")
-        self._load_standalone_merscope_button.clicked.connect(self._on_load_standalone_merscope)
-        self._load_standalone_xenium_button = QPushButton("Load new standalone Xenium dataset")
-        self._load_standalone_xenium_button.clicked.connect(self._on_load_standalone_xenium)
+        # One loader button per standalone platform, in registry order.
+        self._load_standalone_buttons: dict[str, QPushButton] = {}
+        for standalone_platform in standalone_platforms():
+            button = QPushButton(
+                f"Load new standalone {platform_display_name(standalone_platform)} dataset"
+            )
+            button.clicked.connect(
+                lambda _checked=False, name=standalone_platform: self._on_load_standalone(name)
+            )
+            self._load_standalone_buttons[standalone_platform] = button
+        self._load_standalone_merscope_button = self._load_standalone_buttons[MERSCOPE]
+        self._load_standalone_xenium_button = self._load_standalone_buttons[XENIUM]
+        self._load_standalone_atera_button = self._load_standalone_buttons[ATERA]
         self._load_registration_button = QPushButton("Load image data")
         self._load_registration_button.setToolTip(
             "Open a MerXen manual-registration store: <id>_prepared.zarr to place landmarks, "
@@ -1728,8 +1823,8 @@ class ViewerControlPanel(QWidget):
         layout.addWidget(QLabel("Open a different dataset"))
         layout.addWidget(self._load_paired_side_button)
         layout.addWidget(self._load_paired_overlay_button)
-        layout.addWidget(self._load_standalone_merscope_button)
-        layout.addWidget(self._load_standalone_xenium_button)
+        for button in self._load_standalone_buttons.values():
+            layout.addWidget(button)
         layout.addSpacing(10)
         layout.addWidget(QLabel("Paired dataset layout"))
         layout.addWidget(self._switch_side_by_side_button)
@@ -1980,7 +2075,7 @@ class ViewerControlPanel(QWidget):
             platform = str(entry.get("platform", "")).upper()
             path = str(entry.get("path", "")).strip()
             identity = ("standalone", path)
-            if platform not in {"MERSCOPE", "XENIUM"} or not path or identity in seen:
+            if platform not in standalone_platforms() or not path or identity in seen:
                 continue
             seen.add(identity)
             cleaned.append({"platform": platform, "path": path})
@@ -2010,7 +2105,7 @@ class ViewerControlPanel(QWidget):
                 f"{ViewerControlPanel._recent_path_label(Path(entry['path']))}"
             )
         return (
-            f"{entry['platform']} — "
+            f"{platform_display_name(entry['platform'])} — "
             f"{ViewerControlPanel._recent_path_label(Path(entry['path']))}"
         )
 
@@ -2255,29 +2350,35 @@ class ViewerControlPanel(QWidget):
             return
         self.set_paired_view_mode(mode)
 
-    def _on_load_standalone_merscope(self):
+    def _effective_standalone_platform(self, requested: str) -> str:
+        """Platform the last standalone load opened as (falls back to ``requested``)."""
+        callback = self._standalone_platform_callback
+        effective = callback() if callback is not None else None
+        if effective and str(effective).upper() in standalone_platforms():
+            return str(effective).upper()
+        return str(requested).upper()
+
+    def _on_load_standalone(self, platform: str):
+        platform = str(platform).upper()
         path = self._browse_zarr(
-            "Select the spatialdata.zarr folder for the MERSCOPE dataset"
+            f"Select the spatialdata.zarr folder for the {platform_display_name(platform)} dataset"
         )
         if not path:
             return
-        result = self._load_standalone_callback("MERSCOPE", path)
+        result = self._load_standalone_callback(platform, path)
         if result is False or result is None:
             return
-        self.record_recent_dataset("MERSCOPE", path)
+        self.record_recent_dataset(self._effective_standalone_platform(platform), path)
         self.dataset_open_requested.emit()
 
+    def _on_load_standalone_merscope(self):
+        self._on_load_standalone(MERSCOPE)
+
     def _on_load_standalone_xenium(self):
-        path = self._browse_zarr(
-            "Select the spatialdata.zarr folder for the Xenium dataset"
-        )
-        if not path:
-            return
-        result = self._load_standalone_callback("XENIUM", path)
-        if result is False or result is None:
-            return
-        self.record_recent_dataset("XENIUM", path)
-        self.dataset_open_requested.emit()
+        self._on_load_standalone(XENIUM)
+
+    def _on_load_standalone_atera(self):
+        self._on_load_standalone(ATERA)
 
     def _on_recent_dataset_selection_changed(self, current, _previous):
         self._open_recent_dataset_button.setEnabled(
@@ -2323,7 +2424,7 @@ class ViewerControlPanel(QWidget):
         result = self._load_standalone_callback(platform, path)
         if result is False or result is None:
             return
-        self.record_recent_dataset(platform, path)
+        self.record_recent_dataset(self._effective_standalone_platform(platform), path)
         self.dataset_open_requested.emit()
 
     def _on_load_selected_labels(self):
@@ -4985,6 +5086,8 @@ class ComparisonViewerController:
         self._registration_widget = None
         self._registration_workers: dict[str, object] = {}
         self._registration_worker_tokens: dict[str, Event] = {}
+        #: Effective platform of the last standalone load (after authoritative detection).
+        self.last_standalone_platform: str | None = None
         self._registration_progress_keys: set[str] = set()
         #: staging dataset key -> store path, used while a registration store is read on a worker
         self._registration_store_paths: dict[str, Path] = {}
@@ -5684,17 +5787,45 @@ class ComparisonViewerController:
         for layer in list(self.viewer.layers):
             self.viewer.layers.remove(layer)
 
+    @staticmethod
+    def _config_platform(ds: str, cfg: DatasetConfig | None) -> str:
+        """Registry platform a dataset is opened as (its config's, else the dataset name)."""
+        platform = getattr(cfg, "platform", None) if cfg is not None else None
+        return str(platform or ds or "").upper()
+
+    def _dataset_platform_spec(self, ds: str | None):
+        """Registry spec for dataset ``ds`` (``None`` for unknown/test names)."""
+        if ds is None:
+            return None
+        cfg = (self.datasets or {}).get(str(ds).upper()) if isinstance(self.datasets, dict) else None
+        return find_platform_spec(self._config_platform(str(ds), cfg))
+
+    def _uses_lazy_cell_queries(self, ds: str | None) -> bool:
+        """Whether ``ds`` must never build eager transcript groups or whole-store cell scans."""
+        spec = self._dataset_platform_spec(ds)
+        return bool(spec is not None and spec.lazy_transcripts)
+
     def _resolve_optional_transform_paths(self, ds: str, cfg: DatasetConfig) -> tuple[Path | None, Path | None]:
         """Resolve optional transform/spec paths from explicit args or common defaults.
 
         MERSCOPE: an existing explicit CSV wins, then a CSV inside the zarr, then
         one beside it. ``None`` lets :func:`resolve_dataset_mask_affine` fall
         back to the store's own ``merscope_cell_boundaries`` transform.
-        """
-        merscope_transform_path = cfg.merscope_transform_path
-        xenium_spec_path = cfg.xenium_spec_path
 
-        if ds == "MERSCOPE":
+        Spec-file platforms (XENIUM, ATERA): the explicit spec path wins
+        (``spec_path``, or ``xenium_spec_path`` for XENIUM), else
+        :func:`find_spec_path` looks in the zarr and then beside it. Returns
+        ``(merscope_transform_path, spec_path)``.
+        """
+        platform = self._config_platform(ds, cfg)
+        spec = find_platform_spec(platform)
+        merscope_transform_path = cfg.merscope_transform_path
+        spec_path = getattr(cfg, "spec_path", None)
+        if spec_path is None and (spec is None or spec.name == XENIUM):
+            spec_path = cfg.xenium_spec_path
+        xenium_spec_path = spec_path
+
+        if spec is not None and spec.pixel_transform == PIXEL_TRANSFORM_MERSCOPE_AFFINE:
             if merscope_transform_path is not None and not Path(merscope_transform_path).exists():
                 log.warning(
                     "[MERSCOPE] Transform file %s does not exist; looking beside the zarr instead.",
@@ -5707,15 +5838,12 @@ class ComparisonViewerController:
                         merscope_transform_path = candidate
                         break
 
-        if ds == "XENIUM" and xenium_spec_path is None:
-            candidates = [
-                cfg.zarr_path / "experiment.xenium",
-                cfg.zarr_path.parent / "experiment.xenium",
-            ]
-            for candidate in candidates:
-                if candidate.exists():
-                    xenium_spec_path = candidate
-                    break
+        if (
+            spec is not None
+            and spec.pixel_transform == PIXEL_TRANSFORM_SPEC_FILE
+            and xenium_spec_path is None
+        ):
+            xenium_spec_path = find_spec_path(cfg.zarr_path, spec.name)
 
         return merscope_transform_path, xenium_spec_path
 
@@ -5723,12 +5851,13 @@ class ComparisonViewerController:
         self, ds: str, cfg: DatasetConfig
     ) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
         """Pixel->micron transform used to place this dataset's images and labels."""
-        ms_tf_path, xe_spec_path = self._resolve_optional_transform_paths(ds, cfg)
+        ms_tf_path, spec_path = self._resolve_optional_transform_paths(ds, cfg)
+        platform = self._config_platform(ds, cfg)
         return resolve_dataset_mask_affine(
-            ds,
+            platform if find_platform_spec(platform) is not None else ds,
             merscope_transform_path=ms_tf_path,
-            xenium_spec_path=xe_spec_path,
-            zarr_path=cfg.zarr_path if ds == "MERSCOPE" else None,
+            spec_path=spec_path,
+            zarr_path=cfg.zarr_path,
         )
 
     def _remove_layer_by_name(self, layer_name: str):
@@ -6540,12 +6669,7 @@ class ComparisonViewerController:
         return True
 
     def _build_dataset_config(self, platform: str, zarr_path: Path) -> DatasetConfig:
-        return DatasetConfig(
-            name=platform,
-            zarr_path=zarr_path,
-            merscope_transform_path=getattr(self.args, "merscope_transform_path", None),
-            xenium_spec_path=getattr(self.args, "xenium_spec_path", None),
-        )
+        return dataset_config_for(platform, zarr_path, self.args)
 
     @staticmethod
     def _paired_image_slots(
@@ -7272,6 +7396,13 @@ class ComparisonViewerController:
                 if not path.exists():
                     raise FileNotFoundError(f"{label} zarr path not found: {path}")
                 validate_spatialdata_store_compatibility(path)
+                # Refuse an authoritatively non-matching store before anything
+                # pending is cancelled: a refused request is a no-op.
+                refusal = self._paired_slot_refusal(label.upper(), path)
+                if refusal is not None:
+                    self._set_status(refusal)
+                    log.warning("Refused paired load: %s", refusal)
+                    return False
             datasets = {
                 "MERSCOPE": self._build_dataset_config("MERSCOPE", merscope_path),
                 "XENIUM": self._build_dataset_config("XENIUM", xenium_path),
@@ -7327,14 +7458,21 @@ class ComparisonViewerController:
         return None
 
     def load_standalone_dataset(self, platform: str, path):
-        """Open a single MERSCOPE or Xenium store browsed from the loader tab."""
+        """Open a single store browsed from the loader tab (MERSCOPE, Xenium or Atera).
+
+        Order: validate, then the manual-registration redirect, then platform
+        detection. Only authoritative detection (``merxen_schema.platform`` or
+        ``merxen_native_latest.json``) re-labels a store; heuristics never
+        override the requested platform. The effective platform is recorded on
+        :attr:`last_standalone_platform`. Returns the ``_replace_datasets``
+        result, ``None`` for a registration redirect, or ``False`` when refused.
+        """
         platform = str(platform).upper()
         try:
             path = Path(path)
             if not path.exists():
                 raise FileNotFoundError(f"{platform} zarr path not found: {path}")
             validate_spatialdata_store_compatibility(path)
-            datasets = {platform: self._build_dataset_config(platform, path)}
         except Exception as exc:
             self._set_status(f"Could not open {platform} dataset: {exc}")
             log.exception("Failed to open standalone %s dataset", platform)
@@ -7349,10 +7487,72 @@ class ComparisonViewerController:
                 "opening it in the Manual registration tab."
             )
             return self.load_registration_store(path)
+        detected_message = None
+        try:
+            detection = detect_store_platform(path)
+        except Exception as exc:  # detection is advisory; never block a load on it
+            log.warning("Could not detect the platform of %s (%s)", path, exc)
+            detection = None
+        if (
+            detection is not None
+            and detection.authoritative
+            and detection.platform is not None
+            and detection.platform != platform
+        ):
+            log.warning(
+                "Store %s was requested as %s but its metadata says %s (%s); opening it as %s.",
+                path,
+                platform,
+                detection.platform,
+                "; ".join(detection.evidence),
+                detection.platform,
+            )
+            platform = detection.platform
+            detected_message = (
+                f"Detected {platform_display_name(platform)} store; opening as {platform}."
+            )
+        if platform not in standalone_platforms():
+            self._set_status(
+                f"Could not open {platform} dataset: standalone viewing supports "
+                + ", ".join(platform_display_name(name) for name in standalone_platforms())
+                + "."
+            )
+            return False
         if not self._confirm_leave_registration():
             self._set_status("Kept the current registration session (unsaved changes).")
             return False
+        if detected_message is not None:
+            self._set_status(detected_message)
+        datasets = {platform: self._build_dataset_config(platform, path)}
+        self.last_standalone_platform = platform
         return self._replace_datasets(datasets, initial=platform)
+
+    def _paired_slot_refusal(self, slot_platform: str, path: Path) -> str | None:
+        """Status text refusing ``path`` in the ``slot_platform`` paired slot, or ``None``.
+
+        Only authoritative detection refuses: an Atera store (standalone only)
+        or a store of the other paired role. Heuristic or no evidence passes;
+        the paired data contract stays the backstop.
+        """
+        try:
+            detection = detect_store_platform(path)
+        except Exception as exc:
+            log.warning("Could not detect the platform of %s (%s)", path, exc)
+            return None
+        if not detection.authoritative or detection.platform is None:
+            return None
+        if detection.platform == slot_platform:
+            return None
+        if detection.platform not in PAIRED_PLATFORMS:
+            return (
+                f"{platform_display_name(detection.platform)} stores open standalone only; "
+                "paired viewing supports MERSCOPE + Xenium "
+                f"({path.name} was given as the {platform_display_name(slot_platform)} store)."
+            )
+        return (
+            f"{path.name} is a {platform_display_name(detection.platform)} store but was given "
+            f"as the {platform_display_name(slot_platform)} store of the pair."
+        )
 
     # -- Manual registration host --------------------------------------------------------------
     def load_registration_store(self, path):
@@ -8374,6 +8574,15 @@ class ComparisonViewerController:
             and self._label_cache_matches_pixel_transform(label_key)
         )
 
+    def _active_pixel_transform_is_merscope_affine(self) -> bool:
+        """Whether the active dataset places pixels through the MERSCOPE affine.
+
+        Only that transform changes source (CSV vs. the store's own transform vs.
+        the fallback), so only it can leave a cached label raster misplaced.
+        """
+        spec = self._dataset_platform_spec(self.active_dataset)
+        return spec is not None and spec.pixel_transform == PIXEL_TRANSFORM_MERSCOPE_AFFINE
+
     def _label_cache_matches_pixel_transform(self, label_key: str) -> bool:
         """Whether a cached label raster still lines up with the current transform.
 
@@ -8389,7 +8598,7 @@ class ComparisonViewerController:
         matches and is never rebuilt on the MERSCOPE grid.
         """
         sdata = self._active_sdata
-        if str(self.active_dataset or "").upper() != "MERSCOPE":
+        if not self._active_pixel_transform_is_merscope_affine():
             return True
         if sdata is None or self._x_transform is None or self._y_transform is None:
             return True
@@ -8427,7 +8636,7 @@ class ComparisonViewerController:
         (see :meth:`_label_cache_matches_pixel_transform`) leaves them with a
         transformation that no longer matches.
         """
-        if str(self.active_dataset or "").upper() != "MERSCOPE":
+        if not self._active_pixel_transform_is_merscope_affine():
             return True
         try:
             cache_affine = self._napari_affine_from_element(sdata.labels[cache_key])
@@ -10310,6 +10519,14 @@ class ComparisonViewerController:
             self._set_status(f"Could not activate dataset {dataset_name}.")
             return
         ds = str(dataset_name).upper()
+        if self._uses_lazy_cell_queries(ds):
+            # The eager build would stream every transcript row of an Atera store
+            # (~1.4e9) and the marker-reference lookup would read the whole table X.
+            self._set_status(
+                f"{platform_display_name(self._config_platform(ds, self.datasets.get(ds)))} "
+                "transcripts: lazy engine not available yet"
+            )
+            return
         session = self._dataset_sessions.get(ds)
         self._publish_transcript_sources()
         if (reuse_cached and session is not None and session.gene_payload is not None
@@ -11513,7 +11730,13 @@ class ComparisonViewerController:
         Cellpose/in-mask counts have no probabilistic assignment column. Their
         transcripts are the measured points inside that mask, including points
         assigned elsewhere by ProSeg.
+
+        Lazy-transcript platforms (ATERA) get an empty index: both the
+        assignment filter and the polygon fallback would scan every transcript
+        row of the store.
         """
+        if self._uses_lazy_cell_queries(ds):
+            return self._empty_cell_transcript_index()
         source, analysis = self._inspection_identity(ds)
         cache_key = (str(ds).upper(), source, analysis, normalize_cell_key(cell_id))
         if not hasattr(self, "_inspection_indexes"):
@@ -15545,13 +15768,85 @@ def request_gl_core_profile() -> None:
         log.warning("Could not request an OpenGL core profile (%s)", exc)
 
 
+def startup_dataset_configs(args) -> dict[str, DatasetConfig]:
+    """``{platform: DatasetConfig}`` for the ``--<platform>-zarr`` flags, in registry order."""
+    datasets: dict[str, DatasetConfig] = {}
+    for platform in supported_platforms():
+        zarr_path = getattr(args, f"{platform.lower()}_zarr", None)
+        if zarr_path is not None:
+            datasets[platform] = dataset_config_for(platform, Path(zarr_path), args)
+    return datasets
+
+
+def apply_startup_store_detection(
+    datasets: dict[str, DatasetConfig],
+    args,
+    *,
+    paired: bool,
+) -> tuple[dict[str, DatasetConfig], str | None]:
+    """Check each CLI store against its authoritative platform metadata.
+
+    Returns the (possibly re-labelled) configs and the initial dataset name.
+    A standalone startup store whose ``merxen_schema.platform`` /
+    ``merxen_native_latest.json`` names another platform is re-labelled to it
+    (with a warning), unless that platform is already supplied. A paired
+    startup only warns: :meth:`ComparisonViewerController.load_paired_dataset`
+    refuses an authoritatively mismatched slot. Heuristic evidence never
+    changes anything.
+    """
+    initial = getattr(args, "initial_dataset", None)
+    out: dict[str, DatasetConfig] = {}
+    for name, cfg in datasets.items():
+        try:
+            detection = detect_store_platform(cfg.zarr_path)
+        except Exception as exc:
+            log.warning("Could not detect the platform of %s (%s)", cfg.zarr_path, exc)
+            out[name] = cfg
+            continue
+        detected = detection.platform
+        if not detection.authoritative or detected is None or detected == name:
+            out[name] = cfg
+            continue
+        if paired or detected in datasets or detected in out:
+            log.warning(
+                "%s was given as the %s store but its metadata says %s (%s).",
+                cfg.zarr_path,
+                name,
+                detected,
+                "; ".join(detection.evidence),
+            )
+            out[name] = cfg
+            continue
+        log.warning(
+            "%s was given as the %s store but its metadata says %s (%s); opening it as %s.",
+            cfg.zarr_path,
+            name,
+            detected,
+            "; ".join(detection.evidence),
+            detected,
+        )
+        out[detected] = dataset_config_for(detected, cfg.zarr_path, args)
+        if initial == name:
+            initial = detected
+    return out, initial
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="napari-compare-xenium-merscope",
-        description="Napari comparison viewer for MERSCOPE and Xenium SpatialData outputs."
+        description=(
+            "Napari comparison viewer for MERSCOPE and Xenium SpatialData outputs "
+            "(Atera stores open standalone)."
+        ),
     )
     parser.add_argument("--merscope-zarr", default=None, type=Path, help="Path to MERSCOPE .zarr output")
     parser.add_argument("--xenium-zarr", default=None, type=Path, help="Path to Xenium .zarr output")
+    parser.add_argument(
+        "--atera-zarr",
+        default=None,
+        type=Path,
+        help="Path to an Atera .zarr output (standalone viewing only)",
+    )
 
     parser.add_argument(
         "--merscope-transform-path",
@@ -15568,12 +15863,21 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help="Optional Xenium experiment.xenium path (for pixel_size)",
     )
+    parser.add_argument(
+        "--atera-spec-path",
+        default=None,
+        type=Path,
+        help=(
+            "Optional Atera experiment.spatial path (for pixel_size). Default: "
+            "atera/experiment_override.spatial, then atera/experiment.spatial, in or beside the zarr."
+        ),
+    )
 
     parser.add_argument(
         "--initial-dataset",
-        default="MERSCOPE",
-        choices=["MERSCOPE", "XENIUM"],
-        help="Dataset loaded first when the viewer opens",
+        default=None,
+        choices=list(supported_platforms()),
+        help="Dataset loaded first when the viewer opens (default: the first one supplied)",
     )
     parser.add_argument(
         "--paired-view",
@@ -15778,9 +16082,24 @@ def parse_args() -> argparse.Namespace:
 
     args = parser.parse_args()
     if args.registration_store is not None and (
-        args.merscope_zarr is not None or args.xenium_zarr is not None
+        args.merscope_zarr is not None
+        or args.xenium_zarr is not None
+        or args.atera_zarr is not None
     ):
-        parser.error("--registration-store cannot be combined with --merscope-zarr or --xenium-zarr.")
+        parser.error(
+            "--registration-store cannot be combined with --merscope-zarr, --xenium-zarr "
+            "or --atera-zarr."
+        )
+    if args.atera_zarr is not None and (
+        args.merscope_zarr is not None
+        or args.xenium_zarr is not None
+        or args.paired_view is not None
+    ):
+        parser.error(
+            "--atera-zarr opens an Atera store standalone and cannot be combined with "
+            "--merscope-zarr, --xenium-zarr or --paired-view (paired viewing supports "
+            "MERSCOPE + Xenium only)."
+        )
     if args.label_chunk_size <= 0:
         parser.error("--label-chunk-size must be positive.")
     if args.label_contour_width < 0:
@@ -15833,6 +16152,11 @@ def run_package_smoke_test_without_opengl() -> None:
         raise RuntimeError("The empty viewer did not select the Dataset loader tab.")
     if panel._tab_stack.count() != 10:
         raise RuntimeError("The control panel is missing the Manual registration tab.")
+    missing = [
+        name for name in standalone_platforms() if name not in panel._load_standalone_buttons
+    ]
+    if missing or getattr(panel, "_load_standalone_atera_button", None) is None:
+        raise RuntimeError(f"The Dataset loader is missing standalone buttons for {missing}.")
     panel.close()
     app.processEvents()
 
@@ -15848,43 +16172,37 @@ def main():
         raise FileNotFoundError(f"MERSCOPE zarr path not found: {args.merscope_zarr}")
     if args.xenium_zarr is not None and not args.xenium_zarr.exists():
         raise FileNotFoundError(f"Xenium zarr path not found: {args.xenium_zarr}")
+    atera_zarr = getattr(args, "atera_zarr", None)
+    if atera_zarr is not None and not atera_zarr.exists():
+        raise FileNotFoundError(f"Atera zarr path not found: {atera_zarr}")
     if args.registration_store is not None and not args.registration_store.exists():
         raise FileNotFoundError(
             f"Manual registration store not found: {args.registration_store}"
         )
 
-    datasets: dict[str, DatasetConfig] = {}
-    if args.merscope_zarr is not None:
-        datasets["MERSCOPE"] = DatasetConfig(
-            name="MERSCOPE",
-            zarr_path=args.merscope_zarr,
-            merscope_transform_path=args.merscope_transform_path,
-            xenium_spec_path=args.xenium_spec_path,
-        )
-    if args.xenium_zarr is not None:
-        datasets["XENIUM"] = DatasetConfig(
-            name="XENIUM",
-            zarr_path=args.xenium_zarr,
-            merscope_transform_path=args.merscope_transform_path,
-            xenium_spec_path=args.xenium_spec_path,
-        )
-
-    available_datasets = list(datasets.keys())
+    datasets = startup_dataset_configs(args)
     initial_pair = (
         "MERSCOPE" in datasets
         and "XENIUM" in datasets
         and args.paired_view is not None
     )
-    initial_dataset: str | None = (
-        None if initial_pair else args.initial_dataset if datasets else None
+    datasets, initial_dataset = apply_startup_store_detection(
+        datasets, args, paired=initial_pair
     )
-    if not initial_pair and datasets and initial_dataset not in datasets:
+
+    available_datasets = list(datasets.keys())
+    if initial_pair:
+        initial_dataset = None
+    elif not datasets:
+        initial_dataset = None
+    elif initial_dataset not in datasets:
         initial_dataset = available_datasets[0]
-        log.info(
-            "Initial dataset %s was not supplied; starting with %s.",
-            args.initial_dataset,
-            initial_dataset,
-        )
+        if args.initial_dataset is not None:
+            log.info(
+                "Initial dataset %s was not supplied; starting with %s.",
+                args.initial_dataset,
+                initial_dataset,
+            )
 
     for cfg in datasets.values():
         validate_spatialdata_store_compatibility(cfg.zarr_path)
@@ -15980,6 +16298,7 @@ def main():
         expand_layer_controls_callback=left_panel.expand_layer_controls,
         load_registration_callback=controller.load_registration_store,
         registration_widget=registration_widget,
+        standalone_platform_callback=lambda: controller.last_standalone_platform,
     )
     controller.set_status_callback(panel.set_status)
     controller.set_progress_callback(panel.set_progress)
