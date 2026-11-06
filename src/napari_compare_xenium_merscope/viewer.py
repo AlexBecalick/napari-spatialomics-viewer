@@ -5088,6 +5088,10 @@ class ComparisonViewerController:
         self._registration_worker_tokens: dict[str, Event] = {}
         #: Effective platform of the last standalone load (after authoritative detection).
         self.last_standalone_platform: str | None = None
+        # (dataset, text): a one-shot notice (e.g. a detection re-label) that
+        # prefixes that dataset's loading/loaded/failed status so the regular
+        # progress messages do not overwrite it before the user can read it.
+        self._pending_load_notice: tuple[str, str] | None = None
         self._registration_progress_keys: set[str] = set()
         #: staging dataset key -> store path, used while a registration store is read on a worker
         self._registration_store_paths: dict[str, Path] = {}
@@ -6575,14 +6579,27 @@ class ComparisonViewerController:
         elapsed = time.time() - started_at
         mem_after = memory_snapshot_gb()
         self._set_status(
-            f"{ds} metadata loaded in {elapsed:.1f}s | images={len(self._image_keys)} "
-            f"{self._segmentation_layer_type()}_keys={len(self._segmentation_keys)} | "
-            f"RSS {mem_before['rss_gb']:.1f}->{mem_after['rss_gb']:.1f} GB | "
-            "starting progressive background loads…"
+            self._with_load_notice(
+                ds,
+                f"{ds} metadata loaded in {elapsed:.1f}s | images={len(self._image_keys)} "
+                f"{self._segmentation_layer_type()}_keys={len(self._segmentation_keys)} | "
+                f"RSS {mem_before['rss_gb']:.1f}->{mem_after['rss_gb']:.1f} GB | "
+                "starting progressive background loads…",
+                consume=True,
+            )
         )
         self._evict_dataset_sessions()
         self._start_startup_autoload(ds)
         self._schedule_canvas_visibility_repair(ds)
+
+    def _with_load_notice(self, ds: str, text: str, *, consume: bool = False) -> str:
+        """Prefix ``text`` with the pending load notice for ``ds``, if any."""
+        pending = getattr(self, "_pending_load_notice", None)
+        if pending is None or pending[0] != ds:
+            return text
+        if consume:
+            self._pending_load_notice = None
+        return f"{pending[1]} {text}"
 
     def _handle_dataset_load_error(self, generation: int, ds: str, exc) -> None:
         if generation != self._dataset_load_generation:
@@ -6592,8 +6609,11 @@ class ComparisonViewerController:
         self._end_progress("dataset")
         message = exc[1] if isinstance(exc, tuple) and len(exc) > 1 else exc
         if not self._dataset_load_cancel.is_set():
-            self._set_status(f"Failed to load {ds}: {message}")
+            self._set_status(
+                self._with_load_notice(ds, f"Failed to load {ds}: {message}", consume=True)
+            )
             log.error("[%s] Failed to load dataset: %s", ds, message)
+        self._pending_load_notice = None
 
     def load_dataset(self, dataset_name: str, force: bool = False):
         ds = str(dataset_name).upper()
@@ -6637,7 +6657,10 @@ class ComparisonViewerController:
         if force:
             self._dataset_sessions.pop(ds, None)
         cached = self._dataset_sessions.get(ds)
-        self._begin_progress("dataset", f"Loading {ds} metadata…")
+        pending = getattr(self, "_pending_load_notice", None)
+        if pending is not None and pending[0] != ds:
+            self._pending_load_notice = None
+        self._begin_progress("dataset", self._with_load_notice(ds, f"Loading {ds} metadata…"))
         if cached is not None:
             self._apply_dataset_session(generation, cached, mem_before, t0)
             return True
@@ -7523,6 +7546,11 @@ class ComparisonViewerController:
             return False
         if detected_message is not None:
             self._set_status(detected_message)
+        # Carried into the load's progress and final status (see load_dataset),
+        # which would otherwise overwrite the notice immediately.
+        self._pending_load_notice = (
+            (platform, detected_message) if detected_message is not None else None
+        )
         datasets = {platform: self._build_dataset_config(platform, path)}
         self.last_standalone_platform = platform
         return self._replace_datasets(datasets, initial=platform)

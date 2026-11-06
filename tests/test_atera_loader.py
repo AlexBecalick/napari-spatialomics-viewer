@@ -417,6 +417,65 @@ def test_standalone_relabels_an_authoritative_atera_store(qapp, atera_store, mon
     assert "Detected Atera store; opening as ATERA." in statuses
 
 
+def _run_real_standalone_load(ctrl, monkeypatch, platform, store):
+    """Run load_standalone_dataset through _replace_datasets/load_dataset for real.
+
+    Only the worker thread and the post-load background autoloads are removed;
+    the metadata session is prepared and applied synchronously.
+    """
+    monkeypatch.setattr(V, "thread_worker", None)
+    monkeypatch.setattr(ctrl, "_start_startup_autoload", lambda ds: None)
+    monkeypatch.setattr(ctrl, "_schedule_canvas_visibility_repair", lambda ds: None)
+    progress: list[tuple[str, str, bool]] = []
+    ctrl.set_progress_callback(lambda key, text, active: progress.append((key, text, active)))
+    return ctrl.load_standalone_dataset(platform, store), progress
+
+
+def test_standalone_relabel_notice_survives_the_real_load(qapp, atera_store, monkeypatch):
+    ctrl = _controller()
+    statuses = _statuses(ctrl)
+    result, progress = _run_real_standalone_load(ctrl, monkeypatch, "XENIUM", atera_store)
+    notice = "Detected Atera store; opening as ATERA."
+    assert result is True
+    assert ctrl.active_dataset == "ATERA"
+    # The progress stage text shown while metadata loads carries the notice ...
+    started = [text for key, text, active in progress if key == "dataset" and active]
+    assert started and started[-1].startswith(notice)
+    assert "Loading ATERA metadata" in started[-1]
+    # ... and so does the status that is actually left on screen afterwards.
+    assert statuses[-1].startswith(notice)
+    assert "ATERA metadata loaded" in statuses[-1]
+    # The notice is one-shot: a later reload does not repeat it.
+    assert ctrl._pending_load_notice is None
+    statuses.clear()
+    ctrl.load_dataset("ATERA", force=True)
+    assert statuses and not any(notice in text for text in statuses)
+
+
+def test_standalone_relabel_notice_is_kept_on_a_failed_load(qapp, atera_store, monkeypatch):
+    ctrl = _controller()
+    statuses = _statuses(ctrl)
+
+    def boom(ds, cfg, cancel_token):
+        raise RuntimeError("metadata unreadable")
+
+    monkeypatch.setattr(ctrl, "_prepare_dataset_session", boom)
+    result, _ = _run_real_standalone_load(ctrl, monkeypatch, "XENIUM", atera_store)
+    assert result is False
+    assert statuses[-1].startswith("Detected Atera store; opening as ATERA.")
+    assert "Failed to load ATERA: metadata unreadable" in statuses[-1]
+    assert ctrl._pending_load_notice is None
+
+
+def test_standalone_load_without_relabel_has_no_notice(qapp, atera_store, monkeypatch):
+    ctrl = _controller()
+    statuses = _statuses(ctrl)
+    result, _ = _run_real_standalone_load(ctrl, monkeypatch, "ATERA", atera_store)
+    assert result is True
+    assert not any("Detected" in text for text in statuses)
+    assert statuses[-1].startswith("ATERA metadata loaded")
+
+
 def test_standalone_heuristic_store_keeps_the_requested_platform(qapp, atera_store, tmp_path, monkeypatch):
     store = _heuristic_only_copy(atera_store, tmp_path)
     ctrl = _controller()
