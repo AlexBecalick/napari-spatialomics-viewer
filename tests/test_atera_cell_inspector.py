@@ -423,6 +423,53 @@ def test_without_an_exact_read_the_table_counts_stay(qapp, tmp_path, monkeypatch
     assert payload["gene_rows"] and "unavailable" in payload["transcript_note"]
 
 
+@pytest.mark.parametrize("failure", ["exact_read", "common", "memory"])
+def test_a_failed_exact_read_keeps_the_table_counts(qapp, atera_store, monkeypatch, failure):
+    ctrl = _activate(atera_store, monkeypatch)
+    _forbid_scans(ctrl, monkeypatch)
+
+    def boom(*_a, **_k):
+        if failure == "memory":
+            raise MemoryError("out of memory")
+        raise RuntimeError("phase two failed")
+
+    if failure == "common":
+        # An image-statistics error alone must not wipe the table counts.
+        monkeypatch.setattr(ctrl, "_cell_selection_common", boom)
+    else:
+        monkeypatch.setattr(V, "indexed_cell_transcripts", boom)
+    gdf = ctrl._active_sdata.shapes["atera_cell_boundaries"]
+    cell_id, geometry = ctrl._shape_for_cell_id(gdf, 3)
+    ctrl._add_cell_selection("ATERA", cell_id, geometry)
+
+    entry = ctrl._selected_cells["ATERA"][0]
+    table_counts = U.table_cell_gene_counts(atera_store, "table_original", 3)
+    assert [(r["gene"], r["count"]) for r in entry["gene_rows"]] == table_counts.ranked()
+    assert entry["transcript_source"] == "table"
+    assert not entry.get("inspection_error")
+    assert entry["transcripts_loading"] is False and entry["intensities_loading"] is False
+    assert "could not be read" in entry["transcript_note"]
+    assert not ctrl._cell_inspection_workers
+    summary = V._cell_summary_html(entry)
+    assert "Reading the assigned transcripts" not in summary
+    assert "could not be read; showing the table counts" in summary
+    genes = V._cell_gene_list_html(entry)
+    assert "could not be loaded" not in genes and table_counts.ranked()[0][0] in genes
+    assert any("showing the table counts" in s for s in ctrl.statuses)
+
+
+def test_a_failed_table_read_still_reports_an_inspection_error(qapp, atera_store, monkeypatch):
+    ctrl = _activate(atera_store, monkeypatch)
+    _forbid_scans(ctrl, monkeypatch)
+    monkeypatch.setattr(ctrl, "_lazy_cell_table_display",
+                        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("table failed")))
+    gdf = ctrl._active_sdata.shapes["atera_cell_boundaries"]
+    cell_id, geometry = ctrl._shape_for_cell_id(gdf, 3)
+    ctrl._add_cell_selection("ATERA", cell_id, geometry)
+    entry = ctrl._selected_cells["ATERA"][0]
+    assert "table failed" in entry["inspection_error"]
+
+
 # ---------------------------------------------------------------------------
 # WTA-scale presentation (size-gated)
 # ---------------------------------------------------------------------------

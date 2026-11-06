@@ -13677,19 +13677,20 @@ class ComparisonViewerController(AteraTranscriptMixin):
                 ds, cell_id, geometry, color, gene_visuals=visuals, image_specs=image_specs,
                 control_genes=controls)
 
-        def run(compute, on_done):
+        def run(compute, on_done, on_error=None):
+            on_error = on_error or self._handle_cell_selection_error
             if thread_worker is None:
                 try:
                     result = compute()
                 except Exception as exc:
-                    self._handle_cell_selection_error(generation, worker_key, exc)
+                    on_error(generation, worker_key, exc)
                     return
                 on_done(result)
                 return
             worker = thread_worker(compute)()
             worker.returned.connect(on_done)
             worker.errored.connect(
-                lambda exc, gen=generation, wk=worker_key: self._handle_cell_selection_error(gen, wk, exc))
+                lambda exc, gen=generation, wk=worker_key: on_error(gen, wk, exc))
             self._cell_inspection_workers[worker_key] = worker
             worker.start()
 
@@ -13704,7 +13705,8 @@ class ComparisonViewerController(AteraTranscriptMixin):
             if self._cell_selection_entry(ds, worker_key[1]) is None:
                 return
             run(indexed_phase, lambda payload: self._apply_cell_selection_payload(
-                generation, worker_key, payload, empty))
+                generation, worker_key, payload, empty),
+                self._handle_lazy_cell_exact_read_error)
 
         run(table_phase, table_done)
 
@@ -13743,6 +13745,36 @@ class ComparisonViewerController(AteraTranscriptMixin):
                 break
         self._rebuild_cell_highlights(ds)
         self._set_status(status or f"{ds}: cell {payload.get('cell_id')} statistics ready.")
+
+    def _handle_lazy_cell_exact_read_error(
+        self, generation: int, worker_key: tuple, exc
+    ):
+        """Phase 2 of a lazy-platform cell failed: keep the table counts.
+
+        The phase-1 table counts are the first paint and also the fallback, so
+        the entry keeps its gene rows; only the loading lines are cleared and a
+        note says the exact read failed.
+        """
+        if generation != self._cell_inspection_generation:
+            return
+        self._cell_inspection_workers.pop(worker_key, None)
+        message = exc[1] if isinstance(exc, tuple) and len(exc) > 1 else exc
+        ds, norm = worker_key[:2]
+        if len(worker_key) > 2 and tuple(worker_key[2:]) != self._transcript_source_identity(ds):
+            return
+        entry = self._cell_selection_entry(ds, norm)
+        if entry is not None:
+            entry.update(
+                loading=False,
+                transcripts_loading=False,
+                intensities_loading=False,
+                transcript_note="Assigned transcripts could not be read; showing the table counts.",
+            )
+            if self.active_dataset == ds:
+                self._rebuild_cell_highlights(ds)
+        self._set_status(f"{ds}: cell {worker_key[1]} assigned transcripts could not be read "
+                         f"({message}); showing the table counts.")
+        log.warning("[%s] Exact cell read failed; keeping table counts: %s", ds, message)
 
     def _handle_cell_selection_error(
         self, generation: int, worker_key: tuple[str, str], exc
