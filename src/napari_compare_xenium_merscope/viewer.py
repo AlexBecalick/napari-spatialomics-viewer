@@ -18,6 +18,7 @@ import hashlib
 import html
 import json
 import logging
+import re
 import shutil
 import sys
 import time
@@ -86,7 +87,9 @@ except ImportError:
 
 try:
     from qtpy.QtCore import (
+        QAbstractListModel,
         QEvent,
+        QModelIndex,
         QObject,
         QPoint,
         QPointF,
@@ -107,6 +110,7 @@ try:
         QIcon,
         QPainter,
         QPainterPath,
+        QPalette,
         QPen,
         QPixmap,
         QPolygonF,
@@ -125,6 +129,7 @@ try:
         QLabel,
         QLayout,
         QLineEdit,
+        QListView,
         QListWidget,
         QListWidgetItem,
         QMessageBox,
@@ -134,6 +139,8 @@ try:
         QSizePolicy,
         QSlider,
         QStackedWidget,
+        QStyle,
+        QStyledItemDelegate,
         QToolButton,
         QVBoxLayout,
         QWidget,
@@ -161,6 +168,9 @@ from .manual_registration_controller import REGISTRATION_DATASET, ManualRegistra
 from .manual_registration_model import LAYER_METADATA_KEY, STORE_ATTR
 from .platforms import (
     ATERA,
+    GENE_PANEL_MODE_FULL,
+    GENE_PANEL_MODE_SELECTION,
+    GENE_SELECTION_SLOT_CAP,
     MERSCOPE,
     PAIRED_PLATFORMS,
     PIXEL_TRANSFORM_MERSCOPE_AFFINE,
@@ -168,6 +178,7 @@ from .platforms import (
     XENIUM,
     detect_store_platform,
     find_platform_spec,
+    gene_panel_mode_for,
     find_spec_path,
     standalone_platforms,
     supported_platforms,
@@ -222,6 +233,7 @@ from .transcript_cache import (
 )
 from .utils import (
     CELLPOSE_LABEL_KEY,
+    CONTROL_GROUP_TITLE,
     CELLPOSE_QUANTIFICATION_TABLE_KEY,
     CELLPOSE_SHAPE_KEY,
     CELLPOSE_VALUE_BINS,
@@ -231,6 +243,7 @@ from .utils import (
     CORTICAL_DEPTH_ROLE_SPECS,
     OBJECT_ID_PROPERTY,
     ObjectAnnotationShapeInput,
+    GeneSlotAllocator,
     GeneVisual,
     GENE_MARKER_SYMBOLS,
     CellTranscriptIndex,
@@ -531,6 +544,14 @@ class GeneInspectorState:
     panel_control_genes: set[str] | None = None
     assignment_source: str = "native"
     analysis_id: str = ""
+    #: ``"full"`` lists and shows every gene; ``"selection"`` (Atera, or a panel
+    #: above GENE_SELECTION_MODE_FEATURE_THRESHOLD features) starts empty and
+    #: gives each ticked gene one of ``slot_allocator.cap`` colour slots.
+    panel_mode: str = GENE_PANEL_MODE_FULL
+    slot_allocator: object | None = None       # utils.GeneSlotAllocator
+    #: Selection mode's "All-transcript overview": every real gene drawn in its
+    #: scheme colour regardless of the selection.
+    overview_visible: bool = False
 
 
 @dataclass
@@ -2837,7 +2858,7 @@ def make_gene_marker_pixmap(rgba, symbol: str, px: int = 20) -> QPixmap:
 
 
 class _GroupHeaderLabel(QLabel):
-    """A gene-group heading that emits ``clicked`` when pressed."""
+    """A group heading that emits ``clicked`` when pressed (cell-type panel)."""
 
     clicked = Signal()
 
@@ -2846,8 +2867,544 @@ class _GroupHeaderLabel(QLabel):
         super().mousePressEvent(event)
 
 
+#: Fixed row height (px) of the gene list. Every row -- gene or group heading --
+#: has the same height so the view can use uniform item sizes and lay out a
+#: 25k-row Atera panel without asking each row for its size.
+GENE_LIST_ROW_HEIGHT = 26
+#: Marker icon size drawn beside each gene.
+GENE_LIST_ICON_PX = 22
+#: Panels with more rows than this debounce the filter box instead of filtering
+#: on every keystroke.
+GENE_FILTER_DEBOUNCE_ROWS = 2000
+GENE_FILTER_DEBOUNCE_MS = 120
+#: Visible rows of the pinned "Selected" list in selection mode.
+GENE_SELECTED_LIST_ROWS = 6
+
+_GENE_NAME_ROLE = int(Qt.UserRole) + 1
+_GENE_IS_HEADER_ROLE = int(Qt.UserRole) + 2
+_GENE_HEADER_RGBA_ROLE = int(Qt.UserRole) + 3
+_GENE_HEADER_TITLE_ROLE = int(Qt.UserRole) + 4
+_GENE_HEADER_COLLAPSIBLE_ROLE = int(Qt.UserRole) + 5
+_GENE_HEADER_COLLAPSED_ROLE = int(Qt.UserRole) + 6
+
+
+def _check_state_is_on(value) -> bool:
+    """True for a checked CheckStateRole value (int under PyQt5, enum under Qt6)."""
+    raw = getattr(value, "value", value)
+    try:
+        return int(raw) == int(getattr(Qt.Checked, "value", Qt.Checked))
+    except (TypeError, ValueError):
+        return bool(value)
+
+
+def _visual_icon_key(visual) -> tuple:
+    rgba = getattr(visual, "rgba", (1.0, 1.0, 1.0, 1.0))
+    symbol = str(getattr(visual, "symbol", "disc"))
+    return tuple(round(float(v), 4) for v in rgba) + (symbol,)
+
+
+class GeneListModel(QAbstractListModel):
+    """Every row of the gene panel: group headings and gene rows, in layout order.
+
+    State lives in numpy arrays indexed by gene (``checked``, ``is_control``,
+    the lowercased names used by the filter) and by row (header flag, gene
+    index, group index), so filtering and bulk toggles never loop over Qt
+    items. A gene's tick is stored once; every view row showing that gene
+    reads it. Ticking a row goes through ``check_handler(gene, on) -> bool`` so
+    the owner can refuse it (selection-mode cap); an accepted change emits
+    :attr:`check_toggled`.
+    """
+
+    check_toggled = Signal(str, bool)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.check_handler = None
+        self.panel_mode = GENE_PANEL_MODE_FULL
+        self._icon_cache: dict[tuple, QIcon] = {}
+        self._reset_arrays()
+
+    # -- construction -------------------------------------------------------
+    def _reset_arrays(self) -> None:
+        self.genes: list[str] = []
+        self.gene_index: dict[str, int] = {}
+        self.gene_text: list[str] = []
+        self.gene_lower = np.empty(0, dtype=str)
+        self.is_control = np.zeros(0, dtype=bool)
+        self.checked = np.zeros(0, dtype=bool)
+        self.gene_row = np.zeros(0, dtype=np.int64)
+        self.row_is_header = np.zeros(0, dtype=bool)
+        self.row_gene = np.zeros(0, dtype=np.int64)
+        self.row_group = np.zeros(0, dtype=np.int64)
+        self.header_rows = np.zeros(0, dtype=np.int64)
+        self.header_titles: list[str] = []
+        self.header_rgba: list[tuple] = []
+        self.header_collapsible = np.zeros(0, dtype=bool)
+        self.collapsed = np.zeros(0, dtype=bool)
+        self.group_genes: list[np.ndarray] = []
+        self.gene_visuals: dict = {}
+
+    def set_rows(
+        self,
+        layout: list[tuple],
+        gene_visuals: Mapping,
+        gene_counts: Mapping,
+        control_genes: set,
+        enabled_genes: set,
+        labels: Mapping,
+        ordering: str,
+        panel_mode: str = GENE_PANEL_MODE_FULL,
+    ) -> None:
+        """Rebuild every row from a ``("header", title, rgba)`` / ``("gene", name)`` layout."""
+        self.beginResetModel()
+        try:
+            self._reset_arrays()
+            self.panel_mode = str(panel_mode)
+            self.gene_visuals = dict(gene_visuals)
+            row_is_header: list[bool] = []
+            row_gene: list[int] = []
+            row_group: list[int] = []
+            header_rows: list[int] = []
+            group_members: list[list[int]] = []
+            gene_row: list[int] = []
+            alphabetical = str(ordering) == "alphabetical"
+            group = -1
+            for entry in layout:
+                if entry[0] == "header":
+                    group = len(self.header_titles)
+                    header_rows.append(len(row_is_header))
+                    self.header_titles.append(str(entry[1]))
+                    self.header_rgba.append(tuple(entry[2]) if entry[2] is not None else (0.6, 0.6, 0.6, 1.0))
+                    group_members.append([])
+                    row_is_header.append(True)
+                    row_gene.append(-1)
+                    row_group.append(group)
+                    continue
+                gene = str(entry[1])
+                gi = self.gene_index.get(gene)
+                if gi is None:
+                    gi = len(self.genes)
+                    self.gene_index[gene] = gi
+                    self.genes.append(gene)
+                    count = int(gene_counts.get(gene, 0))
+                    text = f"{gene}    ({count:,})"
+                    if alphabetical and labels.get(gene):
+                        text = f"{text}    ·  {labels[gene]}"
+                    self.gene_text.append(text)
+                    gene_row.append(len(row_is_header))
+                if group >= 0:
+                    group_members[group].append(gi)
+                row_is_header.append(False)
+                row_gene.append(gi)
+                row_group.append(group)
+            self.row_is_header = np.asarray(row_is_header, dtype=bool)
+            self.row_gene = np.asarray(row_gene, dtype=np.int64)
+            self.row_group = np.asarray(row_group, dtype=np.int64)
+            self.header_rows = np.asarray(header_rows, dtype=np.int64)
+            self.gene_row = np.asarray(gene_row, dtype=np.int64)
+            self.group_genes = [np.asarray(m, dtype=np.int64) for m in group_members]
+            self.gene_lower = np.char.lower(np.asarray(self.genes, dtype=str)) if self.genes else np.empty(0, dtype=str)
+            controls = {str(g) for g in control_genes}
+            enabled = {str(g) for g in enabled_genes}
+            self.is_control = np.fromiter((g in controls for g in self.genes), dtype=bool, count=len(self.genes))
+            self.checked = np.fromiter((g in enabled for g in self.genes), dtype=bool, count=len(self.genes))
+            # In selection mode a heading whose genes are all controls folds away
+            # (its rows hide) instead of disappearing, so the control features
+            # stay discoverable with their count.
+            self.header_collapsible = np.asarray(
+                [
+                    self.panel_mode == GENE_PANEL_MODE_SELECTION
+                    and len(members) > 0
+                    and bool(np.all(self.is_control[members]))
+                    for members in self.group_genes
+                ],
+                dtype=bool,
+            )
+            self.collapsed = self.header_collapsible.copy()
+        finally:
+            self.endResetModel()
+
+    # -- Qt model API -------------------------------------------------------
+    def rowCount(self, parent=QModelIndex()):  # noqa: N802 (Qt override)
+        return 0 if parent.isValid() else int(len(self.row_is_header))
+
+    def flags(self, index):
+        if not index.isValid():
+            return Qt.NoItemFlags
+        if self.row_is_header[index.row()]:
+            return Qt.ItemIsEnabled
+        return Qt.ItemIsEnabled | Qt.ItemIsUserCheckable
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid():
+            return None
+        return self.row_data(int(index.row()), role)
+
+    def row_data(self, row: int, role):
+        if row < 0 or row >= len(self.row_is_header):
+            return None
+        role = int(role)
+        if self.row_is_header[row]:
+            group = int(self.row_group[row])
+            title = self.header_titles[group]
+            if role == int(Qt.DisplayRole):
+                if self.panel_mode == GENE_PANEL_MODE_SELECTION:
+                    return f"{title}  ({len(self.group_genes[group]):,})"
+                return title
+            if role == _GENE_IS_HEADER_ROLE:
+                return True
+            if role == _GENE_HEADER_TITLE_ROLE:
+                return title
+            if role == _GENE_HEADER_RGBA_ROLE:
+                return self.header_rgba[group]
+            if role == _GENE_HEADER_COLLAPSIBLE_ROLE:
+                return bool(self.header_collapsible[group])
+            if role == _GENE_HEADER_COLLAPSED_ROLE:
+                return bool(self.collapsed[group])
+            if role == int(Qt.ToolTipRole):
+                if self.header_collapsible[group]:
+                    return "Click to show / hide the control features"
+                return "Click to show / hide all genes in this group"
+            return None
+        return self.gene_data(int(self.row_gene[row]), role)
+
+    def gene_data(self, gi: int, role):
+        role = int(role)
+        if gi < 0 or gi >= len(self.genes):
+            return None
+        if role == int(Qt.DisplayRole):
+            return self.gene_text[gi]
+        if role == int(Qt.CheckStateRole):
+            return Qt.Checked if self.checked[gi] else Qt.Unchecked
+        if role == int(Qt.DecorationRole):
+            return self._icon_for(self.genes[gi])
+        if role == _GENE_NAME_ROLE:
+            return self.genes[gi]
+        if role == _GENE_IS_HEADER_ROLE:
+            return False
+        return None
+
+    def setData(self, index, value, role=Qt.EditRole):  # noqa: N802 (Qt override)
+        if not index.isValid() or int(role) != int(Qt.CheckStateRole):
+            return False
+        row = int(index.row())
+        if self.row_is_header[row]:
+            return False
+        return self.request_check(int(self.row_gene[row]), _check_state_is_on(value))
+
+    # -- checks -------------------------------------------------------------
+    def request_check(self, gi: int, on: bool) -> bool:
+        """Tick/untick gene ``gi`` as a user action (the handler may refuse)."""
+        on = bool(on)
+        if bool(self.checked[gi]) == on:
+            return True
+        gene = self.genes[gi]
+        if self.check_handler is not None and not self.check_handler(gene, on):
+            return False
+        self.set_checked(np.asarray([gi], dtype=np.int64), on)
+        self.check_toggled.emit(gene, on)
+        return True
+
+    def set_checked(self, gene_indices, on: bool) -> None:
+        """Set ticks for ``gene_indices`` and emit ONE dataChanged over their rows."""
+        idx = np.asarray(gene_indices, dtype=np.int64)
+        if idx.size == 0:
+            return
+        self.checked[idx] = bool(on)
+        self._emit_rows_changed(self.gene_row[idx], [int(Qt.CheckStateRole)])
+
+    def set_checked_mask(self, mask: np.ndarray) -> None:
+        """Replace every tick at once (one dataChanged)."""
+        mask = np.asarray(mask, dtype=bool)
+        if mask.shape != self.checked.shape:
+            return
+        changed = np.flatnonzero(mask != self.checked)
+        self.checked = mask.copy()
+        if changed.size:
+            self._emit_rows_changed(self.gene_row[changed], [int(Qt.CheckStateRole)])
+
+    def set_gene_visuals(self, visuals: Mapping) -> None:
+        """Update marker icons for some genes (one DecorationRole dataChanged)."""
+        rows = []
+        for gene, visual in visuals.items():
+            gi = self.gene_index.get(str(gene))
+            if gi is None:
+                continue
+            self.gene_visuals[str(gene)] = visual
+            rows.append(int(self.gene_row[gi]))
+        if rows:
+            self._emit_rows_changed(np.asarray(rows, dtype=np.int64), [int(Qt.DecorationRole)])
+
+    def refresh_decorations(self) -> None:
+        if len(self.row_is_header):
+            self._emit_rows_changed(
+                np.asarray([0, len(self.row_is_header) - 1], dtype=np.int64),
+                [int(Qt.DecorationRole)],
+            )
+
+    def set_collapsed(self, group: int, collapsed: bool) -> None:
+        self.collapsed[int(group)] = bool(collapsed)
+        row = int(self.header_rows[int(group)])
+        self._emit_rows_changed(np.asarray([row], dtype=np.int64), [_GENE_HEADER_COLLAPSED_ROLE])
+
+    def _emit_rows_changed(self, rows: np.ndarray, roles: list[int]) -> None:
+        if rows.size == 0:
+            return
+        top = self.index(int(rows.min()), 0)
+        bottom = self.index(int(rows.max()), 0)
+        self.dataChanged.emit(top, bottom, roles)
+
+    def _icon_for(self, gene: str):
+        visual = self.gene_visuals.get(gene)
+        if visual is None:
+            return None
+        key = _visual_icon_key(visual)
+        icon = self._icon_cache.get(key)
+        if icon is None:
+            icon = QIcon(make_gene_marker_pixmap(key[:4], key[4], px=GENE_LIST_ICON_PX))
+            self._icon_cache[key] = icon
+        return icon
+
+    # -- filtering ----------------------------------------------------------
+    def gene_match_mask(self, text: str) -> np.ndarray:
+        """Genes matching the filter text, computed once with numpy.
+
+        A single word matches as a case-insensitive substring. Text containing
+        a comma or whitespace is treated as a pasted gene list: each token must
+        match a gene name exactly (case-insensitive).
+        """
+        n = len(self.genes)
+        text = str(text or "").strip()
+        if not text or n == 0:
+            return np.ones(n, dtype=bool)
+        if any(sep in text for sep in (",", ";")) or any(ch.isspace() for ch in text):
+            tokens = [t for t in re.split(r"[\s,;]+", text.lower()) if t]
+            return np.isin(self.gene_lower, np.asarray(tokens, dtype=str))
+        return np.char.find(self.gene_lower, text.lower()) >= 0
+
+    def row_accept_mask(self, text: str, show_controls: bool) -> np.ndarray:
+        """Which rows survive the filter, including group headings.
+
+        A gene row shows when its gene matches the text, it is not a hidden
+        control, and its heading is not folded. A heading shows while any gene
+        beneath it would show; a foldable (control) heading shows while any of
+        its genes matches the text, so its count stays visible while folded.
+        """
+        n_rows = len(self.row_is_header)
+        if n_rows == 0:
+            return np.zeros(0, dtype=bool)
+        match = self.gene_match_mask(text)
+        visible_gene = match & (bool(show_controls) | ~self.is_control)
+        gene_rows = ~self.row_is_header
+        safe_gene = np.where(gene_rows, self.row_gene, 0)
+        safe_group = np.where(self.row_group >= 0, self.row_group, 0)
+        in_group = self.row_group >= 0
+        collapsible_row = in_group & self.header_collapsible[safe_group] if len(self.header_collapsible) else np.zeros(n_rows, dtype=bool)
+        collapsed_row = in_group & self.collapsed[safe_group] if len(self.collapsed) else np.zeros(n_rows, dtype=bool)
+        child_visible = gene_rows & np.where(collapsible_row, match[safe_gene], visible_gene[safe_gene])
+        accept = child_visible & ~collapsed_row
+        if self.header_rows.size:
+            basis = np.where(collapsible_row, gene_rows & match[safe_gene], child_visible)
+            basis = basis & gene_rows
+            any_child = np.add.reduceat(basis.astype(np.int64), self.header_rows) > 0
+            accept[self.header_rows] = any_child
+        return accept
+
+
+class GeneFilterProxy(QAbstractListModel):
+    """The filtered view of a :class:`GeneListModel`.
+
+    ``set_accept_mask`` takes the precomputed per-row boolean array; the visible
+    rows are its ``flatnonzero`` and the inverse map is one numpy scatter, so a
+    keystroke on a 25k-row panel costs a few milliseconds instead of a Python
+    ``filterAcceptsRow`` call per row.
+    """
+
+    def __init__(self, source: GeneListModel, parent=None):
+        super().__init__(parent)
+        self._source = source
+        self._accept = np.zeros(0, dtype=bool)
+        self._rows = np.zeros(0, dtype=np.int64)
+        self._inverse = np.zeros(0, dtype=np.int64)
+        source.dataChanged.connect(self._on_source_data_changed)
+        source.modelReset.connect(self._on_source_reset)
+
+    def source_model(self) -> GeneListModel:
+        return self._source
+
+    def filter_accepts_row(self, source_row: int) -> bool:
+        return 0 <= int(source_row) < len(self._accept) and bool(self._accept[int(source_row)])
+
+    def set_accept_mask(self, accept: np.ndarray) -> None:
+        accept = np.asarray(accept, dtype=bool)
+        self.beginResetModel()
+        try:
+            self._accept = accept
+            self._rows = np.flatnonzero(accept).astype(np.int64)
+            self._inverse = np.full(len(accept), -1, dtype=np.int64)
+            self._inverse[self._rows] = np.arange(len(self._rows), dtype=np.int64)
+        finally:
+            self.endResetModel()
+
+    def map_to_source(self, row: int) -> int:
+        return int(self._rows[int(row)])
+
+    def map_from_source(self, source_row: int) -> int:
+        if 0 <= int(source_row) < len(self._inverse):
+            return int(self._inverse[int(source_row)])
+        return -1
+
+    def rowCount(self, parent=QModelIndex()):  # noqa: N802 (Qt override)
+        return 0 if parent.isValid() else int(len(self._rows))
+
+    def flags(self, index):
+        if not index.isValid():
+            return Qt.NoItemFlags
+        return self._source.flags(self._source.index(self.map_to_source(index.row()), 0))
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid() or index.row() >= len(self._rows):
+            return None
+        return self._source.row_data(self.map_to_source(index.row()), role)
+
+    def setData(self, index, value, role=Qt.EditRole):  # noqa: N802 (Qt override)
+        if not index.isValid():
+            return False
+        return self._source.setData(self._source.index(self.map_to_source(index.row()), 0), value, role)
+
+    def _on_source_reset(self):
+        self.set_accept_mask(np.zeros(self._source.rowCount(), dtype=bool))
+
+    def _on_source_data_changed(self, top, bottom, roles=None):
+        if not len(self._rows):
+            return
+        lo = int(np.searchsorted(self._rows, int(top.row()), side="left"))
+        hi = int(np.searchsorted(self._rows, int(bottom.row()), side="right")) - 1
+        if hi < lo:
+            return
+        self.dataChanged.emit(self.index(lo, 0), self.index(hi, 0), list(roles or []))
+
+
+class GeneSelectionModel(QAbstractListModel):
+    """The pinned "Selected" list of selection mode (at most the slot cap)."""
+
+    def __init__(self, source: GeneListModel, parent=None):
+        super().__init__(parent)
+        self._source = source
+        self._genes: list[int] = []
+        source.dataChanged.connect(self._on_source_data_changed)
+
+    def set_genes(self, gene_indices: list[int]) -> None:
+        self.beginResetModel()
+        self._genes = [int(gi) for gi in gene_indices]
+        self.endResetModel()
+
+    def genes(self) -> list[str]:
+        return [self._source.genes[gi] for gi in self._genes]
+
+    def rowCount(self, parent=QModelIndex()):  # noqa: N802 (Qt override)
+        return 0 if parent.isValid() else len(self._genes)
+
+    def flags(self, index):
+        if not index.isValid():
+            return Qt.NoItemFlags
+        return Qt.ItemIsEnabled | Qt.ItemIsUserCheckable
+
+    def data(self, index, role=Qt.DisplayRole):
+        if not index.isValid() or index.row() >= len(self._genes):
+            return None
+        return self._source.gene_data(self._genes[index.row()], role)
+
+    def setData(self, index, value, role=Qt.EditRole):  # noqa: N802 (Qt override)
+        if not index.isValid() or int(role) != int(Qt.CheckStateRole):
+            return False
+        return self._source.request_check(self._genes[index.row()], _check_state_is_on(value))
+
+    def _on_source_data_changed(self, _top, _bottom, roles=None):
+        if self._genes:
+            self.dataChanged.emit(self.index(0, 0), self.index(len(self._genes) - 1, 0), list(roles or []))
+
+
+class _GeneRowDelegate(QStyledItemDelegate):
+    """Paints group headings and makes a click anywhere on a gene row toggle it."""
+
+    def sizeHint(self, option, index):  # noqa: N802 (Qt override)
+        # A narrow width: list-mode rows stretch to the viewport anyway, and long
+        # names elide instead of forcing a horizontal scroll bar.
+        return QSize(120, GENE_LIST_ROW_HEIGHT)
+
+    def paint(self, painter, option, index):
+        if not index.data(_GENE_IS_HEADER_ROLE):
+            super().paint(painter, option, index)
+            return
+        painter.save()
+        try:
+            rect = option.rect
+            state = getattr(QStyle, "State_MouseOver", None)
+            if state is None:
+                state = QStyle.StateFlag.State_MouseOver
+            if option.state & state:
+                painter.fillRect(rect, QColor(255, 255, 255, 20))
+            rgba = index.data(_GENE_HEADER_RGBA_ROLE) or (0.6, 0.6, 0.6, 1.0)
+            painter.fillRect(QRect(rect.left() + 2, rect.top() + 3, 7, rect.height() - 6), _rgba_to_qcolor(rgba))
+            font = QFont(option.font)
+            font.setBold(True)
+            if font.pointSizeF() > 0:
+                font.setPointSizeF(font.pointSizeF() * 1.12)
+            painter.setFont(font)
+            painter.setPen(option.palette.color(QPalette.Text))
+            text = str(index.data(Qt.DisplayRole) or "")
+            if index.data(_GENE_HEADER_COLLAPSIBLE_ROLE):
+                text = ("▸ " if index.data(_GENE_HEADER_COLLAPSED_ROLE) else "▾ ") + text
+            painter.drawText(rect.adjusted(16, 0, -4, 0), int(Qt.AlignVCenter | Qt.AlignLeft), text)
+        finally:
+            painter.restore()
+
+    def editorEvent(self, event, model, option, index):  # noqa: N802 (Qt override)
+        if index.data(_GENE_IS_HEADER_ROLE):
+            return False
+        etype = event.type()
+        if etype in (QEvent.MouseButtonPress, QEvent.MouseButtonDblClick):
+            return event.button() == Qt.LeftButton
+        if etype == QEvent.MouseButtonRelease:
+            pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
+            if event.button() != Qt.LeftButton or not option.rect.contains(pos):
+                return False
+            on = not _check_state_is_on(index.data(Qt.CheckStateRole))
+            model.setData(index, Qt.Checked if on else Qt.Unchecked, Qt.CheckStateRole)
+            return True
+        return super().editorEvent(event, model, option, index)
+
+
+def _make_gene_list_view() -> QListView:
+    view = QListView()
+    view.setSelectionMode(QAbstractItemView.NoSelection)
+    view.setUniformItemSizes(True)
+    view.setMouseTracking(True)
+    view.setEditTriggers(QAbstractItemView.NoEditTriggers)
+    view.setIconSize(QSize(GENE_LIST_ICON_PX, GENE_LIST_ICON_PX))
+    view.setTextElideMode(Qt.ElideRight)
+    view.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    view.setItemDelegate(_GeneRowDelegate(view))
+    return view
+
+
 class GeneInspectorWidget(QWidget):
-    """Right-dock panel listing every gene with a colour+shape marker and toggle."""
+    """Right-dock panel listing every gene with a colour+shape marker and toggle.
+
+    The list is a virtualised ``QListView`` over :class:`GeneListModel` through
+    :class:`GeneFilterProxy`, so a 25k-feature Atera panel populates and
+    filters in milliseconds. Two modes:
+
+    * ``full`` (MERSCOPE / Xenium panels): every gene listed and ticked by
+      default, "Show all genes" toggles them all, controls hidden until asked.
+    * ``selection`` (Atera, or any panel above
+      :data:`GENE_SELECTION_MODE_FEATURE_THRESHOLD` features): nothing ticked
+      by default, the search box takes focus, ticked genes are pinned in a
+      "Selected (k/cap)" list and ticking stops at the slot cap. The controls
+      sit folded under one heading, and the "Show all genes" box becomes the
+      "All-transcript overview" switch.
+    """
 
     status_message = Signal(str)
 
@@ -2875,6 +3432,7 @@ class GeneInspectorWidget(QWidget):
         show_controls: bool = False,
         colour_by_assignment: bool = False,
         set_assignment_source_callback=None,
+        set_overview_callback=None,
     ):
         super().__init__()
         self._close_callback = close_callback
@@ -2888,16 +3446,21 @@ class GeneInspectorWidget(QWidget):
         self._set_ordering_callback = set_ordering_callback
         self._set_genes_visible_callback = set_genes_visible_callback
         self._set_assignment_source_callback = set_assignment_source_callback
+        self._set_overview_callback = set_overview_callback
 
         self._dataset: str | None = None
-        self._checkboxes: dict[str, QCheckBox] = {}
-        self._items: dict[str, QListWidgetItem] = {}
-        #: (header item, group title, genes-in-group) so filtering can hide a
-        #: header once all of its genes are filtered/hidden.
-        self._headers: list[tuple[QListWidgetItem, str, list[str]]] = []
-        self._control_genes: set[str] = set()
         self._ordering = "coarse"
         self._suppress = False
+        self._mode = GENE_PANEL_MODE_FULL
+        self._selection_cap = GENE_SELECTION_SLOT_CAP
+        #: Genes ticked in selection mode, in the order they were ticked.
+        self._selection_order: list[int] = []
+
+        self._model = GeneListModel(self)
+        self._model.check_handler = self._handle_check_request
+        self._model.check_toggled.connect(self._on_gene_toggled)
+        self._proxy = GeneFilterProxy(self._model, self)
+        self._selected_model = GeneSelectionModel(self._model, self)
 
         self._title = QLabel("Gene Inspector")
         self._status_label = QLabel(
@@ -2970,14 +3533,25 @@ class GeneInspectorWidget(QWidget):
 
         self._filter_edit = QLineEdit()
         self._filter_edit.setPlaceholderText("Filter genes…")
-        self._filter_edit.textChanged.connect(self._apply_filter)
+        self._filter_edit.setClearButtonEnabled(True)
+        self._filter_edit.textChanged.connect(self._on_filter_text_changed)
+        self._filter_edit.returnPressed.connect(self._on_filter_return)
+        self._filter_timer = QTimer(self)
+        self._filter_timer.setSingleShot(True)
+        self._filter_timer.setInterval(GENE_FILTER_DEBOUNCE_MS)
+        self._filter_timer.timeout.connect(self.flush_filter)
 
-        self._gene_list = QListWidget()
-        self._gene_list.setSelectionMode(QAbstractItemView.NoSelection)
-        # Rows are not a uniform height: the group headings are taller than the
-        # gene rows, so each item must be sized from its own widget.
-        self._gene_list.setUniformItemSizes(False)
-        self._gene_list.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._selected_label = QLabel("")
+        self._selected_view = _make_gene_list_view()
+        self._selected_view.setModel(self._selected_model)
+        self._selected_view.setFixedHeight(GENE_LIST_ROW_HEIGHT * GENE_SELECTED_LIST_ROWS + 4)
+        self._selected_label.setVisible(False)
+        self._selected_view.setVisible(False)
+
+        self._gene_view = _make_gene_list_view()
+        self._gene_view.setModel(self._proxy)
+        self._gene_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self._gene_view.clicked.connect(self._on_view_clicked)
 
         root = QVBoxLayout()
         root.setContentsMargins(8, 8, 8, 8)
@@ -3004,7 +3578,9 @@ class GeneInspectorWidget(QWidget):
         order_row.addWidget(self._order_alpha_btn)
         root.addLayout(order_row)
         root.addWidget(self._filter_edit)
-        root.addWidget(self._gene_list, stretch=1)
+        root.addWidget(self._selected_label)
+        root.addWidget(self._selected_view)
+        root.addWidget(self._gene_view, stretch=1)
         root.addWidget(self._status_label)
         self.setLayout(root)
         self.setMinimumWidth(240)
@@ -3053,15 +3629,24 @@ class GeneInspectorWidget(QWidget):
     def dataset(self) -> str | None:
         return self._dataset
 
+    @property
+    def panel_mode(self) -> str:
+        return self._mode
+
+    @property
+    def selection_cap(self) -> int:
+        return int(self._selection_cap)
+
     def clear(self):
         self._suppress = True
         try:
-            self._gene_list.clear()
-            self._checkboxes.clear()
-            self._items.clear()
-            self._headers = []
-            self._control_genes = set()
+            self._filter_timer.stop()
+            self._model.set_rows([], {}, {}, set(), set(), {}, "alphabetical")
+            self._proxy.set_accept_mask(np.zeros(0, dtype=bool))
+            self._selection_order = []
+            self._selected_model.set_genes([])
             self._dataset = None
+            self._apply_mode_widgets(GENE_PANEL_MODE_FULL)
             self._show_all_check.setCheckState(Qt.Unchecked)
         finally:
             self._suppress = False
@@ -3109,102 +3694,193 @@ class GeneInspectorWidget(QWidget):
         show_controls: bool,
         spot_size: float,
         colour_by_assignment: bool = False,
+        *,
+        mode: str = GENE_PANEL_MODE_FULL,
+        selection_cap: int = GENE_SELECTION_SLOT_CAP,
+        overview: bool = False,
     ):
         """Build the gene rows for ``dataset`` (called on the GUI thread).
 
         ``layout`` is an ordered list of ``("header", title, rgba)`` and
         ``("gene", name)`` entries. In A–Z (flat) mode there are no headers and
-        each row is annotated with its ``labels[name]`` broad/fine text.
+        each row is annotated with its ``labels[name]`` broad/fine text. This is
+        one model reset: no per-row widgets are created.
         """
         self._suppress = True
         try:
-            self._gene_list.clear()
-            self._checkboxes.clear()
-            self._items.clear()
-            self._headers = []
+            self._filter_timer.stop()
             self._dataset = str(dataset)
             self._ordering = str(ordering)
-            self._control_genes = set(control_genes)
+            self._selection_cap = max(1, int(selection_cap))
             self._hide_assigned_check.setChecked(bool(hide_assigned))
             self._hide_bg_check.setChecked(bool(hide_background))
             self._colour_by_assignment_check.setChecked(bool(colour_by_assignment))
             self._show_controls_check.setChecked(bool(show_controls))
             self._set_spot_widgets(float(spot_size))
-
-            pending_header: tuple | None = None
-            header_genes: list[str] = []
-
-            def _finalize_header():
-                if pending_header is None:
-                    return
-                item, widget, title = pending_header
-                genes = list(header_genes)
-                self._headers.append((item, title, genes))
-                # Clicking a heading selects/deselects every gene beneath it.
-                widget.clicked.connect(lambda gs=genes: self._on_header_clicked(gs))
-
-            for entry in layout:
-                if entry[0] == "header":
-                    _finalize_header()
-                    _, title, rgba = entry
-                    item = QListWidgetItem()
-                    item.setFlags(Qt.NoItemFlags)
-                    widget = self._make_header_widget(str(title), rgba)
-                    # Reserve extra height so the heading isn't crowded by the gene
-                    # rows above/below (the stylesheet top margin isn't counted in
-                    # the label's own sizeHint).
-                    hint = widget.sizeHint()
-                    item.setSizeHint(QSize(hint.width(), hint.height() + 14))
-                    self._gene_list.addItem(item)
-                    self._gene_list.setItemWidget(item, widget)
-                    pending_header = (item, widget, str(title))
-                    header_genes = []
-                    continue
-
-                gene = str(entry[1])
-                visual = gene_visuals.get(gene)
-                symbol = getattr(visual, "symbol", "disc")
-                rgba = getattr(visual, "rgba", (1.0, 1.0, 1.0, 1.0))
-                count = int(gene_counts.get(gene, 0))
-                text = f"{gene}    ({count:,})"
-                if str(ordering) == "alphabetical" and labels.get(gene):
-                    text = f"{text}    ·  {labels[gene]}"
-                check = QCheckBox(text)
-                check.setIcon(QIcon(make_gene_marker_pixmap(rgba, symbol, px=22)))
-                check.setChecked(gene in enabled_genes)
-                check.toggled.connect(lambda on, g=gene: self._on_gene_toggled(g, on))
-                item = QListWidgetItem()
-                item.setSizeHint(check.sizeHint())
-                self._gene_list.addItem(item)
-                self._gene_list.setItemWidget(item, check)
-                self._checkboxes[gene] = check
-                self._items[gene] = item
-                header_genes.append(gene)
-
-            _finalize_header()
-
-            self._refresh_row_visibility()
-            self._refresh_show_all_state()
+            self._model.set_rows(
+                layout,
+                gene_visuals,
+                gene_counts,
+                control_genes,
+                enabled_genes,
+                labels,
+                ordering,
+                panel_mode=mode,
+            )
+            if mode == GENE_PANEL_MODE_SELECTION:
+                # Folded control headings open with the "show controls" box.
+                for group in np.flatnonzero(self._model.header_collapsible):
+                    self._model.collapsed[int(group)] = not bool(show_controls)
+            self._apply_mode_widgets(mode)
+            self._selection_order = [
+                int(gi) for gi in np.flatnonzero(self._model.checked)
+            ] if mode == GENE_PANEL_MODE_SELECTION else []
+            self._refresh_selected_list()
+            self.flush_filter()
+            if mode == GENE_PANEL_MODE_SELECTION:
+                self._show_all_check.setCheckState(Qt.Checked if overview else Qt.Unchecked)
+                self._filter_edit.setFocus()
+            else:
+                self._refresh_show_all_state()
         finally:
             self._suppress = False
 
-    def _make_header_widget(self, title: str, rgba) -> QLabel:
-        """A clickable, bold group heading with a colour cue from the group's shade.
+    # -- accessors (tests and controller) ------------------------------------
+    def gene_names(self) -> list[str]:
+        return list(self._model.genes)
 
-        Clicking the heading toggles every (currently visible) gene under it.
-        """
-        label = _GroupHeaderLabel(title)
-        label.setCursor(Qt.PointingHandCursor)
-        label.setToolTip("Click to show / hide all genes in this group")
-        r, g, b = (int(round(255 * float(c))) for c in (rgba[:3] if rgba else (0.6, 0.6, 0.6)))
-        label.setStyleSheet(
-            "QLabel { font-weight: bold; font-size: 13pt; color: #f0f0f0; margin-top: 6px;"
-            f" padding: 4px 4px 4px 8px; border-left: 7px solid rgb({r}, {g}, {b}); }}"
-            "QLabel:hover { color: #ffffff; background: rgba(255, 255, 255, 20); }"
+    def is_gene_checked(self, gene: str) -> bool:
+        gi = self._model.gene_index.get(str(gene))
+        return gi is not None and bool(self._model.checked[gi])
+
+    def is_gene_row_hidden(self, gene: str) -> bool:
+        """True when ``gene``'s row in the main list is filtered out or folded."""
+        gi = self._model.gene_index.get(str(gene))
+        if gi is None:
+            return True
+        return not self._proxy.filter_accepts_row(int(self._model.gene_row[gi]))
+
+    def header_titles(self) -> list[str]:
+        return list(self._model.header_titles)
+
+    def is_header_hidden(self, title: str) -> bool:
+        try:
+            group = self._model.header_titles.index(str(title))
+        except ValueError:
+            return True
+        return not self._proxy.filter_accepts_row(int(self._model.header_rows[group]))
+
+    def is_header_collapsed(self, title: str) -> bool:
+        try:
+            group = self._model.header_titles.index(str(title))
+        except ValueError:
+            return False
+        return bool(self._model.collapsed[group])
+
+    def gene_row_text(self, gene: str) -> str:
+        gi = self._model.gene_index.get(str(gene))
+        return "" if gi is None else self._model.gene_text[gi]
+
+    def visible_gene_names(self) -> list[str]:
+        """Genes whose main-list rows currently pass the filter, in list order."""
+        rows = self._proxy._rows
+        genes = self._model.row_gene[rows]
+        return [self._model.genes[int(gi)] for gi in genes[genes >= 0]]
+
+    def selected_genes(self) -> list[str]:
+        """Ticked genes in selection mode, in the order they were ticked."""
+        return [self._model.genes[gi] for gi in self._selection_order]
+
+    def set_gene_checked(self, gene: str, on: bool) -> bool:
+        """Tick/untick ``gene`` as the user would; returns False when refused."""
+        gi = self._model.gene_index.get(str(gene))
+        if gi is None:
+            return False
+        return self._model.request_check(int(gi), bool(on))
+
+    def sync_checked_genes(self, genes) -> None:
+        """Make the ticks match ``genes`` exactly, without calling back."""
+        wanted = {str(g) for g in genes}
+        mask = np.fromiter((g in wanted for g in self._model.genes), dtype=bool, count=len(self._model.genes))
+        self._suppress = True
+        try:
+            self._model.set_checked_mask(mask)
+            if self._mode == GENE_PANEL_MODE_SELECTION:
+                kept = [gi for gi in self._selection_order if mask[gi]]
+                known = set(kept)
+                kept.extend(int(gi) for gi in np.flatnonzero(mask) if int(gi) not in known)
+                self._selection_order = kept
+                self._refresh_selected_list()
+            else:
+                self._refresh_show_all_state()
+        finally:
+            self._suppress = False
+
+    def set_gene_visuals(self, visuals: Mapping) -> None:
+        """Repaint the marker icons of some genes (one DecorationRole update)."""
+        self._model.set_gene_visuals(visuals)
+
+    def refresh_decorations(self) -> None:
+        self._model.refresh_decorations()
+
+    def set_overview_checked(self, on: bool) -> None:
+        if self._mode != GENE_PANEL_MODE_SELECTION:
+            return
+        self._show_all_check.blockSignals(True)
+        self._show_all_check.setCheckState(Qt.Checked if on else Qt.Unchecked)
+        self._show_all_check.blockSignals(False)
+
+    def click_header(self, title: str) -> None:
+        """Act as a click on group heading ``title``."""
+        try:
+            group = self._model.header_titles.index(str(title))
+        except ValueError:
+            return
+        self._on_header_group_clicked(group)
+
+    def flush_filter(self) -> None:
+        """Apply the filter box now (skips the debounce)."""
+        self._filter_timer.stop()
+        self._proxy.set_accept_mask(
+            self._model.row_accept_mask(
+                self._filter_edit.text(), self._show_controls_check.isChecked()
+            )
         )
-        return label
 
     # -- helpers ------------------------------------------------------------
+    def _apply_mode_widgets(self, mode: str) -> None:
+        self._mode = str(mode)
+        selection = self._mode == GENE_PANEL_MODE_SELECTION
+        self._show_all_check.blockSignals(True)
+        if selection:
+            self._show_all_check.setTristate(False)
+            self._show_all_check.setText("All-transcript overview")
+            self._show_all_check.setToolTip(
+                "Show every transcript as an overview, independent of the selected genes."
+            )
+            self._filter_edit.setPlaceholderText(
+                "Search genes… (paste a list to match exact names)"
+            )
+        else:
+            self._show_all_check.setTristate(True)
+            self._show_all_check.setText("Show all genes")
+            self._show_all_check.setToolTip("")
+            self._filter_edit.setPlaceholderText("Filter genes…")
+        self._show_all_check.blockSignals(False)
+        self._selected_label.setVisible(selection)
+        self._selected_view.setVisible(selection and bool(self._selection_order))
+
+    def _refresh_selected_list(self) -> None:
+        if self._mode != GENE_PANEL_MODE_SELECTION:
+            return
+        self._selected_model.set_genes(self._selection_order)
+        shown_rows = min(len(self._selection_order), GENE_SELECTED_LIST_ROWS)
+        self._selected_view.setVisible(shown_rows > 0)
+        self._selected_view.setFixedHeight(GENE_LIST_ROW_HEIGHT * max(1, shown_rows) + 4)
+        self._selected_label.setText(
+            f"Selected ({len(self._selection_order)}/{self._selection_cap})"
+        )
+
     def _spot_size_to_slider(self, um: float) -> int:
         raw = int(round(float(um) * self._SPOT_SLIDER_SCALE))
         return max(self._SPOT_SLIDER_MIN, min(self._SPOT_SLIDER_MAX, raw))
@@ -3222,32 +3898,21 @@ class GeneInspectorWidget(QWidget):
         self._spot_slider.blockSignals(False)
         self._spot_spin.blockSignals(False)
 
-    def _eligible_genes(self) -> list[str]:
-        show_controls = self._show_controls_check.isChecked()
-        return [g for g in self._checkboxes if show_controls or g not in self._control_genes]
-
-    def _refresh_row_visibility(self):
-        show_controls = self._show_controls_check.isChecked()
-        needle = self._filter_edit.text().strip().lower()
-        for gene, item in self._items.items():
-            hidden = (gene in self._control_genes and not show_controls) or (
-                bool(needle) and needle not in gene.lower()
-            )
-            item.setHidden(hidden)
-        # A group heading disappears once every gene beneath it is hidden.
-        for header_item, _title, genes in self._headers:
-            any_visible = any(
-                g in self._items and not self._items[g].isHidden() for g in genes
-            )
-            header_item.setHidden(not any_visible)
+    def _eligible_mask(self) -> np.ndarray:
+        if self._show_controls_check.isChecked():
+            return np.ones(len(self._model.genes), dtype=bool)
+        return ~self._model.is_control
 
     def _refresh_show_all_state(self):
-        eligible = self._eligible_genes()
-        checked = sum(1 for g in eligible if self._checkboxes[g].isChecked())
+        if self._mode == GENE_PANEL_MODE_SELECTION:
+            return
+        eligible = self._eligible_mask()
+        n_eligible = int(np.count_nonzero(eligible))
+        checked = int(np.count_nonzero(self._model.checked & eligible))
         self._show_all_check.blockSignals(True)
-        if not eligible or checked == 0:
+        if not n_eligible or checked == 0:
             self._show_all_check.setCheckState(Qt.Unchecked)
-        elif checked == len(eligible):
+        elif checked == n_eligible:
             self._show_all_check.setCheckState(Qt.Checked)
         else:
             self._show_all_check.setCheckState(Qt.PartiallyChecked)
@@ -3258,7 +3923,29 @@ class GeneInspectorWidget(QWidget):
         if self._dataset is not None:
             self._close_callback(self._dataset)
 
+    def _handle_check_request(self, gene: str, on: bool) -> bool:
+        """Refuse a tick that would exceed the selection-mode slot cap."""
+        if (
+            on
+            and self._mode == GENE_PANEL_MODE_SELECTION
+            and not self._suppress
+            and int(np.count_nonzero(self._model.checked)) >= self._selection_cap
+        ):
+            self.set_status(
+                f"Selection is full ({self._selection_cap}/{self._selection_cap} genes). "
+                "Untick a gene before adding another."
+            )
+            return False
+        return True
+
     def _on_gene_toggled(self, gene: str, on: bool):
+        if self._mode == GENE_PANEL_MODE_SELECTION:
+            gi = self._model.gene_index[gene]
+            if on and gi not in self._selection_order:
+                self._selection_order.append(gi)
+            elif not on and gi in self._selection_order:
+                self._selection_order.remove(gi)
+            self._refresh_selected_list()
         if self._suppress or self._dataset is None:
             return
         self._set_gene_visible_callback(self._dataset, gene, bool(on))
@@ -3267,12 +3954,19 @@ class GeneInspectorWidget(QWidget):
     def _on_show_all_clicked(self, _checked=None):
         if self._suppress or self._dataset is None:
             return
+        if self._mode == GENE_PANEL_MODE_SELECTION:
+            on = self._show_all_check.checkState() == Qt.Checked
+            if self._set_overview_callback is not None:
+                self._set_overview_callback(self._dataset, bool(on))
+            else:
+                self.set_status("The all-transcript overview is not available for this dataset.")
+                self.set_overview_checked(False)
+            return
         # A click on a tri-state box cycles to fully on unless already fully on.
         turn_on = self._show_all_check.checkState() != Qt.Unchecked
         self._suppress = True
         try:
-            for gene in self._eligible_genes():
-                self._checkboxes[gene].setChecked(turn_on)
+            self._model.set_checked(np.flatnonzero(self._eligible_mask()), turn_on)
         finally:
             self._suppress = False
         self._refresh_show_all_state()
@@ -3296,7 +3990,9 @@ class GeneInspectorWidget(QWidget):
             self._set_colour_by_assignment_callback(self._dataset, bool(on))
 
     def _on_show_controls_toggled(self, on: bool):
-        self._refresh_row_visibility()
+        for group in np.flatnonzero(self._model.header_collapsible):
+            self._model.set_collapsed(int(group), not bool(on))
+        self.flush_filter()
         self._refresh_show_all_state()
         if self._suppress or self._dataset is None:
             return
@@ -3310,26 +4006,97 @@ class GeneInspectorWidget(QWidget):
             return
         self._set_ordering_callback(self._dataset, str(kind))
 
-    def _on_header_clicked(self, genes: list[str]):
-        """Toggle every currently-visible gene under a group heading at once."""
+    def _on_view_clicked(self, index):
+        if not index.isValid() or not index.data(_GENE_IS_HEADER_ROLE):
+            return
+        title = index.data(_GENE_HEADER_TITLE_ROLE)
+        try:
+            group = self._model.header_titles.index(str(title))
+        except ValueError:
+            return
+        self._on_header_group_clicked(group)
+
+    def _visible_group_genes(self, group: int) -> np.ndarray:
+        members = self._model.group_genes[int(group)]
+        if members.size == 0:
+            return members
+        accept = self._proxy._accept
+        if len(accept) != len(self._model.row_is_header):
+            return members[:0]
+        return members[accept[self._model.gene_row[members]]]
+
+    def _on_header_group_clicked(self, group: int):
+        """Toggle every currently-visible gene under a heading at once.
+
+        A foldable control heading (selection mode) opens or folds instead.
+        """
+        if self._model.header_collapsible[int(group)]:
+            # Folding follows the "show controls" box so both stay in step.
+            self._show_controls_check.setChecked(not self._show_controls_check.isChecked())
+            return
         if self._suppress or self._dataset is None or self._set_genes_visible_callback is None:
             return
-        visible = [
-            g for g in genes
-            if g in self._checkboxes and g in self._items and not self._items[g].isHidden()
-        ]
-        if not visible:
+        visible = self._visible_group_genes(group)
+        if visible.size == 0:
             return
+        self._bulk_toggle(visible)
+
+    def _bulk_toggle(self, gene_indices: np.ndarray) -> None:
         # If any visible gene is off, turn the group on; otherwise turn it all off.
-        turn_on = not all(self._checkboxes[g].isChecked() for g in visible)
+        turn_on = not bool(np.all(self._model.checked[gene_indices]))
+        if turn_on and self._mode == GENE_PANEL_MODE_SELECTION:
+            would_be = int(np.count_nonzero(self._model.checked)) + int(
+                np.count_nonzero(~self._model.checked[gene_indices])
+            )
+            if would_be > self._selection_cap:
+                self.set_status(
+                    f"Selecting these {gene_indices.size:,} genes would exceed the "
+                    f"{self._selection_cap}-gene selection limit; narrow the search "
+                    "or tick genes individually."
+                )
+                return
+        changed = gene_indices[self._model.checked[gene_indices] != turn_on]
         self._suppress = True
         try:
-            for g in visible:
-                self._checkboxes[g].setChecked(turn_on)
+            self._model.set_checked(gene_indices, turn_on)
+            if self._mode == GENE_PANEL_MODE_SELECTION:
+                if turn_on:
+                    self._selection_order.extend(int(gi) for gi in changed)
+                else:
+                    drop = {int(gi) for gi in gene_indices}
+                    self._selection_order = [gi for gi in self._selection_order if gi not in drop]
+                self._refresh_selected_list()
         finally:
             self._suppress = False
         self._refresh_show_all_state()
-        self._set_genes_visible_callback(self._dataset, visible, turn_on)
+        genes = [self._model.genes[int(gi)] for gi in gene_indices]
+        if self._set_genes_visible_callback is not None:
+            self._set_genes_visible_callback(self._dataset, genes, turn_on)
+
+    def _on_filter_text_changed(self, _text: str):
+        if len(self._model.row_is_header) > GENE_FILTER_DEBOUNCE_ROWS:
+            self._filter_timer.start()
+        else:
+            self.flush_filter()
+
+    def _on_filter_return(self):
+        """Enter selects the matching genes in selection mode (within the cap)."""
+        self.flush_filter()
+        if self._mode != GENE_PANEL_MODE_SELECTION or self._dataset is None:
+            return
+        if not self._filter_edit.text().strip():
+            return
+        rows = self._proxy._rows
+        genes = self._model.row_gene[rows]
+        genes = genes[genes >= 0]
+        genes = genes[~self._model.is_control[genes] | self._show_controls_check.isChecked()]
+        if genes.size == 0:
+            self.set_status("No gene matches the search.")
+            return
+        off = genes[~self._model.checked[genes]]
+        if off.size == 0:
+            return
+        self._bulk_toggle(off)
 
     def _emit_spot_size(self, um: float):
         self._set_spot_widgets(um)
@@ -3349,9 +4116,6 @@ class GeneInspectorWidget(QWidget):
 
     def _on_spot_spin_changed(self, um: float):
         self._emit_spot_size(float(um))
-
-    def _apply_filter(self, _text: str):
-        self._refresh_row_visibility()
 
 
 class CellTypeWidget(QWidget):
@@ -10988,7 +11752,12 @@ class ComparisonViewerController:
         hide_background = bool(getattr(self.args, "gene_hide_background", False))
         show_controls = bool(getattr(self.args, "gene_show_controls", False))
         spot_size = float(getattr(self.args, "gene_spot_size", DEFAULT_GENE_SPOT_SIZE))
-        enabled = {g for g in store.genes if show_controls or g not in store.control_genes}
+        panel_mode = gene_panel_mode_for(ds, len(store.genes))
+        if panel_mode == GENE_PANEL_MODE_SELECTION:
+            # Too many features to draw or tick them all: start empty, search first.
+            enabled = set()
+        else:
+            enabled = {g for g in store.genes if show_controls or g not in store.control_genes}
 
         timer = QTimer()
         timer.setSingleShot(True)
@@ -11026,6 +11795,12 @@ class ComparisonViewerController:
             ordering=ordering,
             color_kind="coarse",
             colour_by_assignment=False,
+            panel_mode=panel_mode,
+            slot_allocator=(
+                GeneSlotAllocator(GENE_SELECTION_SLOT_CAP)
+                if panel_mode == GENE_PANEL_MODE_SELECTION
+                else None
+            ),
         )
         timer.timeout.connect(lambda d=ds: self._flush_gene_group_rebuild(d))
         self._gene_inspector_states[ds] = state
@@ -11126,9 +11901,14 @@ class ComparisonViewerController:
             ]
         shown = state.group_shown_masks[gi]
         shown.fill(False)
+        overview = bool(getattr(state, "overview_visible", False))
         for gene in store.genes:
             entry = store.gene_offsets.get(gene)
-            if entry is None or int(entry[0]) != int(gi) or gene not in state.enabled_genes:
+            if entry is None or int(entry[0]) != int(gi):
+                continue
+            if gene not in state.enabled_genes and not (
+                overview and gene not in store.control_genes
+            ):
                 continue
             _group, fg_start, fg_end, bg_end = entry
             if not state.hide_assigned:
@@ -12937,7 +13717,7 @@ class ComparisonViewerController:
         self._set_status("".join(lines))
 
     def _gene_highlight_status_line(self, state: GeneInspectorState, gene: str) -> str:
-        visual = state.gene_visuals.get(gene)
+        visual = self._selection_slot_visual(state, gene) or state.gene_visuals.get(gene)
         symbol = getattr(visual, "symbol", state.store.gene_symbol(gene) or "disc")
         rgba = getattr(visual, "rgba", (1.0, 1.0, 1.0, 1.0))
         glyph = GENE_STATUS_SYMBOL_GLYPHS.get(str(symbol), "●")
@@ -12983,6 +13763,127 @@ class ComparisonViewerController:
             layout.extend(("gene", gene) for gene in genes)
         return layout, labels
 
+    @staticmethod
+    def _gene_control_set(state: GeneInspectorState) -> set:
+        return set(
+            state.panel_control_genes
+            if state.panel_control_genes is not None
+            else state.store.control_genes
+        )
+
+    def _selection_gene_layout(self, state: GeneInspectorState, layout: list[tuple]) -> list[tuple]:
+        """Move every control feature under ONE trailing heading (selection mode).
+
+        Control probes and codewords can outnumber the genes several times over
+        on Atera (6.6k controls next to 18k genes), so they fold away under a
+        single "Control / blank probes" heading with their count instead of
+        being scattered through the list or the cell-type groups.
+        """
+        controls = self._gene_control_set(state)
+        if not controls:
+            return layout
+        out: list[tuple] = []
+        pending_header: tuple | None = None
+        control_rows: list[str] = []
+        for entry in layout:
+            if entry[0] == "header":
+                if entry[1] == CONTROL_GROUP_TITLE:
+                    pending_header = None
+                    continue
+                pending_header = entry
+                continue
+            gene = str(entry[1])
+            if gene in controls:
+                control_rows.append(gene)
+                continue
+            if pending_header is not None:
+                out.append(pending_header)
+                pending_header = None
+            out.append(entry)
+        if control_rows:
+            out.append(("header", CONTROL_GROUP_TITLE, (0.6, 0.6, 0.6, 1.0)))
+            out.extend(("gene", gene) for gene in sorted(control_rows))
+        return out
+
+    def _selection_slot_visual(self, state: GeneInspectorState, gene: str):
+        """The slot colour of a selected gene (selection mode), else ``None``.
+
+        The eager point store groups points by their build-time symbol, so the
+        slot recolours a gene but keeps the symbol its layer draws.
+        """
+        allocator = getattr(state, "slot_allocator", None)
+        if allocator is None:
+            return None
+        visual = allocator.visual(gene)
+        if visual is None:
+            return None
+        symbol = state.store.gene_symbol(gene) or visual.symbol
+        return GeneVisual(rgba=visual.rgba, symbol=symbol)
+
+    def _paint_gene_points(self, state: GeneInspectorState, gene: str, rgba) -> int | None:
+        """Fill one gene's contiguous run in its store group with ``rgba``."""
+        entry = state.store.gene_offsets.get(str(gene))
+        if entry is None:
+            return None
+        gi, fg_start, _fg_end, bg_end = entry
+        if gi >= len(state.store.group_colors):
+            return None
+        state.store.group_colors[gi][int(fg_start):int(bg_end)] = np.asarray(rgba, dtype=np.float32)
+        return int(gi)
+
+    def _apply_selection_slots(
+        self, state: GeneInspectorState, genes, on: bool
+    ) -> tuple[list[str], set[int]]:
+        """Allocate (or free) colour slots for ``genes``; returns (accepted, groups).
+
+        Genes past the slot cap are refused; freed genes get their scheme colour
+        back. Only touched groups are returned for a recolour.
+        """
+        allocator = getattr(state, "slot_allocator", None)
+        accepted: list[str] = []
+        groups: set[int] = set()
+        widget_visuals: dict = {}
+        for gene in genes:
+            gene = str(gene)
+            if on:
+                if allocator.allocate(gene) is None:
+                    continue
+                visual = self._selection_slot_visual(state, gene)
+            else:
+                allocator.release(gene)
+                visual = state.gene_visuals.get(gene)
+            accepted.append(gene)
+            if visual is not None:
+                widget_visuals[gene] = visual
+                gi = self._paint_gene_points(state, gene, visual.rgba)
+                if gi is not None:
+                    groups.add(gi)
+        widget = self._gene_inspector_widget
+        if widget_visuals and widget is not None and hasattr(widget, "set_gene_visuals"):
+            widget.set_gene_visuals(widget_visuals)
+        return accepted, groups
+
+    def _reapply_selection_slot_colours(self, state: GeneInspectorState) -> None:
+        """Re-paint the slot colours after a scheme recolour overwrote them."""
+        if getattr(state, "slot_allocator", None) is None:
+            return
+        for gene in state.slot_allocator.genes:
+            visual = self._selection_slot_visual(state, gene)
+            if visual is not None:
+                self._paint_gene_points(state, gene, visual.rgba)
+
+    def _refuse_selection_overflow(self, state: GeneInspectorState, refused: list[str]) -> None:
+        cap = getattr(state.slot_allocator, "cap", GENE_SELECTION_SLOT_CAP)
+        self._set_status(
+            f"Selection is full ({cap}/{cap} genes); not shown: "
+            + ", ".join(refused[:5])
+            + (" …" if len(refused) > 5 else "")
+            + ". Untick a gene before adding another."
+        )
+        widget = self._gene_inspector_widget
+        if widget is not None and hasattr(widget, "sync_checked_genes"):
+            widget.sync_checked_genes(state.enabled_genes)
+
     def _populate_gene_inspector(self, state: GeneInspectorState):
         """(Re)build the gene inspector list widget for ``state``'s ordering."""
         widget = self._gene_inspector_widget
@@ -12997,10 +13898,28 @@ class ComparisonViewerController:
             fine_available=state.fine_ordering_available,
             reference_summary=state.reference_summary,
         )
+        selection = getattr(state, "panel_mode", GENE_PANEL_MODE_FULL) == GENE_PANEL_MODE_SELECTION
+        gene_visuals = state.gene_visuals or {}
+        extra: dict = {}
+        if selection:
+            layout = self._selection_gene_layout(state, layout)
+            slot_visuals = {
+                gene: visual
+                for gene in getattr(state.slot_allocator, "genes", [])
+                for visual in [self._selection_slot_visual(state, gene)]
+                if visual is not None
+            }
+            if slot_visuals:
+                gene_visuals = {**gene_visuals, **slot_visuals}
+            extra = {
+                "mode": GENE_PANEL_MODE_SELECTION,
+                "selection_cap": getattr(state.slot_allocator, "cap", GENE_SELECTION_SLOT_CAP),
+                "overview": bool(state.overview_visible),
+            }
         widget.populate(
             "PAIRED" if self._paired_session is not None else state.dataset,
             layout,
-            state.gene_visuals or {},
+            gene_visuals,
             (
                 dict(state.panel_gene_counts)
                 if state.panel_gene_counts is not None
@@ -13019,6 +13938,7 @@ class ComparisonViewerController:
             state.show_controls,
             state.spot_size,
             state.colour_by_assignment,
+            **extra,
         )
 
     def _gene_states_for_control(self, dataset_name: str) -> tuple[GeneInspectorState, ...]:
@@ -13056,6 +13976,7 @@ class ComparisonViewerController:
                     state.store.recolor(scheme.visuals)
                     state.gene_visuals = scheme.visuals
                     state.color_kind = kind
+                    self._reapply_selection_slot_colours(state)
                     self._recolor_gene_group_layers(state, group_indices=None)
                     if state.highlighted_genes:
                         self._set_gene_highlight_status(state)
@@ -13067,6 +13988,12 @@ class ComparisonViewerController:
     def set_gene_visible(self, dataset_name: str, gene: str, on: bool):
         gene = str(gene)
         for state in self._gene_states_for_control(dataset_name):
+            if getattr(state, "slot_allocator", None) is not None:
+                accepted, groups = self._apply_selection_slots(state, [gene], bool(on))
+                if not accepted:
+                    self._refuse_selection_overflow(state, [gene])
+                    continue
+                self._recolor_gene_group_layers(state, group_indices=groups)
             if on:
                 state.enabled_genes.add(gene)
             else:
@@ -13082,6 +14009,16 @@ class ComparisonViewerController:
         on = bool(on)
         for state in self._gene_states_for_control(dataset_name):
             groups: set[int] = set()
+            if getattr(state, "slot_allocator", None) is not None:
+                wanted = [str(g) for g in genes]
+                fresh = [g for g in wanted if g not in state.slot_allocator]
+                if on and len(state.slot_allocator) + len(fresh) > state.slot_allocator.cap:
+                    # All or nothing: a heading never half-enables past the cap.
+                    self._refuse_selection_overflow(state, fresh)
+                    continue
+                accepted, slot_groups = self._apply_selection_slots(state, wanted, on)
+                genes = accepted
+                self._recolor_gene_group_layers(state, group_indices=slot_groups)
             for gene in genes:
                 if on:
                     state.enabled_genes.add(str(gene))
@@ -13110,6 +14047,17 @@ class ComparisonViewerController:
                 if state.panel_control_genes is not None
                 else store.control_genes
             )
+            if getattr(state, "slot_allocator", None) is not None:
+                if on:
+                    # Selection mode never ticks every gene; the overview shows them.
+                    self.set_gene_overview(dataset_name, True)
+                    continue
+                released = list(state.slot_allocator.genes)
+                _accepted, groups = self._apply_selection_slots(state, released, False)
+                self._recolor_gene_group_layers(state, group_indices=groups)
+                widget = self._gene_inspector_widget
+                if widget is not None and hasattr(widget, "sync_checked_genes"):
+                    widget.sync_checked_genes(())
             if on:
                 state.enabled_genes = {
                     gene
@@ -13120,6 +14068,23 @@ class ComparisonViewerController:
                 state.enabled_genes = set()
                 self._clear_highlighted_genes(state)
             self._rebuild_gene_group_layers(state, group_indices=None)
+
+    def set_gene_overview(self, dataset_name: str, on: bool):
+        """Selection mode's "All-transcript overview" switch.
+
+        For an in-memory point store this draws every real gene (controls stay
+        hidden) in its scheme colour on top of the selected genes; turning it
+        off leaves only the selection.
+        """
+        states = self._gene_states_for_control(dataset_name)
+        for state in states:
+            if getattr(state, "panel_mode", GENE_PANEL_MODE_FULL) != GENE_PANEL_MODE_SELECTION:
+                continue
+            state.overview_visible = bool(on)
+            self._rebuild_gene_group_layers(state, group_indices=None)
+        widget = self._gene_inspector_widget
+        if widget is not None and hasattr(widget, "set_overview_checked"):
+            widget.set_overview_checked(any(getattr(state, "overview_visible", False) for state in states))
 
     def set_gene_spot_size(self, dataset_name: str, size: float):
         for state in self._gene_states_for_control(dataset_name):
@@ -13150,7 +14115,13 @@ class ComparisonViewerController:
         for state in states:
             state.colour_by_assignment = bool(on)
             self._recolor_gene_group_layers(state, group_indices=None)
-        if states:
+        if not states:
+            return
+        widget = self._gene_inspector_widget
+        if widget is not None and hasattr(widget, "refresh_decorations"):
+            # Only the icons can change: one DecorationRole update, no model reset.
+            widget.refresh_decorations()
+        else:
             self._populate_gene_inspector(states[0])
 
     def set_gene_show_controls(self, dataset_name: str, on: bool):
@@ -13164,8 +14135,24 @@ class ComparisonViewerController:
                     else state.store.control_genes
                 )
                 self._discard_highlighted_genes(state, set(control_genes))
+                if getattr(state, "slot_allocator", None) is not None:
+                    selected_controls = [
+                        g for g in state.slot_allocator.genes if g in set(control_genes)
+                    ]
+                    if selected_controls:
+                        _accepted, groups = self._apply_selection_slots(
+                            state, selected_controls, False
+                        )
+                        self._recolor_gene_group_layers(state, group_indices=groups)
                 state.enabled_genes -= set(control_genes)
                 self._rebuild_gene_group_layers(state, group_indices=None)
+                widget = self._gene_inspector_widget
+                if (
+                    getattr(state, "slot_allocator", None) is not None
+                    and widget is not None
+                    and hasattr(widget, "sync_checked_genes")
+                ):
+                    widget.sync_checked_genes(state.enabled_genes)
 
     # -- Cell-type mask colouring ------------------------------------------
     def _cell_type_state(self, dataset_name: str) -> CellTypeOverlayState:
@@ -16671,6 +17658,7 @@ def main():
         set_assignment_source_callback=controller.set_transcript_assignment_source,
         set_ordering_callback=controller.set_gene_ordering,
         set_genes_visible_callback=controller.set_genes_visible,
+        set_overview_callback=controller.set_gene_overview,
         spot_size=args.gene_spot_size,
         hide_assigned=args.gene_hide_assigned,
         hide_background=args.gene_hide_background,

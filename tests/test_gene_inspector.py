@@ -219,20 +219,20 @@ def test_gene_inspector_widget_populate_and_callbacks(qapp):
     w.populate("TEST", layout, assign_gene_visuals(store.genes),
                dict(store.gene_counts), set(store.control_genes),
                {"AAA", "BBB"}, {}, "alphabetical", False, False, False, 2.0)
-    assert len(w._checkboxes) == 3
+    assert len(w.gene_names()) == 3
     assert w._hide_assigned_check.text() == "Hide assigned spots"
     assert w._hide_bg_check.text() == "Hide unassigned spots"
     assert w._colour_by_assignment_check.text() == "Colour transcripts by assigned/unassigned"
-    assert w._items["Blank-1"].isHidden()      # control hidden by default
-    assert not w._items["AAA"].isHidden()
-    assert w._checkboxes["AAA"].isChecked()
+    assert w.is_gene_row_hidden("Blank-1")      # control hidden by default
+    assert not w.is_gene_row_hidden("AAA")
+    assert w.is_gene_checked("AAA")
 
-    w._checkboxes["AAA"].setChecked(False)
+    w.set_gene_checked("AAA", False)
     assert ("vis", ("TEST", "AAA", False)) in calls
 
     # Showing controls reveals the control row.
     w._show_controls_check.setChecked(True)
-    assert not w._items["Blank-1"].isHidden()
+    assert not w.is_gene_row_hidden("Blank-1")
     assert ("ctrl", ("TEST", True)) in calls
 
     w._hide_assigned_check.setChecked(True)
@@ -376,14 +376,13 @@ def test_widget_grouped_populate_creates_headers_and_filters(qapp):
     counts = {"SLC17A7": 5, "SST": 3, "AQP4": 4}
     w.populate("TEST", layout, visuals, counts, set(), {"SLC17A7", "SST", "AQP4"},
                {}, "coarse", False, False, False, 2.0)
-    assert len(w._checkboxes) == 3
-    assert [t for _item, t, _g in w._headers] == ["Neuron", "Astrocyte"]
+    assert len(w.gene_names()) == 3
+    assert w.header_titles() == ["Neuron", "Astrocyte"]
 
     # Filtering to SST leaves the Neuron header visible but hides the Astrocyte one.
     w._filter_edit.setText("SST")
-    headers = {t: item for item, t, _g in w._headers}
-    assert not headers["Neuron"].isHidden()
-    assert headers["Astrocyte"].isHidden()
+    assert not w.is_header_hidden("Neuron")
+    assert w.is_header_hidden("Astrocyte")
 
 
 def test_clicking_group_header_toggles_group_genes(qapp):
@@ -410,20 +409,17 @@ def test_clicking_group_header_toggles_group_genes(qapp):
     ]
     w.populate("TEST", layout, visuals, {"SLC17A7": 1, "SST": 1, "AQP4": 1}, set(),
                {"SLC17A7", "SST", "AQP4"}, {}, "coarse", False, False, False, 2.0)
-    neuron_item = next(item for item, t, _g in w._headers if t == "Neuron")
-    header = w._gene_list.itemWidget(neuron_item)
-
     # All on -> a header click turns the group off (and leaves other groups alone).
-    header.clicked.emit()
+    w.click_header("Neuron")
     assert calls[-1] == ("TEST", ("SLC17A7", "SST"), False)
-    assert not w._checkboxes["SLC17A7"].isChecked()
-    assert not w._checkboxes["SST"].isChecked()
-    assert w._checkboxes["AQP4"].isChecked()
+    assert not w.is_gene_checked("SLC17A7")
+    assert not w.is_gene_checked("SST")
+    assert w.is_gene_checked("AQP4")
 
     # Clicking again turns the whole group back on.
-    header.clicked.emit()
+    w.click_header("Neuron")
     assert calls[-1] == ("TEST", ("SLC17A7", "SST"), True)
-    assert w._checkboxes["SLC17A7"].isChecked()
+    assert w.is_gene_checked("SLC17A7")
 
 
 def test_controller_set_genes_visible_batch(qapp):
@@ -454,8 +450,8 @@ def test_widget_alphabetical_appends_celltype_labels(qapp):
     labels = {"SLC17A7": "Neuron / L2/3 IT", "AQP4": "Astrocyte / Protoplasmic astrocyte"}
     w.populate("TEST", layout, visuals, {"SLC17A7": 1, "AQP4": 1}, set(),
                {"SLC17A7", "AQP4"}, labels, "alphabetical", False, False, False, 2.0)
-    assert w._headers == []
-    assert "Neuron / L2/3 IT" in w._checkboxes["SLC17A7"].text()
+    assert w.header_titles() == []
+    assert "Neuron / L2/3 IT" in w.gene_row_text("SLC17A7")
 
 
 def test_move_gene_layers_to_bottom(qapp):

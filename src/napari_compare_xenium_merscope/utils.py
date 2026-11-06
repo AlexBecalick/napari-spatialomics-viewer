@@ -22,6 +22,7 @@ from shapely.ops import linemerge, polygonize, unary_union
 
 from .platforms import (
     ATERA_ROOT_ATTR,
+    GENE_SELECTION_SLOT_CAP,
     PIXEL_TRANSFORM_MERSCOPE_AFFINE,
     PIXEL_TRANSFORM_SPEC_FILE,
     find_platform_spec,
@@ -2534,6 +2535,71 @@ def assign_gene_visuals(
     return visuals
 
 
+class GeneSlotAllocator:
+    """Colour slots for the genes shown in selection mode.
+
+    Selection mode draws at most ``cap`` genes at once, each as a ``disc`` in
+    one of ``cap`` maximally distinct (glasbey) colours. A newly selected gene
+    takes the lowest free slot, so a freed colour is reused before a new one is
+    handed out and the palette never grows past ``cap``. ``allocate`` returns
+    ``None`` once every slot is taken; callers show a status instead.
+    """
+
+    SYMBOL = "disc"
+
+    def __init__(self, cap: int = GENE_SELECTION_SLOT_CAP, alpha: float = 1.0):
+        self.cap = max(1, int(cap))
+        self._palette = gene_palette_rgba(self.cap, alpha=alpha)
+        self._slot_of: dict[str, int] = {}
+
+    def __len__(self) -> int:
+        return len(self._slot_of)
+
+    def __contains__(self, gene: object) -> bool:
+        return str(gene) in self._slot_of
+
+    @property
+    def full(self) -> bool:
+        return len(self._slot_of) >= self.cap
+
+    @property
+    def genes(self) -> list[str]:
+        """Allocated genes in slot order."""
+        return sorted(self._slot_of, key=self._slot_of.__getitem__)
+
+    def slot_of(self, gene: object) -> int | None:
+        return self._slot_of.get(str(gene))
+
+    def allocate(self, gene: object) -> int | None:
+        """Give ``gene`` the lowest free slot (idempotent); ``None`` when full."""
+        gene = str(gene)
+        if gene in self._slot_of:
+            return self._slot_of[gene]
+        if self.full:
+            return None
+        used = set(self._slot_of.values())
+        slot = next(i for i in range(self.cap) if i not in used)
+        self._slot_of[gene] = slot
+        return slot
+
+    def release(self, gene: object) -> int | None:
+        """Free ``gene``'s slot and return it (``None`` if it had none)."""
+        return self._slot_of.pop(str(gene), None)
+
+    def clear(self) -> None:
+        self._slot_of.clear()
+
+    def slot_rgba(self, slot: int) -> tuple[float, float, float, float]:
+        return self._palette[int(slot) % self.cap]
+
+    def visual(self, gene: object) -> GeneVisual | None:
+        """The slot colour + disc for an allocated ``gene``, else ``None``."""
+        slot = self.slot_of(gene)
+        if slot is None:
+            return None
+        return GeneVisual(rgba=self.slot_rgba(slot), symbol=self.SYMBOL)
+
+
 # -- Cell-type marker reference ------------------------------------------------
 # A curated map from marker gene -> (broad, fine) cell type, optionally stored in
 # a SpatialData object so the gene inspector can group genes by the cell type
@@ -3030,6 +3096,48 @@ def resolve_cell_type_marker_reference(
     )
 
 
+def _read_marker_table_parts(group) -> Any:
+    """Read only the marker-bearing parts of one AnnData zarr group.
+
+    Never reads ``X``, ``obsm`` or ``layers``: an Atera ``table_original`` holds
+    millions of cells by ~18k genes, so a full ``ad.read_zarr`` would load
+    gigabytes to look for a few hundred marker rows. ``uns`` contributes only
+    the marker entry, and ``obs`` / ``var`` are read only when their column order
+    lists ``broad_cell_type``. Returns an object with ``uns`` / ``obs`` / ``var``
+    (``None`` for parts not read), or ``None`` when the table has no marker data.
+    """
+    from types import SimpleNamespace
+
+    from anndata.io import read_elem
+
+    uns: dict[str, Any] = {}
+    try:
+        uns_group = group["uns"]
+    except KeyError:
+        uns_group = None
+    if uns_group is not None:
+        try:
+            marker = uns_group[CELL_TYPE_MARKER_UNS_KEY]
+        except KeyError:
+            marker = None
+        if marker is not None:
+            uns[CELL_TYPE_MARKER_UNS_KEY] = read_elem(marker)
+    frames: dict[str, Any] = {"obs": None, "var": None}
+    for name in frames:
+        try:
+            frame_group = group[name]
+        except KeyError:
+            continue
+        columns = frame_group.attrs.get("column-order", [])
+        if isinstance(columns, str):
+            columns = [columns]
+        if CELL_TYPE_BROAD_COL in list(columns):
+            frames[name] = read_elem(frame_group)
+    if not uns and frames["obs"] is None and frames["var"] is None:
+        return None
+    return SimpleNamespace(uns=uns, obs=frames["obs"], var=frames["var"])
+
+
 def _resolve_marker_table(source: Any):
     """Return the AnnData table carrying the marker reference, or ``None``."""
     if source is None:
@@ -3041,30 +3149,23 @@ def _resolve_marker_table(source: Any):
     # not present" warnings for otherwise valid stores.  Direct reads also let
     # us stop as soon as the small dedicated marker-reference table is found.
     if isinstance(source, (str, Path)):
-        import anndata as ad
-
         path = Path(source)
         root = open_zarr_group_unconsolidated(path)
         if "tables" not in root:
             return None
-        table_keys = list(root["tables"].group_keys())
+        tables_group = root["tables"]
+        table_keys = list(tables_group.group_keys())
         preferred = [CELL_TYPE_MARKER_UNS_KEY, "table"]
         ordered_keys = list(dict.fromkeys([*preferred, *table_keys]))
         for key in ordered_keys:
             if key not in table_keys:
                 continue
             try:
-                table = ad.read_zarr(str(path / "tables" / key))
+                table = _read_marker_table_parts(tables_group[key])
             except Exception as exc:
                 log.warning("Could not read marker candidate table %s in %s: %s", key, path, exc)
                 continue
-            uns = getattr(table, "uns", {})
-            obs = getattr(table, "obs", None)
-            var = getattr(table, "var", None)
-            has_uns = isinstance(uns, Mapping) and CELL_TYPE_MARKER_UNS_KEY in uns
-            has_obs = obs is not None and CELL_TYPE_BROAD_COL in getattr(obs, "columns", [])
-            has_var = var is not None and CELL_TYPE_BROAD_COL in getattr(var, "columns", [])
-            if has_uns or has_obs or has_var:
+            if table is not None:
                 return table
         return None
     tables = getattr(source, "tables", None)

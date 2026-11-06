@@ -29,6 +29,11 @@ PIXEL_TRANSFORM_SPEC_FILE = "spec_file"
 
 GENE_PANEL_MODE_FULL = "full"
 GENE_PANEL_MODE_SELECTION = "selection"
+#: A panel with more features than this opens the gene inspector in selection
+#: mode (empty by default, search first) whatever its platform.
+GENE_SELECTION_MODE_FEATURE_THRESHOLD = 2000
+#: Maximum number of genes selection mode shows at once (one colour slot each).
+GENE_SELECTION_SLOT_CAP = 32
 
 MERXEN_NATIVE_LATEST_JSON = "merxen_native_latest.json"
 ATERA_ROOT_ATTR = "merxen_atera"
@@ -166,6 +171,22 @@ def supported_platforms() -> tuple[str, ...]:
 def standalone_platforms() -> tuple[str, ...]:
     """Platforms that open on their own (all of them)."""
     return supported_platforms()
+
+
+def gene_panel_mode_for(platform: object, feature_count: int) -> str:
+    """Gene-inspector mode for a panel of ``feature_count`` features on ``platform``.
+
+    The platform's own mode wins when it asks for selection mode (ATERA); any
+    other panel switches to selection mode above
+    :data:`GENE_SELECTION_MODE_FEATURE_THRESHOLD` features, where listing and
+    drawing every gene at once stops being useful.
+    """
+    spec = find_platform_spec(platform)
+    if spec is not None and spec.gene_panel_mode == GENE_PANEL_MODE_SELECTION:
+        return GENE_PANEL_MODE_SELECTION
+    if int(feature_count) > GENE_SELECTION_MODE_FEATURE_THRESHOLD:
+        return GENE_PANEL_MODE_SELECTION
+    return GENE_PANEL_MODE_FULL
 
 
 def find_platform_spec(name: object) -> PlatformSpec | None:
