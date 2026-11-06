@@ -236,6 +236,12 @@ from .utils import (
     CellTranscriptIndex,
     CorticalDepthShapeInput,
     DERIVED_CACHE_ATTR,
+    LABEL_CACHE_ATTR,
+    MaskQuantification,
+    discover_mask_quantification,
+    hidden_vendor_label_keys,
+    is_vendor_label_marker,
+    vendor_label_alias_markers,
     assign_gene_visuals,
     build_cell_type_gene_visuals,
     build_cell_type_color_dict,
@@ -417,6 +423,9 @@ class DatasetSession:
     cellpose_channels: list[str] = field(default_factory=list)
     cellpose_statistics: list[str] = field(default_factory=list)
     cellpose_values_available: bool = False
+    #: The per-cell image-statistics table the statistic options come from
+    #: (Cellpose for MOSAIK stores, e.g. the Atera cell-boundary table otherwise).
+    quantification: MaskQuantification | None = None
     cell_type_available: dict[str, bool] = field(default_factory=dict)
     umap_available: dict[str, bool] = field(default_factory=dict)
     gene_payload: dict | None = None
@@ -606,6 +615,9 @@ class CellUmapState:
     #: source -> whether any view has that source's clustering table.
     available_sources: dict = field(default_factory=dict)
     statistics_available: bool = False
+    #: Mask the per-cell statistics were measured on (Cellpose unless the store
+    #: carries another quantification, e.g. Atera's atera_cell_boundaries).
+    statistics_shape_key: str = CELLPOSE_SHAPE_KEY
     #: (channel, statistic) -> (label_ids, values, (clip_low, clip_high)) or None.
     statistic_values: dict = field(default_factory=dict)
     views: dict = field(default_factory=dict)
@@ -691,7 +703,6 @@ GENE_STATUS_SYMBOL_GLYPHS = {
 # ready fallback instead of repeatedly exposing unloaded black edge tiles.
 SYNTHETIC_IMAGE_PYRAMID_MIN_SIZE = 1024
 SYNTHETIC_IMAGE_PYRAMID_MAX_LEVELS = 10
-LABEL_CACHE_ATTR = "napari_compare_label_cache"
 # A viewer-built label raster is reused only while the current pixel->micron
 # transform places it within this distance of where it was rasterized. Larger
 # drift (e.g. a cache built with the old untranslated 0.108 um/px fallback on a
@@ -1988,9 +1999,53 @@ class ViewerControlPanel(QWidget):
             self._dataset_combo.blockSignals(False)
         self._reload_button.setEnabled(bool(names))
 
+    def _cortical_depth_tools(self) -> tuple:
+        return (
+            self._create_annotations_button,
+            self._new_piece_button,
+            self._apply_piece_button,
+            self._snap_side_edges_button,
+            self._validate_annotations_button,
+            self._export_annotations_button,
+        )
+
+    def _object_annotation_tools(self) -> tuple:
+        return (
+            self._create_object_annotations_button,
+            self._validate_object_annotations_button,
+            self._export_object_annotations_button,
+            self._load_object_annotations_button,
+        )
+
+    def set_dataset_capabilities(
+        self,
+        *,
+        cortical_depth: bool = True,
+        object_annotations: bool = True,
+        cortical_depth_reason: str = "",
+        object_annotations_reason: str = "",
+    ) -> None:
+        """Enable the annotation tools only for platforms that support them.
+
+        A disabled tool carries the reason as its tooltip. Paired and
+        registration modes still disable them on top of this.
+        """
+        self._supports_cortical_depth = bool(cortical_depth)
+        self._supports_object_annotations = bool(object_annotations)
+        for widgets, supported, reason in (
+            (self._cortical_depth_tools(), self._supports_cortical_depth, cortical_depth_reason),
+            (self._object_annotation_tools(), self._supports_object_annotations, object_annotations_reason),
+        ):
+            for widget in widgets:
+                widget.setToolTip("" if supported else str(reason))
+        if getattr(self, "_registration_active", False):
+            return
+        self.set_paired_view_mode(getattr(self, "_paired_view_mode", None))
+
     def set_paired_view_mode(self, mode: ViewMode | str | None):
         """Update dataset controls for standalone or simultaneous paired viewing."""
         paired_mode = None if mode is None else ViewMode.coerce(mode)
+        self._paired_view_mode = paired_mode
         paired = paired_mode is not None
         self._dataset_combo.setEnabled(not paired)
         self._reload_button.setEnabled(not paired and self._dataset_combo.count() > 0)
@@ -2002,19 +2057,13 @@ class ViewerControlPanel(QWidget):
         )
         # These tools currently have one-dataset export semantics. Keep them
         # unavailable rather than accidentally attaching an unmanaged grid layer.
-        for widget in (
-            self._create_annotations_button,
-            self._new_piece_button,
-            self._apply_piece_button,
-            self._snap_side_edges_button,
-            self._validate_annotations_button,
-            self._export_annotations_button,
-            self._create_object_annotations_button,
-            self._validate_object_annotations_button,
-            self._export_object_annotations_button,
-            self._load_object_annotations_button,
-        ):
-            widget.setEnabled(not paired)
+        # Platforms without the capability (Atera) keep them off too.
+        cortical = getattr(self, "_supports_cortical_depth", True)
+        objects = getattr(self, "_supports_object_annotations", True)
+        for widget in self._cortical_depth_tools():
+            widget.setEnabled(not paired and cortical)
+        for widget in self._object_annotation_tools():
+            widget.setEnabled(not paired and objects)
 
     @property
     def recent_datasets(self) -> list[dict[str, str]]:
@@ -4985,6 +5034,7 @@ class ComparisonViewerController:
         self._loaded_image_entries_callback = None
         self._datasets_changed_callback = None
         self._paired_view_mode_callback = None
+        self._dataset_capabilities_callback = None
         self._paired_dataset_loaded_callback = None
         self._cellpose_value_options_callback = None
         self._current_cortical_depth_piece_id = CORTICAL_DEPTH_DEFAULT_PIECE_ID
@@ -5565,6 +5615,41 @@ class ComparisonViewerController:
     def set_paired_view_mode_callback(self, fn):
         self._paired_view_mode_callback = fn
 
+    def set_dataset_capabilities_callback(self, fn):
+        self._dataset_capabilities_callback = fn
+
+    def _unsupported_tool_reason(self, ds: str | None, tool: str) -> str | None:
+        """Why ``tool`` ('cortical_depth' or 'object_annotations') is off for ``ds``."""
+        spec = self._dataset_platform_spec(ds)
+        if spec is None:
+            return None
+        if tool == "cortical_depth" and not spec.supports_cortical_depth:
+            return (
+                f"Cortical-depth annotations are not available for {spec.display_name} "
+                "stores yet: their export is defined for MERSCOPE and Xenium datasets."
+            )
+        if tool == "object_annotations" and not spec.supports_object_annotations:
+            return (
+                f"Distance-from-object annotations are not available for {spec.display_name} "
+                "stores yet: their export is defined for MERSCOPE and Xenium datasets."
+            )
+        return None
+
+    def _publish_dataset_capabilities(self) -> None:
+        """Tell the control panel which per-platform tools the active dataset supports."""
+        callback = getattr(self, "_dataset_capabilities_callback", None)
+        if callback is None:
+            return
+        ds = self.active_dataset
+        cortical = self._unsupported_tool_reason(ds, "cortical_depth")
+        objects = self._unsupported_tool_reason(ds, "object_annotations")
+        callback(
+            cortical_depth=cortical is None,
+            object_annotations=objects is None,
+            cortical_depth_reason=cortical or "",
+            object_annotations_reason=objects or "",
+        )
+
     def set_paired_dataset_loaded_callback(self, fn):
         self._paired_dataset_loaded_callback = fn
 
@@ -5760,12 +5845,13 @@ class ComparisonViewerController:
             )
             return
 
-        cfg = self.datasets[self.active_dataset]
         try:
-            if not cellpose_quantification_table_available(cfg.zarr_path):
+            quantification = self._dataset_quantification(self.active_dataset)
+            if quantification is None:
                 self._cellpose_value_options_callback([], [], False)
                 return
-            features = cellpose_quantification_features(cfg.zarr_path)
+            cfg = self.datasets[self.active_dataset]
+            features = cellpose_quantification_features(cfg.zarr_path, quantification.table_key)
             channels = sorted(set(cellpose_quantification_channel_labels(features)))
             statistic_order = ["min", "median", "mean", "max", "iqr"]
             statistics = sorted(
@@ -5803,6 +5889,25 @@ class ComparisonViewerController:
             return None
         cfg = (self.datasets or {}).get(str(ds).upper()) if isinstance(self.datasets, dict) else None
         return find_platform_spec(self._config_platform(str(ds), cfg))
+
+    def _dataset_quantification(self, ds: str | None) -> MaskQuantification | None:
+        """The per-cell image-statistics table of standalone dataset ``ds``.
+
+        Taken from the prepared session when there is one, otherwise discovered
+        from the store (Cellpose first, then any ``mask_image_quantification``).
+        """
+        if ds is None:
+            return None
+        key = str(ds).upper()
+        session = getattr(self, "_dataset_sessions", {}).get(key)
+        if session is not None and getattr(session, "config", None) is not None:
+            if session.cellpose_values_available:
+                return session.quantification or (
+                    discover_mask_quantification(session.config.zarr_path)
+                )
+            return None
+        cfg = (self.datasets or {}).get(key) if isinstance(self.datasets, dict) else None
+        return discover_mask_quantification(getattr(cfg, "zarr_path", None))
 
     def _uses_lazy_cell_queries(self, ds: str | None) -> bool:
         """Whether ``ds`` must never build eager transcript groups or whole-store cell scans."""
@@ -6002,6 +6107,10 @@ class ComparisonViewerController:
         return layers_by_role, layer_names
 
     def create_cortical_depth_annotation_layers(self, dataset_name: str):
+        reason = self._unsupported_tool_reason(dataset_name, "cortical_depth")
+        if reason is not None:
+            self._set_status(reason)
+            return
         if not self._ensure_dataset_is_active(dataset_name):
             self._set_status(f"Could not activate dataset {dataset_name}.")
             return
@@ -6219,6 +6328,9 @@ class ComparisonViewerController:
         object_type: str,
     ):
         """Create or activate a named polygon layer for distance analysis."""
+        reason = self._unsupported_tool_reason(dataset_name, "object_annotations")
+        if reason is not None:
+            raise RuntimeError(reason)
         if not self._ensure_dataset_is_active(dataset_name):
             raise RuntimeError(f"Could not activate dataset {dataset_name}.")
         layer = self._ensure_distance_object_annotation_layer(
@@ -6315,6 +6427,9 @@ class ComparisonViewerController:
         path: Path,
     ) -> int:
         """Load or replace named object layers from an existing GeoJSON file."""
+        reason = self._unsupported_tool_reason(dataset_name, "object_annotations")
+        if reason is not None:
+            raise RuntimeError(reason)
         if not self._ensure_dataset_is_active(dataset_name):
             raise RuntimeError(f"Could not activate dataset {dataset_name}.")
         objects = read_object_annotation_geojson(path)
@@ -6363,7 +6478,9 @@ class ComparisonViewerController:
 
         Prefer MerXen's exact ``MOSAIK_*`` keys, otherwise resolve aligned or
         variant names while keeping ProSeg and ProSeg hybrid distinct.
-        Each mask is skipped when its ``--skip-*`` flag is set.
+        Each mask is skipped when its ``--skip-*`` flag is set. When no MOSAIK
+        mask matched, the platform's ``startup_shape_keys`` (Atera's vendor
+        ``atera_cell_boundaries``, or its label alias in labels mode) load instead.
         """
         keys = list(self._segmentation_keys)
         selected: list[str] = []
@@ -6381,6 +6498,15 @@ class ComparisonViewerController:
             match = next((k for k in keys if segmentation_method(k) == token), None)
             if match is not None:
                 selected.append(match)
+        if not selected:
+            # No MOSAIK mask: fall back to the platform's own original cell mask
+            # (Atera's vendor cells), by shape key or its label element.
+            spec = self._dataset_platform_spec(getattr(self, "active_dataset", None))
+            labels_mode = self._segmentation_source() == "labels"
+            for shape_key in spec.startup_shape_keys if spec is not None else ():
+                candidate = f"{shape_key}_labels" if labels_mode else shape_key
+                if candidate in keys:
+                    selected.append(candidate)
         return list(dict.fromkeys(selected))
 
     def _start_startup_autoload(self, ds: str):
@@ -6466,8 +6592,14 @@ class ComparisonViewerController:
             images_sdata = None
         x_transform, y_transform = self._resolve_dataset_pixel_transform(ds, cfg)
         if self._segmentation_source() == "labels":
+            # A vendor raster already shown through its complete MerXen alias
+            # (e.g. Atera cell_labels behind atera_cell_boundaries_labels) is
+            # listed once, under the alias.
+            hidden = hidden_vendor_label_keys(vendor_label_alias_markers(cfg.zarr_path))
             segmentation_keys = sorted(
-                str(key) for key in sdata.labels.keys() if not is_derived_cache_key(str(key))
+                str(key)
+                for key in sdata.labels.keys()
+                if not is_derived_cache_key(str(key)) and str(key) not in hidden
             )
             if not segmentation_keys:
                 raise RuntimeError(
@@ -6486,8 +6618,9 @@ class ComparisonViewerController:
         cellpose_channels: list[str] = []
         cellpose_statistics: list[str] = []
         cellpose_available = False
-        if cellpose_quantification_table_available(cfg.zarr_path):
-            features = cellpose_quantification_features(cfg.zarr_path)
+        quantification = discover_mask_quantification(cfg.zarr_path)
+        if quantification is not None:
+            features = cellpose_quantification_features(cfg.zarr_path, quantification.table_key)
             cellpose_channels = sorted(set(cellpose_quantification_channel_labels(features)))
             order = ["min", "median", "mean", "max", "iqr"]
             cellpose_statistics = sorted(
@@ -6512,6 +6645,7 @@ class ComparisonViewerController:
             cellpose_channels=cellpose_channels,
             cellpose_statistics=cellpose_statistics,
             cellpose_values_available=cellpose_available,
+            quantification=quantification,
             cell_type_available=cell_type_available,
             umap_available={source.key: cell_umap_available(cfg.zarr_path, source.key)
                             for source in CELL_TYPE_SOURCES},
@@ -6581,6 +6715,7 @@ class ComparisonViewerController:
         self._publish_cell_type_options()
         self._publish_umap_options()
         self._publish_spatialdata_explorer()
+        self._publish_dataset_capabilities()
         self._update_scale_bar_visibility()
         self._end_progress("dataset")
         elapsed = time.time() - started_at
@@ -8598,6 +8733,48 @@ class ComparisonViewerController:
         except Exception:
             return {}
 
+    def _vendor_label_marker(self, label_key: str) -> dict | None:
+        """The vendor-labels alias marker of ``label_key``, or ``None``."""
+        attrs = self._label_cache_attrs(label_key)
+        return attrs if is_vendor_label_marker(attrs) else None
+
+    def _refuse_vendor_label_write(self, label_key: str, action: str) -> None:
+        """Raise if ``label_key`` is a MerXen-managed vendor-label alias."""
+        if self._vendor_label_marker(label_key) is not None:
+            raise ValueError(
+                f"Refusing to {action} '{label_key}': it is a MerXen-managed alias of "
+                "vendor label payloads (source: vendor_labels) and is never rewritten."
+            )
+
+    def _resolve_vendor_label_alias(self, label_key: str, shape_key: str, marker: dict) -> str:
+        """Use a vendor-label alias as stored; never rebuild it.
+
+        A complete alias for ``shape_key`` is returned as-is. A stale or
+        incomplete one falls back to the vendor element it names
+        (``source_label_key``), displayed directly. Nothing is written.
+        """
+        alias_ok = bool(marker.get("complete")) and marker.get("source_shape_key") == str(shape_key)
+        if alias_ok and (
+            label_key in self._active_sdata.labels or self._refresh_label_key_from_store(label_key)
+        ):
+            return label_key
+        source = marker.get("source_label_key")
+        if isinstance(source, str) and source and (
+            source in self._active_sdata.labels or self._refresh_label_key_from_store(source)
+        ):
+            log.warning(
+                "[%s] Vendor label alias %s is stale for %s; displaying vendor labels %s directly.",
+                self.active_dataset,
+                label_key,
+                shape_key,
+                source,
+            )
+            return source
+        raise ValueError(
+            f"Vendor label alias '{label_key}' is stale and its source labels "
+            f"'{source}' are missing; refusing to rebuild a MerXen-managed alias."
+        )
+
     def _label_cache_is_complete(self, label_key: str, shape_key: str) -> bool:
         attrs = self._label_cache_attrs(label_key)
         return bool(
@@ -8683,6 +8860,7 @@ class ComparisonViewerController:
     def _mark_label_cache_complete(self, label_key: str, shape_key: str, shape: tuple[int, int], chunks: tuple[int, int]):
         if self.active_dataset is None:
             return
+        self._refuse_vendor_label_write(label_key, "re-mark label cache")
         cfg = self.datasets[self.active_dataset]
         label_path = cfg.zarr_path / "labels" / label_key
         group = zarr.open_group(str(label_path), mode="a")
@@ -8702,6 +8880,13 @@ class ComparisonViewerController:
             return
 
         attrs = self._label_cache_attrs(label_key)
+        if is_vendor_label_marker(attrs):
+            # MerXen hardlinks vendor label payloads into these aliases: deleting
+            # the directory would unlink the vendor arrays' second name.
+            raise ValueError(
+                f"Refusing to delete label element '{label_key}': it is a MerXen-managed "
+                "alias of vendor label payloads (source: vendor_labels)."
+            )
         generated_name = str(label_key) == f"{shape_key}_labels"
         has_matching_cache_attr = attrs.get("source_shape_key") == str(shape_key)
         explicit_overwrite = bool(getattr(self.args, "overwrite_labels", False))
@@ -8740,6 +8925,7 @@ class ComparisonViewerController:
             return 0
         if shape_key not in sdata.shapes:
             raise KeyError(f"Shape key '{shape_key}' not found in current dataset.")
+        self._refuse_vendor_label_write(label_key, "rasterize into")
 
         cfg = self.datasets[ds]
         label_path = cfg.zarr_path / "labels" / label_key / "s0"
@@ -8816,6 +9002,10 @@ class ComparisonViewerController:
             raise RuntimeError("No active dataset.")
 
         label_key = self._label_key_for_shape_key(shape_key)
+        vendor = self._vendor_label_marker(label_key)
+        if vendor is not None:
+            # Even --overwrite-labels never rebuilds a vendor-label alias.
+            return self._resolve_vendor_label_alias(label_key, shape_key, vendor)
         exact_existing_label = label_key == str(shape_key)
         if (
             (not self.args.overwrite_labels)
@@ -9505,32 +9695,53 @@ class ComparisonViewerController:
         return levels, self._label_display_affine(label_elem)
 
     def _ensure_cellpose_label_key(
-        self, *, cancel_check=None, expected_dataset: str | None = None
+        self,
+        *,
+        quantification: MaskQuantification | None = None,
+        cancel_check=None,
+        expected_dataset: str | None = None,
     ) -> str:
+        """Return the label element the per-cell statistics colour.
+
+        ``quantification`` defaults to the MOSAIK Cellpose table. A MerXen
+        vendor-label alias (Atera) is used as stored; it is never rebuilt.
+        """
         self._raise_if_task_cancelled(cancel_check, expected_dataset)
         if self._active_sdata is None or self.active_dataset is None:
             raise RuntimeError("No active dataset.")
+        if quantification is None:
+            quantification = discover_mask_quantification(
+                getattr(self.datasets.get(self.active_dataset), "zarr_path", None)
+            ) or MaskQuantification(
+                CELLPOSE_QUANTIFICATION_TABLE_KEY, CELLPOSE_SHAPE_KEY, CELLPOSE_LABEL_KEY
+            )
+        shape_key = quantification.shape_key
+        label_key = quantification.label_key
 
-        if CELLPOSE_SHAPE_KEY not in self._active_sdata.shapes:
+        if shape_key not in self._active_sdata.shapes:
             shapes_sdata = self._read_shapes_from_store()
             if shapes_sdata is not None:
                 for key, value in shapes_sdata.shapes.items():
                     self._active_sdata.shapes[key] = value
+
+        vendor = self._vendor_label_marker(label_key)
+        if vendor is not None:
+            return self._resolve_vendor_label_alias(label_key, shape_key, vendor)
 
         # This ``*_labels`` name is viewer-generated, so require its cache
         # marker. Markerless legacy caches may still use positional id+1.
         if (
             not self.args.overwrite_labels
             and (
-                CELLPOSE_LABEL_KEY in self._active_sdata.labels
-                or self._refresh_label_key_from_store(CELLPOSE_LABEL_KEY)
+                label_key in self._active_sdata.labels
+                or self._refresh_label_key_from_store(label_key)
             )
         ):
-            if self._label_cache_is_complete(CELLPOSE_LABEL_KEY, CELLPOSE_SHAPE_KEY):
-                return CELLPOSE_LABEL_KEY
+            if self._label_cache_is_complete(label_key, shape_key):
+                return label_key
 
         return self.ensure_label_for_shape_key(
-            CELLPOSE_SHAPE_KEY,
+            shape_key,
             cancel_check=cancel_check,
             expected_dataset=expected_dataset,
         )
@@ -9541,11 +9752,13 @@ class ComparisonViewerController:
         channel: str,
         statistic: str,
         colormap_name: str,
+        table_key: str | None = None,
     ) -> dict[str, object]:
         quantification = load_cellpose_quantification_values(
             zarr_path,
             channel=channel,
             statistic=statistic,
+            table_key=table_key,
         )
         colors_rgba = ensure_colormap(colormap_name).map(
             np.linspace(0.0, 1.0, CELLPOSE_VALUE_BINS, dtype=np.float32)
@@ -9593,7 +9806,8 @@ class ComparisonViewerController:
         ds = self.active_dataset
         channel = str(payload["channel"])
         statistic = str(payload["statistic"])
-        layer_name = make_layer_name(ds, "cell_values", CELLPOSE_SHAPE_KEY, f"{channel} {statistic}")
+        shape_key = str(payload.get("shape_key") or CELLPOSE_SHAPE_KEY)
+        layer_name = make_layer_name(ds, "cell_values", shape_key, f"{channel} {statistic}")
         self._remove_layers_by_prefix(layer_name_prefix(ds, "cell_values"))
         self.viewer.add_labels(
             label_data,
@@ -9608,8 +9822,9 @@ class ComparisonViewerController:
         )
 
         mapping = payload["mapping"]
+        source_name = str(payload.get("source_name") or "Cellpose")
         self._set_status(
-            f"{ds} Cellpose values: {channel} {statistic} ({payload['colormap_name']}), "
+            f"{ds} {source_name} values: {channel} {statistic} ({payload['colormap_name']}), "
             f"{mapping.lower_percentile:g}-{mapping.upper_percentile:g}%="
             f"{mapping.clip_low:.4g}..{mapping.clip_high:.4g}; "
             f"finite={mapping.finite_count:,}/{mapping.label_count:,}, "
@@ -9659,7 +9874,8 @@ class ComparisonViewerController:
             self._set_status(f"Could not activate dataset {dataset_name}.")
             return
         cfg = self.datasets[self.active_dataset]
-        if not cellpose_quantification_table_available(cfg.zarr_path):
+        quantification = self._dataset_quantification(self.active_dataset)
+        if quantification is None:
             self._set_status(f"Missing {CELLPOSE_QUANTIFICATION_TABLE_KEY}; cannot load Cellpose value overlay.")
             return
 
@@ -9687,6 +9903,7 @@ class ComparisonViewerController:
             with self._store_io_slots:
                 self._raise_if_task_cancelled(cancel_token.is_set, ds)
                 label_key = self._ensure_cellpose_label_key(
+                    quantification=quantification,
                     cancel_check=cancel_token.is_set,
                     expected_dataset=ds,
                 )
@@ -9697,11 +9914,14 @@ class ComparisonViewerController:
                 )
                 self._raise_if_task_cancelled(cancel_token.is_set, ds)
                 payload = self._compute_cellpose_value_payload(
-                    cfg.zarr_path, channel, statistic, colormap_name
+                    cfg.zarr_path, channel, statistic, colormap_name,
+                    table_key=quantification.table_key,
                 )
             return {
                 **payload,
                 "dataset": ds,
+                "shape_key": quantification.shape_key,
+                "source_name": quantification.display_name,
                 "label_key": label_key,
                 "label_levels": label_levels,
                 "napari_affine": napari_affine,
@@ -11432,8 +11652,12 @@ class ComparisonViewerController:
 
     def _inspection_source(self, ds: str) -> str:
         state = getattr(self, "_cell_type_states", {}).get(str(ds).upper())
-        return state.segmentation if state is not None else (
-            self._transcript_source_key(ds) if self._transcript_source_key(ds) != "native" else "proseg")
+        if state is not None:
+            return state.segmentation
+        if self._transcript_source_key(ds) != "native":
+            return self._transcript_source_key(ds)
+        cfg = (getattr(self, "datasets", None) or {}).get(str(ds).upper())
+        return self._default_cell_type_source(getattr(cfg, "zarr_path", None)) or "proseg"
 
     def _inspection_identity(self, ds: str) -> tuple[str, str]:
         source = self._inspection_source(ds)
@@ -11476,7 +11700,16 @@ class ComparisonViewerController:
             return None
         if not shape_keys:
             return None
-        for preferred in CELL_INSPECTOR_SHAPE_PREFERENCE:
+        spec = self._dataset_platform_spec(ds)
+        preference = (
+            spec.inspector_shape_preference if spec is not None else CELL_INSPECTOR_SHAPE_PREFERENCE
+        )
+        exact = spec.original_cell_shape_key if spec is not None else None
+        for preferred in preference:
+            # A platform listing its original cell mask by name (Atera) resolves
+            # it exactly, not by the 'cell' substring.
+            if preferred == exact and exact in shape_keys:
+                return exact
             for key in shape_keys:
                 if preferred in key.lower():
                     return key
@@ -11560,11 +11793,58 @@ class ComparisonViewerController:
                     continue
                 hit = pick_cell_at_point(other, *world)
                 if hit is not None:
+                    join = self._nucleus_cell_join_key(str(key), shape_key)
+                    if join is not None and join in getattr(other, "columns", ()):
+                        # A nucleus names its cell explicitly; never guess by overlap.
+                        return self._cell_for_nucleus_hit(gdf, other, hit[0], join)
                     return self._match_inspection_geometry(gdf, hit[1])
             return None
         except Exception as exc:
             log.debug("Cell pick failed: %s", exc)
             return None
+
+    def _nucleus_cell_join_key(self, nucleus_shape_key: str, cell_shape_key: str) -> str | None:
+        """Column of ``nucleus_shape_key`` naming its cell in ``cell_shape_key``, or None.
+
+        Read from the store's ``merxen_schema`` (a segmentation registered on
+        the nucleus shape with a ``cell_key``, whose parent ``<name>`` minus the
+        ``_nucleus`` suffix is registered on ``cell_shape_key``), else from the
+        platform spec's original nucleus/cell pair.
+        """
+        schema = getattr(self._active_sdata, "attrs", {}).get("merxen_schema", {})
+        segmentations = schema.get("segmentations") if isinstance(schema, dict) else None
+        if isinstance(segmentations, dict):
+            for name, entry in segmentations.items():
+                if not isinstance(entry, dict) or entry.get("shape") != str(nucleus_shape_key):
+                    continue
+                cell_key = entry.get("cell_key")
+                if not isinstance(cell_key, str) or not cell_key:
+                    continue
+                parent = segmentations.get(str(name).removesuffix("_nucleus"))
+                if isinstance(parent, dict) and parent.get("shape") == str(cell_shape_key):
+                    return cell_key
+        spec = self._dataset_platform_spec(getattr(self, "active_dataset", None))
+        if (
+            spec is not None
+            and spec.nucleus_cell_join_key
+            and spec.original_nucleus_shape_key == str(nucleus_shape_key)
+            and spec.original_cell_shape_key == str(cell_shape_key)
+        ):
+            return spec.nucleus_cell_join_key
+        return None
+
+    def _cell_for_nucleus_hit(self, cells_gdf, nuclei_gdf, nucleus_id, join: str):
+        """``(cell id, geometry)`` of the cell a clicked nucleus names, or None."""
+        try:
+            value = nuclei_gdf.loc[nucleus_id, join]
+        except Exception:
+            return None
+        if isinstance(value, pd.Series):
+            value = value.iloc[0] if len(value) else None
+        cell_id = cell_id_to_int(value) if value is not None and not pd.isna(value) else None
+        if cell_id is None or cell_id <= 0:
+            return None  # a nucleus with no cell selects nothing
+        return self._shape_for_cell_id(cells_gdf, cell_id)
 
     def _cell_inspector_annotation_source(
         self, state: CellTypeOverlayState
@@ -11862,6 +12142,11 @@ class ComparisonViewerController:
         if self._paired_session is not None:
             segmentation = self._paired_segmentation_for_cell_type(ds, "cellpose")
             cellpose_shape = segmentation.shape_key if segmentation else cellpose_shape
+        else:
+            quantification = self._dataset_quantification(ds)
+            if quantification is not None and not quantification.is_cellpose:
+                # e.g. Atera: statistics measured on the vendor cell boundaries.
+                return self._stored_mask_intensities(ds, cell_id, geometry, quantification)
         shapes = getattr(sdata, "shapes", {})
         matched = None
         if cellpose_shape in shapes:
@@ -11885,6 +12170,33 @@ class ComparisonViewerController:
         # polygon whenever available rather than the clicked ProSeg boundary.
         return self._compute_cell_channel_intensities_from_specs(
             matched[1] if matched is not None else geometry, specs), matched[0] if matched else None
+
+    def _stored_mask_intensities(self, ds, cell_id, geometry, quantification: MaskQuantification):
+        """Stored per-cell means from a non-Cellpose quantification table.
+
+        The clicked cell is matched to the quantified mask by id when it is that
+        mask, otherwise by greatest overlap.
+        """
+        sdata = self._inspection_sdata(ds)
+        shapes = getattr(sdata, "shapes", {})
+        shape_key = quantification.shape_key
+        matched = None
+        if shape_key in shapes:
+            if self._inspection_shape(ds) == shape_key:
+                matched = self._shape_for_cell_id(shapes[shape_key], cell_id)
+            elif geometry is not None:
+                matched = self._match_inspection_geometry(shapes[shape_key], geometry)
+        path = getattr((getattr(self, "datasets", {}) or {}).get(str(ds).upper()), "zarr_path", None)
+        if matched is None:
+            features = cellpose_quantification_features(path, quantification.table_key)
+            return [
+                (channel, None)
+                for channel in cellpose_quantification_channel_labels(
+                    [f for f in features if f.statistic == "mean"]
+                )
+            ], None
+        label = normalize_cell_key(matched[0])
+        return cellpose_cell_mean_intensities(path, label, quantification.table_key), matched[0]
 
     def _cell_selection_display(
         self,
@@ -12851,18 +13163,40 @@ class ComparisonViewerController:
                 store_path=store_path,
                 opacity=float(getattr(self.args, "shape_opacity", 0.95)),
             )
+            default = self._default_cell_type_source(zarr_path)
+            if default is not None:
+                state.segmentation = default
             self._cell_type_states[ds] = state
         return state
+
+    @staticmethod
+    def _default_cell_type_source(zarr_path) -> str | None:
+        """Store-aware default cell-type source, or ``None`` to keep ``"proseg"``.
+
+        When the store has no ProSeg mask, the first clustering source whose
+        mask is present (``"original"`` on an Atera store). Metadata only.
+        """
+        if zarr_path is None or not Path(zarr_path).exists():
+            return None
+        if cell_type_shape_key_for_source(zarr_path, "proseg") is not None:
+            return None
+        for source in CELL_TYPE_SOURCES:
+            if source.method != "clustering":
+                continue
+            if cell_type_shape_key_for_source(zarr_path, source.key) is not None:
+                return source.key
+        return None
 
     def _cell_type_layer_name(self, dataset: str, segmentation: str) -> str:
         return make_layer_name(dataset, "cell_types", str(segmentation))
 
-    def _mask_shape_key_for_source(self, source_key: str) -> str:
+    def _mask_shape_key_for_source(self, source_key: str) -> str | None:
         """Resolve the segmentation mask shape key a cell-type source colours.
 
         A source (e.g. ``"proseg"``/``"proseg_mask"``) names candidate mask shape
-        keys; the first present in the store wins. Falls back to the historical
-        ``MOSAIK_<source>`` name for unknown sources.
+        keys; the first present in the store wins (then the store's
+        ``merxen_schema`` registration). Unknown sources try the historical
+        ``MOSAIK_<source>`` name. ``None`` when no candidate mask is present.
         """
         cfg = getattr(self, "datasets", {}).get(getattr(self, "active_dataset", None))
         exact = cell_type_shape_key_for_source(getattr(cfg, "zarr_path", None), source_key)
@@ -12874,7 +13208,7 @@ class ComparisonViewerController:
         for candidate in candidates:
             if candidate in shapes:
                 return candidate
-        return candidates[0]
+        return None
 
     def _load_cell_type_data(self, state: CellTypeOverlayState, segmentation: str) -> bool:
         """Cache assignments + colour schemes for ``segmentation``; True if present.
@@ -13600,6 +13934,14 @@ class ComparisonViewerController:
         if self._active_sdata is None:
             raise RuntimeError("No active dataset.")
         shape_key = self._mask_shape_key_for_source(segmentation)
+        if shape_key is None:
+            shapes_sdata = self._read_shapes_from_store()
+            if shapes_sdata is not None:
+                for key, value in shapes_sdata.shapes.items():
+                    self._active_sdata.shapes[key] = value
+            shape_key = self._mask_shape_key_for_source(segmentation)
+        if shape_key is None:
+            raise KeyError(f"No segmentation mask for cell-type source '{segmentation}' in this dataset.")
         label_key = self._label_key_for_shape_key(shape_key)
         if shape_key not in self._active_sdata.shapes:
             shapes_sdata = self._read_shapes_from_store()
@@ -13946,12 +14288,13 @@ class ComparisonViewerController:
 
     @staticmethod
     def _umap_statistic_source(state: CellUmapState) -> str | None:
-        """The cell-type source whose cells carry the Cellpose statistics."""
+        """The cell-type source whose cells carry the per-cell statistics."""
         if not state.statistics_available:
             return None
+        shape_key = getattr(state, "statistics_shape_key", None) or CELLPOSE_SHAPE_KEY
         for source in CELL_TYPE_SOURCES:
             if state.available_sources.get(source.key) and statistic_joins_source(
-                source.key, CELLPOSE_SHAPE_KEY
+                source.key, shape_key
             ):
                 return source.key
         return None
@@ -14008,7 +14351,14 @@ class ComparisonViewerController:
             channels = list(session.cellpose_channels)
             statistics = list(session.cellpose_statistics)
             stats_ok = bool(session.cellpose_values_available)
+            quantification = getattr(session, "quantification", None)
+            state.statistics_shape_key = (
+                quantification.shape_key if quantification is not None else CELLPOSE_SHAPE_KEY
+            )
         state.available_sources = available
+        set_note = getattr(widget, "set_statistic_mask", None) if widget is not None else None
+        if callable(set_note):
+            set_note(state.statistics_shape_key)
         state.statistics_available = bool(stats_ok and channels and statistics)
         if not state.statistics_available:
             channels, statistics = [], []
@@ -14112,7 +14462,7 @@ class ComparisonViewerController:
             return
         state.source = str(source)
         if state.colour_by == "statistic" and not statistic_joins_source(
-            state.source, CELLPOSE_SHAPE_KEY
+            state.source, state.statistics_shape_key
         ):
             state.colour_by = "broad"
             if self._umap_widget is not None:
@@ -14120,6 +14470,10 @@ class ComparisonViewerController:
                 self._umap_widget.set_status(
                     "Per-cell statistics only colour the Cellpose UMAP, so the "
                     "UMAP is now coloured by broad cell type."
+                    if state.statistics_shape_key == CELLPOSE_SHAPE_KEY
+                    else f"Per-cell statistics only colour the UMAP of the "
+                    f"{state.statistics_shape_key} masks, so the UMAP is now coloured "
+                    "by broad cell type."
                 )
         self._publish_umap_levels(state)
         self._refresh_umap()
@@ -14145,6 +14499,9 @@ class ComparisonViewerController:
                         if state.paired
                         else "Per-cell statistics need the Cellpose quantification and "
                         "the Cellpose clustering, which this dataset lacks."
+                        if state.statistics_shape_key == CELLPOSE_SHAPE_KEY
+                        else "Per-cell statistics need a clustering of the "
+                        f"{state.statistics_shape_key} masks, which this dataset lacks."
                     )
             elif state.source != stat_source:
                 state.source = stat_source
@@ -14153,6 +14510,10 @@ class ComparisonViewerController:
                     self._umap_widget.set_status(
                         "Per-cell statistics are measured on the Cellpose masks, so "
                         "the UMAP now shows the Cellpose clustering."
+                        if state.statistics_shape_key == CELLPOSE_SHAPE_KEY
+                        else "Per-cell statistics are measured on the "
+                        f"{state.statistics_shape_key} masks, so the UMAP now shows "
+                        f"the {cell_type_source_label(stat_source)} clustering."
                     )
         self._publish_umap_levels(state)
         self._refresh_umap()
@@ -14178,7 +14539,7 @@ class ComparisonViewerController:
         if kind in CELL_TYPE_LEVEL_LABELS:
             state.colour_by = str(kind)
         elif state.colour_by == "statistic" and not statistic_joins_source(
-            state.source, CELLPOSE_SHAPE_KEY
+            state.source, state.statistics_shape_key
         ):
             state.colour_by = "broad"
         self._publish_umap_levels(state)
@@ -14368,6 +14729,12 @@ class ComparisonViewerController:
             for name in state.views
         }
         stat_path = paths.get(state.primary.dataset)
+        stat_quantification = (
+            self._dataset_quantification(state.primary.dataset)
+            if stat_key is not None and not state.paired
+            else None
+        )
+        stat_table_key = stat_quantification.table_key if stat_quantification is not None else None
         if self._umap_widget is not None:
             self._umap_widget.set_status(f"Loading the {cell_type_source_label(source)} UMAP…")
 
@@ -14389,7 +14756,8 @@ class ComparisonViewerController:
                 if stat_key is not None:
                     try:
                         values = load_cellpose_quantification_values(
-                            stat_path, channel=stat_key[0], statistic=stat_key[1]
+                            stat_path, channel=stat_key[0], statistic=stat_key[1],
+                            table_key=stat_table_key,
                         )
                         clip = cellpose_value_clip_range(values.values)
                         result["statistic"] = (values.label_ids, values.values, clip)
@@ -16343,6 +16711,7 @@ def main():
     controller.set_loaded_image_entries_callback(panel.set_loaded_image_entries)
     controller.set_datasets_changed_callback(panel.set_datasets)
     controller.set_paired_view_mode_callback(panel.set_paired_view_mode)
+    controller.set_dataset_capabilities_callback(panel.set_dataset_capabilities)
     controller.set_paired_dataset_loaded_callback(panel.paired_dataset_loaded)
     controller.set_cellpose_value_options_callback(panel.set_cellpose_value_options)
     controller.set_registration_widget(registration_widget)

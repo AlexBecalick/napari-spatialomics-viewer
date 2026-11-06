@@ -981,3 +981,24 @@ def test_cell_type_sources_resolve_to_their_own_tables(tmp_path):
     assert "MOSAIK_proseg" in cell_type_source("proseg_mask").mask_shape_keys
     assert "merscope_cell_boundaries" in cell_type_source("original").mask_shape_keys
     assert cell_type_source("not_a_source") is None
+
+
+def test_original_source_gains_only_the_atera_cell_boundaries(tmp_path):
+    from napari_compare_xenium_merscope.utils import (
+        cell_type_shape_key_for_source,
+        cell_type_source,
+    )
+
+    original = cell_type_source("original").mask_shape_keys
+    assert original == ("merscope_cell_boundaries", "cell_boundaries", "atera_cell_boundaries")
+    assert "xenium_cell_boundaries" not in original
+    pciseq = cell_type_source("pciseq_original").mask_shape_keys
+    assert pciseq == ("merscope_cell_boundaries", "xenium_cell_boundaries", "cell_boundaries")
+
+    # A MerXen-native Xenium store with only xenium_cell_boundaries keeps no
+    # 'original' mask (there is no merxen_schema registration to fall back to).
+    store = tmp_path / "xenium_only.zarr"
+    root = zarr.open_group(str(store), mode="w")
+    root.create_group("shapes").create_group("xenium_cell_boundaries")
+    root.create_group("tables")
+    assert cell_type_shape_key_for_source(store, "original") is None

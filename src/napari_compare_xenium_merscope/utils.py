@@ -41,6 +41,10 @@ DERIVED_CACHE_ATTR = "napari_compare_derived_cache"
 CELLPOSE_SHAPE_KEY = "MOSAIK_cellpose"
 CELLPOSE_LABEL_KEY = "MOSAIK_cellpose_labels"
 CELLPOSE_QUANTIFICATION_TABLE_KEY = "table_MOSAIK_cellpose_image_quantification"
+#: zarr attribute marking a viewer label cache (or a MerXen vendor-label alias).
+LABEL_CACHE_ATTR = "napari_compare_label_cache"
+#: ``source`` of a MerXen-managed alias hardlinked to vendor label payloads.
+VENDOR_LABELS_SOURCE = "vendor_labels"
 CELLPOSE_VALUE_BINS = 256
 CELLPOSE_VALUE_CLIP_PERCENTILES = (1.0, 99.0)
 TRANSPARENT_RGBA = (0.0, 0.0, 0.0, 0.0)
@@ -252,8 +256,8 @@ def _read_zarr_string_list(array_like) -> list[str]:
     return [str(value) for value in values]
 
 
-def _cellpose_quantification_table(root):
-    return root[f"tables/{CELLPOSE_QUANTIFICATION_TABLE_KEY}"]
+def _cellpose_quantification_table(root, table_key: str | None = None):
+    return root[f"tables/{table_key or CELLPOSE_QUANTIFICATION_TABLE_KEY}"]
 
 
 def _cellpose_quantification_features_from_table(table) -> list[CellposeQuantificationFeature]:
@@ -287,19 +291,23 @@ def _cellpose_quantification_features_from_table(table) -> list[CellposeQuantifi
     ]
 
 
+_QUANTIFICATION_REQUIRED_PARTS = (
+    "obs/label_id",
+    "var/image_key",
+    "var/channel",
+    "var/statistic",
+    "X",
+)
+
+
 def cellpose_quantification_table_available(zarr_path: str | Path) -> bool:
     """Return whether the hard-coded Cellpose value-overlay inputs are present."""
     try:
         root = open_zarr_group_unconsolidated(zarr_path)
         table = _cellpose_quantification_table(root)
-        required = (
-            "obs/label_id",
-            "var/image_key",
-            "var/channel",
-            "var/statistic",
-            "X",
+        has_required_table_parts = all(
+            _zarr_path_exists(table, key) for key in _QUANTIFICATION_REQUIRED_PARTS
         )
-        has_required_table_parts = all(_zarr_path_exists(table, key) for key in required)
         has_region = _zarr_path_exists(root, f"labels/{CELLPOSE_LABEL_KEY}") or _zarr_path_exists(
             root,
             f"shapes/{CELLPOSE_SHAPE_KEY}",
@@ -309,10 +317,154 @@ def cellpose_quantification_table_available(zarr_path: str | Path) -> bool:
         return False
 
 
-def cellpose_quantification_features(zarr_path: str | Path) -> list[CellposeQuantificationFeature]:
-    """List available Cellpose image-statistic quantification columns."""
+@dataclass(frozen=True)
+class MaskQuantification:
+    """A per-cell image-statistics table and the mask it was measured on.
+
+    ``label_key`` is the label element whose pixel values are the table's
+    ``obs/label_id`` values. For a MerXen vendor-label store it is the managed
+    alias (``atera_cell_boundaries_labels``), never the vendor element named by
+    the table's ``mask_label_key``.
+    """
+
+    table_key: str
+    shape_key: str
+    label_key: str
+
+    @property
+    def is_cellpose(self) -> bool:
+        return self.table_key == CELLPOSE_QUANTIFICATION_TABLE_KEY
+
+    @property
+    def display_name(self) -> str:
+        """User-facing name: ``Cellpose`` or ``Per-cell image statistics (<mask>)``."""
+        if self.is_cellpose:
+            return "Cellpose"
+        return f"Per-cell image statistics ({self.shape_key})"
+
+
+CELLPOSE_MASK_QUANTIFICATION = MaskQuantification(
+    table_key=CELLPOSE_QUANTIFICATION_TABLE_KEY,
+    shape_key=CELLPOSE_SHAPE_KEY,
+    label_key=CELLPOSE_LABEL_KEY,
+)
+
+
+def _read_group_attributes(path: Path) -> dict:
+    """Attributes of a zarr v3 (``zarr.json``) or v2 (``.zattrs``) group, or ``{}``."""
+    for name, nested in (("zarr.json", True), (".zattrs", False)):
+        payload = _read_json_mapping(Path(path) / name)
+        if payload is None:
+            continue
+        attrs = payload.get("attributes") if nested else payload
+        if isinstance(attrs, dict):
+            return attrs
+    return {}
+
+
+def vendor_label_alias_markers(zarr_path: str | Path) -> dict[str, dict]:
+    """``{label_key: marker}`` for every label carrying a vendor-labels alias marker.
+
+    MerXen links vendor label rasters (for example Atera ``cell_labels``) into
+    ``<shape>_labels`` aliases and marks them with the viewer's label-cache
+    attribute plus ``source: vendor_labels``. Such aliases are hardlinked
+    payloads: the viewer must never delete, rewrite or re-mark them. Reads JSON
+    metadata only.
+    """
+    labels_dir = Path(zarr_path) / "labels"
+    out: dict[str, dict] = {}
+    try:
+        children = sorted(p for p in labels_dir.iterdir() if p.is_dir())
+    except OSError:
+        return out
+    for child in children:
+        if is_derived_cache_key(child.name):
+            continue
+        marker = _read_group_attributes(child).get(LABEL_CACHE_ATTR)
+        if isinstance(marker, dict) and marker.get("source") == VENDOR_LABELS_SOURCE:
+            out[child.name] = dict(marker)
+    return out
+
+
+def is_vendor_label_marker(marker: Any) -> bool:
+    """Whether a label-cache marker describes a MerXen-managed vendor-label alias."""
+    return isinstance(marker, Mapping) and marker.get("source") == VENDOR_LABELS_SOURCE
+
+
+def hidden_vendor_label_keys(markers: Mapping[str, Mapping]) -> set[str]:
+    """Vendor label elements already shown through a complete alias (hide them)."""
+    return {
+        str(marker["source_label_key"])
+        for key, marker in markers.items()
+        if marker.get("complete") and marker.get("source_label_key")
+        and str(marker.get("source_label_key")) != str(key)
+    }
+
+
+def _quantification_label_key(zarr_path: Path, shape_key: str) -> str:
+    """The label element whose pixels carry ``shape_key``'s instance ids.
+
+    A complete vendor-label alias marked for ``shape_key`` wins; otherwise the
+    viewer's own ``<shape>_labels`` name (rasterized on demand).
+    """
+    for key, marker in vendor_label_alias_markers(zarr_path).items():
+        if marker.get("complete") and marker.get("source_shape_key") == str(shape_key):
+            return key
+    return f"{shape_key}_labels"
+
+
+def discover_mask_quantification(zarr_path: str | Path | None) -> MaskQuantification | None:
+    """Find the per-cell image-statistics table of a store.
+
+    The MOSAIK Cellpose table is tried first (identical to
+    :func:`cellpose_quantification_table_available`). Otherwise the first table,
+    in key order, whose ``uns['mask_image_quantification']`` names a shape that
+    is present in the store and which has the label-id, var metadata and ``X``
+    parts. Only metadata is read.
+    """
+    if zarr_path is None:
+        return None
+    if cellpose_quantification_table_available(zarr_path):
+        return CELLPOSE_MASK_QUANTIFICATION
+    try:
+        root = open_zarr_group_unconsolidated(zarr_path)
+        if "tables" not in root:
+            return None
+        tables = root["tables"]
+        shapes = set(root["shapes"].group_keys()) if "shapes" in root else set()
+        from anndata.io import read_elem
+
+        for table_key in sorted(tables.group_keys()):
+            table = tables[table_key]
+            try:
+                if "uns" not in table or "mask_image_quantification" not in table["uns"]:
+                    continue
+                meta = read_elem(table["uns"]["mask_image_quantification"])
+            except Exception:
+                continue
+            shape_key = meta.get("shape_key") if isinstance(meta, Mapping) else None
+            if not isinstance(shape_key, str) or shape_key not in shapes:
+                continue
+            if not all(_zarr_path_exists(table, part) for part in _QUANTIFICATION_REQUIRED_PARTS):
+                continue
+            return MaskQuantification(
+                table_key=str(table_key),
+                shape_key=shape_key,
+                label_key=_quantification_label_key(Path(zarr_path), shape_key),
+            )
+    except Exception:
+        log.debug("Cannot discover a mask quantification table in %s", zarr_path, exc_info=True)
+    return None
+
+
+def cellpose_quantification_features(
+    zarr_path: str | Path, table_key: str | None = None
+) -> list[CellposeQuantificationFeature]:
+    """List the image-statistic quantification columns (Cellpose by default)."""
     root = open_zarr_group_unconsolidated(zarr_path)
-    return _cellpose_quantification_features_from_table(_cellpose_quantification_table(root))
+    return _cellpose_quantification_features_from_table(
+        _cellpose_quantification_table(root, table_key)
+    )
 
 
 def cellpose_quantification_channel_labels(
@@ -350,19 +502,23 @@ def resolve_cellpose_quantification_feature(
     zarr_path: str | Path,
     channel: str,
     statistic: str,
+    table_key: str | None = None,
 ) -> CellposeQuantificationFeature:
     """Resolve a channel (image-qualified when shared) and statistic."""
-    return _resolve_cellpose_feature(cellpose_quantification_features(zarr_path), channel, statistic)
+    return _resolve_cellpose_feature(
+        cellpose_quantification_features(zarr_path, table_key), channel, statistic
+    )
 
 
 def load_cellpose_quantification_values(
     zarr_path: str | Path,
     channel: str,
     statistic: str,
+    table_key: str | None = None,
 ) -> CellposeQuantificationValues:
-    """Load label ids and one selected Cellpose quantification column."""
+    """Load label ids and one selected quantification column (Cellpose by default)."""
     root = open_zarr_group_unconsolidated(zarr_path)
-    table = _cellpose_quantification_table(root)
+    table = _cellpose_quantification_table(root, table_key)
     feature = _resolve_cellpose_feature(
         _cellpose_quantification_features_from_table(table), channel, statistic
     )
@@ -377,10 +533,12 @@ def load_cellpose_quantification_values(
     return CellposeQuantificationValues(feature=feature, label_ids=label_ids, values=values)
 
 
-def cellpose_cell_mean_intensities(zarr_path, label_id) -> list[tuple[str, float | None]]:
-    """Read only one Cellpose row, retaining image-qualified channel names."""
+def cellpose_cell_mean_intensities(
+    zarr_path, label_id, table_key: str | None = None
+) -> list[tuple[str, float | None]]:
+    """Read only one quantification row, retaining image-qualified channel names."""
     root = open_zarr_group_unconsolidated(zarr_path)
-    table = _cellpose_quantification_table(root)
+    table = _cellpose_quantification_table(root, table_key)
     features = _cellpose_quantification_features_from_table(table)
     labels = cellpose_quantification_channel_labels(features)
     matches = np.flatnonzero(np.asarray(table["obs/label_id"][:]).astype(str) == str(label_id))
@@ -509,11 +667,17 @@ def pick_default_shape_key(shape_keys: Iterable[str]) -> str | None:
 _FRIENDLY_LAYER_TYPE_LABELS = {"labels": "Segmentation", "cell_types": "Cell types"}
 
 
+#: Display names for platform segmentation keys the generic shortening reads badly.
+_SEGMENTATION_DISPLAY_NAMES = {"atera_nucleus": "Nucleus"}
+
+
 def _pretty_segmentation_key(key: str) -> str:
     """Shorten a segmentation element key for display (MOSAIK_proseg -> Proseg)."""
     text = str(key)
     if text.endswith("_labels"):
         text = text[: -len("_labels")]
+    if text in _SEGMENTATION_DISPLAY_NAMES:
+        return _SEGMENTATION_DISPLAY_NAMES[text]
     if text.startswith("MOSAIK_"):
         text = text[len("MOSAIK_"):]
     text = text.replace("_", " ").strip()
@@ -3002,7 +3166,7 @@ CELL_TYPE_SOURCES: tuple[CellTypeSource, ...] = (
         key="original",
         label="Original segmentation",
         clustering_tables=("table_original_clustering_squidpy",),
-        mask_shape_keys=("merscope_cell_boundaries", "cell_boundaries"),
+        mask_shape_keys=("merscope_cell_boundaries", "cell_boundaries", "atera_cell_boundaries"),
     ),
     *(
         CellTypeSource(
@@ -3159,10 +3323,44 @@ def cell_type_shape_key_for_source(zarr_path: Any, source_key: str) -> str | Non
         metadata = analysis_source_metadata(zarr_path, source_key)
         return metadata["shape"] if metadata else None
     try:
-        shapes = open_zarr_group_unconsolidated(zarr_path)["shapes"]
-        return next((key for key in source.mask_shape_keys if key in shapes), None)
+        root = open_zarr_group_unconsolidated(zarr_path)
+        shapes = root["shapes"]
+        exact = next((key for key in source.mask_shape_keys if key in shapes), None)
+        return exact if exact is not None else _schema_shape_key_for_source(root, source)
     except Exception:
         return None
+
+
+def _schema_shape_key_for_source(root, source: CellTypeSource) -> str | None:
+    """``merxen_schema.segmentations[source.key].shape``, when its table links to it.
+
+    Used only when none of the source's candidate mask keys is present. The
+    registered shape must exist and the source's clustering table (or the
+    registered table) must declare exactly that region and instance key.
+    """
+    schema = root.attrs.get("merxen_schema", {})
+    segmentations = schema.get("segmentations") if isinstance(schema, Mapping) else None
+    entry = segmentations.get(source.key) if isinstance(segmentations, Mapping) else None
+    if not isinstance(entry, Mapping):
+        return None
+    shape_key = entry.get("shape")
+    if not isinstance(shape_key, str) or shape_key not in root["shapes"]:
+        return None
+    instance_key = entry.get("instance_key") or "instance_id"
+    if "tables" not in root:
+        return None
+    tables = root["tables"]
+    candidates = [key for key in source.clustering_tables if key in tables]
+    registered = entry.get("table")
+    if isinstance(registered, str) and registered in tables:
+        candidates.append(registered)
+    for table_key in candidates:
+        try:
+            if _table_region_matches(tables[table_key], shape_key, str(instance_key)):
+                return shape_key
+        except Exception:
+            continue
+    return None
 
 
 def cell_type_table_key_for_source(

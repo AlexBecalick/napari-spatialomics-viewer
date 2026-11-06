@@ -1187,7 +1187,7 @@ class UmapRoiPanel(QFrame):
 
 
 #: Panel headings for paired views (top to bottom).
-UMAP_PLATFORM_HEADINGS = {"MERSCOPE": "MERSCOPE", "XENIUM": "Xenium"}
+UMAP_PLATFORM_HEADINGS = {"MERSCOPE": "MERSCOPE", "XENIUM": "Xenium", "ATERA": "Atera"}
 
 
 class UmapPanel(QWidget):
@@ -1736,6 +1736,20 @@ class UmapControlWidget(QWidget):
         finally:
             self._suppress = False
         self._refresh_statistic_box()
+
+    def set_statistic_mask(self, shape_key: str | None) -> None:
+        """Name the mask the per-cell statistics were measured on in the note."""
+        if not shape_key or str(shape_key) == "MOSAIK_cellpose":
+            text = (
+                "Per-cell statistics are measured on the Cellpose masks, so they "
+                "colour the Cellpose clustering's UMAP."
+            )
+        else:
+            text = (
+                f"Per-cell statistics are measured on the {shape_key} masks, so they "
+                "colour that segmentation's clustering UMAP."
+            )
+        self._statistic_note.setText(text)
 
     def set_statistic_options(
         self, channels: list[str], statistics: list[str], available: bool
