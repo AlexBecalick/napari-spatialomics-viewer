@@ -487,6 +487,14 @@ napari-compare-xenium-merscope ... \
   --gene-max-render-points 40000000 # subsample cap for very large panels
 ```
 
+For Atera stores, `--gene-max-render-points` is the whole-slide sample budget.
+Unset, it is AUTO: half the RAM over about 200 B per point. `0` means every
+transcript, and a memory guard clamps any budget to 85% of RAM.
+`--atera-transcript-mode lazy` instead shows a density overview and loads only
+the ticked genes, and `--atera-viewport-max-points` (default 20M) caps the
+full-density top-up of the visible field. The Gene inspector has the same
+controls, with a Reload button. See `docs/performance_notes.md` for timings.
+
 Loading jobs are cancellable and duplicate requests are coalesced. These optional
 limits tune reuse and storage concurrency:
 

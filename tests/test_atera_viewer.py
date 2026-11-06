@@ -500,3 +500,18 @@ def test_helpers_bounds_estimate_and_cap():
     rows = {"x": np.arange(10.0), "key": np.array([9, 1, 8, 2, 7, 3, 6, 4, 5, 0], dtype=np.uint32)}
     capped = AV.cap_rows_by_key(rows, 3)
     np.testing.assert_array_equal(capped["x"], [1.0, 3.0, 9.0])
+
+
+def test_aggregate_row_and_layer_order_include_the_dynamic_layers(qapp, atera_store, monkeypatch):
+    ctrl = _controller(atera_store, monkeypatch, atera_transcript_mode="lazy")
+    ctrl.open_gene_inspector("ATERA")
+    state = _state(ctrl)
+    state.atera.view_timer = None
+    ctrl.set_gene_visible("ATERA", _real_genes(state)[0], True)
+    ctrl._atera_flush_gene_reads("ATERA")
+    ctrl.set_gene_overview("ATERA", True)
+    row = V.GeneLayerAggregateRow(ctrl.viewer)
+    names = {layer.name for layer in row.gene_layers()}
+    assert set(state.layer_names) <= names
+    assert {AV.ATERA_DENSITY_LAYER, AV.ATERA_VIEWPORT_LAYER} <= names
+    assert state.layer_names  # the per-gene groups were created

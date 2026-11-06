@@ -119,6 +119,16 @@ at 8 GiB; inactive sessions are evicted first.
   image/segmentation viewport slicing.
 - `--gl-core-profile` (experimental): request an OpenGL 4.1 core context instead
   of the macOS default legacy 2.1 context; see below.
+- `--gene-max-render-points INT`: per platform. MERSCOPE/Xenium: cap on the
+  points rendered (default 40,000,000; 0 = no cap). Atera: the whole-slide
+  sample budget; unset = AUTO (half the RAM over 200 B per point, about
+  172M on a 64 GB Mac), 0 = every transcript. The memory guard clamps any
+  Atera budget to 85% of RAM, and a MemoryError halves it.
+- `--atera-transcript-mode {full,lazy}` (default `full`): `full` streams every
+  file into a nested whole-slide sample; `lazy` shows a 5 um density image and
+  loads only the ticked genes.
+- `--atera-viewport-max-points INT` (default 20,000,000): cap on the
+  transcripts streamed for the visible field at full density.
 
 ## Environment / GPU
 
@@ -227,3 +237,81 @@ about 0.5-0.8 s more than a warm one. A store on a slower external or network
 drive will be I/O bound: the overview reads about 10 GB, so at 100-200 MB/s
 it would take about 1-2 minutes. That is why the overview runs in a
 background worker and is cached outside the store.
+
+## Atera transcripts in the viewer (M7)
+
+An Atera store opens in one of two transcript modes; both are set from the
+CLI and from the Gene inspector ("Atera transcripts" mode, "Point budget" with
+a Reload button, "Viewport cap" applied at once).
+
+`full` (default) streams every parquet file once, in a background worker on
+the engine's 4-thread pool, and keeps a deterministic hash sample: every row
+whose splitmix64 key of (file, row) is below `budget / total`. Samples nest
+(a smaller budget is a subset of a larger one) and a budget at or above the
+store total keeps every row. The sample becomes an ordinary
+`GenePointStore` (vectorised build, uint16 radix sort), so every
+gene-inspector feature works as for Xenium/MERSCOPE. The same pass yields the
+overview and code-range map. The sample is cached under `atera-sample-v1/`
+(the largest one per store, 18 B/row, up to 400M rows); a smaller budget
+filters it by key without touching the store. While the budget leaves rows
+out, a persistent `Genes | viewport` layer tops the visible field up to full
+density with exactly the rows the sample skipped (ticked genes, or every
+real gene under the All-transcript overview). It reads a window 50% larger
+than the view, only when the density raster estimates at most the viewport
+cap, single-flight and latest-wins.
+
+`lazy` shows the 5 um density image of every real gene, loads ticked genes at
+full resolution with one batched `read_genes` per debounce window, and uses the
+viewport layer for the other genes under the overview.
+
+Measured on the real store (1,409,601,228 rows; 64 GB / 16-core M4 Max; warm
+OS page cache; napari 0.7.0 in a visible 1500x950 window, images skipped,
+cell outlines loaded). "Cold" is a transcript-cache miss: the whole store is
+streamed. "Warm" is a cache hit (the cached sample is at least as large).
+Pan times are the median and p90 of 30 synchronous repaints while the camera
+moves by 2% of the view.
+
+Headless load (engine pass, sample and `GenePointStore`, no layers):
+
+| Budget | Points | Cold | Warm | Peak RSS cold / warm |
+| --- | --- | --- | --- | --- |
+| 40M | 40.0M | 15.3 s | 1.8 s | 5.0 / 3.3 GB |
+| 100M | 100.0M | 15.1 s | 3.3 s | 8.7 / 6.3 GB |
+| 200M | 200.0M | 19.0 s | 6.6 s | 14.6 / 11.6 GB |
+| AUTO | 171.8M | 17.4 s | 5.6 s | 12.2 / 10.1 GB |
+
+In the viewer (load = process start to layers ready, including napari start-up
+and the cell outlines; one run per budget):
+
+| Budget | Load | RSS loaded | Peak RSS | Pan, nothing ticked | Tick a gene | Pan, 3 genes | All-transcript overview on | Pan, overview | 250 um field at full density | Pan in that field |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 40M (warm) | 10.2 s | 8.9 GB | 14.8 GB | 8 / 9 ms | 0.8-1.0 s | 9 / 18 ms | 13.1 s | 94 / 212 ms | 2.9 s, 7.3M points | 45 / 129 ms |
+| 100M (warm) | 15.5 s | 17.7 GB | 23.7 GB | 8 / 8 ms | 1.4-3.1 s | 19 / 26 ms | 28.2 s | 244 / 394 ms | 3.0 s, 6.9M points | 185 / 307 ms |
+| 200M (cold) | 34.8 s | 14.6 GB | 21.8 GB | 8 / 11 ms | 1.5-6.0 s | 20 / 32 ms | 38.1 s | 954 / 1131 ms | 4.0 s, 6.4M points | 184 / 566 ms |
+| AUTO 171.8M (warm) | 25.2 s | 27.3 GB | 35.1 GB | 8 / 9 ms | 1.5-4.4 s | 21 / 35 ms | 29.5 s | 921 / 1209 ms | 3.9 s, 6.6M points | 313 / 492 ms |
+| lazy | 5.1 s | 1.9 GB | 9.6 GB | 4 / 13 ms | async: 0.04 s to tick, 0.6 s to read and group 3 genes (7.5M points) | 40 / 50 ms | 2.5 s | 20 / 26 ms | 2.7 s, 7.5M points | 13 / 30 ms |
+
+RSS readings on macOS move with memory compression, so the RSS columns are
+indicative only. Between the 40M and AUTO runs the loaded RSS grows by about
+140 B per point (store and napari layers); the vertex buffer adds about 56 B
+per shown point. That is where the AUTO formula's 200 B per point comes from.
+Every transcript (1.41B points, about 280 GB) does not fit on this machine,
+and the memory guard clamps it to about 292M.
+
+What this means in practice:
+- Ticked genes stay fluid at every budget (about 10-35 ms per frame), and
+  toggling a gene costs about 1-6 s at 100-200M because its symbol group's
+  colours are re-uploaded.
+- The All-transcript overview draws every loaded point. It pans at about
+  10 fps at 40M, 4 fps at 100M and about 1 fps at AUTO; turning it on
+  uploads every point (13-38 s). For a fluid all-gene view, dial the budget
+  back to about 40M, or use lazy mode, where the overview is the density image.
+- Creating the layers for a large sample runs on the Qt thread: about 10-15 s
+  at AUTO, during which the window does not respond. The read, sample and
+  store build stay in the background.
+- The viewport needs about 0.5 s to read a 500 um window and about 2 s to
+  swap 7M points into its layer, with one vispy upload. Pans inside the
+  padded window reuse its rows.
+
+Not measured: a store on a slower or external drive (the cold pass is about
+10 GB of reads), and GPUs other than this Apple M4 Max.
