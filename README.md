@@ -235,9 +235,10 @@ platforms. What differs:
   **Show all genes** becomes the **All-transcript overview** switch. Any panel
   above 2,000 features uses the same mode.
 - **Cell inspector** shows the cell's table counts at once, then its exact
-  assigned transcripts. A cell with thousands of genes shows the top 24 genes
-  in the pie plus an "Other" slice, 200 gene rows and at most 2,000 transcript
-  links.
+  assigned transcripts. A cell with thousands of genes shows the top 10 genes
+  in the pie plus a labelled "Other" share. A ranked legend beside the pie
+  gives their counts and shares. The cell also shows 200 gene rows and at most
+  2,000 transcript links. The stored image means are labelled "Atera cell".
 - **Not available for Atera:** cortical-depth and distance-from-object
   annotations, and pciSeq sources (their MerXen exports are defined for MERSCOPE
   and Xenium); the disabled controls say why in their tooltips. The bundled

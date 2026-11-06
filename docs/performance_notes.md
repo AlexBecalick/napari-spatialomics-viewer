@@ -460,10 +460,19 @@ Cell 177 straddles two tiles.
 
 Presentation is capped at WTA scale. Below the caps the output is unchanged:
 
-- The pie shows the top 24 genes plus one neutral "Other" slice.
+- The pie shows the top 10 genes plus one neutral "Other" slice labelled
+  with its share. Beside it, a ranked legend lists the same 10 genes as
+  horizontal bars, each with its glyph in the gene layer's colour, its count
+  and its share, and then "Other (k genes)". Slices narrower than 8 degrees
+  have no glyph. (M10(d). Cell 1001 has 5,940 genes, and "Other" is 96.3% of
+  its 17,199 gene transcripts.)
 - The gene list shows 200 rows plus an "N more genes" footer.
 - Each cell draws at most 2,000 transcript links, evenly spaced and
   deterministic. The summary says when links are capped.
+- The stored per-cell means are labelled "Atera cell: <id>". MERSCOPE and
+  Xenium keep "Cellpose cell: <id>". When the exact read fails before any
+  means arrive, the summary says "image statistics could not be computed",
+  not "no image channels loaded".
 
 Not in this effort: vendor Azimuth as a second cell-type/UMAP source
 (`vendor_azimuth_*`, `X_umap_vendor`). Also not done: reusing the viewport's

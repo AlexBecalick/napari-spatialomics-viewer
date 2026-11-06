@@ -839,11 +839,17 @@ CELL_LINK_WIDTH = 0.25
 CELL_PIE_SLICE_DARKEN = 0.6
 #: WTA-scale caps of the cell inspector.  Below them the output is unchanged:
 #: a cell with more genes gets the top genes plus one neutral 'Other' slice,
-#: a list footer, and an evenly spaced subset of links.
-CELL_PIE_MAX_SLICES = 24
+#: a list footer, and an evenly spaced subset of links.  The pie's top genes
+#: are exactly the ranked legend's rows, so both 'Other' shares agree.
+CELL_PIE_MAX_SLICES = 10
 CELL_GENE_LIST_MAX_ROWS = 200
 CELL_LINKS_MAX_PER_CELL = 2_000
 CELL_OTHER_SLICE_RGBA = (0.42, 0.45, 0.50, 1.0)
+#: Ranked legend beside a capped (WTA) cell's pie: the top genes with counts
+#: and shares as horizontal bars, then the 'Other' share.  A capped pie draws a
+#: gene glyph only on slices at least this wide, so thin slices stay clean.
+CELL_PIE_LEGEND_ROWS = CELL_PIE_MAX_SLICES
+CELL_PIE_MIN_GLYPH_DEG = 8.0
 #: Maximum canvas movement still treated as an inspection click. Hit-testing
 #: transcripts and cell polygons is deferred until release; moving farther than
 #: this makes the gesture a pure napari pan with no synchronous pick work.
@@ -4891,12 +4897,19 @@ class CellInfoPieChart(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._slices: list[dict] = []
+        #: Slices narrower than this (degrees) get no glyph; 0 draws every glyph.
+        self._min_glyph_deg = 0.0
         self.setMinimumSize(150, 150)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-    def set_slices(self, slices: list[dict]):
-        """``slices``: list of ``{count, rgba, glyph}`` (highest count first)."""
+    def set_slices(self, slices: list[dict], min_glyph_deg: float = 0.0):
+        """``slices``: list of ``{count, rgba, glyph}`` (highest count first).
+
+        A slice may carry a ``label`` (the capped pie's 'Other' share), drawn
+        inside it; ``min_glyph_deg`` skips the glyphs of thinner slices.
+        """
         self._slices = list(slices or [])
+        self._min_glyph_deg = float(min_glyph_deg)
         self.update()
 
     def sizeHint(self):  # noqa: N802 (Qt override)
@@ -4936,8 +4949,19 @@ class CellInfoPieChart(QWidget):
             painter.setPen(QPen(QColor(20, 20, 20), 1))
             painter.drawPie(rect, int(round(start_deg * 16)), int(round(-span_deg * 16)))
 
+            label = str(entry.get("label", ""))
+            if label and span_deg >= 30.0:
+                mid_rad = np.deg2rad(start_deg - span_deg / 2.0)
+                lx = cx + np.cos(mid_rad) * radius * 0.5
+                ly = cy - np.sin(mid_rad) * radius * 0.5
+                label_font = QFont(glyph_font)
+                label_font.setBold(True)
+                painter.setFont(label_font)
+                painter.setPen(QPen(QColor(255, 255, 255)))
+                painter.drawText(QRectF(lx - 40, ly - 16, 80, 32), Qt.AlignCenter, label)
+                painter.setFont(glyph_font)
             glyph = str(entry.get("glyph", ""))
-            if glyph:
+            if glyph and span_deg >= self._min_glyph_deg:
                 mid_deg = start_deg - span_deg / 2.0
                 mid_rad = np.deg2rad(mid_deg)
                 gx = cx + np.cos(mid_rad) * radius * 0.72
@@ -4988,10 +5012,13 @@ def _cell_summary_html(cell: dict) -> str:
     elif intensity_rows:
         lines.append("<b>Mean intensity:</b>")
         if cell.get("cellpose_cell_id") is not None:
-            lines.append(f"Cellpose cell: {html.escape(str(cell['cellpose_cell_id']))}")
+            source = str(cell.get("intensity_cell_label") or "Cellpose cell")
+            lines.append(f"{html.escape(source)}: {html.escape(str(cell['cellpose_cell_id']))}")
         for channel, value in intensity_rows:
             value_text = f"{value:,.1f}" if value is not None else "n/a"
             lines.append(f"&nbsp;&nbsp;{html.escape(str(channel))}: {value_text}")
+    elif cell.get("intensities_failed"):
+        lines.append("<b>Mean intensity:</b> image statistics could not be computed")
     else:
         lines.append("<b>Mean intensity:</b> no image channels loaded")
     return "<br>".join(lines)
@@ -5021,7 +5048,134 @@ def _cell_pie_slices(rows: list[dict], max_slices: int | None = None) -> list[di
             "rgba": CELL_OTHER_SLICE_RGBA,
             "other_genes": len(rest),
         })
+        total = sum(max(0, int(s["count"])) for s in slices)
+        if total > 0:
+            slices[-1]["label"] = f"Other\n{slices[-1]['count'] / total:.1%}"
     return slices
+
+
+def _cell_pie_legend_rows(rows: list[dict], max_rows: int = CELL_PIE_LEGEND_ROWS) -> list[dict]:
+    """Ranked legend of a capped cell's top ``max_rows`` genes plus 'Other'.
+
+    Each row: ``label``, ``count``, ``share`` (of all the cell's gene
+    transcripts), ``glyph``, ``rgba`` (the gene layer's colour, for the glyph)
+    and ``bar_rgba`` (its pie-slice colour).  The last row aggregates every gene
+    beyond ``max_rows`` as ``Other (k genes)``.
+    """
+    total = sum(max(0, int(row.get("count", 0))) for row in rows)
+    if total <= 0:
+        return []
+    legend = []
+    for row in rows[:max_rows]:
+        rgba = tuple(row.get("rgba", (.6, .6, .6, 1.)))
+        count = max(0, int(row.get("count", 0)))
+        legend.append({
+            "label": str(row.get("gene", "")),
+            "count": count,
+            "share": count / total,
+            "glyph": str(row.get("glyph", "")),
+            "rgba": rgba,
+            "bar_rgba": darken_rgba(rgba, CELL_PIE_SLICE_DARKEN),
+        })
+    rest = rows[max_rows:]
+    if rest:
+        count = sum(max(0, int(row.get("count", 0))) for row in rest)
+        legend.append({
+            "label": f"Other ({len(rest):,} genes)",
+            "count": count,
+            "share": count / total,
+            "glyph": "",
+            "rgba": CELL_OTHER_SLICE_RGBA,
+            "bar_rgba": CELL_OTHER_SLICE_RGBA,
+            "other_genes": len(rest),
+        })
+    return legend
+
+
+class CellInfoPieLegend(QWidget):
+    """Ranked horizontal bars of a capped (WTA) cell's top genes.
+
+    One row per gene: its glyph in the gene layer's colour, the gene name, a
+    bar as long as its share relative to the top row (in the pie-slice colour)
+    and ``count · share``.  The final row is the 'Other (k genes)' share.
+    """
+
+    ROW_HEIGHT = 14
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("CellPieLegend")
+        self._rows: list[dict] = []
+        self.setFixedWidth(270)
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+    def set_rows(self, rows: list[dict]):
+        self._rows = list(rows or [])
+        self.setFixedHeight(max(1, len(self._rows)) * self.ROW_HEIGHT + 4)
+        self.update()
+
+    def rows(self) -> list[dict]:
+        return list(self._rows)
+
+    @staticmethod
+    def _qcolor(rgba) -> QColor:
+        return QColor.fromRgbF(float(rgba[0]), float(rgba[1]), float(rgba[2]),
+                               float(rgba[3]) if len(rgba) >= 4 else 1.0)
+
+    def legend_font(self) -> QFont:
+        font = QFont(self.font())
+        font.setPointSizeF(8.5)
+        return font
+
+    def layout_columns(self) -> dict:
+        """Pixel columns: glyph, name, bar and value (shared with the tests).
+
+        The value column is as wide as the widest ``count · share`` text, so
+        large counts never run into the bars.
+        """
+        width = self.width()
+        metrics = QFontMetricsF(self.legend_font())
+        value_w = max([60.0, *(metrics.horizontalAdvance(self.value_text(r)) + 2 for r in self._rows)])
+        value_x0 = width - value_w
+        return {"glyph": (0, 14), "name": (16, 82), "bar": (84, max(90.0, value_x0 - 4)),
+                "value": (value_x0, width)}
+
+    def value_text(self, row: dict) -> str:
+        return f"{int(row['count']):,} · {row['share']:.1%}"
+
+    def paintEvent(self, _event):  # noqa: N802 (Qt override)
+        if not self._rows:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        font = self.legend_font()
+        painter.setFont(font)
+        metrics = QFontMetricsF(font)
+        cols = self.layout_columns()
+        top_share = max(row["share"] for row in self._rows[:-1] or self._rows) or 1.0
+        for index, row in enumerate(self._rows):
+            y = 2 + index * self.ROW_HEIGHT
+            h = self.ROW_HEIGHT
+            if row.get("glyph"):
+                painter.setPen(QPen(self._qcolor(row["rgba"])))
+                painter.drawText(QRectF(cols["glyph"][0], y, cols["glyph"][1], h),
+                                 Qt.AlignCenter, row["glyph"])
+            other = "other_genes" in row
+            painter.setPen(QPen(QColor(154, 164, 178) if other else QColor(230, 235, 242)))
+            # The 'Other (k genes)' row has no bar: its name may use that room.
+            name_w = (cols["bar"][1] if other else cols["name"][1]) - cols["name"][0]
+            painter.drawText(QRectF(cols["name"][0], y, name_w, h), Qt.AlignVCenter | Qt.AlignLeft,
+                             metrics.elidedText(row["label"], Qt.ElideRight, name_w))
+            bar_x0, bar_x1 = cols["bar"]
+            if not other:
+                length = max(1.0, (bar_x1 - bar_x0) * min(1.0, row["share"] / top_share))
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(self._qcolor(row["bar_rgba"])))
+                painter.drawRect(QRectF(bar_x0, y + 3, length, h - 6))
+            painter.setPen(QPen(QColor(154, 164, 178)))
+            painter.drawText(QRectF(cols["value"][0], y, cols["value"][1] - cols["value"][0], h),
+                             Qt.AlignVCenter | Qt.AlignRight, self.value_text(row))
+        painter.end()
 
 
 def _cell_gene_list_html(cell: dict, max_rows: int | None = None) -> str:
@@ -5107,6 +5261,10 @@ class _CellPanel(QWidget):
         self._pie = CellInfoPieChart(self)
         self._pie.setFixedSize(170, 170)
         outer.addWidget(self._pie, 0, Qt.AlignTop)
+        # Only capped (WTA) cells show the ranked legend beside the pie.
+        self._pie_legend = CellInfoPieLegend(self)
+        self._pie_legend.setVisible(False)
+        outer.addWidget(self._pie_legend, 0, Qt.AlignTop)
         self._gene_scroll = QScrollArea(self)
         self._gene_scroll.setObjectName("CellGenes")
         self._gene_scroll.setWidgetResizable(True)
@@ -5143,9 +5301,17 @@ class _CellPanel(QWidget):
                     min(280, self._broad.sizeHint().width()),
                     min(280, self._fine.sizeHint().width()) if not pciseq else 0)
         self._statistics.setFixedWidth(int(min(310, max(170, width + 8))))
-        self._pie.set_slices(_cell_pie_slices(
-            list(cell.get("gene_rows", [])),
-            CELL_PIE_MAX_SLICES if _cell_wta_capped(cell) else None))
+        gene_rows = list(cell.get("gene_rows", []))
+        if _cell_wta_capped(cell):
+            self._pie.set_slices(_cell_pie_slices(gene_rows, CELL_PIE_MAX_SLICES),
+                                 min_glyph_deg=CELL_PIE_MIN_GLYPH_DEG)
+            legend = _cell_pie_legend_rows(gene_rows)
+            self._pie_legend.set_rows(legend)
+            self._pie_legend.setVisible(bool(legend))
+        else:
+            self._pie.set_slices(_cell_pie_slices(gene_rows, None))
+            self._pie_legend.set_rows([])
+            self._pie_legend.setVisible(False)
         self._gene_list.setText(_cell_gene_list_html(cell))
         self._gene_list.ensurePolished()
         document.setDefaultFont(self._gene_list.font())
@@ -13853,6 +14019,7 @@ class ComparisonViewerController(AteraTranscriptMixin):
             self._cell_intensity_cache[cache_key] = intensity_result
         intensities, cellpose_id = intensity_result
         annotation = self._cell_type_annotation_for_cell(key, cell_id, load=True)
+        source_label = self._intensity_cell_label(key) if cellpose_id is not None else None
         return {
             "cell_id": cell_id,
             "geometry": geometry,
@@ -13862,9 +14029,25 @@ class ComparisonViewerController(AteraTranscriptMixin):
             "area": area_um2,
             "intensities": intensities,
             "cellpose_cell_id": cellpose_id,
+            "intensity_cell_label": source_label,
+            "intensities_failed": False,
             "loading": False,
             **annotation,
         }
+
+    def _intensity_cell_label(self, ds: str) -> str:
+        """Summary label of the cell whose stored means are shown.
+
+        ``Cellpose cell`` for the MOSAIK Cellpose table (and every paired
+        view); a vendor-mask quantification (Atera) names the platform's cells.
+        """
+        if self._paired_session is None:
+            quantification = self._dataset_quantification(ds)
+            if quantification is not None and not quantification.is_cellpose:
+                spec = self._dataset_platform_spec(ds)
+                name = spec.display_name if spec is not None else quantification.shape_key
+                return f"{name} cell"
+        return "Cellpose cell"
 
     def _lazy_cell_selection_display(
         self, ds: str, cell_id, geometry, color: str, *, gene_visuals=None, image_specs=None,
@@ -14367,6 +14550,9 @@ class ComparisonViewerController(AteraTranscriptMixin):
                 loading=False,
                 transcripts_loading=False,
                 intensities_loading=False,
+                # Earlier means stay; without any, say they failed rather than
+                # implying the dataset has no image channels.
+                intensities_failed=not entry.get("intensities"),
                 transcript_note="Assigned transcripts could not be read; showing the table counts.",
             )
             if self.active_dataset == ds:

@@ -513,7 +513,7 @@ def test_a_wta_cell_is_capped_in_the_pie_list_and_links(qapp):
 def test_a_large_non_lazy_cell_keeps_every_slice_row_and_link(qapp):
     """MERSCOPE/XENIUM cells (no ``wta_caps``) render as before the caps:
     one pie slice per gene, every gene row and one link per transcript."""
-    n_genes = V.CELL_PIE_MAX_SLICES + 164  # P7513 MERSCOPE max is 188 genes
+    n_genes = max(188, V.CELL_PIE_MAX_SLICES + 164)  # P7513 MERSCOPE max is 188 genes
     rows = _rows(n_genes)
     big_rows = _rows(V.CELL_GENE_LIST_MAX_ROWS + 50)
     n_links = V.CELL_LINKS_MAX_PER_CELL + 421  # P7513 MERSCOPE max is 2,421
@@ -554,6 +554,140 @@ def test_a_small_cell_renders_exactly_as_before(qapp):
     summary = V._cell_summary_html({"total": 2, "coords_yx": coords})
     assert "Links drawn" not in summary and "Control features" not in summary
     assert "<b>Total transcripts:</b> 2" in summary
+
+
+# ---------------------------------------------------------------------------
+# M10(d): readable WTA pie, source-named stored means, failed image statistics
+# ---------------------------------------------------------------------------
+
+
+def test_a_wta_pie_has_a_ranked_legend_and_a_labelled_other_share(qapp):
+    rows = _rows(6_000)
+    total = sum(r["count"] for r in rows)
+    slices = V._cell_pie_slices(rows, V.CELL_PIE_MAX_SLICES)
+    other = slices[-1]
+    assert other["label"] == f"Other\n{other['count'] / total:.1%}"
+    assert all("label" not in s for s in slices[:-1])
+
+    legend = V._cell_pie_legend_rows(rows)
+    assert len(legend) == V.CELL_PIE_LEGEND_ROWS + 1
+    top = legend[:-1]
+    assert [r["label"] for r in top] == [r["gene"] for r in rows[:V.CELL_PIE_LEGEND_ROWS]]
+    assert [r["count"] for r in top] == sorted((r["count"] for r in top), reverse=True)
+    assert top[0]["share"] == pytest.approx(rows[0]["count"] / total)
+    # Glyphs keep the gene layer's colour; bars use the pie-slice colour.
+    assert all(r["rgba"] == rows[i]["rgba"] and r["glyph"] == rows[i]["glyph"] for i, r in enumerate(top))
+    assert all(r["bar_rgba"] == slices[i]["rgba"] for i, r in enumerate(top))
+    tail = legend[-1]
+    assert tail["label"] == f"Other ({6_000 - V.CELL_PIE_LEGEND_ROWS:,} genes)"
+    assert tail["other_genes"] == 6_000 - V.CELL_PIE_LEGEND_ROWS
+    assert sum(r["count"] for r in legend) == total
+    assert sum(r["share"] for r in legend) == pytest.approx(1.0)
+    # The pie's 'Other' slice is the legend's 'Other' row.
+    assert tail["count"] == other["count"] and tail["other_genes"] == other["other_genes"]
+
+    panel = V._CellPanel({"cell_id": 1, "gene_rows": rows, "wta_caps": True})
+    assert not panel._pie_legend.isHidden() and panel._pie_legend.rows() == legend
+    assert panel._pie._min_glyph_deg == V.CELL_PIE_MIN_GLYPH_DEG
+    assert panel._pie_legend.value_text(top[0]) == f"{top[0]['count']:,} · {top[0]['share']:.1%}"
+    panel._pie_legend.resize(panel._pie_legend.width(), panel._pie_legend.height())
+    image = panel._pie_legend.grab().toImage()
+    assert not image.isNull() and image.height() >= len(legend) * V.CellInfoPieLegend.ROW_HEIGHT
+    # The value column fits every row's text without overlapping the bar column.
+    from qtpy.QtGui import QFontMetricsF
+
+    metrics = QFontMetricsF(panel._pie_legend.legend_font())
+    cols = panel._pie_legend.layout_columns()
+    assert cols["bar"][1] < cols["value"][0]
+    value_w = cols["value"][1] - cols["value"][0]
+    assert all(metrics.horizontalAdvance(panel._pie_legend.value_text(r)) <= value_w for r in legend)
+    assert metrics.horizontalAdvance(tail["label"]) <= cols["bar"][1] - cols["name"][0]
+    assert not panel._pie.grab().isNull()
+
+
+def test_a_small_wta_cell_has_a_legend_without_other(qapp):
+    rows = _rows(4)
+    legend = V._cell_pie_legend_rows(rows)
+    assert [r["label"] for r in legend] == [r["gene"] for r in rows]
+    assert all("other_genes" not in r for r in legend)
+    assert V._cell_pie_legend_rows([]) == []
+    panel = V._CellPanel({"cell_id": 1, "gene_rows": [], "wta_caps": True})
+    assert panel._pie_legend.isHidden()
+
+
+def test_a_non_wta_cell_has_no_legend_and_every_glyph(qapp):
+    """MERSCOPE/XENIUM keep the plain pie: no legend, no labels, every glyph."""
+    rows = _rows(V.CELL_PIE_MAX_SLICES + 164)
+    panel = V._CellPanel({"cell_id": 7, "gene_rows": rows})
+    assert panel._pie_legend.isHidden() and panel._pie_legend.rows() == []
+    assert panel._pie._min_glyph_deg == 0.0
+    assert all("label" not in s for s in panel._pie._slices)
+    # Switching a reused panel from a WTA cell back to a plain one hides it.
+    panel.set_cell({"cell_id": 8, "gene_rows": rows, "wta_caps": True})
+    assert not panel._pie_legend.isHidden()
+    panel.set_cell({"cell_id": 7, "gene_rows": rows})
+    assert panel._pie_legend.isHidden() and panel._pie._min_glyph_deg == 0.0
+
+
+def test_atera_stored_means_name_the_atera_cell(qapp, atera_store, monkeypatch):
+    ctrl = _activate(atera_store, monkeypatch)
+    gdf = ctrl._active_sdata.shapes["atera_cell_boundaries"]
+    cell_id, geometry = ctrl._shape_for_cell_id(gdf, 3)
+    ctrl._add_cell_selection("ATERA", cell_id, geometry)
+    entry = ctrl._selected_cells["ATERA"][0]
+    assert entry["intensities"] and entry["intensity_cell_label"] == "Atera cell"
+    summary = V._cell_summary_html(entry)
+    assert "Atera cell: 3" in summary and "Cellpose cell" not in summary
+    assert ctrl._intensity_cell_label("ATERA") == "Atera cell"
+
+
+def test_the_summary_label_defaults_to_cellpose():
+    base = {"total": 1, "intensities": [("DAPI", 1.0)], "cellpose_cell_id": 12}
+    assert "Cellpose cell: 12" in V._cell_summary_html(base)
+    assert "Cellpose cell: 12" in V._cell_summary_html({**base, "intensity_cell_label": None})
+    assert "Xenium cell: 12" in V._cell_summary_html({**base, "intensity_cell_label": "Xenium cell"})
+
+
+@pytest.mark.parametrize("failure", ["exact_read", "common"])
+def test_a_failed_exact_read_says_the_image_statistics_failed(qapp, atera_store, monkeypatch, failure):
+    ctrl = _activate(atera_store, monkeypatch)
+
+    def boom(*_a, **_k):
+        raise RuntimeError("phase two failed")
+
+    if failure == "common":
+        monkeypatch.setattr(ctrl, "_cell_selection_common", boom)
+    else:
+        monkeypatch.setattr(V, "indexed_cell_transcripts", boom)
+    gdf = ctrl._active_sdata.shapes["atera_cell_boundaries"]
+    cell_id, geometry = ctrl._shape_for_cell_id(gdf, 3)
+    ctrl._add_cell_selection("ATERA", cell_id, geometry)
+    entry = ctrl._selected_cells["ATERA"][0]
+    assert entry["intensities_failed"] is True
+    summary = V._cell_summary_html(entry)
+    assert "image statistics could not be computed" in summary
+    assert "no image channels loaded" not in summary
+
+
+def test_a_failed_exact_read_keeps_earlier_means(qapp, atera_store, monkeypatch):
+    ctrl = _activate(atera_store, monkeypatch)
+    gdf = ctrl._active_sdata.shapes["atera_cell_boundaries"]
+    cell_id, geometry = ctrl._shape_for_cell_id(gdf, 3)
+    ctrl._selected_cells["ATERA"] = [{"cell_id": cell_id, "intensities": [("DAPI", 5.0)],
+                                      "cellpose_cell_id": 3, "intensity_cell_label": "Atera cell"}]
+    generation = ctrl._cell_inspection_generation
+    ctrl._handle_lazy_cell_exact_read_error(
+        generation, ("ATERA", V.normalize_cell_key(cell_id), *ctrl._transcript_source_identity("ATERA")),
+        RuntimeError("phase two failed"))
+    entry = ctrl._selected_cells["ATERA"][0]
+    assert entry["intensities_failed"] is False
+    summary = V._cell_summary_html(entry)
+    assert "DAPI: 5.0" in summary and "could not be computed" not in summary
+
+
+def test_no_image_channels_is_still_reported_as_such():
+    summary = V._cell_summary_html({"total": 0, "intensities": [], "intensities_failed": False})
+    assert "no image channels loaded" in summary and "could not be computed" not in summary
 
 
 # ---------------------------------------------------------------------------
