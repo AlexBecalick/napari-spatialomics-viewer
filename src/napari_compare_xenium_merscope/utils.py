@@ -2401,8 +2401,12 @@ def _iter_point_partitions(
     *,
     cancel_check: Callable[[], bool] | None = None,
     read_ahead: int | None = None,
+    progress: Callable[[int, int], None] | None = None,
 ):
     """Yield the non-empty pandas partitions of ``points_obj[cols]`` in order.
+
+    ``progress(done, n_partitions)`` is called as each partition (empty ones
+    included) has been read, before it is handed out.
 
     A dask frame's next ``read_ahead`` partitions are computed on one helper
     thread while the caller processes the current one, so reading overlaps the
@@ -2413,11 +2417,14 @@ def _iter_point_partitions(
     work = points_obj[cols]
     if hasattr(work, "to_delayed"):
         parts = list(work.to_delayed())
+        n_parts = len(parts)
         depth = _POINT_PARTITION_READ_AHEAD if read_ahead is None else max(0, int(read_ahead))
         if depth == 0 or len(parts) <= 1:
-            for part in parts:
+            for index, part in enumerate(parts):
                 _check_transcript_cancelled(cancel_check)
                 pdf = part.compute()
+                if progress is not None:
+                    progress(index + 1, n_parts)
                 if len(pdf) > 0:
                     yield pdf
             return
@@ -2427,6 +2434,7 @@ def _iter_point_partitions(
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="points-read-ahead")
         pending: deque = deque()
         next_part = 0
+        handed = 0
         try:
             while next_part < len(parts) and len(pending) <= depth:
                 pending.append(executor.submit(parts[next_part].compute))
@@ -2437,6 +2445,9 @@ def _iter_point_partitions(
                 if next_part < len(parts) and len(pending) < depth:
                     pending.append(executor.submit(parts[next_part].compute))
                     next_part += 1
+                handed += 1
+                if progress is not None:
+                    progress(handed, n_parts)
                 if len(pdf) > 0:
                     yield pdf
         finally:
@@ -2446,6 +2457,8 @@ def _iter_point_partitions(
         return
 
     pdf = to_pandas(work)
+    if progress is not None:
+        progress(1, 1)
     if len(pdf) > 0:
         yield pdf
 
@@ -4597,8 +4610,12 @@ def build_gene_point_groups(
     cancel_check: Callable[[], bool] | None = None,
     status_col: str | None = None,
     is_gene_col: str | None = None,
+    progress: Callable[[int, int], None] | None = None,
 ) -> GenePointStore:
     """Read all transcripts into a symbol-grouped, gene-sorted point store.
+
+    ``progress(done, total)`` counts partitions over both streaming passes
+    (``total`` is twice the partition count).
 
     ``background`` is taken from ``background_col`` (bool) if present, else from
     ``assignment_col`` (unassigned == not :func:`assignment_mask`), else all
@@ -4644,7 +4661,16 @@ def build_gene_point_groups(
     cell_counts: dict[str, int] = {}
     partition_counts: list[int] = []
     total_source = 0
-    for pdf in _iter_point_partitions(points_obj, cols, cancel_check=cancel_check):
+    def pass_progress(offset: int):
+        if progress is None:
+            return None
+
+        def report(done: int, n: int) -> None:
+            progress(offset * int(n) + int(done), 2 * int(n))
+
+        return report
+
+    for pdf in _iter_point_partitions(points_obj, cols, cancel_check=cancel_check, progress=pass_progress(0)):
         _check_transcript_cancelled(cancel_check)
         gene_coding = _sorted_string_vocab(pdf[gene_col])
         if is_gene_flags is not None:
@@ -4728,7 +4754,7 @@ def build_gene_point_groups(
     # coordinate set in memory (a global position draw above numpy's limit).
     sampler = _StreamingSampler(partition_counts, render_count, random_state)
     render_cursor = 0
-    for pdf in _iter_point_partitions(points_obj, cols, cancel_check=cancel_check):
+    for pdf in _iter_point_partitions(points_obj, cols, cancel_check=cancel_check, progress=pass_progress(1)):
         _check_transcript_cancelled(cancel_check)
         arrays = partition_arrays(pdf)
         if arrays is None:

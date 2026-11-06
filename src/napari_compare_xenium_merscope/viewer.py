@@ -179,8 +179,11 @@ from .atera_viewer import (
     DEFAULT_ATERA_OVERVIEW_MAX_POINTS,
     DEFAULT_ATERA_TRANSCRIPT_MODE,
     DEFAULT_ATERA_VIEWPORT_MAX_POINTS,
+    ATERA_GENES_PROGRESS_KEY,
+    ATERA_VIEWPORT_PROGRESS_KEY,
     AteraTranscriptMixin,
 )
+from .progress import ProgressDisplay, ProgressReporter
 from .manual_registration_model import LAYER_METADATA_KEY, STORE_ATTR
 from .platforms import (
     ATERA,
@@ -573,6 +576,8 @@ class GeneInspectorState:
     overview_visible: bool = False
     #: Atera lazy-engine context (atera_viewer.AteraTranscriptContext), else None.
     atera: object | None = None
+    #: Token of the chunked layer creation still adding this state's layers.
+    layer_chain: object | None = None
 
 
 @dataclass
@@ -711,6 +716,12 @@ REGISTRATION_RECENT_KIND = "registration"
 REGISTRATION_APP_DIR_NAME = "napari-compare-xenium-merscope"
 REGISTRATION_CACHE_LOCK_TIMEOUT_S = 30.0
 REGISTRATION_PROGRESS_KEY = "registration"
+#: Progress stage of the Qt-thread gene-layer creation (one chunk per group).
+GENE_LAYERS_PROGRESS_KEY = "gene_layers"
+#: Stores at least this large create their gene layers one group per event-loop
+#: turn (0 disables chunking).  Below it the build is fast enough to stay atomic.
+GENE_LAYER_CHUNK_MIN_POINTS = 5_000_000
+GENE_LAYER_CHUNK_DELAY_MS = 15
 REGISTRATION_IMAGES_STATUS = (
     "Channels of a registration session are in the layer list; show or hide them there."
 )
@@ -1510,7 +1521,8 @@ class ViewerControlPanel(QWidget):
     Tabs (a wrapping button bar across the top): Gene inspector, Cell segmentation, Cell type labels,
     Per cell statistics, Draw tissue annotations, Images, Dataset, UMAP, Zarr metadata, and
     Manual registration.
-    A busy progress bar plus a stage label sit below the tabs and stay visible whatever tab is selected.
+    A progress bar (determinate while a stage reports counts, else busy) plus a stage label sit
+    below the tabs and stay visible whatever tab is selected.
     """
 
     # Thread-safe status/progress updates: heavy work runs in napari
@@ -1519,6 +1531,8 @@ class ViewerControlPanel(QWidget):
     # the GUI thread.
     status_message = Signal(str)
     progress_message = Signal(str, str, bool)  # (stage key, text, active)
+    # (stage key, done, total, phase text, unit); object carries counts > 2**31.
+    progress_value = Signal(str, object, object, str, str)
     dataset_open_requested = Signal()
 
     def __init__(
@@ -1598,7 +1612,8 @@ class ViewerControlPanel(QWidget):
         self._export_object_annotations_callback = export_object_annotations_callback
         self._load_object_annotations_callback = load_object_annotations_callback
 
-        self._active_stages: dict[str, str] = {}
+        self._progress_display = ProgressDisplay()
+        self._active_stages: dict[str, str] = self._progress_display.stages
         self._loaded_shape_keys: set[str] = set()
         self._loaded_image_entries: set[tuple[str, str]] = set()
         self._LOADED_TEXT_COLOR = QColor(0x3E, 0xCF, 0x6B)  # green for loaded rows
@@ -1762,6 +1777,7 @@ class ViewerControlPanel(QWidget):
         self._status_label.setWordWrap(True)
         self.status_message.connect(self._on_status_message)
         self.progress_message.connect(self._on_progress_message)
+        self.progress_value.connect(self._on_progress_value)
 
         # -- Assemble tabs ---------------------------------------------------
         # A wrapping button bar (each button keeps its full-text width and wraps
@@ -2037,17 +2053,35 @@ class ViewerControlPanel(QWidget):
     def _on_status_message(self, text: str):
         self._status_label.setText(str(text))
 
+    def set_progress_value(self, key: str, done: int, total: int, text: str = "", unit: str = ""):
+        """Determinate count for an active stage. Safe to call from any thread."""
+        self.progress_value.emit(str(key), int(done), int(total), str(text or ""), str(unit or ""))
+
     def _on_progress_message(self, key: str, text: str, active: bool):
-        if active:
-            self._active_stages[key] = text
-        else:
-            self._active_stages.pop(key, None)
-        if self._active_stages:
-            self._progress_bar.setVisible(True)
-            self._progress_label.setText(" | ".join(v for v in self._active_stages.values() if v))
-        else:
+        self._progress_display.set_stage(str(key), str(text), bool(active))
+        self._refresh_progress()
+
+    def _on_progress_value(self, key: str, done, total, text: str, unit: str):
+        if self._progress_display.set_value(str(key), int(done), int(total), str(text), str(unit)):
+            self._refresh_progress()
+
+    def _refresh_progress(self):
+        """Draw the combined stages: determinate when a stage has a count, else busy."""
+        display = self._progress_display
+        if not display.active:
             self._progress_bar.setVisible(False)
+            self._progress_bar.setRange(0, 0)
             self._progress_label.setText("")
+            return
+        minimum, maximum, value = display.bar()
+        bar = self._progress_bar
+        if (bar.minimum(), bar.maximum()) != (minimum, maximum):
+            bar.setRange(minimum, maximum)
+        if maximum > 0:
+            bar.setValue(value)
+        bar.setTextVisible(maximum > 0)
+        bar.setVisible(True)
+        self._progress_label.setText(display.label())
 
     def set_shape_keys(self, keys: list[str]):
         self._shape_list.clear()
@@ -6861,23 +6895,64 @@ class ComparisonViewerController(AteraTranscriptMixin):
         if self._status_callback is not None:
             self._status_callback(text)
 
-    def _begin_progress(self, key: str, text: str):
-        """Mark a loading stage as active (shows the busy bar + stage text)."""
-        self._set_status(text)
+    def set_progress_value_callback(self, fn):
+        """``fn(key, done, total, text, unit)``: determinate counts (any thread)."""
+        self._progress_value_callback = fn
+
+    def _progress_reporter(self) -> ProgressReporter:
+        reporter = getattr(self, "_progress_reporter_obj", None)
+        if reporter is None:
+            # Built lazily: some tests make controllers without __init__.
+            reporter = ProgressReporter(self._emit_progress_value)
+            self._progress_reporter_obj = reporter
+        return reporter
+
+    def _emit_progress_value(self, key: str, done: int, total: int, text: str, unit: str) -> None:
+        callback = getattr(self, "_progress_value_callback", None)
+        if callback is not None:
+            callback(key, done, total, text, unit)
+
+    def _begin_progress(
+        self, key: str, text: str, total: int | None = None, *, status: bool = True, unit: str = ""
+    ):
+        """Mark a loading stage as active (shows the bar + stage text).
+
+        With ``total`` the bar starts determinate at 0; otherwise it is busy
+        until the first :meth:`_report_progress`.  ``status=False`` leaves the
+        status line alone (a quiet stage, e.g. a background read).
+        """
+        if status:
+            self._set_status(text)
+        self._progress_reporter().begin(str(key))
         if self._progress_callback is not None:
             self._progress_callback(str(key), str(text), True)
+        if total is not None and int(total) > 0:
+            self._report_progress(key, 0, int(total), unit=unit, force=True)
+
+    def _report_progress(
+        self, key: str, done: int, total: int, text: str | None = None, unit: str = "", *, force: bool = False
+    ) -> None:
+        """Report ``done`` of ``total`` for a stage; safe from any thread, throttled.
+
+        ``text`` (optional) replaces the stage text while this phase runs;
+        ``total <= 0`` turns the stage back into a busy bar showing ``text``.
+        """
+        self._progress_reporter().report(str(key), done, total, text, unit, force=force)
 
     def _end_progress(self, key: str):
-        """Mark a loading stage as finished (hides the busy bar when idle)."""
+        """Mark a loading stage as finished (hides the bar when idle)."""
+        self._progress_reporter().end(str(key))
         if self._progress_callback is not None:
             self._progress_callback(str(key), "", False)
 
     def _reset_progress(self):
         """Clear all loading stages (e.g. when switching datasets)."""
-        keys = ["dataset", "images", "masks", "transcripts", REGISTRATION_PROGRESS_KEY]
+        keys = ["dataset", "images", "masks", "transcripts", GENE_LAYERS_PROGRESS_KEY,
+                ATERA_GENES_PROGRESS_KEY, ATERA_VIEWPORT_PROGRESS_KEY, REGISTRATION_PROGRESS_KEY]
         keys.extend(sorted(getattr(self, "_registration_progress_keys", ())))
         for key in dict.fromkeys(keys):
             self._end_progress(key)
+        self._progress_reporter().reset()
         if hasattr(self, "_registration_progress_keys"):
             self._registration_progress_keys.clear()
 
@@ -9382,7 +9457,7 @@ class ComparisonViewerController(AteraTranscriptMixin):
             return
         if only_keys is not None:
             image_keys = [k for k in image_keys if k in only_keys]
-        for image_key in image_keys:
+        for position, image_key in enumerate(image_keys):
             if cancel_check is not None and cancel_check():
                 return
             try:
@@ -9397,6 +9472,9 @@ class ComparisonViewerController(AteraTranscriptMixin):
                 )
             except Exception as exc:
                 log.warning("[%s] Could not build image pyramid cache for %s (%s)", ds, image_key, exc)
+            finally:
+                if len(image_keys) > 1:
+                    self._report_progress("images", position + 1, len(image_keys), unit="images")
 
     def _default_visible_channels(self, labels: list[str]) -> set[str]:
         """Channels shown by default on load; the rest are loaded but hidden.
@@ -10658,6 +10736,8 @@ class ComparisonViewerController(AteraTranscriptMixin):
                         n_labels = 1
                     specs.append({"label_key": label_key, "prepared": prepared, "n_labels": n_labels})
                     total_labels += n_labels
+                    if len(keys) > 1:
+                        self._report_progress("masks", len(specs), len(keys), unit="segmentations")
             return {"specs": specs, "total_labels": total_labels, "build_seconds": time.time() - t0}
 
         if thread_worker is None:
@@ -11573,6 +11653,10 @@ class ComparisonViewerController(AteraTranscriptMixin):
                                 build_cell_index=cell_index_wanted[platform],
                                 cancel_check=cancel_token.is_set,
                                 status_col=status_col,
+                                progress=lambda done, n, p=platform, i=offset: self._report_progress(
+                                    "transcripts", done, n,
+                                    text=f"{p}: streaming transcripts ({i + 1} of 2)", unit="partition reads",
+                                ),
                             )
                         payload = {
                             "points_key": points_key,
@@ -12149,6 +12233,10 @@ class ComparisonViewerController(AteraTranscriptMixin):
                         build_cell_index=build_cell_index,
                         cancel_check=cancel_token.is_set,
                         status_col=status_col,
+                        progress=lambda done, n: self._report_progress(
+                            "transcripts", done, n,
+                            text=f"{ds}: streaming transcripts for {points_key}", unit="partition reads",
+                        ),
                     )
                     payload = {
                         "points_key": points_key,
@@ -12301,15 +12389,108 @@ class ComparisonViewerController(AteraTranscriptMixin):
         # per-point colours + symbol. Building populated (vs. empty then growing)
         # avoids napari's data-resize path that both drops the per-point symbol
         # back to the default disc and can reset colours to white.
+        n_groups = len(store.group_symbols)
+        if self._gene_layers_chunked(store):
+            # Large stores: one group per Qt event-loop turn, so the window
+            # repaints and the progress bar moves between chunks.
+            chain = object()
+            self._gene_layer_chain = chain
+            state.layer_chain = chain
+            self._begin_progress(
+                GENE_LAYERS_PROGRESS_KEY, f"{ds}: creating the transcript layers…", total=n_groups, status=False,
+                unit="layers",
+            )
+            self._defer_gene_layer_step(
+                lambda: self._gene_layer_step(chain, generation, ds, state, payload, 0)
+            )
+            return
         try:
-            for gi, symbol in enumerate(store.group_symbols):
-                coords, colors, sizes, ranges, shown = self._gene_group_arrays(state, gi)
-                state.group_display_ranges[gi] = ranges
-                layer_name = self._gene_layer_name(ds, symbol)
-                self._create_gene_points_layer(
-                    layer_name, symbol, spot_size, coords, colors, sizes, shown=shown
-                )
-                state.layer_names.append(layer_name)
+            for gi in range(n_groups):
+                self._create_gene_group_layer(state, gi)
+        except MemoryError:
+            if atera is None:
+                raise
+            # Atera layers are the bulk of the per-point memory: tear the
+            # partial layers down and reload at half the budget.
+            state.atera = atera
+            self._atera_layers_out_of_memory(ds, atera)
+            return
+        self._finish_gene_inspector_build(state, payload)
+
+    def _gene_layers_chunked(self, store) -> bool:
+        """Create the gene layers over several event-loop turns (large stores only)."""
+        threshold = int(getattr(self.args, "gene_layer_chunk_min_points", GENE_LAYER_CHUNK_MIN_POINTS) or 0)
+        return threshold > 0 and len(store.group_symbols) > 1 and int(store.total_points) >= threshold
+
+    def _defer_gene_layer_step(self, step) -> None:
+        """Run ``step`` on a later Qt event-loop turn (tests swap this out).
+
+        A short non-zero delay, not 0: a chain of zero-timers can starve the
+        other timers and the repaint on macOS, so the bar would not move.
+        """
+        QTimer.singleShot(GENE_LAYER_CHUNK_DELAY_MS, step)
+
+    def _create_gene_group_layer(self, state: GeneInspectorState, gi: int) -> None:
+        symbol = state.store.group_symbols[gi]
+        coords, colors, sizes, ranges, shown = self._gene_group_arrays(state, gi)
+        state.group_display_ranges[gi] = ranges
+        layer_name = self._gene_layer_name(state.dataset, symbol)
+        self._create_gene_points_layer(
+            layer_name, symbol, state.spot_size, coords, colors, sizes, shown=shown
+        )
+        state.layer_names.append(layer_name)
+
+    def _gene_layer_step(self, chain, generation: int, ds: str, state: GeneInspectorState, payload: dict, gi: int):
+        """One chunk of the chunked layer creation, then the next or the finish."""
+        if getattr(self, "_gene_layer_chain", None) is not chain:
+            return  # a newer build owns the progress stage
+        if (
+            generation != self._gene_build_generation
+            or self._gene_inspector_states.get(ds) is not state
+        ):
+            # Torn down or superseded mid-way: stop quietly.
+            self._gene_layer_chain = None
+            self._end_progress(GENE_LAYERS_PROGRESS_KEY)
+            return
+        atera = payload.get("atera")
+        n_groups = len(state.store.group_symbols)
+        t0 = time.perf_counter()
+        try:
+            if gi < n_groups:
+                self._create_gene_group_layer(state, gi)
+        except MemoryError:
+            self._gene_layer_chain = None
+            self._end_progress(GENE_LAYERS_PROGRESS_KEY)
+            if atera is not None:
+                state.atera = atera
+                self._atera_layers_out_of_memory(ds, atera)
+            else:
+                self._teardown_gene_inspector(ds)
+                self._set_status(f"{ds}: out of memory while creating the transcript layers.")
+                log.error("[%s] Out of memory while creating the transcript layers.", ds)
+            return
+        log.debug("[%s] Gene layer %d/%d created in %.2fs", ds, gi + 1, n_groups, time.perf_counter() - t0)
+        if gi + 1 < n_groups:
+            self._report_progress(GENE_LAYERS_PROGRESS_KEY, gi + 1, n_groups, unit="layers", force=True)
+            self._defer_gene_layer_step(
+                lambda: self._gene_layer_step(chain, generation, ds, state, payload, gi + 1)
+            )
+            return
+        self._report_progress(GENE_LAYERS_PROGRESS_KEY, n_groups, n_groups, unit="layers", force=True)
+        self._gene_layer_chain = None
+        state.layer_chain = None
+        try:
+            self._finish_gene_inspector_build(state, payload)
+        finally:
+            self._end_progress(GENE_LAYERS_PROGRESS_KEY)
+
+    def _finish_gene_inspector_build(self, state: GeneInspectorState, payload: dict) -> None:
+        """After the gene layers exist: order them, install Atera, fill the widget."""
+        ds = state.dataset
+        store = state.store
+        atera = payload.get("atera")
+        resolution = payload.get("reference_resolution")
+        try:
             # Pin the (long) gene-layer block to the bottom of the layer list so it
             # stays below images and masks regardless of which background load finishes
             # first. Layers added later by napari sit on top, so without this the
@@ -12321,8 +12502,6 @@ class ComparisonViewerController(AteraTranscriptMixin):
         except MemoryError:
             if atera is None:
                 raise
-            # Atera layers are the bulk of the per-point memory: tear the
-            # partial layers down and reload at half the budget.
             state.atera = atera
             self._atera_layers_out_of_memory(ds, atera)
             return
@@ -17741,6 +17920,7 @@ class ComparisonViewerController(AteraTranscriptMixin):
         self._gene_build_worker = None
         state = self._gene_inspector_states.pop(ds, None)
         if state is not None:
+            self._cancel_gene_layer_chain(state)
             self._atera_teardown(state)
         if state is not None and state.rebuild_timer is not None:
             try:
@@ -17752,10 +17932,19 @@ class ComparisonViewerController(AteraTranscriptMixin):
         if self._gene_inspector_widget is not None and self._gene_inspector_widget.dataset == ds:
             self._gene_inspector_widget.clear()
 
+    def _cancel_gene_layer_chain(self, state: GeneInspectorState) -> None:
+        """Stop a chunked layer creation of ``state`` and hide its progress."""
+        chain = getattr(state, "layer_chain", None)
+        state.layer_chain = None
+        if chain is not None and getattr(self, "_gene_layer_chain", None) is chain:
+            self._gene_layer_chain = None
+            self._end_progress(GENE_LAYERS_PROGRESS_KEY)
+
     def _clear_gene_inspector_states(self):
         self._gene_build_generation += 1
         self._gene_build_worker = None
         for state in list(self._gene_inspector_states.values()):
+            self._cancel_gene_layer_chain(state)
             self._atera_teardown(state)
             if state.rebuild_timer is not None:
                 try:
@@ -18686,6 +18875,7 @@ def main():
     )
     controller.set_status_callback(panel.set_status)
     controller.set_progress_callback(panel.set_progress)
+    controller.set_progress_value_callback(panel.set_progress_value)
     controller.set_shape_keys_callback(panel.set_shape_keys)
     controller.set_loaded_shape_keys_callback(panel.set_loaded_shape_keys)
     controller.set_image_entries_callback(panel.set_image_entries)

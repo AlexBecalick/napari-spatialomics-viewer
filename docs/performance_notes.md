@@ -527,3 +527,27 @@ The `original_assignment` instance-key fallback in
 points that carry only `original_assignment` keep `assignment_col=None`, so
 their cache identity is unchanged. `build_cell_index` is also off for every
 lazy platform.
+
+## Determinate progress and chunked layer creation (M10b)
+
+The shared progress bar is determinate whenever a stage reports counts, and
+busy otherwise. Counts come from the Atera streaming pass (files), the Atera
+sample-cache restore (bytes), the Atera lazy gene reads and wide viewport reads
+(files), the Xenium/MERSCOPE eager build and the paired build (partition reads
+over both passes), multi-segmentation mask loads and multi-image pyramid builds.
+Workers report through a thread-safe reporter that keeps values monotonic and
+forwards at most about 10 updates per second. Stores of at least 5M points
+create their gene layers one marker group per Qt event-loop turn (QTimer chain,
+15 ms apart), and report `k/14 layers`.
+
+Bar values sampled every 100 ms in the real viewer on this Mac:
+
+| run | what the bar showed | longest Qt-thread stall during the transcript load |
+|---|---|---|
+| Atera AUTO (171.8M), empty transcript cache | 1/409 to 409/409 files over 13 s, then busy while saving and grouping, then 0/14 to 13/14 layers over 15 s | 2.5 s (formerly one freeze of about 15 s) |
+| Atera AUTO, warm cache | 0 B to 2.9 GB restored, busy grouping (6 s), 0/14 to 13/14 layers | 2.4 s |
+| P7513 Xenium, empty transcript cache | 1/4 to 4/4 partition reads, 1/14 to 13/14 layers | 1.6 s |
+
+Creating each layer's arrays and napari layer takes 0.05 to 0.5 s; most of each
+stall is the first draw of the new layer's points, which happens on the Qt
+thread after the chunk.

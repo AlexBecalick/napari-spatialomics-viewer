@@ -1563,8 +1563,14 @@ def load_atera_sample(
     threshold: int,
     cache_root: str | Path | None = None,
     cancel_check: Callable[[], bool] | None = None,
+    progress: Callable[[int, int], None] | None = None,
 ) -> Any:
-    """The cached sample filtered to ``threshold``, or ``None`` if it cannot serve it."""
+    """The cached sample filtered to ``threshold``, or ``None`` if it cannot serve it.
+
+    The columns are copied out of their memory maps in chunks, reporting
+    ``progress(bytes_done, bytes_total)`` as they go (a cold page cache makes
+    this a multi-second disk read at the AUTO budget).
+    """
     from .atera_transcripts import SAMPLE_KEY_SPACE, SampledTranscripts
 
     found = _cached_sample_manifest(index, cache_root)
@@ -1594,9 +1600,23 @@ def load_atera_sample(
                 parts.append(np.flatnonzero(np.asarray(mapped["key"][start : start + step]) < np.uint32(threshold)) + start)
             keep = np.concatenate(parts) if parts else np.zeros(0, dtype=np.int64)
         columns: dict[str, np.ndarray] = {}
+        out_rows = rows if keep is None else int(len(keep))
+        total_bytes = sum(out_rows * int(array.dtype.itemsize) for array in mapped.values())
+        done_bytes = 0
+        if progress is not None:
+            progress(0, total_bytes)
         for name, array in mapped.items():
             _cancelled(cancel_check)
-            columns[name] = np.array(array) if keep is None else np.asarray(array[keep])
+            out = np.empty(out_rows, dtype=array.dtype)
+            step = _chunk_rows(array)
+            for start in range(0, out_rows, step):
+                _cancelled(cancel_check)
+                stop = min(out_rows, start + step)
+                out[start:stop] = array[start:stop] if keep is None else array[keep[start:stop]]
+                done_bytes += (stop - start) * int(array.dtype.itemsize)
+                if progress is not None:
+                    progress(done_bytes, total_bytes)
+            columns[name] = out
         return SampledTranscripts(threshold=min(threshold, cached), total_rows=int(index.n_rows), **columns)
     except TranscriptBuildCancelled:
         raise

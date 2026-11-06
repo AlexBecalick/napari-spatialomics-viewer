@@ -177,6 +177,24 @@ def _map_files(
         raise
 
 
+class _FileCounter:
+    """``progress(done, n)`` per consumed file (no-op without a callback)."""
+
+    def __init__(self, n: int, progress: Callable[[int, int], None] | None) -> None:
+        self.n = int(n)
+        self.done = 0
+        self.progress = progress
+
+    def start(self) -> None:
+        if self.progress is not None:
+            self.progress(0, self.n)
+
+    def step(self) -> None:
+        self.done += 1
+        if self.progress is not None:
+            self.progress(self.done, self.n)
+
+
 def _read_row_group(parquet_file: pq.ParquetFile, row_group: int, columns: Sequence[str]) -> pa.Table:
     """The single place a row group is read (tests spy on it)."""
     return parquet_file.read_row_group(int(row_group), columns=list(columns), use_threads=_READ_USE_THREADS)
@@ -1400,11 +1418,13 @@ class AteraTranscriptEngine:
         genes: Iterable[str],
         columns: Sequence[str] = DEFAULT_READ_COLUMNS,
         cancel: Any = None,
+        progress: Callable[[int, int], None] | None = None,
     ) -> dict[str, dict[str, np.ndarray]]:
         """Rows of each gene, reading the union of their row groups once.
 
         Unknown names map to empty arrays.  Rows are in index file order, then
-        row-group and row order.
+        row-group and row order.  ``progress(files_done, n_files)`` follows the
+        files read.
         """
         names = list(dict.fromkeys(str(g) for g in genes))
         columns = self._columns(columns)
@@ -1436,11 +1456,16 @@ class AteraTranscriptEngine:
 
         parts: dict[int, list[dict[str, np.ndarray]]] = {c: [] for c in wanted}
 
+        positions = sorted(plan)
+        counter = _FileCounter(len(positions), progress)
+
         def consume(_position: int, found: dict[int, list[dict[str, np.ndarray]]]) -> None:
             for code, items in found.items():
                 parts[code].extend(items)
+            counter.step()
 
-        _map_files(work, sorted(plan), cancel, consume)
+        counter.start()
+        _map_files(work, positions, cancel, consume)
         result: dict[str, dict[str, np.ndarray]] = {}
         for name in names:
             code = codes[name]
@@ -1672,6 +1697,7 @@ class AteraTranscriptEngine:
         *,
         exclude_below: int = 0,
         clip: bool = True,
+        progress: Callable[[int, int], None] | None = None,
     ) -> dict[str, np.ndarray] | None:
         """Rows of ``codes`` in the window whose sample key is NOT below ``exclude_below``.
 
@@ -1742,7 +1768,14 @@ class AteraTranscriptEngine:
             return out
 
         parts: list[dict[str, np.ndarray]] = []
-        _map_files(work, positions, cancel, lambda _p, found: parts.extend(found))
+        counter = _FileCounter(len(positions), progress)
+
+        def consume(_position: int, found: list[dict[str, np.ndarray]]) -> None:
+            parts.extend(found)
+            counter.step()
+
+        counter.start()
+        _map_files(work, positions, cancel, consume)
         sample = self._merge_sample(parts, 0)
         return {"x": sample.x, "y": sample.y, "code": sample.code, "cell_id": sample.cell_id, "key": sample.key}
 

@@ -86,6 +86,11 @@ ATERA_OVERVIEW_BIN_UM = 5.0
 ATERA_VIEWPORT_DEBOUNCE_MS = 200
 ATERA_GENE_DEBOUNCE_MS = 120
 ATERA_PROGRESS_POLL_MS = 500
+#: Progress stages of the lazy per-gene reads and of multi-file viewport reads.
+ATERA_GENES_PROGRESS_KEY = "atera_genes"
+ATERA_VIEWPORT_PROGRESS_KEY = "atera_viewport"
+#: A viewport read shows the progress bar only when it touches this many files.
+ATERA_VIEWPORT_PROGRESS_MIN_FILES = 8
 #: The viewport reads a window this much larger than the view on each side,
 #: so small pans are served from the cached rows.
 ATERA_VIEWPORT_PAD_FRACTION = 0.5
@@ -602,17 +607,24 @@ class AteraTranscriptMixin:
                 ds, budget.note, total, threshold, SAMPLE_KEY_SPACE,
             )
 
-        def report(phase: str):
+        def report(phase: str, unit: str = "files"):
             def _report(done: int, n: int) -> None:
                 progress.update(done=int(done), total=int(n), phase=phase)
+                self._report_progress("transcripts", done, n, text=f"{ds}: {phase}", unit=unit)
             return _report
 
+        def busy(phase: str) -> None:
+            self._report_progress("transcripts", 0, 0, text=f"{ds}: {phase}…")
+
         cancel = cancel_token.is_set
+        busy("restoring the transcript overview")
         overview = load_atera_overview(index, bin_um=ATERA_OVERVIEW_BIN_UM)
         cache_hit = overview is not None
         sample = None
         if threshold > 0:
-            sample = load_atera_sample(index, threshold, cancel_check=cancel)
+            sample = load_atera_sample(
+                index, threshold, cancel_check=cancel, progress=report("restoring the cached sample", "bytes"),
+            )
             cache_hit = cache_hit and sample is not None
         memory_note = ""
         resolution = None
@@ -636,12 +648,14 @@ class AteraTranscriptMixin:
                     if overview.hash_sample is not None:
                         sample = overview.hash_sample
                         overview.hash_sample = None
+                    busy("saving the overview and sample to the transcript cache")
                     if not cancel():
                         save_atera_overview(index, overview, cancel_check=cancel)
                     if sample is not None and not cancel():
                         save_atera_sample(index, sample, cancel_check=cancel)
                 elif threshold > 0 and sample is None:
                     sample = engine.sample_rows(threshold, cancel_token, progress=report("sampling transcripts"))
+                    busy("saving the sample to the transcript cache")
                     if not cancel():
                         save_atera_sample(index, sample, cancel_check=cancel)
                 if overview.code_map is not None and engine.code_map is None:
@@ -650,6 +664,7 @@ class AteraTranscriptMixin:
                     overview.cell_tiles = self._atera_restore_cell_tiles(ds, engine, cancel_token, report)
                 if cancel():
                     raise TranscriptBuildCancelled("Atera transcript load cancelled")
+                busy("grouping the points by gene")
                 overview_threshold = (
                     sample_threshold(overview_cap, total) if overview_cap > 0 else SAMPLE_KEY_SPACE
                 )
@@ -1137,9 +1152,19 @@ class AteraTranscriptMixin:
         visuals = dict(state.gene_visuals or {})
         if wanted:
             self._set_status(f"{ds}: loading {len(wanted)} gene(s) at full resolution…")
+            self._begin_progress(
+                ATERA_GENES_PROGRESS_KEY, f"{ds}: reading {len(wanted)} gene(s)…", status=False
+            )
+
+        def report(done: int, n: int) -> None:
+            self._report_progress(ATERA_GENES_PROGRESS_KEY, done, n, unit="files")
 
         def compute():
-            rows = ctx.engine.read_genes(wanted, columns=_READ_COLUMNS, cancel=cancel) if wanted else {}
+            rows = (
+                ctx.engine.read_genes(wanted, columns=_READ_COLUMNS, cancel=cancel, progress=report)
+                if wanted
+                else {}
+            )
             merged = lru_gene_cache(loaded, rows, enabled, ATERA_LAZY_GENE_CACHE_BYTES)
             # Only the ticked genes become points; unticked rows stay in the LRU.
             shown = {g: r for g, r in merged.items() if g in enabled}
@@ -1149,16 +1174,31 @@ class AteraTranscriptMixin:
             return merged, store, frozenset(shown)
 
         def done(result, gen=generation):
-            self._atera_gene_read_done(ds, ctx, gen, result, runner)
+            try:
+                self._atera_gene_read_done(ds, ctx, gen, result, runner)
+            finally:
+                self._atera_end_read_progress(ATERA_GENES_PROGRESS_KEY, runner, "gene_runner")
 
         def failed(exc, gen=generation):
             runner.finish(gen)
+            self._atera_end_read_progress(ATERA_GENES_PROGRESS_KEY, runner, "gene_runner")
             message = exc[1] if isinstance(exc, tuple) and len(exc) > 1 else exc
             if not isinstance(message, TranscriptBuildCancelled):
                 self._set_status(f"{ds}: gene read failed: {message}")
                 log.error("[%s] Atera gene read failed: %s", ds, message)
 
         self._atera_run(compute, done, failed)
+
+    def _atera_end_read_progress(self, key: str, runner, attr: str) -> None:
+        """Hide a read's progress unless a read of the same kind is (still) running."""
+        if runner is not None and runner.busy:
+            return
+        for state in list(getattr(self, "_gene_inspector_states", {}).values()):
+            ctx = getattr(state, "atera", None)
+            other = None if ctx is None else getattr(ctx, attr, None)
+            if other is not None and other is not runner and other.busy:
+                return
+        self._end_progress(key)
 
     def _atera_gene_read_done(self, ds: str, ctx, generation: int, result, runner=None) -> None:
         runner = ctx.gene_runner if runner is None else runner
@@ -1366,11 +1406,26 @@ class AteraTranscriptMixin:
                 runner.finish(generation)
             return
         cap = int(ctx.viewport_cap)
+        try:
+            n_files = len(ctx.engine.files_in_window(request["bounds"]))
+        except Exception:
+            n_files = 0
+        report = None
+        if n_files >= ATERA_VIEWPORT_PROGRESS_MIN_FILES:
+            # Only a wide (multi-file) window read shows the bar; a pan's
+            # small read would just flicker it.
+            self._begin_progress(
+                ATERA_VIEWPORT_PROGRESS_KEY, f"{ds}: streaming the transcripts in view…", status=False
+            )
+
+            def report(done: int, n: int) -> None:
+                self._report_progress(ATERA_VIEWPORT_PROGRESS_KEY, done, n, unit="files")
 
         def compute():
             t0 = time.perf_counter()
             rows = ctx.engine.read_window_rows(
-                request["bounds"], sorted(request["codes"]), cancel, exclude_below=request["exclude"]
+                request["bounds"], sorted(request["codes"]), cancel, exclude_below=request["exclude"],
+                progress=report,
             )
             if rows is None:
                 return None
@@ -1379,10 +1434,14 @@ class AteraTranscriptMixin:
             return rows
 
         def done(rows, gen=generation):
-            self._atera_view_read_done(ds, ctx, gen, request, rows, runner)
+            try:
+                self._atera_view_read_done(ds, ctx, gen, request, rows, runner)
+            finally:
+                self._atera_end_read_progress(ATERA_VIEWPORT_PROGRESS_KEY, runner, "view_runner")
 
         def failed(exc, gen=generation):
             runner.finish(gen)
+            self._atera_end_read_progress(ATERA_VIEWPORT_PROGRESS_KEY, runner, "view_runner")
             message = exc[1] if isinstance(exc, tuple) and len(exc) > 1 else exc
             if not isinstance(message, TranscriptBuildCancelled):
                 log.warning("[%s] Atera viewport read failed: %s", ds, message)
