@@ -3162,16 +3162,57 @@ class CellTypeAssignments:
     statuses: np.ndarray | None = None
     shape_key: str | None = None
     analysis_id: str | None = None
+    bootstrap_scores: dict[str, np.ndarray] = field(default_factory=dict)
+    prediction_metadata: dict[str, pd.DataFrame] = field(default_factory=dict)
 
-    def labels_for(self, kind: str) -> np.ndarray:
+    def labels_for(self, kind: str, min_bootstrap: float = 0.0) -> np.ndarray:
         """Return labels at a stored level; absent levels remain unannotated."""
         if self.levels:
-            return self.levels.get(str(kind), np.full(len(self.cell_ids), None, dtype=object))
+            labels = self.levels.get(str(kind), np.full(len(self.cell_ids), None, dtype=object))
+            if min_bootstrap > 0 and kind in self.bootstrap_scores:
+                scores = self.bootstrap_scores[kind]
+                labels = labels.copy()
+                labels[~np.isfinite(scores) | (scores < min_bootstrap - 1e-6)] = None
+            return labels
         if kind == "broad":
             return self.broad
         if kind == "fine":
             return self.fine
         return np.full(len(self.cell_ids), None, dtype=object)
+
+    def predictions_for_cell(self, row: int) -> list[dict]:
+        """Saved candidates in upstream order; scores are bootstrap support.
+
+        Subclass alternatives are conditional on the mapper's chosen parent.
+        Empty slots are omitted, and at most five types including the winner
+        are displayed. The original five runner-up slots remain in the store.
+        """
+        result = []
+        for kind, frame in self.prediction_metadata.items():
+            item = frame.iloc[row]
+            candidates = []
+            for rank in range(5):
+                name_key = "raw_name" if rank == 0 else f"runner_up_{rank}_name"
+                score_key = "bp" if rank == 0 else f"runner_up_{rank}_probability"
+                name, score = item.get(name_key), item.get(score_key)
+                if pd.notna(name) and pd.notna(score):
+                    candidates.append({"name": str(name), "bootstrap": float(score)})
+            name = item.get("raw_name")
+            if pd.isna(name):
+                continue
+            result.append({
+                "level": CELL_TYPE_LEVEL_LABELS[kind].replace(" (all predictions)", ""),
+                "name": str(name),
+                "bootstrap": float(item["bp"]) if pd.notna(item.get("bp")) else None,
+                "aggregate_bootstrap": (
+                    float(item["aggregate_probability"])
+                    if pd.notna(item.get("aggregate_probability")) else None
+                ),
+                "status": str(item.get("resolution_status", "not recorded")),
+                "candidates": candidates,
+                "conditional": kind == "ct_seaad_subclass_raw",
+            })
+        return result
 
 
 def clustering_table_key_for_segmentation(zarr_path: Any, segmentation: str) -> str | None:
@@ -3247,17 +3288,26 @@ def _resolve_instance_key(table) -> str:
 CELL_TYPE_LEVEL_LABELS = {
     "broad": "Broad cell type",
     "fine": "Fine cell type",
+    "ct_seaad_subclass_raw": "SEA-AD · subclass (all predictions)",
+    "ct_whb_supercluster_raw": "Allen · supercluster (all predictions)",
     "ct_final": "Allen · final assignment",
     "ct_lineage": "Allen · lineage",
     "ct_broad": "Allen · broad type",
     "ct_class": "Allen · class",
     "ct_nt": "Allen · neurotransmitter",
     "ct_supercluster": "Allen · supercluster",
+    "ct_whb_supercluster": "Allen WHB · supercluster (accepted)",
     "ct_subclass": "Allen · subclass",
     "ct_seaad_subclass": "SEA-AD · subclass",
     "ct_cluster": "Allen · cluster (report only)",
     "ct_supertype": "Allen · supertype (report only)",
     "pciseq": "pciSeq · cell type",
+}
+
+# Explicit raw kinds keep unfiltered predictions separate from accepted labels.
+BOOTSTRAP_PREDICTION_STEMS = {
+    "ct_seaad_subclass_raw": "ct_seaad_subclass",
+    "ct_whb_supercluster_raw": "ct_whb_supercluster",
 }
 
 
@@ -3341,6 +3391,8 @@ def _read_cell_type_obs(zarr_path: Any, segmentation: str):
     wanted = {CELL_TYPE_BROAD_CLASS_COL, CELL_TYPE_FINE_CLUSTER_COL,
               CELL_TYPE_NEURON_SPLIT_COL, instance_key}
     wanted.update(f"{key}_name" for key in CELL_TYPE_LEVEL_LABELS if key.startswith("ct_"))
+    for stem in BOOTSTRAP_PREDICTION_STEMS.values():
+        wanted.update(column for column in columns if column.startswith(stem + "_"))
     if source is not None and source.method == "pciseq":
         wanted = {instance_key, "pciseq_cell_type", "pciseq_probability", "pciseq_status"}
     index_key = str(obs_group.attrs.get("_index", "_index"))
@@ -3426,6 +3478,15 @@ def load_cell_type_assignments(zarr_path: Any, segmentation: str = "proseg") -> 
         levels = {key: values[valid] for key, values in levels.items()}
         broad = levels.get("broad", levels.get("ct_broad", next(iter(levels.values()))))
         fine = levels.get("fine", levels.get("ct_final", broad))
+        prediction_metadata = {}
+        bootstrap_scores = {}
+        for kind, stem in BOOTSTRAP_PREDICTION_STEMS.items():
+            if kind not in levels:
+                continue
+            fields = {column: column[len(stem) + 1:] for column in obs if column.startswith(stem + "_")}
+            prediction_metadata[kind] = obs[list(fields)].rename(columns=fields).iloc[np.flatnonzero(valid)].reset_index(drop=True)
+            if f"{stem}_bp" in obs:
+                bootstrap_scores[kind] = pd.to_numeric(obs[f"{stem}_bp"], errors="coerce").to_numpy(dtype=float)[valid]
         return CellTypeAssignments(
             segmentation=str(segmentation), table_key=table_key,
             instance_key=instance_key, cell_ids=ids[valid],
@@ -3437,6 +3498,8 @@ def load_cell_type_assignments(zarr_path: Any, segmentation: str = "proseg") -> 
             statuses=(obs["pciseq_status"].to_numpy()[valid] if "pciseq_status" in obs else None),
             shape_key=metadata["shape"] if metadata else cell_type_shape_key_for_source(zarr_path, segmentation),
             analysis_id=metadata["analysis_id"] if metadata else None,
+            bootstrap_scores=bootstrap_scores,
+            prediction_metadata=prediction_metadata,
         )
     except Exception:
         log.debug("Cannot load cell-type assignments for %s", segmentation, exc_info=True)
