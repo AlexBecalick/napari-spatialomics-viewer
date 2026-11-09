@@ -221,8 +221,8 @@ def test_gene_inspector_widget_populate_and_callbacks(qapp):
                {"AAA", "BBB"}, {}, "alphabetical", False, False, False, 2.0)
     assert len(w.gene_names()) == 3
     assert w._hide_assigned_check.text() == "Hide assigned spots"
-    assert w._hide_bg_check.text() == "Hide unassigned spots"
-    assert w._colour_by_assignment_check.text() == "Colour by assignment"
+    assert w._hide_bg_check.text() == "Hide unassigned"
+    assert w._colour_by_assignment_check.text() == "Assignment colours"
     assert w.is_gene_row_hidden("Blank-1")      # control hidden by default
     assert not w.is_gene_row_hidden("AAA")
     assert w.is_gene_checked("AAA")

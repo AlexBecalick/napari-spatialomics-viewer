@@ -1723,7 +1723,8 @@ class ViewerControlPanel(QWidget):
         self.set_cellpose_value_options([], [], enabled=False)
 
         # -- Transcripts (Gene inspector tab) -------------------------------
-        self._load_transcripts_button = QPushButton("Load / reload transcripts")
+        self._load_transcripts_button = QPushButton("Load transcripts")
+        self._load_transcripts_button.setToolTip("Load or reload transcripts and rebuild the gene panel.")
         self._load_transcripts_button.clicked.connect(self._on_load_transcripts)
         self._unload_transcripts_button = QPushButton("Unload transcripts")
         self._unload_transcripts_button.clicked.connect(self._on_unload_transcripts)
@@ -1884,8 +1885,8 @@ class ViewerControlPanel(QWidget):
         # forcing the tab wider than the panel (side by side they need ~370 px).
         self._transcript_buttons_row = QWidget()
         row = FlowLayout(self._transcript_buttons_row, margin=0, hspacing=6, vspacing=6)
-        # Lined up with the inspector's contents; with napari's stylesheet
-        # "Load / reload transcripts" alone is ~200 px of the tab's ~215 px.
+        # Lined up with the inspector's contents; short button captions fit
+        # beside the scrollbar across native and napari styles.
         side = GeneInspectorWidget.SIDE_MARGIN
         row.setContentsMargins(side, 0, side, 0)
         row.addWidget(self._load_transcripts_button)
@@ -3647,7 +3648,7 @@ class GeneInspectorWidget(QWidget):
 
         self._title = QLabel("Gene Inspector")
         self._status_label = QLabel(
-            "Transcripts load automatically. Use “Load / reload transcripts” to rebuild the gene panel."
+            "Transcripts load automatically. Use “Load transcripts” to rebuild the gene panel."
         )
         self._status_label.setWordWrap(True)
         self.status_message.connect(self._status_label.setText)
@@ -3685,12 +3686,12 @@ class GeneInspectorWidget(QWidget):
         self._hide_assigned_check = QCheckBox("Hide assigned spots")
         self._hide_assigned_check.setChecked(bool(hide_assigned))
         self._hide_assigned_check.toggled.connect(self._on_hide_assigned_toggled)
-        self._hide_bg_check = QCheckBox("Hide unassigned spots")
+        self._hide_bg_check = QCheckBox("Hide unassigned")
         self._hide_bg_check.setChecked(bool(hide_background))
         self._hide_bg_check.toggled.connect(self._on_hide_background_toggled)
         # Short check-box texts: a QCheckBox cannot wrap, and at the panel's
         # 240 px minimum the inspector has ~180 px beside the indicator.
-        self._colour_by_assignment_check = QCheckBox("Colour by assignment")
+        self._colour_by_assignment_check = QCheckBox("Assignment colours")
         self._colour_by_assignment_check.setToolTip(
             "Colour transcripts by whether they are assigned to a cell or unassigned."
         )
@@ -3790,7 +3791,10 @@ class GeneInspectorWidget(QWidget):
         root.addWidget(self._gene_view, stretch=1)
         root.addWidget(self._status_label)
         self.setLayout(root)
-        self.setMinimumWidth(self.MINIMUM_WIDTH)
+        self.setMinimumWidth(max(
+            self.MINIMUM_WIDTH,
+            self._atera_mode_combo.minimumSizeHint().width() + 2 * self.SIDE_MARGIN,
+        ))
 
     #: Narrower than the control panel's own 240 px minimum: inside the
     #: scrollable Gene inspector tab the vertical scrollbar takes up to ~20 px
@@ -5457,7 +5461,9 @@ class CellInfoOverlay(QWidget):
             widget.deleteLater()
         self._panels_by_key = panels
         self._row_layout.addStretch(1)
-        self._preferred_height = max(260, self._row.minimumSizeHint().height() + 65)
+        # The preferred height must include wrapped type names and summaries.
+        # minimumSizeHint omits that space and can clip the last statistics row.
+        self._preferred_height = max(260, self._row.sizeHint().height() + 65)
         self.updateGeometry()
 
     def cell_panels(self) -> list[_CellPanel]:
