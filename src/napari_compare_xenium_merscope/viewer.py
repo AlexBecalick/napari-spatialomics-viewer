@@ -212,6 +212,7 @@ from .manual_registration_store import (
 )
 from .manual_registration_widget import ManualRegistrationWidget
 from .spatialdata_explorer import SpatialDataExplorerWidget
+from .hitl_crop_widget import HitlCropWidget
 from .cell_groups import (
     CELL_GROUP_SHAPE_KEY,
     CellGroup,
@@ -1543,7 +1544,7 @@ class ViewerControlPanel(QWidget):
 
     Tabs (a wrapping button bar across the top): Gene inspector, Cell segmentation, Cell type labels,
     Per cell statistics, Draw tissue annotations, Images, Dataset, UMAP, Cell groups, Zarr metadata, and
-    Manual registration.
+    Manual registration and HITL seg crops.
     A progress bar (determinate while a stage reports counts, else busy) plus a stage label sit
     below the tabs and stay visible whatever tab is selected.
     """
@@ -1594,6 +1595,7 @@ class ViewerControlPanel(QWidget):
         registration_widget=None,
         standalone_platform_callback=None,
         cell_group_widget=None,
+        hitl_crop_widget=None,
     ):
         super().__init__()
         # Returns the effective platform of the last standalone load (the controller
@@ -1607,6 +1609,7 @@ class ViewerControlPanel(QWidget):
         self._registration_active = False
         self._registration_tab_index: int | None = None
         self._cell_group_widget = cell_group_widget
+        self._hitl_crop_widget = hitl_crop_widget
         self.spatialdata_explorer = SpatialDataExplorerWidget()
         self._load_callback = load_callback
         self._load_selected_labels_callback = load_selected_labels_callback
@@ -1830,6 +1833,7 @@ class ViewerControlPanel(QWidget):
             ("Cell groups", self._build_cell_groups_tab),
             ("Zarr metadata", lambda: self.spatialdata_explorer),
             ("Manual registration", self._build_registration_tab),
+            ("HITL seg crops", self._build_hitl_crops_tab),
         )
         for title, builder in tabs:
             self._add_tab(title, builder())
@@ -1857,7 +1861,7 @@ class ViewerControlPanel(QWidget):
     _TAB_BUTTON_STYLE = (
         "QPushButton {"
         " background: #ffffff; color: #000000; font-weight: bold;"
-        " border: 1px solid #b0b0b0; border-radius: 4px; padding: 4px 10px; }"
+        " border: 1px solid #b0b0b0; border-radius: 4px; padding: 3px 8px; }"
         "QPushButton:hover { background: #eef2f7; }"
         "QPushButton:checked {"
         " background: #ffffff; color: #000000;"
@@ -1872,7 +1876,7 @@ class ViewerControlPanel(QWidget):
         button.setCursor(Qt.PointingHandCursor)
         button.setStyleSheet(self._TAB_BUTTON_STYLE)
         button.clicked.connect(lambda _checked=False, idx=index: self._tab_stack.setCurrentIndex(idx))
-        if title == "Draw tissue annotations" and self._expand_layer_controls_callback is not None:
+        if title in {"Draw tissue annotations", "HITL seg crops"} and self._expand_layer_controls_callback is not None:
             button.clicked.connect(
                 lambda _checked=False: self._expand_layer_controls_callback()
             )
@@ -1954,6 +1958,14 @@ class ViewerControlPanel(QWidget):
         if self._cell_group_widget is not None:
             return self._cell_group_widget
         return QLabel("Cell groups unavailable.")
+
+    def _build_hitl_crops_tab(self) -> QWidget:
+        if self._hitl_crop_widget is not None:
+            layout = QVBoxLayout()
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.addWidget(self._hitl_crop_widget)
+            return self._scrollable(layout)
+        return QLabel("Open a standalone dataset to choose HITL crops.")
 
     def _build_segmentation_tab(self) -> QWidget:
         layout = QVBoxLayout()
@@ -6548,6 +6560,7 @@ class ComparisonViewerController(AteraTranscriptMixin):
         # Hand-curated Cellpose cell groups, kept per store path so switching
         # datasets and back restores them.
         self._cell_group_widget = None
+        self._hitl_crop_widget = None
         self._cell_groups_by_store: dict[str, list[CellGroup]] = {}
         self._active_cell_group_by_store: dict[str, str | None] = {}
         self._cell_group_picking = False
@@ -6649,6 +6662,21 @@ class ComparisonViewerController(AteraTranscriptMixin):
     def set_cell_group_widget(self, widget):
         self._cell_group_widget = widget
         self._publish_cell_groups()
+
+    def set_hitl_crop_widget(self, widget):
+        """Connect the native HITL crop tab to standalone dataset activation."""
+        self._hitl_crop_widget = widget
+        self._publish_hitl_crops()
+
+    def _publish_hitl_crops(self):
+        widget = self._hitl_crop_widget
+        if widget is not None:
+            key = self._cell_group_store_key()
+            config = self.datasets.get(self.active_dataset)
+            widget.set_dataset(
+                Path(key) if key is not None else None,
+                self._config_platform(self.active_dataset, config),
+            )
 
     def set_spatialdata_explorer(self, widget):
         self._spatialdata_explorer = widget
@@ -13248,6 +13276,9 @@ class ComparisonViewerController(AteraTranscriptMixin):
 
     def _handle_viewer_click(self, event):
         """Run the existing transcript/cell inspection logic for a true click."""
+        active_layer = getattr(getattr(self.viewer.layers, "selection", None), "active", None)
+        if getattr(active_layer, "metadata", {}).get("hitl_seg_crops"):
+            return
         if self._paired_session is not None:
             self._handle_paired_viewer_click(event)
             return
@@ -13554,6 +13585,7 @@ class ComparisonViewerController(AteraTranscriptMixin):
 
     def _publish_cell_groups(self):
         """Enable the Cell groups tab for a standalone store and redraw its groups."""
+        self._publish_hitl_crops()
         widget = self._cell_group_widget
         if self._cell_group_store_key() is None:
             self._cell_group_picking = False
@@ -19571,8 +19603,8 @@ def run_package_smoke_test_without_opengl() -> None:
     if panel._tab_stack.currentIndex() != 6:
         raise RuntimeError("The empty viewer did not select the Dataset loader tab.")
     tab_titles = {button.text() for button in panel._tab_group.buttons()}
-    if not {"Cell groups", "Manual registration"} <= tab_titles:
-        raise RuntimeError("The control panel is missing the Cell groups or Manual registration tab.")
+    if not {"Cell groups", "Manual registration", "HITL seg crops"} <= tab_titles:
+        raise RuntimeError("The control panel is missing a Cell groups, Manual registration or HITL seg crops tab.")
     missing = [
         name for name in standalone_platforms() if name not in panel._load_standalone_buttons
     ]
@@ -19692,6 +19724,7 @@ def main():
     )
     # The "Manual registration" tab: landmark registration of two images.
     registration_widget = ManualRegistrationWidget()
+    hitl_crop_widget = HitlCropWidget(viewer)
     # The "Cell groups" tab: click Cellpose masks into named, exportable groups.
     cell_group_widget = CellGroupWidget(
         set_picking_callback=controller.set_cell_group_picking,
@@ -19709,6 +19742,7 @@ def main():
         cell_type_widget=cell_type_widget,
         umap_widget=umap_widget,
         cell_group_widget=cell_group_widget,
+        hitl_crop_widget=hitl_crop_widget,
         load_callback=controller.load_dataset,
         load_selected_labels_callback=controller.load_selected_labels,
         unload_selected_shapes_callback=controller.unload_selected_shapes,
@@ -19758,6 +19792,7 @@ def main():
     controller.set_cell_type_widget(cell_type_widget)
     controller.set_umap_widget(umap_widget)
     controller.set_cell_group_widget(cell_group_widget)
+    controller.set_hitl_crop_widget(hitl_crop_widget)
     controller.set_spatialdata_explorer(panel.spatialdata_explorer)
     viewer_controls_dock = viewer.window.add_dock_widget(
         panel, area="right", name="Viewer Controls"

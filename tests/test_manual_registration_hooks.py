@@ -356,13 +356,13 @@ def test_dataset_tab_has_manual_registration_section_after_paired_layout(qapp):
     assert not _panel([])._load_registration_button.isEnabled()
 
 
-def test_manual_registration_tab_is_appended_last(qapp):
+def test_registration_tab_keeps_its_index_when_hitl_is_appended(qapp):
     from qtpy.QtWidgets import QWidget
 
     sentinel = QWidget()
     panel = _panel([], registration_widget=sentinel)
-    assert panel._tab_stack.count() == 11
-    assert [panel._tab_group.button(i).text() for i in range(11)] == [
+    assert panel._tab_stack.count() == 12
+    assert [panel._tab_group.button(i).text() for i in range(12)] == [
         "Gene inspector",
         "Cell segmentation",
         "Cell type labels",
@@ -374,6 +374,7 @@ def test_manual_registration_tab_is_appended_last(qapp):
         "Cell groups",
         "Zarr metadata",
         "Manual registration",
+        "HITL seg crops",
     ]
     assert panel._tab_stack.currentIndex() == 6
     assert panel._tab_stack.widget(10).isAncestorOf(sentinel)

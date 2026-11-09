@@ -327,6 +327,10 @@ dock so every full name stays readable.
 - **Cell groups** — click Cellpose masks into named groups of cells that share
   a feature you recognise, then export them with their per-channel statistics
   (see [Cell groups](#cell-groups)). Standalone mode only.
+- **HITL seg crops** — draw rectangular regions for a prefilled Cellpose
+  correction package, see their estimated cell count, and save the regions.
+  The 800–1,200 cell target turns green when reached. Standalone Atera and
+  Xenium native views only; see [HITL segmentation crops](#hitl-segmentation-crops).
 
 The left dock is simplified for the spatial-transcriptomics workflow. **Layer
 controls** starts collapsed and can be expanded or collapsed with the arrow in
@@ -831,6 +835,48 @@ into the current groups by name, and reports label ids that are not Cellpose
 cells of the open store. Clicks follow the display rotation, so the selected
 cell is the one under the cursor when the view is rotated. Grouping is
 unavailable in paired mode.
+
+## HITL segmentation crops
+
+Choose **HITL seg crops** in the right-hand Viewer Controls. No Python console
+or MerXen installation is required in the viewer environment.
+
+1. Open the same native Atera or Xenium store used for the segmentation, and
+   display its native morphology image. Aligned/paired/registration views are
+   not crop-selection frames.
+2. Click **Load crop setup…** and select `roi_context.json` from the MerXen
+   annotation package (or `merxen cellpose-hitl-prepare-rois`). The viewer checks
+   the source identity and remembers matching setups. It also discovers
+   `merxen_hitl_roi_context.json` inside the store or `roi_context.json` beside it.
+   Copying an unchanged store to the laptop retains its source identity.
+3. Click **Add rectangular crop**, then click and drag across the image. One
+   rectangle is added per button press. Crops can have different widths and
+   heights; use at least 256 native pixels on each axis and keep each crop
+   entirely inside one cyan guide. These guides preserve the original model's
+   image-normalization context.
+4. Each crop appears in the list with its physical size and estimated Cellpose
+   cell count. Select a row to select its rectangle, drag/resize with the Shapes
+   selection tool, or use **Remove selected crop**. Rotation and overlapping
+   crops must be corrected before saving.
+5. The total estimates **unique nonzero Cellpose labels** touching the selected
+   regions, including partial edge cells. Shared labels count once overall.
+   Reads happen in the background and only access the selected native mask
+   windows; no transcript scan or full-slide mask computation is needed. The
+   target turns green from **800 through 1,200**. This is a starting-mask estimate;
+   missing/false masks will change the final manually annotated count. Stores
+   without native Cellpose masks show that the estimate is unavailable rather
+   than substituting vendor masks.
+6. Click **Save crop regions…** to write a new GeoJSON outside the source store.
+   Existing region files are preserved. Export that GeoJSON with MerXen's
+   rectangle-enabled `cellpose-hitl-export`, then copy the resulting annotation
+   package to the laptop for offline correction in the separate Cellpose GUI.
+
+The saved GeoJSON carries native-pixel coordinates, source/grid identity and
+`merxen_hitl_regions_version: 2`. Use the corresponding MerXen exporter with
+rectangle support; older square-only exporters refuse these rectangles.
+Selection never changes the source data, existing masks or training inputs.
+Selections are retained per store while switching datasets in the running
+viewer. Save them before closing the application.
 
 ## Data Assumptions
 
