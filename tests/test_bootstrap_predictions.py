@@ -7,6 +7,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import anndata as ad
 import numpy as np
 import pandas as pd
+import pytest
 import zarr
 
 from napari_compare_xenium_merscope.utils import (
@@ -121,3 +122,86 @@ def test_bootstrap_control_converts_percent_and_does_not_dispatch_refreshes():
     assert not widget.isEnabled()
     widget.close()
     assert app is not None
+
+
+def _add_raw_spatial_cells(path):
+    clustered = ad.read_zarr(path / "tables" / "table_original_clustering_squidpy")
+    low = clustered.obs.iloc[[1]].copy()
+    low.index = ["low_expression"]
+    low["instance_id"] = np.array([9223372036854775821], dtype=np.uint64)
+    for stem in ["ct_seaad_subclass", "ct_whb_supercluster"]:
+        low[f"{stem}_raw_name"] = ["Low-expression prediction"]
+        low[f"{stem}_name"] = [None]
+        low[f"{stem}_bp"] = [0.2]
+        low[f"{stem}_aggregate_probability"] = [0.1]
+        low[f"{stem}_resolution_status"] = ["outside_calibrated_depth"]
+    low["ct_supercluster_name"] = [None]
+    empty = clustered.obs.iloc[[2]].copy()
+    empty.index = ["extra_empty"]
+    empty["instance_id"] = np.array([9223372036854775823], dtype=np.uint64)
+    obs = pd.concat([low, empty, clustered.obs.iloc[::-1]])
+    # Raw and clustered stores need not call their instance columns the same.
+    obs = obs.rename(columns={"instance_id": "raw_mask_id"})
+    raw = ad.AnnData(np.zeros((len(obs), 1)), obs=obs)
+    raw.uns["spatialdata_attrs"] = {"instance_key": "raw_mask_id"}
+    raw.write_zarr(path / "tables" / "table_original")
+    return raw
+
+
+def test_spatial_predictions_include_expressed_cells_outside_clustering_qc(tmp_path):
+    from napari_compare_xenium_merscope.cell_umap import load_cell_umap
+
+    path, ids = _store(tmp_path)
+    before = load_cell_umap(path, "original")
+    _add_raw_spatial_cells(path)
+    labels = load_cell_type_assignments(path, "original")
+    assert labels.cell_ids.tolist() == [*ids[:2].tolist(), 9223372036854775821]
+    assert labels.labels_for("ct_seaad_subclass_raw").tolist() == [
+        "Type <A>",
+        "Type B",
+        "Low-expression prediction",
+    ]
+    assert labels.labels_for("ct_seaad_subclass").tolist() == [None, "Type B", None]
+    assert labels.labels_for("ct_seaad_subclass_raw", 0.5).tolist() == [
+        None,
+        "Type B",
+        None,
+    ]
+    details = labels.predictions_for_cell(2)[0]
+    assert details["status"] == "outside_calibrated_depth"
+    assert len(details["candidates"]) == 1
+    assert details["candidates"][0]["bootstrap"] == 0.2
+    after = load_cell_umap(path, "original")
+    np.testing.assert_array_equal(after.cell_ids, before.cell_ids)
+    np.testing.assert_array_equal(after.coords, before.coords)
+    assert after.table_key == labels.table_key
+
+
+@pytest.mark.parametrize("mismatch", ["prediction", "duplicate_id", "provenance"])
+def test_spatial_extension_never_mixes_an_incompatible_raw_table(tmp_path, mismatch):
+    path, ids = _store(tmp_path)
+    raw = _add_raw_spatial_cells(path)
+    if mismatch == "prediction":
+        raw.obs["ct_seaad_subclass_raw_name"] = raw.obs[
+            "ct_seaad_subclass_raw_name"
+        ].astype(object)
+        raw.obs.loc["a", "ct_seaad_subclass_raw_name"] = "Different annotation run"
+    elif mismatch == "duplicate_id":
+        raw.obs.loc["low_expression", "raw_mask_id"] = raw.obs.loc["a", "raw_mask_id"]
+    else:
+        raw.uns["merxen_hippocampal_annotation_json"] = "raw-run"
+        table = path / "tables" / "table_original_clustering_squidpy"
+        clustered = ad.read_zarr(table)
+        clustered.uns["merxen_hippocampal_annotation_json"] = "different-run"
+        clustered.write_zarr(table)
+    raw.write_zarr(path / "tables" / "table_original")
+    labels = load_cell_type_assignments(path, "original")
+    assert labels.cell_ids.tolist() == ids[:2].tolist()
+    assert labels.labels_for("ct_seaad_subclass_raw").tolist() == ["Type <A>", "Type B"]
+
+
+def test_incomplete_optional_raw_table_does_not_hide_clustered_annotations(tmp_path):
+    path, ids = _store(tmp_path)
+    zarr.open_group(path, mode="a")["tables"].create_group("table_original")
+    labels = load_cell_type_assignments(path, "original")
+    assert labels.cell_ids.tolist() == ids[:2].tolist()

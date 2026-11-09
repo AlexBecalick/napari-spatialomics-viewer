@@ -430,6 +430,9 @@ compete within the selected parent class. Candidate scores are not renormalized.
 Zero-expression objects retain no expression-based prediction. Earlier exports
 with raw labels and scores already support the display cut-off; enriched exports
 also expose the saved candidate lists. No annotation or UMAP rerun is needed.
+The spatial view also includes saved raw predictions for expressed cells excluded
+from clustering QC. Their exact mask IDs join to the matching source table;
+accepted clustering labels and the UMAP's original cell set stay unchanged.
 
 Hovering over the canvas reports world `x`/`y`, the cell ID under the cursor,
 and its broad and fine cell-type annotations in napari's status bar. This
