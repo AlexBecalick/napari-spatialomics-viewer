@@ -60,6 +60,7 @@ from .utils import (
     cell_type_table_key_for_source,
     open_zarr_group_unconsolidated,
 )
+from .prediction_controls import BootstrapFilterWidget
 
 log = logging.getLogger("napari_compare")
 
@@ -1514,6 +1515,7 @@ class UmapControlWidget(QWidget):
         set_point_size_callback,
         set_lasso_active_callback=None,
         clear_roi_callback=None,
+        set_bootstrap_callback=None,
     ):
         super().__init__()
         self._set_window_visible_callback = set_window_visible_callback
@@ -1522,6 +1524,7 @@ class UmapControlWidget(QWidget):
         self._set_point_size_callback = set_point_size_callback
         self._set_lasso_active_callback = set_lasso_active_callback
         self._clear_roi_callback = clear_roi_callback
+        self.bootstrap_filter = BootstrapFilterWidget(set_bootstrap_callback)
         self._suppress = False
         self._statistics_available = False
 
@@ -1620,6 +1623,7 @@ class UmapControlWidget(QWidget):
         layout.addWidget(self._source_combo)
         layout.addWidget(QLabel("Colour by"))
         layout.addWidget(self._colour_combo)
+        layout.addWidget(self.bootstrap_filter)
         layout.addWidget(self._statistic_box)
         layout.addWidget(self._statistic_note)
         point_row = QHBoxLayout()

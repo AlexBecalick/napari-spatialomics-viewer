@@ -413,6 +413,24 @@ and inject one into one or more SpatialData stores with
 
 ### Cell inspector
 
+For whole-panel hippocampal RCA, **SEA-AD · subclass (all predictions)** and
+**Allen · supercluster (all predictions)** show the saved raw calls, including
+cells whose accepted annotations are unresolved. Accepted annotations remain
+separate choices. **Minimum bootstrap support** starts at 0%, showing every
+available prediction. Raising it leaves below-cut-off cells grey on UMAP and
+unfilled in the spatial overlay. The cut-off is shared between the Cell type
+labels and UMAP tabs and filters the bootstrap vote fraction at the selected
+level. It does not modify saved labels or the acceptance policy.
+
+The cell inspector shows raw calls, bootstrap support, support along the chosen
+hierarchy, acceptance status, and up to five saved candidates including the
+winner. Fewer candidates are shown when fewer received support. **Bootstrap
+support measures stability, not biological probability**; subclass alternatives
+compete within the selected parent class. Candidate scores are not renormalized.
+Zero-expression objects retain no expression-based prediction. Earlier exports
+with raw labels and scores already support the display cut-off; enriched exports
+also expose the saved candidate lists. No annotation or UMAP rerun is needed.
+
 Hovering over the canvas reports world `x`/`y`, the cell ID under the cursor,
 and its broad and fine cell-type annotations in napari's status bar. This
 readout remains active whether or not the Cell inspector dock is open. Clicking

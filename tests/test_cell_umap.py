@@ -1204,6 +1204,44 @@ def test_cell_type_widget_hides_unavailable_hierarchy_levels(qapp):
     assert widget._level_combo.findData("broad") == 0
 
 
+def test_bootstrap_cutoff_updates_spatial_colours_umap_and_retains_candidates(qapp):
+    ctrl, widget = _controller(qapp)
+    state = ctrl._umap_state()
+    annotations = ctrl._cell_type_state("MERSCOPE")
+    raw = "ct_seaad_subclass_raw"
+    accepted = "ct_seaad_subclass"
+    assignments = CellTypeAssignments(
+        segmentation="proseg", table_key="unused", instance_key="instance_id",
+        cell_ids=np.array([202, 303]), broad=np.array([None, "Neuron"], dtype=object),
+        fine=np.array([None, "Neuron"], dtype=object),
+        levels={raw: np.array(["A", "B"], dtype=object), accepted: np.array([None, "B"], dtype=object)},
+        bootstrap_scores={raw: np.array([0.4, 1.0])},
+    )
+    ctrl._cache_cell_type_data(annotations, "proseg", assignments)
+    annotations.kind = raw
+    state.colour_by = raw
+    # Avoid unrelated control publication in this focused controller test.
+    ctrl._publish_cell_type_levels = lambda: None
+    ctrl._publish_umap_levels = lambda *_: None
+    ctrl._populate_cell_type_panel = lambda *_: None
+    view = state.primary
+    embedding = view.embeddings["proseg"]
+    before = ctrl._umap_labels(state, view, embedding, raw).copy()
+    assert before.tolist() == ["B", "A"]
+    ctrl.set_cell_type_bootstrap("MERSCOPE", 0.5)
+    assert ctrl._umap_labels(state, view, embedding, raw).tolist() == ["B", None]
+    colors = ctrl._cell_type_color_dict(annotations)
+    assert colors.get(202, colors[None])[-1] == 0 and colors[303][-1] > 0
+    colouring, _, subtitle = ctrl._umap_colouring(state, view, embedding)
+    assert "bootstrap ≥ 50.0%" in subtitle
+    assert "Below bootstrap cut-off" in colouring.legend[-1].label
+    assert assignments.labels_for(accepted).tolist() == [None, "B"]
+    ctrl.set_cell_type_bootstrap("MERSCOPE", 0)
+    assert ctrl._umap_labels(state, view, embedding, raw).tolist() == before.tolist()
+    with pytest.raises(ValueError):
+        ctrl.set_cell_type_bootstrap("MERSCOPE", 2)
+
+
 def test_cell_type_dropdowns_dispatch_user_choices_only(qapp):
     changes = []
     callback = lambda *args: None

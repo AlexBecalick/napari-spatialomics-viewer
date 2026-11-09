@@ -216,6 +216,7 @@ from .utils import (
     build_assignment_color_schemes,
     cell_type_levels,
     CELL_TYPE_LEVEL_LABELS,
+    BOOTSTRAP_PREDICTION_STEMS,
     CELL_TYPE_SOURCES,
     cell_type_source,
     assignment_source_points,
@@ -457,6 +458,7 @@ class CellTypeOverlayState:
     #: segmentation -> normalized cell id -> (broad label, fine label).
     annotation_lookup: dict = field(default_factory=dict)
     available_levels: dict = field(default_factory=dict)
+    min_bootstrap: float = 0.0
 
 
 @dataclass
@@ -3013,6 +3015,7 @@ class CellTypeWidget(QWidget):
         set_all_types_callback,
         set_opacity_callback,
         opacity: float = 0.95,
+        set_bootstrap_callback=None,
     ):
         super().__init__()
         self._close_callback = close_callback
@@ -3022,6 +3025,11 @@ class CellTypeWidget(QWidget):
         self._set_types_visible_callback = set_types_visible_callback
         self._set_all_types_callback = set_all_types_callback
         self._set_opacity_callback = set_opacity_callback
+        from .prediction_controls import BootstrapFilterWidget
+        self.bootstrap_filter = BootstrapFilterWidget(
+            lambda value: set_bootstrap_callback(self._dataset, value)
+            if set_bootstrap_callback is not None and self._dataset is not None else None
+        )
 
         self._dataset: str | None = None
         self._checkboxes: dict[str, QCheckBox] = {}
@@ -3085,6 +3093,7 @@ class CellTypeWidget(QWidget):
         root.addWidget(self._seg_combo)
         root.addWidget(self._level_label)
         root.addWidget(self._level_combo)
+        root.addWidget(self.bootstrap_filter)
         opacity_row = QHBoxLayout()
         opacity_row.addWidget(QLabel("Mask opacity"))
         opacity_row.addWidget(self._opacity_slider)
@@ -3426,6 +3435,24 @@ def _cell_summary_html(cell: dict) -> str:
         f"<b>Total transcripts:</b> {int(cell.get('total', 0)):,}",
         f"<b>Area:</b> {area_text}",
     ]
+    for prediction in cell.get("bootstrap_predictions", []):
+        lines.append(f"<b>{html.escape(prediction['level'])}:</b> {html.escape(prediction['name'])}")
+        support = prediction.get("bootstrap")
+        if support is not None:
+            lines.append(f"<b>Bootstrap support:</b> {support:.1%}")
+        aggregate = prediction.get("aggregate_bootstrap")
+        if aggregate is not None:
+            lines.append(f"<b>Bootstrap support along hierarchy:</b> {aggregate:.1%}")
+        lines.append(f"<b>Acceptance status:</b> {html.escape(prediction['status'])}")
+        candidates = prediction.get("candidates", [])
+        if candidates:
+            lines.append("<b>Saved candidates (bootstrap support):</b>")
+            for rank, candidate in enumerate(candidates, start=1):
+                lines.append(f"&nbsp;&nbsp;{rank}. {html.escape(candidate['name'])}: {candidate['bootstrap']:.1%}")
+        if prediction.get("conditional"):
+            lines.append("<i>Subclass alternatives are within the selected parent class.</i>")
+    if cell.get("bootstrap_predictions"):
+        lines.append("<i>Bootstrap support is stability, not biological probability.</i>")
     if cell.get("annotation_method") == "pciseq":
         probability = cell.get("pciseq_probability")
         if probability is not None and np.isfinite(probability):
@@ -10630,6 +10657,9 @@ class ComparisonViewerController:
             "broad_cell_type_rgba": broad_scheme.colors.get(broad, neutral) if broad_scheme else neutral,
             "fine_cell_type_rgba": fine_scheme.colors.get(fine, neutral) if fine_scheme else neutral,
         }
+        row = labels[2] if len(labels) > 2 else None
+        if row is not None and getattr(assignments, "prediction_metadata", None):
+            result["bootstrap_predictions"] = assignments.predictions_for_cell(row)
         if getattr(cell_type_source(segmentation), "method", "") == "pciseq":
             result["annotation_method"] = "pciseq"
             row = labels[2] if len(labels) > 2 else None
@@ -11744,8 +11774,8 @@ class ComparisonViewerController:
         worker.start()
 
     @staticmethod
-    def _cell_type_counts(assignments, kind: str) -> dict[str, int]:
-        labels = np.asarray(assignments.labels_for(kind))
+    def _cell_type_counts(assignments, kind: str, min_bootstrap: float = 0.0) -> dict[str, int]:
+        labels = np.asarray(assignments.labels_for(kind, min_bootstrap))
         values, counts = np.unique(labels[pd.notna(labels)], return_counts=True)
         return {str(v): int(c) for v, c in zip(values.tolist(), counts.tolist())}
 
@@ -11764,7 +11794,8 @@ class ComparisonViewerController:
             return
         scheme = schemes[kind]
         enabled = state.enabled[seg][kind]
-        counts = self._cell_type_counts(assignments, kind)
+        counts = self._cell_type_counts(assignments, kind, state.min_bootstrap)
+        self._update_bootstrap_control(widget, state, seg, kind)
         broad_colors = schemes["broad"].colors if "broad" in schemes else {}
         layout: list[tuple] = []
         for title, members in scheme.groups:
@@ -11891,6 +11922,7 @@ class ComparisonViewerController:
         state = states[0]
         segmentation = state.segmentation
         kind = state.kind or "broad"
+        self._update_bootstrap_control(widget, state, segmentation, kind)
         schemes = state.schemes.get(segmentation)
         if schemes is None:
             widget.set_dataset("PAIRED")
@@ -11904,7 +11936,7 @@ class ComparisonViewerController:
             assignments = paired_state.assignments.get(segmentation)
             if assignments is None:
                 continue
-            for label, count in self._cell_type_counts(assignments, kind).items():
+            for label, count in self._cell_type_counts(assignments, kind, paired_state.min_bootstrap).items():
                 counts[label] = counts.get(label, 0) + int(count)
         broad_colors = schemes["broad"].colors if "broad" in schemes else {}
         layout: list[tuple] = []
@@ -12184,6 +12216,41 @@ class ComparisonViewerController:
         self._recolor_cell_type_layer(state)
         self._refresh_umap()
 
+    @staticmethod
+    def _update_bootstrap_control(widget, state, source, kind):
+        control = getattr(widget, "bootstrap_filter", None)
+        if control is None:
+            return
+        assignments = state.assignments.get(source)
+        enabled = kind in BOOTSTRAP_PREDICTION_STEMS and (
+            assignments is None or kind in getattr(assignments, "bootstrap_scores", {})
+        )
+        control.set_filter(state.min_bootstrap, enabled)
+
+    def set_cell_type_bootstrap(self, dataset_name, minimum):
+        """Filter raw labels in spatial and UMAP views; keep saved calls intact."""
+        if dataset_name is None:
+            return
+        value = float(minimum)
+        if not np.isfinite(value) or not 0 <= value <= 1:
+            raise ValueError("Bootstrap cut-off must be between zero and one")
+        states = (self._paired_cell_type_states() if self._paired_session is not None
+                  else (self._cell_type_state(dataset_name),))
+        for state in states:
+            state.min_bootstrap = value
+            self._recolor_cell_type_layer(state)
+        if self._paired_session is not None:
+            self._populate_paired_cell_type_panel(states)
+            if states:
+                self._update_bootstrap_control(self._cell_type_widget, states[0], states[0].segmentation, states[0].kind)
+        elif states[0].kind and states[0].schemes.get(states[0].segmentation):
+            self._populate_cell_type_panel(states[0])
+        self._publish_cell_type_levels()
+        umap_state = self._umap_state()
+        if umap_state is not None:
+            self._publish_umap_levels(umap_state)
+        self._refresh_umap()
+
     def set_cell_type_opacity(self, dataset_name: str, opacity: float):
         if self._paired_session is not None:
             for state in self._paired_cell_type_states():
@@ -12214,7 +12281,7 @@ class ComparisonViewerController:
             return None
         return build_cell_type_color_dict(
             assignments.cell_ids,
-            assignments.labels_for(kind),
+            assignments.labels_for(kind, state.min_bootstrap),
             schemes[kind],
             enabled=state.enabled[seg][kind],
         )
@@ -12556,6 +12623,7 @@ class ComparisonViewerController:
         widget = self._cell_type_widget
         if widget is not None and hasattr(widget, "set_levels_available"):
             widget.set_levels_available(levels)
+            self._update_bootstrap_control(widget, states[0], states[0].segmentation, states[0].kind)
 
     def _publish_umap_levels(self, state):
         levels = {}
@@ -12567,6 +12635,9 @@ class ComparisonViewerController:
         widget = self._umap_widget
         if widget is not None and hasattr(widget, "set_colour_levels"):
             widget.set_colour_levels(levels, state.colour_by)
+            first_view = next(iter(state.views.values()), None)
+            if first_view is not None:
+                self._update_bootstrap_control(widget, self._cell_type_state(first_view.dataset), state.source, state.colour_by)
 
     def _publish_cell_type_options(self):
         """Refresh the cell-type panel for the active dataset (on dataset load)."""
@@ -13267,7 +13338,15 @@ class ComparisonViewerController:
             order=scheme.order if scheme is not None else None,
             enabled=enabled,
             title=title,
+            missing_label=(
+                "Below bootstrap cut-off / no prediction"
+                if kind in BOOTSTRAP_PREDICTION_STEMS
+                and self._cell_type_state(view.dataset).min_bootstrap > 0 else "Unannotated"
+            ),
         )
+        if kind in BOOTSTRAP_PREDICTION_STEMS:
+            cutoff = self._cell_type_state(view.dataset).min_bootstrap
+            subtitle = f"{source_label} · bootstrap ≥ {cutoff:.1%} · stability, not biological probability"
         return colouring, f"UMAP — {title}", subtitle
 
     def _umap_labels(
@@ -13280,14 +13359,14 @@ class ComparisonViewerController:
         """Per-row broad/fine labels for the embedding (``None`` = unannotated)."""
         cell_type_state = self._cell_type_state(view.dataset)
         assignments = cell_type_state.assignments.get(state.source)
-        cache_key = (state.source, kind, id(assignments))
+        cache_key = (state.source, kind, id(assignments), cell_type_state.min_bootstrap)
         labels = view.label_cache.get(cache_key)
         if labels is None:
             if assignments is None:
                 labels = np.full(len(embedding), None, dtype=object)
             else:
                 labels = labels_for_cell_ids(
-                    assignments.cell_ids, assignments.labels_for(kind), embedding.cell_ids
+                    assignments.cell_ids, assignments.labels_for(kind, cell_type_state.min_bootstrap), embedding.cell_ids
                 )
             view.label_cache = {
                 k: v for k, v in view.label_cache.items() if k[:2] != cache_key[:2]
@@ -14908,6 +14987,7 @@ def main():
         set_types_visible_callback=controller.set_cell_types_visible,
         set_all_types_callback=controller.set_all_cell_types_visible,
         set_opacity_callback=controller.set_cell_type_opacity,
+        set_bootstrap_callback=controller.set_cell_type_bootstrap,
         opacity=float(getattr(args, "shape_opacity", 0.95)),
     )
     # The "UMAP" tab: opens the floating UMAP window and picks its colouring.
@@ -14918,6 +14998,7 @@ def main():
         set_point_size_callback=controller.set_umap_point_size,
         set_lasso_active_callback=controller.set_umap_lasso_active,
         clear_roi_callback=controller.clear_umap_roi,
+        set_bootstrap_callback=lambda value: controller.set_cell_type_bootstrap(controller.active_dataset, value),
     )
     panel = ViewerControlPanel(
         datasets=available_datasets,
