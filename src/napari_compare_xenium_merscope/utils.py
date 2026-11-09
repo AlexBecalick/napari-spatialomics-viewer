@@ -3365,6 +3365,79 @@ def _clean_cell_labels(values) -> np.ndarray:
     return text.to_numpy(dtype=object, na_value=None)
 
 
+def _include_unclustered_predictions(root, source, table_key, obs, instance_key):
+    """Include saved raw calls for spatial cells outside the clustering QC set.
+
+    The source table must agree with the clustered table's saved predictions.
+    Existing clustered rows and accepted labels remain authoritative; only raw
+    metadata is appended for additional exact mask IDs. Embeddings still load
+    exclusively from the original clustering table.
+    """
+    if source is None or source.method != "clustering":
+        return obs, instance_key
+    stems = [stem for stem in BOOTSTRAP_PREDICTION_STEMS.values() if f"{stem}_raw_name" in obs]
+    if not stems:
+        return obs, instance_key
+    base = next((key for key in source.clustering_tables
+                 if table_key == key or table_key.startswith(key + "_")), None)
+    raw_key = base.removesuffix(CLUSTERING_TABLE_SUFFIX) if base else None
+    if raw_key is None or raw_key not in root["tables"]:
+        return obs, instance_key
+    from anndata.io import read_elem
+    from types import SimpleNamespace
+
+    table = root["tables"][raw_key]
+    group = table["obs"]
+    columns = list(group.attrs.get("column-order", []))
+    if not all(f"{stem}_raw_name" in columns for stem in stems):
+        return obs, instance_key
+    attrs = (dict(read_elem(table["uns"]["spatialdata_attrs"]))
+             if "uns" in table and "spatialdata_attrs" in table["uns"] else {})
+    raw_instance = _resolve_instance_key(SimpleNamespace(
+        obs=SimpleNamespace(columns=columns), uns={"spatialdata_attrs": attrs}
+    ))
+    raw_index = str(group.attrs.get("_index", "_index"))
+    raw_ids, raw_valid = cell_ids_as_int64(read_elem(group[raw_instance or raw_index]))
+    ids, valid = cell_ids_as_int64(obs[instance_key] if instance_key else obs.index)
+    present = set(ids[valid].tolist())
+    raw_index_ids = pd.Index(raw_ids[raw_valid].tolist(), dtype=object)
+    if not raw_index_ids.is_unique or not present <= set(raw_index_ids):
+        return obs, instance_key
+    extra_ids = ~raw_index_ids.isin(list(present))
+    if not extra_ids.any():
+        return obs, instance_key
+    # Never mix a raw table from a different annotation run into a named run.
+    provenance = "merxen_hippocampal_annotation_json"
+    clustered = root["tables"][table_key]
+    if ("uns" in table and "uns" in clustered
+            and provenance in table["uns"] and provenance in clustered["uns"]
+            and read_elem(table["uns"][provenance]) != read_elem(clustered["uns"][provenance])):
+        return obs, instance_key
+    fields = [column for column in columns if any(
+        column.startswith(stem + "_") and column not in {f"{stem}_name", f"{stem}_assignment"}
+        for stem in stems
+    )]
+    raw = pd.DataFrame({column: read_elem(group[column])[raw_valid] for column in fields}, index=raw_index_ids)
+    aligned = raw.reindex(ids[valid].tolist())
+    for stem in stems:
+        for field in ("raw_name", "raw_assignment", "bp"):
+            column = f"{stem}_{field}"
+            if column not in obs or column not in aligned:
+                continue
+            old = obs.loc[valid, column].reset_index(drop=True).astype(object)
+            new = aligned[column].reset_index(drop=True).astype(object)
+            if not (old.isna().equals(new.isna()) and old[old.notna()].equals(new[new.notna()])):
+                return obs, instance_key
+    extras = raw.loc[extra_ids].copy()
+    id_column = instance_key or "_prediction_instance_id"
+    primary = obs.copy()
+    primary[id_column] = pd.Series(
+        [int(cid) if ok else None for cid, ok in zip(ids, valid)], index=obs.index, dtype=object
+    )
+    extras[id_column] = pd.Series(extras.index.tolist(), index=extras.index, dtype=object)
+    return pd.concat([primary, extras], ignore_index=True), id_column
+
+
 def _read_cell_type_obs(zarr_path: Any, segmentation: str):
     """Read annotation metadata only, without expression or neighbour matrices."""
     source = cell_type_source(segmentation)
@@ -3379,7 +3452,8 @@ def _read_cell_type_obs(zarr_path: Any, segmentation: str):
     from anndata.io import read_elem
     from types import SimpleNamespace
 
-    table = open_zarr_group_unconsolidated(zarr_path)[f"tables/{table_key}"]
+    root = open_zarr_group_unconsolidated(zarr_path)
+    table = root[f"tables/{table_key}"]
     obs_group = table["obs"]
     columns = list(obs_group.attrs.get("column-order", []))
     attrs = {}
@@ -3404,6 +3478,11 @@ def _read_cell_type_obs(zarr_path: Any, segmentation: str):
         current = analysis_source_metadata(zarr_path, segmentation)
         if current is None or current["analysis_id"] != metadata["analysis_id"]:
             return None
+    try:
+        obs, instance_key = _include_unclustered_predictions(root, source, table_key, obs, instance_key)
+    except (KeyError, ValueError, TypeError, IndexError, OSError):
+        # An optional, incomplete raw table must not hide a valid clustered run.
+        log.debug("Cannot extend spatial predictions for %s", table_key, exc_info=True)
     return table_key, obs, instance_key, metadata
 
 
