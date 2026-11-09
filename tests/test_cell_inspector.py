@@ -192,7 +192,7 @@ def test_cell_info_overlay_shows_instruction_and_scales_panels(qapp):
     fine = panel.findChild(V.QLabel, "FineCellType")
     assert broad.text() == "Broad: Astrocytes"
     assert fine.text() == "Fine: Astrocytes:0"
-    assert "font-size: 22pt" in broad.styleSheet()
+    assert "font-size: 13pt" in broad.styleSheet()
     assert "rgb(51,178,230)" in broad.styleSheet()
     assert "rgb(230,76,128)" in fine.styleSheet()
     assert _divider_count(overlay) == 0  # no divider for a single cell
@@ -235,6 +235,7 @@ class _FakeLayer:
         self.size = kw.get("size", 1.0)
         self.symbol = kw.get("symbol", "disc")
         self.face_color = kw.get("face_color")
+        self.edge_color = kw.get("edge_color")
         self.edge_width = kw.get("edge_width")
         self.affine = kw.get("affine")
         self._pick_value = None
@@ -514,7 +515,7 @@ def test_multiple_cells_accumulate_with_distinct_colours(qapp):
     # One boundary layer holds both cells' outlines, coloured per cell.
     boundary = ctrl._get_layer_by_name(V.CELL_INSPECTOR_BOUNDARY_LAYER)
     assert len(boundary.data) == 2
-    edge = np.asarray(boundary.kw["edge_color"], dtype=float)
+    edge = np.asarray(boundary.edge_color, dtype=float)
     assert edge.shape == (2, 4) and not np.allclose(edge[0], edge[1])
     # Links now cover both cells (3 + 2 transcripts).
     assert len(ctrl._get_layer_by_name(V.CELL_INSPECTOR_LINKS_LAYER).data) == 5
@@ -583,3 +584,415 @@ def test_transcript_click_still_highlights_gene(qapp):
     _dispatch_click(ctrl, _event(2.0, 2.0))
     assert state.highlighted_genes            # a gene got highlighted
     assert "TEST" not in ctrl._selected_cells  # and no cell was selected
+
+
+def test_cellpose_source_uses_in_mask_transcripts_and_types(qapp):
+    ctrl = _controller(qapp)
+    shape = Polygon([(0, 0), (10, 0), (10, 10), (0, 10)])
+    ctrl._active_sdata.shapes['MOSAIK_cellpose'] = gpd.GeoDataFrame(
+        {'geometry': [shape]}, index=[900])
+    ctrl._active_sdata.points['transcripts'] = pd.DataFrame({
+        'x': [3., 5., 20.], 'y': [3., 5., 20.], 'gene': ['Inside', 'Background', 'Outside'],
+        'assignment': [202, 0, 900]})
+    state = ctrl._cell_type_state('TEST')
+    state.segmentation = 'cellpose'
+    ctrl._cache_cell_type_data(state, 'cellpose', CellTypeAssignments(
+        segmentation='cellpose', table_key='test', instance_key='cell',
+        cell_ids=np.array([900]), broad=np.array(['Glia']), fine=np.array(['Astrocyte'])))
+    assert ctrl._pick_cell_from_event(_event(5, 5))[0] == 900
+    ctrl._add_cell_selection('TEST', 900, shape)
+    entry = ctrl._selected_cells['TEST'][0]
+    assert entry['total'] == 2
+    assert {row['gene'] for row in entry['gene_rows']} == {'Inside', 'Background'}
+    assert entry['broad_cell_type'] == 'Glia'
+    assert entry['fine_cell_type'] == 'Astrocyte'
+
+
+def test_intensities_match_cellpose_by_overlap_not_id(qapp, monkeypatch):
+    ctrl = _controller(qapp)
+    geometry = _demo_gdf().geometry.iloc[1]
+    ctrl._active_sdata.shapes['MOSAIK_cellpose'] = gpd.GeoDataFrame(
+        {'geometry': [geometry, Polygon([(50, 50), (60, 50), (60, 60), (50, 60)])]},
+        index=[900, 202])
+    ctrl.datasets['TEST'] = types.SimpleNamespace(zarr_path='test.zarr')
+    monkeypatch.setattr(V, 'cellpose_quantification_table_available', lambda path: True)
+    seen = []
+    monkeypatch.setattr(V, 'cellpose_cell_mean_intensities',
+                        lambda path, cid: seen.append(cid) or [('DAPI', 42.)])
+    values, cid = ctrl._inspection_intensities('TEST', 202, geometry, [])
+    assert cid == 900 and seen == ['900']
+    assert values == [('DAPI', 42.)]
+
+
+def test_visible_cell_types_allow_picking_when_masks_hidden(qapp):
+    ctrl = _controller(qapp)
+    layer = _FakeLayer(V.make_layer_name('TEST', 'labels', 'MOSAIK_proseg_labels'), [])
+    layer.visible = False
+    ctrl.viewer.layers.append(layer)
+    assert not ctrl._cell_inspector_pickable()
+    fill = _FakeLayer(V.make_layer_name('TEST', 'cell_types', 'proseg'), [])
+    fill.visible = True
+    ctrl.viewer.layers.append(fill)
+    assert ctrl._cell_inspector_pickable()
+    assert ctrl._pick_cell_from_event(_event(5, 5))[0] == 202
+
+
+def test_inspector_fits_all_intensities_without_vertical_scroll(qapp):
+    overlay = V.CellInfoOverlay()
+    cell = _cell_dict('202')
+    cell['fine_cell_type'] = 'Neurons/Excitatory:Upper-layer long cell type'
+    cell['intensities'] = [(f'Channel {n}', float(n)) for n in range(9)]
+    overlay.set_cells([cell])
+    overlay.resize(1000, overlay.sizeHint().height())
+    overlay.show()
+    qapp.processEvents()
+    panel = overlay.cell_panels()[0]
+    summary = next(label for label in panel.findChildren(V.QLabel)
+                   if 'Mean intensity:' in label.text())
+    assert summary.height() >= summary.heightForWidth(summary.width())
+    assert overlay._scroll.verticalScrollBar().maximum() == 0
+    overlay.close()
+    overlay.deleteLater()
+    qapp.processEvents()
+
+
+def test_pciseq_inspection_follows_cell_type_tab_independently(qapp, monkeypatch):
+    ctrl = _controller(qapp)
+    ctrl._cell_type_state('TEST').segmentation = 'pciseq_cellpose'
+    shape = _demo_gdf().geometry.iloc[1]
+    ctrl._active_sdata.shapes['MOSAIK_cellpose'] = gpd.GeoDataFrame({'geometry': [shape]}, index=[900])
+    ctrl._active_sdata.points['pciseq_points'] = pd.DataFrame({
+        'x': [3., 4.], 'y': [3., 4.], 'gene': ['pciAssigned', 'NativeOnly'],
+        'assignment': [900, 0]})
+    metadata = {'points': 'pciseq_points', 'shape': 'MOSAIK_cellpose',
+                'assignment_column': 'assignment', 'analysis_id': 'new-fit'}
+    monkeypatch.setattr(ctrl, '_transcript_source_metadata',
+                        lambda ds, source=None: metadata if source == 'pciseq_cellpose' else None)
+    assert ctrl._transcript_source_key('TEST') == 'native'
+    assert ctrl._pick_cell_from_event(_event(4, 4))[0] == 900
+    index = ctrl._inspection_transcript_index('TEST', 900, shape, ctrl._empty_cell_transcript_index())
+    assert index.transcripts_for(900)[1].tolist() == ['pciAssigned']
+    # A missing pciSeq fit must not fall back to native assignments.
+    monkeypatch.setattr(ctrl, '_transcript_source_metadata', lambda *args: None)
+    assert ctrl._inspection_transcript_index('TEST', 900, shape, index).transcripts_for(900)[1].size == 0
+
+
+def test_selected_colour_level_is_reflected_in_inspector(qapp):
+    ctrl = _controller(qapp)
+    state = ctrl._cell_type_state('TEST')
+    assignment = CellTypeAssignments(
+        segmentation='proseg', table_key='test', instance_key='cell',
+        cell_ids=np.array([202]), broad=np.array(['Neurons']), fine=np.array(['Excitatory']),
+        levels={'ct_final': np.array(['L2 IT'])})
+    ctrl._cache_cell_type_data(state, 'proseg', assignment)
+    state.kind = 'ct_final'
+    annotation = ctrl._cell_type_annotation_for_cell('TEST', 202)
+    assert annotation['selected_cell_type'] == 'L2 IT'
+    state.kind = 'broad'
+    assert ctrl._cell_type_annotation_for_cell('TEST', 202)['selected_cell_type'] is None
+
+
+def test_switching_source_remaps_existing_selection(qapp):
+    ctrl = _controller(qapp)
+    geometry = _demo_gdf().geometry.iloc[1]
+    ctrl._active_sdata.shapes['MOSAIK_cellpose'] = gpd.GeoDataFrame({'geometry': [geometry]}, index=[900])
+    state = ctrl._cell_type_state('TEST')
+    ctrl._cache_cell_type_data(state, 'cellpose', CellTypeAssignments(
+        segmentation='cellpose', table_key='test', instance_key='cell',
+        cell_ids=np.array([900]), broad=np.array(['Glia']), fine=np.array(['Astrocyte'])))
+    ctrl._add_cell_selection('TEST', 202, geometry)
+    ctrl.set_cell_type_segmentation('TEST', 'cellpose')
+    entry = ctrl._selected_cells['TEST'][0]
+    assert entry['cell_id'] == 900
+    assert entry['broad_cell_type'] == 'Glia'
+    assert not entry['loading']
+
+
+def test_dask_assignment_inspection_with_large_gene_dictionary(qapp, tmp_path, monkeypatch):
+    import dask.dataframe as dd
+    ctrl = _controller(qapp)
+    frame = pd.DataFrame({'x': np.full(200, 3.), 'y': np.full(200, 3.),
+                          'gene': pd.Categorical([f'Gene{i}' for i in range(200)]),
+                          'hybrid_assignment': np.full(200, 900)})
+    path = tmp_path / 'points.parquet'
+    frame.to_parquet(path)
+    points = dd.read_parquet(path)
+    ctrl._active_sdata.points['transcripts'] = points
+    ctrl._active_sdata.attrs = {'merxen_schema': {'segmentations': {'proseg_hybrid': {
+        'shape': 'MOSAIK_proseg_hybrid', 'points': 'transcripts',
+        'assignment_column': 'hybrid_assignment'}}}}
+    geometry = _demo_gdf().geometry.iloc[1]
+    ctrl._active_sdata.shapes['MOSAIK_proseg_hybrid'] = gpd.GeoDataFrame({'geometry': [geometry]}, index=[900])
+    ctrl._cell_type_state('TEST').segmentation = 'proseg_hybrid'
+    monkeypatch.setattr(ctrl, '_assignment_display_spool',
+                        lambda points: pytest.fail('Ordinary assignments must stream directly'))
+    index = ctrl._inspection_transcript_index('TEST', 900, geometry, ctrl._empty_cell_transcript_index())
+    assert len(index.transcripts_for(900)[1]) == 200
+
+
+def test_display_spool_handles_large_categorical_gene_dictionary(tmp_path):
+    import dask.dataframe as dd
+    frame = pd.DataFrame({'gene': pd.Categorical([f'Gene{i}' for i in range(200)])})
+    path = tmp_path / 'points.parquet'
+    frame.to_parquet(path)
+    points = dd.read_parquet(path)
+    with V.ComparisonViewerController._assignment_display_spool(points) as spooled:
+        assert len(spooled.compute()) == 200
+
+
+def test_inspector_can_shrink_and_scroll_when_screen_is_small(qapp):
+    overlay = V.CellInfoOverlay()
+    cell = _cell_dict('202')
+    cell['intensities'] = [(f'Channel {i}', 10.) for i in range(9)]
+    overlay.set_cells([cell])
+    overlay.resize(900, 140)
+    overlay.show()
+    qapp.processEvents()
+    assert overlay.height() == 140
+    assert overlay._scroll.verticalScrollBar().maximum() > 0
+    overlay.close()
+    overlay.deleteLater()
+
+
+def test_cell_panel_sizes_columns_to_content(qapp):
+    from qtpy.QtWidgets import QScrollArea, QWidget
+    panel = V._CellPanel(_cell_dict('202'))
+    panel.resize(panel.sizeHint())
+    panel.show()
+    qapp.processEvents()
+    stats = panel.findChild(QWidget, 'CellStatistics')
+    genes = panel.findChild(QScrollArea, 'CellGenes')
+    pie = panel.findChild(V.CellInfoPieChart)
+    assert stats.width() < 360
+    assert genes.width() < 230
+    assert 0 <= pie.x() - stats.geometry().right() <= 8
+    assert 0 <= genes.x() - pie.geometry().right() <= 8
+    panel.close()
+    panel.deleteLater()
+
+
+def test_cell_dock_updates_never_raise_or_reshow_visible_dock(qapp):
+    ctrl = _controller(qapp)
+    calls = []
+    class Dock:
+        hidden = True
+        def isHidden(self):
+            return self.hidden
+        def show(self):
+            self.hidden = False
+            calls.append('show')
+        def raise_(self):
+            pytest.fail('Raising a dock can switch macOS full-screen Spaces')
+    ctrl._cell_info_dock = Dock()
+    ctrl._show_cell_dock()
+    ctrl._show_cell_dock()
+    ctrl._show_cell_dock()
+    assert calls == ['show']
+
+
+def test_inspection_build_encodes_only_requested_cell(qapp, monkeypatch):
+    ctrl = _controller(qapp)
+    ctrl._cell_type_state('TEST').segmentation = 'proseg_hybrid'
+    ctrl._active_sdata.attrs = {'merxen_schema': {'segmentations': {'proseg_hybrid': {
+        'shape': 'MOSAIK_proseg_hybrid', 'points': 'transcripts',
+        'assignment_column': 'hybrid_assignment'}}}}
+    geometry = _demo_gdf().geometry.iloc[1]
+    ctrl._active_sdata.shapes['MOSAIK_proseg_hybrid'] = gpd.GeoDataFrame({'geometry': [geometry]}, index=[900])
+    ctrl._active_sdata.points['transcripts'] = pd.DataFrame({
+        'x': [3., 4., 5.], 'y': [3., 4., 5.], 'gene': ['A', 'B', 'C'],
+        'hybrid_assignment': [900, 901, 901]})
+    seen = []
+    def build(points, *columns):
+        seen.append(points['hybrid_assignment'].tolist())
+        return build_cell_transcript_index(points, *columns)
+    monkeypatch.setattr(V, 'build_cell_transcript_index', build)
+    ctrl._inspection_transcript_index('TEST', 900, geometry, ctrl._empty_cell_transcript_index())
+    assert seen == [[900]]
+
+
+def test_paired_inspection_returns_placeholder_before_worker_runs(qapp, monkeypatch):
+    ctrl = _controller(qapp)
+    ctrl._paired_session = types.SimpleNamespace(sdata={'TEST': ctrl._active_sdata})
+    geometry = _demo_gdf().geometry.iloc[1]
+    pending = []
+    callbacks = []
+    def compute(*args, **kwargs):
+        callbacks.append('computed')
+        return {'cell_id': 202, 'loading': False, 'total': 3}
+    monkeypatch.setattr(ctrl, '_cell_selection_display', compute)
+    class Worker:
+        def __init__(self, task):
+            self.task = task
+            self.returned = types.SimpleNamespace(connect=lambda callback: setattr(self, 'done', callback))
+            self.errored = types.SimpleNamespace(connect=lambda callback: None)
+        def start(self):
+            pending.append(self)
+    monkeypatch.setattr(V, 'thread_worker', lambda task: lambda: Worker(task))
+    updates = []
+    monkeypatch.setattr(ctrl, '_update_paired_cell_info_overlay', lambda: updates.append(True))
+    placeholder = ctrl._paired_cell_panel_entry('TEST', 202, geometry, '#fff')
+    assert placeholder['loading'] and not callbacks
+    ctrl._start_cell_selection_build('TEST', 202, geometry, '#fff')
+    assert len(pending) == 1 and not callbacks
+    pending[0].done(pending[0].task())
+    result = ctrl._paired_cell_panel_entry('TEST', 202, geometry, '#fff')
+    assert not result['loading'] and result['total'] == 3
+    assert callbacks == ['computed'] and updates == [True]
+
+
+def test_real_cell_worker_keeps_qt_event_loop_responsive(qapp, monkeypatch):
+    from threading import Event
+    from qtpy.QtCore import QTimer
+    from qtpy.QtTest import QTest
+    from napari.qt.threading import thread_worker
+    ctrl = _controller(qapp)
+    started, release = Event(), Event()
+    received = []
+    def compute(*args, **kwargs):
+        started.set()
+        assert release.wait(3)
+        return {'cell_id': 202}
+    monkeypatch.setattr(V, 'thread_worker', thread_worker)
+    monkeypatch.setattr(ctrl, '_cell_selection_display', compute)
+    monkeypatch.setattr(ctrl, '_apply_cell_selection_payload', lambda *args: received.append(args))
+    ctrl._start_cell_selection_build('TEST', 202, _demo_gdf().geometry.iloc[1], '#fff')
+    heartbeat = []
+    QTimer.singleShot(0, lambda: heartbeat.append(True))
+    try:
+        for _ in range(50):
+            QTest.qWait(10)
+            if started.is_set() and heartbeat:
+                break
+        assert started.is_set() and heartbeat == [True]
+        assert not received
+    finally:
+        release.set()
+    for _ in range(50):
+        QTest.qWait(10)
+        if received:
+            break
+    assert len(received) == 1
+
+
+def test_paired_cell_query_joins_only_selected_exact_transcript_ids(qapp, monkeypatch):
+    ctrl = _controller(qapp)
+    sdata = ctrl._active_sdata
+    assignment_points = pd.DataFrame({
+        'transcript_id': [11, 12], 'x': [1., 2.], 'y': [3., 4.], 'gene': ['A', 'B'],
+        'assignment': [900, 901], 'background': [False, False],
+        'pciseq_assignment_status': ['assigned', 'assigned']})
+    measured = pd.DataFrame({'transcript_id': [12, 11], 'x': [200., 100.],
+                             'y': [400., 300.], 'gene': ['B', 'A']})
+    sdata.points['pciseq_points'] = assignment_points
+    ctrl._cell_type_state('TEST').segmentation = 'pciseq_cellpose'
+    ctrl._paired_session = types.SimpleNamespace(
+        sdata={'TEST': sdata}, contract=types.SimpleNamespace(
+            profile=lambda ds: types.SimpleNamespace(points_key='transcripts')))
+    metadata = {'points': 'pciseq_points', 'shape': 'MOSAIK_cellpose',
+                'assignment_column': 'assignment', 'background_column': 'background',
+                'status_column': 'pciseq_assignment_status', 'analysis_id': 'test-fit'}
+    monkeypatch.setattr(ctrl, '_transcript_source_metadata', lambda *args: metadata)
+    monkeypatch.setattr(ctrl, '_inspection_shape', lambda ds: 'MOSAIK_cellpose')
+    monkeypatch.setattr(ctrl, '_paired_assignment_display_input',
+                        lambda *args: ('transcripts', measured, 'x', 'y', 'gene'))
+    join = V.assignment_points_in_display_frame
+    seen = []
+    def selected_join(assignments, display, **kwargs):
+        seen.append((assignments['transcript_id'].tolist(), display['transcript_id'].tolist()))
+        return join(assignments, display, **kwargs)
+    monkeypatch.setattr(V, 'assignment_points_in_display_frame', selected_join)
+    index = ctrl._inspection_transcript_index('TEST', 900, _demo_gdf().geometry.iloc[1],
+                                              ctrl._empty_cell_transcript_index())
+    coords, genes = index.transcripts_for(900)
+    assert seen == [([11], [11])]
+    assert coords.tolist() == [[300., 100.]]
+    assert genes.tolist() == ['A']
+
+
+def test_long_rare_gene_does_not_widen_the_visible_gene_list(qapp):
+    cell = _cell_dict('202')
+    cell['gene_rows'] = cell['gene_rows'] * 3
+    panel = V._CellPanel(cell)
+    before = panel._gene_scroll.width()
+    cell['gene_rows'].append({'gene': 'UnusuallyLongGeneNameThatAppearsFarDownTheList',
+                             'count': 1, 'rgba': (1., 1., 1., 1.), 'glyph': '●'})
+    panel.set_cell(cell)
+    panel.resize(panel.sizeHint())
+    panel.show()
+    qapp.processEvents()
+    assert panel._gene_scroll.width() == before
+    assert panel._gene_scroll.width() <= 190
+    assert panel._gene_scroll.horizontalScrollBar().maximum() > 0
+    panel.close()
+    panel.deleteLater()
+
+
+def test_inspector_reuses_panels_and_all_child_widgets(qapp):
+    overlay = V.CellInfoOverlay()
+    cell = _cell_dict('202')
+    overlay.set_cells([cell])
+    panel = overlay.cell_panels()[0]
+    widgets = panel.findChildren(V.QWidget)
+    assert panel.parentWidget() is overlay._row
+    overlay.set_cells([cell, _cell_dict('303')])
+    assert overlay.cell_panels()[0] is panel
+    cell['total'] = 42
+    overlay.set_cells([cell, _cell_dict('303')])
+    assert overlay.cell_panels()[0] is panel
+    assert panel.findChildren(V.QWidget) == widgets
+    assert '42' in panel._summary.text()
+    overlay.deleteLater()
+
+
+def test_inspector_updates_reuse_highlight_layers(qapp):
+    ctrl = _controller(qapp)
+    ctrl._add_cell_selection('TEST', 202, _demo_gdf().geometry.iloc[1])
+    boundary = ctrl._get_layer_by_name(V.CELL_INSPECTOR_BOUNDARY_LAYER)
+    links = ctrl._get_layer_by_name(V.CELL_INSPECTOR_LINKS_LAYER)
+    ctrl._add_cell_selection('TEST', 303, _demo_gdf().geometry.iloc[2])
+    assert ctrl._get_layer_by_name(V.CELL_INSPECTOR_BOUNDARY_LAYER) is boundary
+    assert ctrl._get_layer_by_name(V.CELL_INSPECTOR_LINKS_LAYER) is links
+    assert len(boundary.data) == 2
+
+
+def test_inspection_shape_creation_preserves_active_layer(qapp):
+    from napari.components import ViewerModel
+    ctrl = _controller(qapp)
+    model = ViewerModel()
+    original = model.add_image(np.zeros((10, 10)), name='Image')
+    ctrl.viewer = model
+    selected = []
+    model.layers.selection.events.active.connect(lambda event: selected.append(event.value))
+    polygon = np.array([[0., 0.], [0., 1.], [1., 1.], [1., 0.]])
+    ctrl._add_inspection_shapes([polygon], shape_type='polygon', name='selection')
+    assert model.layers.selection.active is original
+    assert list(model.layers.selection) == [original]
+    assert not selected
+
+
+def test_parent_visibility_change_does_not_clear_cell_inspection(qapp):
+    ctrl = _controller(qapp)
+    ctrl._add_cell_selection('TEST', 202, _demo_gdf().geometry.iloc[1])
+    ctrl._cell_info_dock = types.SimpleNamespace(isHidden=lambda: False)
+    ctrl._on_cell_dock_visibility_changed(False)
+    assert len(ctrl._selected_cells['TEST']) == 1
+
+
+def test_inspector_keeps_napari_custom_titlebar_on_visibility_changes(qapp):
+    from qtpy.QtCore import Signal
+    from qtpy.QtWidgets import QWidget
+    ctrl = _controller(qapp)
+    class Dock(QWidget):
+        visibilityChanged = Signal(bool)
+        resets = 0
+        def __init__(self):
+            super().__init__()
+            self.visibilityChanged.connect(self._on_visibility_changed)
+        def _on_visibility_changed(self, visible):
+            self.resets += 1
+    dock = Dock()
+    ctrl.viewer.window = types.SimpleNamespace(add_dock_widget=lambda *args, **kw: dock)
+    ctrl._ensure_cell_info_overlay()
+    dock.visibilityChanged.emit(True)
+    assert dock.resets == 0
+    dock.deleteLater()

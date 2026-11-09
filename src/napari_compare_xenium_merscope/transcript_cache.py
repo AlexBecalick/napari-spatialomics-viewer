@@ -42,6 +42,9 @@ from .utils import (
 log = logging.getLogger(__name__)
 
 TRANSCRIPT_CACHE_VERSION = 1
+#: Manifest ``kind`` of a prepared GenePointStore entry (entries written before
+#: the field existed have none and are this kind).
+TRANSCRIPT_POINTS_KIND = "gene_points"
 TRANSCRIPT_CACHE_ENV = "NAPARI_COMPARE_TRANSCRIPT_CACHE_DIR"
 _MANIFEST = "manifest.json"
 _MAX_MANIFEST_BYTES = 16 * 1024 * 1024
@@ -168,6 +171,7 @@ class TranscriptCacheRequest:
     analysis_id: str = ""
     status_col: str | None = None
     coordinate_points_key: str | None = None
+    is_gene_col: str | None = None
 
     @classmethod
     def create(
@@ -187,6 +191,7 @@ class TranscriptCacheRequest:
         analysis_id: str = "",
         status_col: str | None = None,
         coordinate_points_key: str | None = None,
+        is_gene_col: str | None = None,
     ) -> "TranscriptCacheRequest | None":
         """Create a request for a readable local SpatialData points element.
 
@@ -259,6 +264,10 @@ class TranscriptCacheRequest:
             family_identity["assignment_source"] = str(assignment_source)
             family_identity["analysis_id"] = str(analysis_id)
             family_identity["columns"]["status"] = status_col
+        if is_gene_col is not None:
+            # The control set then comes from the column; keep the address of
+            # every name-only build unchanged.
+            family_identity["columns"]["is_gene"] = str(is_gene_col)
         identity = {**family_identity, "point_tree": tree}
         if coordinate_tree is not None:
             family_identity["coordinate_points_key"] = str(coordinate_points_key)
@@ -282,6 +291,7 @@ class TranscriptCacheRequest:
             analysis_id=str(analysis_id),
             status_col=status_col,
             coordinate_points_key=coordinate_points_key,
+            is_gene_col=None if is_gene_col is None else str(is_gene_col),
         )
 
     @property
@@ -622,7 +632,8 @@ def load_transcript_cache(
         try:
             raw = _read_manifest(entry)
             if (
-                int(raw.get("version", -1)) != TRANSCRIPT_CACHE_VERSION
+                str(raw.get("kind", TRANSCRIPT_POINTS_KIND)) != TRANSCRIPT_POINTS_KIND
+                or int(raw.get("version", -1)) != TRANSCRIPT_CACHE_VERSION
                 or str(raw.get("request_digest", "")) != request.digest
                 or str(raw.get("request_family_digest", ""))
                 != request.family_digest
@@ -724,7 +735,8 @@ def _prune_superseded_entries(
                 except Exception:
                     continue
                 same_family = (
-                    str(raw.get("request_family_digest", ""))
+                    str(raw.get("kind", TRANSCRIPT_POINTS_KIND)) == TRANSCRIPT_POINTS_KIND
+                    and str(raw.get("request_family_digest", ""))
                     == request.family_digest
                 )
                 if same_family:
@@ -825,6 +837,7 @@ def save_transcript_cache(
             }
 
         manifest = {
+            "kind": TRANSCRIPT_POINTS_KIND,
             "version": TRANSCRIPT_CACHE_VERSION,
             "request_digest": request.digest,
             "request_family_digest": request.family_digest,
@@ -914,6 +927,7 @@ def make_transcript_cache_request(
     analysis_id: str = "",
     status_col: str | None = None,
     coordinate_points_key: str | None = None,
+    is_gene_col: str | None = None,
 ) -> TranscriptCacheRequest | None:
     """Return the cache request corresponding to one viewer transcript build."""
     return TranscriptCacheRequest.create(
@@ -932,6 +946,7 @@ def make_transcript_cache_request(
         analysis_id=analysis_id,
         status_col=status_col,
         coordinate_points_key=coordinate_points_key,
+        is_gene_col=is_gene_col,
     )
 
 
@@ -976,3 +991,635 @@ def save_transcript_payload(
         payload.get("reference_resolution"),
         cancel_check=cancel_check,
     ) is not None
+
+
+# ---------------------------------------------------------------------------
+# ATERA: overview and code-range map entries
+# ---------------------------------------------------------------------------
+#
+# These live in their own directories beside ``v1`` (``atera-overview-v1`` and
+# ``atera-codemap-v1``), carry a manifest ``kind`` and their own family digest,
+# so the GenePointStore reader never restores them and its pruning never
+# removes them (nor they it).  Their identity is the points index content, the
+# index fingerprint and each parquet file's size and mtime; ctime is excluded
+# because MerXen's hardlink churn changes it without changing a byte.
+
+ATERA_OVERVIEW_CACHE_KIND = "atera_overview"
+ATERA_OVERVIEW_CACHE_VERSION = 1
+ATERA_CODE_MAP_CACHE_KIND = "atera_code_map"
+ATERA_CODE_MAP_CACHE_VERSION = 1
+_ATERA_OVERVIEW_DIR = f"atera-overview-v{ATERA_OVERVIEW_CACHE_VERSION}"
+_ATERA_CODE_MAP_DIR = f"atera-codemap-v{ATERA_CODE_MAP_CACHE_VERSION}"
+ATERA_CELL_TILES_CACHE_KIND = "atera_cell_tiles"
+ATERA_CELL_TILES_CACHE_VERSION = 1
+_ATERA_CELL_TILES_DIR = f"atera-celltiles-v{ATERA_CELL_TILES_CACHE_VERSION}"
+_CELL_TILE_ARRAYS = (("cell_ids", np.uint64), ("cell_ptr", np.int64), ("tile_index", np.int32))
+_CODE_MAP_ARRAYS = (
+    ("code_ptr", np.int64),
+    ("row_group", np.int32),
+    ("row_start", np.int64),
+    ("row_end", np.int64),
+)
+
+
+def atera_points_identity(index: Any) -> dict[str, Any] | None:
+    """Identity of an :class:`AteraPointsIndex`'s files (``None`` if unreadable)."""
+    from .atera_transcripts import file_stat_identity, index_content_digest
+
+    try:
+        dataset = Path(index.zarr_path).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    files = file_stat_identity(index)
+    if files is None:
+        return None
+    content = index_content_digest(index)
+    if index.validated and content is None:
+        return None
+    return {
+        "dataset_path": str(dataset),
+        "points_key": str(index.points_key),
+        "validated": bool(index.validated),
+        "index_content": content,
+        "fingerprint": {str(k): int(v) for k, v in dict(index.fingerprint).items()},
+        "files": files,
+    }
+
+
+def _atera_cache_root(index: Any, cache_root: str | Path | None) -> Path | None:
+    root = (
+        default_transcript_cache_dir()
+        if cache_root is None
+        else Path(cache_root).expanduser().resolve()
+    )
+    try:
+        dataset = Path(index.zarr_path).expanduser().resolve(strict=True)
+    except (OSError, RuntimeError):
+        return None
+    if root == dataset or _is_relative_to(root, dataset):
+        log.warning("Transcript cache directory %s is inside dataset %s; cache disabled", root, dataset)
+        return None
+    return root
+
+
+@dataclass(frozen=True)
+class _AteraEntryAddress:
+    path: Path
+    digest: str
+    family_digest: str
+
+
+def _atera_address(
+    index: Any,
+    cache_root: str | Path | None,
+    directory: str,
+    kind: str,
+    options: Mapping[str, Any],
+) -> _AteraEntryAddress | None:
+    root = _atera_cache_root(index, cache_root)
+    if root is None:
+        return None
+    identity = atera_points_identity(index)
+    if identity is None:
+        return None
+    family = {
+        "kind": kind,
+        "dataset_path": identity["dataset_path"],
+        "points_key": identity["points_key"],
+        "options": dict(options),
+    }
+    digest = _digest({**family, "points": identity})
+    return _AteraEntryAddress(
+        path=root / directory / digest,
+        digest=digest,
+        family_digest=_digest(family),
+    )
+
+
+def _write_atera_entry(
+    address: _AteraEntryAddress,
+    manifest: dict[str, Any],
+    arrays: Mapping[str, np.ndarray],
+    cancel_check: Callable[[], bool] | None,
+) -> Path | None:
+    final = address.path
+    temp: Path | None = None
+    stale: Path | None = None
+    try:
+        final.parent.mkdir(parents=True, exist_ok=True)
+        temp = Path(tempfile.mkdtemp(prefix=".writing-", dir=final.parent))
+        names: dict[str, str] = {}
+        for key, value in arrays.items():
+            _cancelled(cancel_check)
+            name = f"{key}.npy"
+            _write_npy(temp / name, np.asarray(value), cancel_check=cancel_check)
+            names[key] = name
+        payload = {
+            **manifest,
+            "digest": address.digest,
+            "family_digest": address.family_digest,
+            "arrays": names,
+        }
+        data = _canonical_json(payload)
+        if len(data) > _MAX_MANIFEST_BYTES:
+            raise ValueError("Atera cache manifest exceeds its safe size limit")
+        (temp / _MANIFEST).write_bytes(data)
+        _cancelled(cancel_check)
+        if final.exists():
+            stale = final.parent / f".stale-{uuid4().hex}"
+            try:
+                os.replace(final, stale)
+            except FileNotFoundError:
+                stale = None
+        os.replace(temp, final)
+        temp = None
+        if stale is not None:
+            shutil.rmtree(stale, ignore_errors=True)
+        # Drop older source versions of the same family (same store, points
+        # and options); other families and every v1 entry are left alone.
+        for sibling in final.parent.iterdir():
+            if sibling == final or not sibling.is_dir() or sibling.name.startswith("."):
+                continue
+            try:
+                raw = _read_manifest(sibling)
+            except Exception:
+                continue
+            if (
+                str(raw.get("kind", "")) == str(manifest.get("kind"))
+                and str(raw.get("family_digest", "")) == address.family_digest
+            ):
+                shutil.rmtree(sibling, ignore_errors=True)
+        return final
+    except TranscriptBuildCancelled:
+        raise
+    except Exception as exc:
+        log.warning("Could not save Atera cache %s: %s", final, exc)
+        return None
+    finally:
+        if temp is not None and temp.exists():
+            shutil.rmtree(temp, ignore_errors=True)
+
+
+def _read_atera_entry(
+    address: _AteraEntryAddress | None,
+    kind: str,
+    version: int,
+) -> tuple[Path, dict[str, Any]] | None:
+    if address is None or not address.path.is_dir():
+        return None
+    try:
+        raw = _read_manifest(address.path)
+    except Exception as exc:
+        log.warning("Ignoring invalid Atera cache entry %s: %s", address.path, exc)
+        return None
+    if (
+        str(raw.get("kind", "")) != kind
+        or int(raw.get("version", -1)) != version
+        or str(raw.get("digest", "")) != address.digest
+        or str(raw.get("family_digest", "")) != address.family_digest
+        or not isinstance(raw.get("arrays"), dict)
+    ):
+        return None
+    return address.path, raw
+
+
+def _code_map_arrays(code_map: Any, prefix: str = "") -> dict[str, np.ndarray]:
+    return {
+        f"{prefix}{name}": np.asarray(getattr(code_map, name), dtype=dtype)
+        for name, dtype in _CODE_MAP_ARRAYS
+    }
+
+
+def _restore_code_map(entry: Path, names: Mapping[str, Any], index: Any, prefix: str = "") -> Any:
+    from .atera_transcripts import CodeRangeMap
+
+    values = {}
+    for name, dtype in _CODE_MAP_ARRAYS:
+        values[name] = _load_array(entry, str(names[f"{prefix}{name}"]), ndim=1, dtype=dtype)
+    code_map = CodeRangeMap(**values)
+    if not code_map.validate(index):
+        raise ValueError("cached code-range map does not fit the points index")
+    return code_map
+
+
+def _code_map_address(index: Any, cache_root: str | Path | None) -> _AteraEntryAddress | None:
+    return _atera_address(index, cache_root, _ATERA_CODE_MAP_DIR, ATERA_CODE_MAP_CACHE_KIND, {})
+
+
+def save_atera_code_map(
+    index: Any,
+    code_map: Any,
+    cache_root: str | Path | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> Path | None:
+    """Persist a :class:`CodeRangeMap` as a small sidecar keyed by the points identity."""
+    if code_map is None or not code_map.validate(index):
+        return None
+    address = _code_map_address(index, cache_root)
+    if address is None:
+        return None
+    manifest = {
+        "kind": ATERA_CODE_MAP_CACHE_KIND,
+        "version": ATERA_CODE_MAP_CACHE_VERSION,
+        "points_key": str(index.points_key),
+        "n_codes": int(code_map.n_codes),
+        "vocabulary_digest": _digest(list(index.vocabulary)),
+    }
+    return _write_atera_entry(address, manifest, _code_map_arrays(code_map), cancel_check)
+
+
+def load_atera_code_map(index: Any, cache_root: str | Path | None = None) -> Any:
+    """Restore the code-range map sidecar for ``index``, or ``None``."""
+    found = _read_atera_entry(
+        _code_map_address(index, cache_root), ATERA_CODE_MAP_CACHE_KIND, ATERA_CODE_MAP_CACHE_VERSION
+    )
+    if found is None:
+        return None
+    entry, raw = found
+    try:
+        if str(raw.get("vocabulary_digest", "")) != _digest(list(index.vocabulary)):
+            return None
+        return _restore_code_map(entry, raw["arrays"], index)
+    except Exception as exc:
+        log.warning("Ignoring invalid Atera code-range map %s: %s", entry, exc)
+        return None
+
+
+def _cell_tile_arrays(cell_tiles: Any, prefix: str = "") -> dict[str, np.ndarray]:
+    return {
+        f"{prefix}{name}": np.asarray(getattr(cell_tiles, name), dtype=dtype)
+        for name, dtype in _CELL_TILE_ARRAYS
+    }
+
+
+def _restore_cell_tiles(
+    entry: Path, names: Mapping[str, Any], raw: Mapping[str, Any], index: Any, prefix: str = ""
+) -> Any:
+    from .atera_transcripts import CellTileMap
+
+    values = {
+        name: np.array(_load_array(entry, str(names[f"{prefix}{name}"]), ndim=1, dtype=dtype))
+        for name, dtype in _CELL_TILE_ARRAYS
+    }
+    cell_tiles = CellTileMap(
+        tiles=tuple(str(t) for t in raw.get(f"{prefix}tiles", ())),
+        fingerprint={str(k): int(v) for k, v in dict(raw.get(f"{prefix}fingerprint") or {}).items()},
+        **values,
+    )
+    if not cell_tiles.validate(index):
+        raise ValueError("cached cell -> tile map does not fit the points index")
+    return cell_tiles
+
+
+def _cell_tiles_address(index: Any, cache_root: str | Path | None) -> _AteraEntryAddress | None:
+    return _atera_address(index, cache_root, _ATERA_CELL_TILES_DIR, ATERA_CELL_TILES_CACHE_KIND, {})
+
+
+def save_atera_cell_tiles(
+    index: Any,
+    cell_tiles: Any,
+    cache_root: str | Path | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> Path | None:
+    """Persist a :class:`CellTileMap` as a small sidecar keyed by the points identity."""
+    if cell_tiles is None or not cell_tiles.validate(index):
+        return None
+    address = _cell_tiles_address(index, cache_root)
+    if address is None:
+        return None
+    manifest = {
+        "kind": ATERA_CELL_TILES_CACHE_KIND,
+        "version": ATERA_CELL_TILES_CACHE_VERSION,
+        "points_key": str(index.points_key),
+        "tiles": [str(t) for t in cell_tiles.tiles],
+        "fingerprint": {str(k): int(v) for k, v in dict(cell_tiles.fingerprint).items()},
+    }
+    return _write_atera_entry(address, manifest, _cell_tile_arrays(cell_tiles), cancel_check)
+
+
+def load_atera_cell_tiles(index: Any, cache_root: str | Path | None = None) -> Any:
+    """Restore the cell -> tile map sidecar for ``index``, or ``None``."""
+    found = _read_atera_entry(
+        _cell_tiles_address(index, cache_root), ATERA_CELL_TILES_CACHE_KIND, ATERA_CELL_TILES_CACHE_VERSION
+    )
+    if found is None:
+        return None
+    entry, raw = found
+    try:
+        return _restore_cell_tiles(entry, raw["arrays"], raw, index)
+    except Exception as exc:
+        log.warning("Ignoring invalid Atera cell -> tile map %s: %s", entry, exc)
+        return None
+
+
+def _overview_options(bin_um: float, sample_size: int, sample_seed: int, split_assigned: bool) -> dict[str, Any]:
+    return {
+        "bin_um": float(bin_um),
+        "sample_size": int(max(0, sample_size)),
+        "sample_seed": int(sample_seed),
+        "split_assigned": bool(split_assigned),
+    }
+
+
+def atera_overview_cache_path(
+    index: Any,
+    *,
+    bin_um: float,
+    sample_size: int = 0,
+    sample_seed: int = 0,
+    split_assigned: bool = False,
+    cache_root: str | Path | None = None,
+) -> Path | None:
+    """Where the overview entry for these options would live (``None``: no cache)."""
+    address = _atera_address(
+        index, cache_root, _ATERA_OVERVIEW_DIR, ATERA_OVERVIEW_CACHE_KIND,
+        _overview_options(bin_um, sample_size, sample_seed, split_assigned),
+    )
+    return None if address is None else address.path
+
+
+def save_atera_overview(
+    index: Any,
+    overview: Any,
+    cache_root: str | Path | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> Path | None:
+    """Persist an :class:`AteraOverview` (and its code-range map) externally."""
+    split = overview.assigned_density_counts is not None
+    address = _atera_address(
+        index, cache_root, _ATERA_OVERVIEW_DIR, ATERA_OVERVIEW_CACHE_KIND,
+        _overview_options(overview.bin_um, overview.sample_size, overview.sample_seed, split),
+    )
+    if address is None:
+        return None
+    if tuple(overview.vocabulary) != tuple(index.vocabulary):
+        log.warning("Not caching an Atera overview built from another vocabulary")
+        return None
+    arrays: dict[str, np.ndarray] = {
+        "counts": np.asarray(overview.counts, dtype=np.int64),
+        "assigned_counts": np.asarray(overview.assigned_counts, dtype=np.int64),
+        "is_control": np.asarray(overview.is_control, dtype=bool),
+        "density": np.asarray(overview.density_counts, dtype=np.uint32),
+    }
+    if split:
+        arrays["assigned_density"] = np.asarray(overview.assigned_density_counts, dtype=np.uint32)
+    if overview.code_map is not None:
+        arrays.update(_code_map_arrays(overview.code_map, prefix="code_map_"))
+    if overview.sample is not None:
+        for key, value in overview.sample.items():
+            arrays[f"sample_{key}"] = np.asarray(value)
+    cell_tiles = getattr(overview, "cell_tiles", None)
+    if cell_tiles is not None and not cell_tiles.validate(index):
+        cell_tiles = None
+    if cell_tiles is not None:
+        arrays.update(_cell_tile_arrays(cell_tiles, prefix="cell_tiles_"))
+    manifest = {
+        "kind": ATERA_OVERVIEW_CACHE_KIND,
+        "version": ATERA_OVERVIEW_CACHE_VERSION,
+        "points_key": str(index.points_key),
+        "vocabulary": [str(v) for v in overview.vocabulary],
+        "bin_um": float(overview.bin_um),
+        "origin_um": [float(v) for v in overview.origin_um],
+        "shape": [int(v) for v in overview.density_counts.shape],
+        "total_rows": int(overview.total_rows),
+        "fingerprint": {str(k): int(v) for k, v in dict(overview.fingerprint).items()},
+        "sample_size": int(overview.sample_size),
+        "sample_seed": int(overview.sample_seed),
+        "sample_keys": None if overview.sample is None else sorted(str(k) for k in overview.sample),
+        "has_code_map": overview.code_map is not None,
+        "is_gene_flags_used": bool(overview.is_gene_flags_used),
+        "has_cell_tiles": cell_tiles is not None,
+    }
+    if cell_tiles is not None:
+        manifest["cell_tiles_tiles"] = [str(t) for t in cell_tiles.tiles]
+        manifest["cell_tiles_fingerprint"] = {str(k): int(v) for k, v in dict(cell_tiles.fingerprint).items()}
+    path = _write_atera_entry(address, manifest, arrays, cancel_check)
+    if path is not None and overview.code_map is not None:
+        save_atera_code_map(index, overview.code_map, cache_root=cache_root, cancel_check=cancel_check)
+    if path is not None and cell_tiles is not None:
+        save_atera_cell_tiles(index, cell_tiles, cache_root=cache_root, cancel_check=cancel_check)
+    return path
+
+
+def load_atera_overview(
+    index: Any,
+    *,
+    bin_um: float,
+    sample_size: int = 0,
+    sample_seed: int = 0,
+    split_assigned: bool = False,
+    cache_root: str | Path | None = None,
+) -> Any:
+    """Restore a valid :class:`AteraOverview` for ``index`` and options, or ``None``."""
+    from .atera_transcripts import AteraOverview
+
+    address = _atera_address(
+        index, cache_root, _ATERA_OVERVIEW_DIR, ATERA_OVERVIEW_CACHE_KIND,
+        _overview_options(bin_um, sample_size, sample_seed, split_assigned),
+    )
+    found = _read_atera_entry(address, ATERA_OVERVIEW_CACHE_KIND, ATERA_OVERVIEW_CACHE_VERSION)
+    if found is None:
+        return None
+    entry, raw = found
+    try:
+        names = raw["arrays"]
+        vocabulary = tuple(str(v) for v in raw.get("vocabulary", ()))
+        if vocabulary != tuple(index.vocabulary):
+            raise ValueError("vocabulary differs from the points index")
+        n_codes = len(vocabulary)
+        counts = np.array(_load_array(entry, names["counts"], ndim=1, dtype=np.int64))
+        assigned = np.array(_load_array(entry, names["assigned_counts"], ndim=1, dtype=np.int64))
+        is_control = np.array(_load_array(entry, names["is_control"], ndim=1, dtype=bool))
+        density = np.array(_load_array(entry, names["density"], ndim=2, dtype=np.uint32))
+        if not (len(counts) == len(assigned) == len(is_control) == n_codes):
+            raise ValueError("per-feature arrays do not match the vocabulary")
+        if list(density.shape) != [int(v) for v in raw.get("shape", ())]:
+            raise ValueError("density shape does not match the manifest")
+        total_rows = int(raw.get("total_rows", -1))
+        if total_rows != int(index.n_rows) or int(counts.sum()) > total_rows:
+            raise ValueError("cached counts do not match the points")
+        if np.any(assigned > counts) or int(density.sum(dtype=np.int64)) > int(counts.sum()):
+            raise ValueError("cached counts are inconsistent")
+        assigned_density = None
+        if split_assigned:
+            assigned_density = np.array(_load_array(entry, names["assigned_density"], ndim=2, dtype=np.uint32))
+            if assigned_density.shape != density.shape:
+                raise ValueError("assigned density shape differs")
+        code_map = None
+        if raw.get("has_code_map"):
+            code_map = _restore_code_map(entry, names, index, prefix="code_map_")
+        cell_tiles = None
+        if raw.get("has_cell_tiles"):
+            try:
+                cell_tiles = _restore_cell_tiles(entry, names, raw, index, prefix="cell_tiles_")
+            except Exception as exc:  # optional: per-cell reads fall back to boxes
+                log.warning("Ignoring the cell -> tile map of %s: %s", entry, exc)
+        sample = None
+        keys = raw.get("sample_keys")
+        if keys is not None:
+            sample = {str(k): np.array(_load_array(entry, names[f"sample_{k}"], ndim=1)) for k in keys}
+            lengths = {len(v) for v in sample.values()}
+            if len(lengths) > 1 or (lengths and next(iter(lengths)) > int(sample_size)):
+                raise ValueError("invalid cached sample")
+        origin = raw.get("origin_um")
+        return AteraOverview(
+            vocabulary=vocabulary,
+            counts=counts,
+            assigned_counts=assigned,
+            is_control=is_control,
+            density_counts=density,
+            origin_um=(float(origin[0]), float(origin[1])),
+            bin_um=float(raw["bin_um"]),
+            total_rows=total_rows,
+            fingerprint={str(k): int(v) for k, v in dict(raw.get("fingerprint") or {}).items()},
+            code_map=code_map,
+            assigned_density_counts=assigned_density,
+            sample=sample,
+            sample_size=int(raw.get("sample_size", 0)),
+            sample_seed=int(raw.get("sample_seed", 0)),
+            is_gene_flags_used=bool(raw.get("is_gene_flags_used", False)),
+            cell_tiles=cell_tiles,
+        )
+    except Exception as exc:
+        log.warning("Ignoring invalid Atera overview cache entry %s: %s", entry, exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Atera whole-slide hash sample ("full" transcript mode)
+# ---------------------------------------------------------------------------
+#
+# One entry per points identity (``atera-sample-v1``): the LARGEST sample
+# saved so far.  Samples nest (every row whose sample key is below the
+# threshold), so any smaller budget is served by filtering this entry on its
+# ``key`` column, and a save never replaces a larger cached sample with a
+# smaller one.
+
+ATERA_SAMPLE_CACHE_KIND = "atera_sample"
+ATERA_SAMPLE_CACHE_VERSION = 1
+_ATERA_SAMPLE_DIR = f"atera-sample-v{ATERA_SAMPLE_CACHE_VERSION}"
+#: Larger samples are not cached (18 B/row: 400M rows is about 7 GB on disk).
+ATERA_SAMPLE_CACHE_MAX_ROWS = 400_000_000
+_SAMPLE_COLUMNS = ("x", "y", "code", "cell_id", "key")
+
+
+def _sample_address(index: Any, cache_root: str | Path | None) -> _AteraEntryAddress | None:
+    return _atera_address(index, cache_root, _ATERA_SAMPLE_DIR, ATERA_SAMPLE_CACHE_KIND, {})
+
+
+def _cached_sample_manifest(index: Any, cache_root: str | Path | None) -> tuple[Path, dict[str, Any]] | None:
+    found = _read_atera_entry(_sample_address(index, cache_root), ATERA_SAMPLE_CACHE_KIND, ATERA_SAMPLE_CACHE_VERSION)
+    if found is None:
+        return None
+    entry, raw = found
+    if int(raw.get("total_rows", -1)) != int(index.n_rows):
+        return None
+    if str(raw.get("vocabulary_digest", "")) != _digest(list(index.vocabulary)):
+        return None
+    return entry, raw
+
+
+def cached_atera_sample_threshold(index: Any, cache_root: str | Path | None = None) -> int | None:
+    """Threshold of the cached sample for ``index`` (``None`` when none is cached)."""
+    found = _cached_sample_manifest(index, cache_root)
+    return None if found is None else int(found[1].get("threshold", -1))
+
+
+def save_atera_sample(
+    index: Any,
+    sample: Any,
+    cache_root: str | Path | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+    *,
+    max_rows: int | None = None,
+) -> Path | None:
+    """Persist a :class:`SampledTranscripts` unless a larger one is already cached."""
+    limit = ATERA_SAMPLE_CACHE_MAX_ROWS if max_rows is None else int(max_rows)
+    if sample is None or int(sample.n) > limit:
+        return None
+    if int(sample.total_rows) != int(index.n_rows):
+        return None
+    existing = cached_atera_sample_threshold(index, cache_root)
+    if existing is not None and existing >= int(sample.threshold):
+        return None
+    address = _sample_address(index, cache_root)
+    if address is None:
+        return None
+    manifest = {
+        "kind": ATERA_SAMPLE_CACHE_KIND,
+        "version": ATERA_SAMPLE_CACHE_VERSION,
+        "points_key": str(index.points_key),
+        "threshold": int(sample.threshold),
+        "rows": int(sample.n),
+        "total_rows": int(sample.total_rows),
+        "vocabulary_digest": _digest(list(index.vocabulary)),
+    }
+    arrays = {name: getattr(sample, name) for name in _SAMPLE_COLUMNS}
+    return _write_atera_entry(address, manifest, arrays, cancel_check)
+
+
+def load_atera_sample(
+    index: Any,
+    threshold: int,
+    cache_root: str | Path | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+    progress: Callable[[int, int], None] | None = None,
+) -> Any:
+    """The cached sample filtered to ``threshold``, or ``None`` if it cannot serve it.
+
+    The columns are copied out of their memory maps in chunks, reporting
+    ``progress(bytes_done, bytes_total)`` as they go (a cold page cache makes
+    this a multi-second disk read at the AUTO budget).
+    """
+    from .atera_transcripts import SAMPLE_KEY_SPACE, SampledTranscripts
+
+    found = _cached_sample_manifest(index, cache_root)
+    if found is None:
+        return None
+    entry, raw = found
+    cached = int(raw.get("threshold", -1))
+    threshold = int(threshold)
+    if cached < threshold:
+        return None
+    try:
+        names = raw["arrays"]
+        rows = int(raw.get("rows", -1))
+        dtypes = {
+            "x": np.float32, "y": np.float32, "code": index.code_dtype,
+            "cell_id": index.assignment_dtype, "key": np.uint32,
+        }
+        mapped = {name: _load_array(entry, str(names[name]), ndim=1, dtype=dtypes[name]) for name in _SAMPLE_COLUMNS}
+        if any(len(array) != rows for array in mapped.values()):
+            raise ValueError("cached sample columns differ in length")
+        keep = None
+        if threshold < cached and threshold < SAMPLE_KEY_SPACE:
+            parts = []
+            step = _chunk_rows(mapped["key"])
+            for start in range(0, rows, step):
+                _cancelled(cancel_check)
+                parts.append(np.flatnonzero(np.asarray(mapped["key"][start : start + step]) < np.uint32(threshold)) + start)
+            keep = np.concatenate(parts) if parts else np.zeros(0, dtype=np.int64)
+        columns: dict[str, np.ndarray] = {}
+        out_rows = rows if keep is None else int(len(keep))
+        total_bytes = sum(out_rows * int(array.dtype.itemsize) for array in mapped.values())
+        done_bytes = 0
+        if progress is not None:
+            progress(0, total_bytes)
+        for name, array in mapped.items():
+            _cancelled(cancel_check)
+            out = np.empty(out_rows, dtype=array.dtype)
+            step = _chunk_rows(array)
+            for start in range(0, out_rows, step):
+                _cancelled(cancel_check)
+                stop = min(out_rows, start + step)
+                out[start:stop] = array[start:stop] if keep is None else array[keep[start:stop]]
+                done_bytes += (stop - start) * int(array.dtype.itemsize)
+                if progress is not None:
+                    progress(done_bytes, total_bytes)
+            columns[name] = out
+        return SampledTranscripts(threshold=min(threshold, cached), total_rows=int(index.n_rows), **columns)
+    except TranscriptBuildCancelled:
+        raise
+    except Exception as exc:
+        log.warning("Ignoring invalid Atera sample cache entry %s: %s", entry, exc)
+        return None

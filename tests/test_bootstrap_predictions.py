@@ -205,3 +205,52 @@ def test_incomplete_optional_raw_table_does_not_hide_clustered_annotations(tmp_p
     zarr.open_group(path, mode="a")["tables"].create_group("table_original")
     labels = load_cell_type_assignments(path, "original")
     assert labels.cell_ids.tolist() == ids[:2].tolist()
+
+
+@pytest.mark.parametrize("source", ["original", "cellpose", "proseg"])
+def test_native_atera_inspector_retains_selected_type_and_saved_candidates(tmp_path, source):
+    """The native Atera inspector and bootstrap explorer share one cell payload."""
+    from types import SimpleNamespace
+    from qtpy.QtWidgets import QApplication
+    from napari_compare_xenium_merscope import viewer as V
+    from napari_compare_xenium_merscope.cell_umap import load_cell_umap
+    from napari_compare_xenium_merscope.utils import cell_type_source
+
+    app = QApplication.instance() or QApplication([])
+    path, ids = _store(tmp_path)
+    _add_raw_spatial_cells(path)
+    table_key = cell_type_source(source).clustering_tables[0]
+    if source != "original":
+        (path / "tables" / "table_original_clustering_squidpy").rename(path / "tables" / table_key)
+        (path / "tables" / "table_original").rename(
+            path / "tables" / table_key.removesuffix("_clustering_squidpy")
+        )
+    assignments = load_cell_type_assignments(path, source)
+    embedding = load_cell_umap(path, source)
+    assert assignments.cell_ids.tolist() == [*ids[:2].tolist(), 9223372036854775821]
+    assert embedding.cell_ids.tolist() == ids.tolist()
+    ctrl = V.ComparisonViewerController(SimpleNamespace(layers=[]), {}, SimpleNamespace())
+    ctrl.active_dataset = "ATERA"
+    state = ctrl._cell_type_state("ATERA")
+    state.segmentation = source
+    state.kind = "ct_seaad_subclass_raw"
+    ctrl._cache_cell_type_data(state, source, assignments)
+    annotation = ctrl._cell_type_annotation_for_cell("ATERA", int(ids[0]))
+    assert annotation["selected_cell_type"] == "Type <A>"
+    assert len(annotation["bootstrap_predictions"][0]["candidates"]) == 5
+    text = V._cell_summary_html({
+        **annotation, "total_label": "Gene transcripts", "total": 120,
+        "control_total": 3, "control_features": 2,
+        "transcript_note": "Table counts while exact transcripts load",
+    })
+    assert "Gene transcripts:</b> 120" in text
+    assert "Control features:</b> 3 (2 features)" in text
+    assert "Table counts while exact transcripts load" in text
+    assert "Type &lt;A&gt;" in text
+    assert "not biological probability" in text
+    # The inspector still explains predictions hidden by the display cutoff.
+    state.min_bootstrap = 0.9
+    assert assignments.labels_for(state.kind, state.min_bootstrap).tolist() == [None, "Type B", None]
+    after = ctrl._cell_type_annotation_for_cell("ATERA", int(ids[0]))
+    assert after["bootstrap_predictions"] == annotation["bootstrap_predictions"]
+    assert app is not None

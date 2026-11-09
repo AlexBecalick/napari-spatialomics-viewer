@@ -43,6 +43,8 @@ for package_name in (
     "xarray",
     "zarr",
     "numcodecs",
+    # Atera transcripts are read directly with pyarrow.parquet (lazy engine).
+    "pyarrow",
 ):
     package_datas, package_binaries, package_hiddenimports = collect_all(
         package_name,

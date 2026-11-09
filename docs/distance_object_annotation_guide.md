@@ -5,6 +5,10 @@ MerXen's `distance_from_object` stage. Use these tools for discrete objects such
 as amyloid plaques or tau tangles after the image/cell registration has already
 been applied.
 
+The object tools work on MERSCOPE and Xenium datasets. They are disabled for
+Atera stores, and their tooltips say why: the MerXen `distance_from_object`
+export is defined only for MERSCOPE and Xenium.
+
 ## Draw and export
 
 1. Activate the MERSCOPE or Xenium dataset whose coordinate frame you want to
