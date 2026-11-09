@@ -361,8 +361,8 @@ def test_manual_registration_tab_is_appended_last(qapp):
 
     sentinel = QWidget()
     panel = _panel([], registration_widget=sentinel)
-    assert panel._tab_stack.count() == 10
-    assert [panel._tab_group.button(i).text() for i in range(10)] == [
+    assert panel._tab_stack.count() == 11
+    assert [panel._tab_group.button(i).text() for i in range(11)] == [
         "Gene inspector",
         "Cell segmentation",
         "Cell type labels",
@@ -371,15 +371,16 @@ def test_manual_registration_tab_is_appended_last(qapp):
         "Images",
         "Dataset loader",
         "UMAP",
+        "Cell groups",
         "Zarr metadata",
         "Manual registration",
     ]
     assert panel._tab_stack.currentIndex() == 6
-    assert panel._tab_stack.widget(9).isAncestorOf(sentinel)
+    assert panel._tab_stack.widget(10).isAncestorOf(sentinel)
     assert not sentinel.isEnabled()
     panel.select_registration_tab()
-    assert panel._tab_stack.currentIndex() == 9
-    assert panel._tab_group.button(9).isChecked()
+    assert panel._tab_stack.currentIndex() == 10
+    assert panel._tab_group.button(10).isChecked()
     assert _panel(["MERSCOPE"], initial_dataset="MERSCOPE")._tab_stack.currentIndex() == 0
 
 
