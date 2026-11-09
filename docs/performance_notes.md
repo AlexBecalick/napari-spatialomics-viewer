@@ -119,6 +119,19 @@ at 8 GiB; inactive sessions are evicted first.
   image/segmentation viewport slicing.
 - `--gl-core-profile` (experimental): request an OpenGL 4.1 core context instead
   of the macOS default legacy 2.1 context; see below.
+- `--gene-max-render-points INT`: per platform. MERSCOPE/Xenium: cap on the
+  points rendered (default 40,000,000; 0 = no cap). Atera: the whole-slide
+  sample budget; unset = AUTO (half the RAM over 200 B per point, about
+  172M on a 64 GB Mac), 0 = every transcript. The memory guard clamps any
+  Atera budget to 85% of RAM, and a MemoryError halves it.
+- `--atera-transcript-mode {full,lazy}` (default `full`): `full` streams every
+  file into a nested whole-slide sample; `lazy` shows a 5 um density image and
+  loads only the ticked genes.
+- `--atera-viewport-max-points INT` (default 20,000,000): cap on the
+  transcripts streamed for the visible field at full density.
+- `--atera-overview-max-points INT` (default 40,000,000; 0 = off): the most
+  points the All-transcript overview draws in `full` mode, a nested
+  sub-sample of the loaded sample. Ticked genes keep the whole sample.
 
 ## Environment / GPU
 
@@ -162,3 +175,417 @@ for a larger stress run:
 python scripts/benchmark_transcript_store.py --points 1000000
 python scripts/benchmark_transcript_store.py --points 10000000 --render-cap 2000000
 ```
+
+## Atera at a glance
+
+Atera (10x whole-transcriptome) stores are about 100 times larger than a
+Xenium or MERSCOPE section: 1.41e9 transcripts, 18,049 genes and 6,628
+control features. The Xenium/MERSCOPE code paths do not scale to that, so
+Atera has its own lazy paths. Before and after, on the real store (warm
+cache, 64 GB / 16-core M4 Max):
+
+| Step | Before (Xenium/MERSCOPE path) | Atera path |
+| --- | --- | --- |
+| Gene panel populate, 24,699 rows | 224.5 s (one widget per row) | about 0.035 s (virtualised model, selection mode) |
+| Transcript load | about 20 min of eager build, then a crash: numpy's hypergeometric sampler refuses totals of 1e9 or more | `full` 15-19 s cold, 1.8-6.6 s warm (40M-200M sample, headless); `lazy` 5.1 s to a usable viewer |
+| One gene at full resolution | 3.41 s (`pyarrow.dataset` filter) | 0.09 s with the code-range map, 0.20 s before it exists |
+| Cell click | two dask passes of about 15 s each, and a whole-store cell index of about 6.4 GB | table counts in 0.2-0.4 s, exact rows in about 0.8 s, no index |
+
+The budgets and caps are constants and flags:
+
+- Point budget (`--gene-max-render-points`): AUTO is half the RAM over 200 B
+  per point. A memory guard clamps any budget to 85% of RAM.
+- Viewport cap (`--atera-viewport-max-points`, default 20M): the most
+  transcripts streamed for the visible field at full density.
+- All-genes cap (`--atera-overview-max-points`, default 40M): the most points
+  the All-transcript overview draws in `full` mode.
+- Gene panel: selection mode with at most 32 ticked genes. It applies to
+  Atera and to any panel above 2,000 features.
+- Cell inspector: at most 24 pie slices, 200 gene rows and 2,000 links per
+  cell (Atera cells only).
+- Lazy-mode gene LRU: 1 GiB.
+
+The sections below give the measurements behind each row.
+
+## Atera lazy transcript engine
+
+Atera stores hold about 1.4e9 transcripts in ~400 per-tile parquet files, cut
+by gene within each tile and sorted by feature code. They are never loaded as
+one table. `atera_transcripts.py` (pure numpy/pyarrow, no Qt) validates
+MerXen's `merxen_atera_points_index.json` against the parquet footers. It then
+serves batched gene reads (each row group is read once per call), whole-tile
+and window reads, and a one-pass overview: exact per-feature totals and
+assigned counts, a 5 um density raster over real genes, and the exact
+code-range map (`code -> (row group, row_start, row_end)`).
+
+The overview and the code-range map are cached outside the store, under
+`atera-overview-v1/` and `atera-codemap-v1/` in the transcript cache
+directory. They are keyed by the index JSON content and by each file's size
+and mtime. ctime is not part of the key, because MerXen's hardlink churn
+changes it. Until a code-range map exists, gene reads prune row groups with
+the `feature_name` string statistics, which over-read because control probes
+sort among the gene names.
+
+Measured on the real store: 409 files, 1,409,601,228 rows, 24,677-entry
+shared dictionary. Warm OS page cache, 16-core Mac, pyarrow 24, 4-thread
+pool, `use_threads=False` per read.
+
+| Operation | Time | Notes |
+| --- | --- | --- |
+| Index load and validation | 0.20 s | footers plus one dictionary batch per file |
+| Code-range map build | 1.4 s | 599,029 runs (about 6 MB) |
+| GFAP, string statistics | 0.20 s | 61 row groups, 41.8M rows decoded, 1.24M kept |
+| GFAP, code-range map | 0.09 s | 32 row groups, 27.9M decoded |
+| 24 random genes, code-range map | 1.5 s | 477 distinct row groups, 456M decoded |
+| Largest tile (2,1) | 0.5 s | 87.2M rows |
+| 1 mm2 window | 0.36 s | 70M decoded, 20M kept |
+| Overview pass (5 um bins) | 8.5-9.4 s | 2610 x 1810 raster, about 1.2 GB peak RSS |
+| Overview cache save / load | 0.17 s / 0.32 s | load includes index validation |
+
+With `use_threads=True` on each read, the overview pass takes 6.8 s; with an
+8-thread pool it takes 5.9 s. Both are left off, so lazy reads stay bounded
+next to the viewer's image and label loaders.
+
+Cold-cache timings were taken without `sudo purge`. For each operation the
+points parquet (24.1 GB) was copied with `ditto --nocache` to a fresh scratch
+directory on the same internal SSD. `mincore` confirmed that only 0.007 GB of
+the copy was resident before each run. Each run is a new process: it loads the
+index, then does one operation. The gene reads use a code-range map built on
+another cold copy. The "Read" column is how much of the copy was resident
+afterwards, so it is about what the operation read from disk.
+
+| Operation (cold) | Time | Read | Warm |
+| --- | --- | --- | --- |
+| Index load and validation | 0.50-1.02 s | footers | 0.20 s |
+| Code-range map build | 1.56 s | 0.27 GB | 1.4 s |
+| GFAP, string statistics | 0.24 s | 0.45 GB | 0.20 s |
+| GFAP, code-range map | 0.12 s | 0.32 GB | 0.09 s |
+| 24 random genes, code-range map | 1.67 s | 3.9 GB | 1.5 s |
+| Largest tile (2,1) | 0.47 s | 0.86 GB | 0.5 s |
+| 1 mm2 window | 0.39 s | 0.70 GB | 0.36 s |
+| Overview pass (5 um bins) | 8.8 s | 9.9 GB | 8.5-9.4 s |
+
+On this internal NVMe SSD, about 1.1 GB/s or more, the passes are bound by
+decoding rather than I/O. A cold first open costs only the index footers,
+about 0.5-0.8 s more than a warm one. A store on a slower external or network
+drive will be I/O bound: the overview reads about 10 GB, so at 100-200 MB/s
+it would take about 1-2 minutes. That is why the overview runs in a
+background worker and is cached outside the store.
+
+## Atera transcripts in the viewer (M7)
+
+An Atera store opens in one of two transcript modes; both are set from the
+CLI and from the Gene inspector (Mode, Point budget and All-genes cap, applied
+by Reload; Viewport cap, applied at once).
+
+`full` (default) streams every parquet file once, in a background worker on
+the engine's 4-thread pool, and keeps a deterministic hash sample: every row
+whose splitmix64 key of (file, row) is below `budget / total`. Samples nest
+(a smaller budget is a subset of a larger one) and a budget at or above the
+store total keeps every row. The sample becomes an ordinary
+`GenePointStore` (vectorised build, uint16 radix sort), so every
+gene-inspector feature works as for Xenium/MERSCOPE. The same pass yields the
+overview and code-range map. The sample is cached under `atera-sample-v1/`
+(the largest one per store, 18 B/row, up to 400M rows); a smaller budget
+filters it by key without touching the store. While the budget leaves rows
+out, a persistent `Genes | viewport` layer tops the visible field up to full
+density with exactly the rows the sample skipped (ticked genes, or every
+real gene under the All-transcript overview). It reads a window 50% larger
+than the view, only when the density raster estimates at most the viewport
+cap, single-flight and latest-wins.
+
+`lazy` shows the 5 um density image of every real gene, loads ticked genes at
+full resolution with one batched `read_genes` per debounce window, and uses the
+viewport layer for the other genes under the overview.
+
+Measured on the real store (1,409,601,228 rows; 64 GB / 16-core M4 Max; warm
+OS page cache; napari 0.7.0 in a visible 1500x950 window, images skipped,
+cell outlines loaded). "Cold" is a transcript-cache miss: the whole store is
+streamed. "Warm" is a cache hit (the cached sample is at least as large).
+Pan times are the median and p90 of 30 synchronous repaints while the camera
+moves by 2% of the view.
+
+Headless load (engine pass, sample and `GenePointStore`, no layers):
+
+| Budget | Points | Cold | Warm | Peak RSS cold / warm |
+| --- | --- | --- | --- | --- |
+| 40M | 40.0M | 15.3 s | 1.8 s | 5.0 / 3.3 GB |
+| 100M | 100.0M | 15.1 s | 3.3 s | 8.7 / 6.3 GB |
+| 200M | 200.0M | 19.0 s | 6.6 s | 14.6 / 11.6 GB |
+| AUTO | 171.8M | 17.4 s | 5.6 s | 12.2 / 10.1 GB |
+
+In the viewer (load = process start to layers ready, including napari start-up
+and the cell outlines; one run per budget):
+
+| Budget | Load | RSS loaded | Peak RSS | Pan, nothing ticked | Tick a gene | Pan, 3 genes | All-transcript overview on | Pan, overview | 250 um field at full density | Pan in that field |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 40M (warm) | 10.2 s | 8.9 GB | 14.8 GB | 8 / 9 ms | 0.8-1.0 s | 9 / 18 ms | 13.1 s | 94 / 212 ms | 2.9 s, 7.3M points | 45 / 129 ms |
+| 100M (warm) | 15.5 s | 17.7 GB | 23.7 GB | 8 / 8 ms | 1.4-3.1 s | 19 / 26 ms | 28.2 s | 244 / 394 ms | 3.0 s, 6.9M points | 185 / 307 ms |
+| 200M (cold) | 34.8 s | 14.6 GB | 21.8 GB | 8 / 11 ms | 1.5-6.0 s | 20 / 32 ms | 38.1 s | 954 / 1131 ms | 4.0 s, 6.4M points | 184 / 566 ms |
+| AUTO 171.8M (warm) | 25.2 s | 27.3 GB | 35.1 GB | 8 / 9 ms | 1.5-4.4 s | 21 / 35 ms | 29.5 s | 921 / 1209 ms | 3.9 s, 6.6M points | 313 / 492 ms |
+| lazy | 5.1 s | 1.9 GB | 9.6 GB | 4 / 13 ms | async: 0.04 s to tick, 0.6 s to read and group 3 genes (7.5M points) | 40 / 50 ms | 2.5 s | 20 / 26 ms | 2.7 s, 7.5M points | 13 / 30 ms |
+
+RSS readings on macOS move with memory compression, so the RSS columns are
+indicative only. Between the 40M and AUTO runs the loaded RSS grows by about
+140 B per point (store and napari layers); the vertex buffer adds about 56 B
+per shown point. That is where the AUTO formula's 200 B per point comes from.
+Every transcript (1.41B points, about 280 GB) does not fit on this machine,
+and the memory guard clamps it to about 292M.
+
+What this means in practice:
+- Ticked genes stay fluid at every budget (about 10-35 ms per frame), and
+  toggling a gene costs about 1-6 s at 100-200M because its symbol group's
+  colours are re-uploaded.
+- The All-transcript overview draws every loaded point. It pans at about
+  10 fps at 40M, 4 fps at 100M and about 1 fps at AUTO; turning it on
+  uploads every point (13-38 s). For a fluid all-gene view, dial the budget
+  back to about 40M, or use lazy mode, where the overview is the density image.
+- Creating the layers for a large sample runs on the Qt thread: about 10-15 s
+  at AUTO, during which the window does not respond. The read, sample and
+  store build stay in the background. This, and the 1 fps All-transcript
+  overview at AUTO, are open against the M7 acceptance ("nothing blocks image
+  or mask loads", "a pan storm stays responsive"). M10 caps the
+  All-transcript overview at a nested 40M sub-sample (next section); the
+  per-group, progress-reporting layer creation is still queued.
+- A MemoryError while creating the layers (not only while sampling) tears the
+  partial layers down and reloads at half the budget, saying so in the
+  status bar.
+- Lazy mode keeps the rows of genes read at full resolution in a 1 GiB LRU
+  (about 14-22 B per row). Only ticked genes are napari points: unticking a
+  gene removes its points from the layers, a re-tick restores them from the
+  LRU without a read, and the LRU is dropped when the inspector is torn down.
+- The viewport needs about 0.5 s to read a 500 um window and about 2 s to
+  swap 7M points into its layer, with one vispy upload. Pans inside the
+  padded window reuse its rows.
+
+Not measured: a store on a slower or external drive (the cold pass is about
+10 GB of reads), and GPUs other than this Apple M4 Max.
+
+## All-genes display cap (M10)
+
+The point budget decides how many transcripts are loaded; the all-genes cap
+decides how many of them the All-transcript overview draws. With the cap
+below the loaded sample, the worker moves the sample's rows whose splitmix key
+is below `cap / total` to the front before the point store is built (about
+1 s at AUTO, no store read). The store's stable sort keeps them at the head of
+every gene's foreground and background runs, and `GenePointStore.overview_offsets`
+records where they end. A gene the overview alone shows draws those prefixes;
+a ticked gene draws its whole run. So the overview is a nested sub-sample of
+the loaded sample (a smaller cap is a subset of a larger one), and ticked
+genes keep the whole budget. Changing the cap re-sorts from the cached sample
+on Reload. When zoomed in, the viewport layer reads from the cap threshold
+for the overview genes, so the field still reaches full density, and it
+drops the rows ticked genes already draw. With the budget at or below the
+cap nothing changes, and Xenium/MERSCOPE stores never carry offsets.
+
+Re-measured at AUTO in the same visible 1500x848 window as the M7 table
+(warm transcript cache, images skipped, cell outlines loaded; two runs, the
+second in brackets):
+
+| AUTO 171.8M | Before (M7, no cap) | 40M all-genes cap |
+| --- | --- | --- |
+| Load to layers ready | 25.2 s | 25.2 s (25.2 s) |
+| Points the overview draws | 171.8M | 40.0M |
+| All-transcript overview on | 29.5 s | 8.5 s (9.4 s) |
+| Pan, overview on (median / p90) | 921 / 1209 ms | 96 / 216 ms (113 / 188 ms) |
+| Pan, 3 genes ticked | 21 / 35 ms | 20 / 29 ms (20 / 32 ms) |
+| 250 um field at full density | 3.9 s, 6.6M points | 2.9 s, 7.4M points |
+| Pan in that field | 313 / 492 ms | 51 / 129 ms (52 / 131 ms) |
+| All-transcript overview off | 3.8 s | 1.7 s |
+| Peak RSS | 35.1 GB | 33.9 GB (33.7 GB) |
+
+The overview now pans at about 9-10 fps at AUTO, as the 40M budget did in
+M7, while ticked genes still come from the 171.8M sample. Turning it on still
+costs about 9 s: napari recomputes the `shown` mask and slices over all
+171.8M points of the layers, not just the 40M drawn. The 250 um field holds
+more viewport points than before because the viewport now also supplies the
+overview genes' rows between the cap and the budget.
+
+The Atera controls in the Gene inspector are a form: Mode, Point budget,
+All-genes cap and Viewport cap each have a label column entry and a growing
+field, the Reload button has its own full-width row, and a one- or two-line
+summary sits under it (the AUTO derivation is in its tooltip; clamp and
+out-of-memory notes stay visible). The mode items are short ("Whole-slide
+sample", "Lazy (density)") with the long descriptions as item tooltips, and
+the spin boxes show "Auto" / "Off" / "40.0 M" instead of long special texts.
+At 240 px the Mode combo moves under its label rather than clip. The Gene
+inspector tab now scrolls vertically like the other tabs, so a short window
+no longer squashes its rows on top of each other (in the 848 px window it did,
+for every platform).
+
+## Atera cell inspector (M8)
+
+A cell click on an Atera store never builds a whole-store transcript index
+(about 6.4 GB) and never runs a dask scan. It paints in two phases:
+
+1. One row of `tables/table_original/X`, read through `indptr` (the var names
+   and the `instance_id -> row` lookup are cached per table). These are gene
+   transcripts: `X` holds no control features.
+2. The cell's exact assigned transcripts. Each of the cell's files is read
+   in two steps. First only `original_assignment` is decoded and the matching
+   rows are found. Then `x`, `y` and `feature_name` are read for just the row
+   groups with hits, and only those rows are kept. The image statistics and
+   the stored annotation arrive with this phase. Control features are counted
+   separately from the genes.
+
+The read covers only the tiles holding the cell's transcripts, so the first
+question was whether cells span tiles. Measured over all 409 files:
+
+- 91,429 cells have assigned transcripts.
+- 907 of them (about 1%) have them in more than one tile, at most 4.
+- Choosing tiles by the cell's bounding box would still have found all of
+  them (0 misses), because tile boxes are tile-wide.
+
+To be safe, the overview pass builds an exact cell -> tile map
+(`CellTileMap`). It is cached inside the overview entry and as a
+`atera-celltiles-v1/` sidecar. An overview cached before M8 gets the map once,
+from an assignment-only pass: 3.2 s warm, then 0.03 s from the sidecar.
+Collecting the ids adds about 1.5-2 s to a warm overview pass (8.2 s
+without, 9.7-10.3 s with). A read that cannot be exact returns nothing, and
+the inspector keeps the table counts with a note. That happens when the index
+is not validated, or when a file's size or mtime changed since the engine
+opened.
+
+Real store, warm unless noted:
+
+| Step | Cell 1001 | Others |
+| --- | --- | --- |
+| Table row | 17,199 transcripts, 5,940 genes; 37 ms for the first call (lookup build), then 8-10 ms | 7-10 ms |
+| Exact read | 17,202 rows (3 controls), 22 files, 85 row groups, 0.30-0.35 s | 0.26-0.35 s |
+| Exact read, cold | 0.38 s (1.3 GB of files copied with `ditto --nocache`) | cell 45000: 0.32 s |
+| Real viewer, click to table paint | 0.40 s (0.30 s of it is the first overlay build) | cell 177: 0.18 s |
+| Real viewer, click to exact rows | 0.85 s | 0.77 s |
+
+Cell 177 straddles two tiles.
+
+Presentation is capped at WTA scale. Below the caps the output is unchanged:
+
+- The pie shows the top 10 genes plus one neutral "Other" slice labelled
+  with its share. Beside it, a ranked legend lists the same 10 genes as
+  horizontal bars, each with its glyph in the gene layer's colour, its count
+  and its share, and then "Other (k genes)". Slices narrower than 8 degrees
+  have no glyph. (M10(d). Cell 1001 has 5,940 genes, and "Other" is 96.3% of
+  its 17,199 gene transcripts.)
+- The gene list shows 200 rows plus an "N more genes" footer.
+- Each cell draws at most 2,000 transcript links, evenly spaced and
+  deterministic. The summary says when links are capped.
+- The stored per-cell means are labelled "Atera cell: <id>". MERSCOPE and
+  Xenium keep "Cellpose cell: <id>". When the exact read fails before any
+  means arrive, the summary says "image statistics could not be computed",
+  not "no image channels loaded".
+
+Not in this effort: vendor Azimuth as a second cell-type/UMAP source
+(`vendor_azimuth_*`, `X_umap_vendor`). Also not done: reusing the viewport's
+rows for a cell inside it, because the sample drops cell ids and the per-cell
+read is already about 0.3 s.
+
+## Vectorised eager transcript build (M4, Xenium/MERSCOPE)
+
+`build_gene_point_groups` (the eager two-pass build Xenium and MERSCOPE use;
+Atera never does) no longer runs Python per transcript:
+
+- Gene and cell-id columns are factorised once per partition (categorical
+  codes, or `pd.factorize` on columns where equal values always convert
+  alike). `astype("string")` and `normalize_cell_key` run on the distinct
+  values only and reach the rows through small lookup tables. Mixed object
+  columns (such as `1` next to `True`) fall back to converting row by row.
+  Floats are factorised on their bit patterns, so `0.0` and `-0.0` stay apart.
+- Pass 1 uses `np.bincount` over the codes. Pass 2 maps codes to global codes
+  through lookup tables and scatters the cell index with one stable argsort per
+  partition.
+- The status column and the assignment mask are evaluated per distinct value.
+- The next dask partition is read on one helper thread while the current one is
+  processed (`_POINT_PARTITION_READ_AHEAD = 1`, so at most two partitions are
+  held). Cancellation is checked before each partition.
+- The sampler replays the historical sequential hypergeometric draws whenever
+  numpy accepts every one of them, which needs each `ngood` and `nbad` below
+  1e9. So the output is unchanged even for totals of 1e9 and more. Only when
+  `total - first partition` reaches 1e9 (where numpy raised before) does it
+  draw global positions once with `sample_global_positions` and split them
+  across the partitions.
+- `CellTranscriptIndex.transcripts_for` reuses one object array of gene names.
+
+The outputs are bit-identical to the previous implementation. A frozen copy of
+it lives in `tests/_frozen_gene_point_groups.py`, and
+`tests/test_gene_point_build_equivalence.py` compares every store field, dtype,
+dict order and cell slice across:
+
+- gene dtypes: object, string, pyarrow, arrow dictionary, categorical, int,
+  float and mixed;
+- assignment dtypes: uint32, negative int64, float with NaN/inf/2**60,
+  strings with blank, NA and alias spellings, 19-digit strings, uint64 up to
+  2**64-1, nullable UInt64/Int64 with NA, categorical, pyarrow int and mixed;
+- render sampling and multi-partition dask frames with read-ahead depths of 0
+  to 3.
+
+Measured on this Mac (both passes, warm):
+
+| input | before | after |
+|---|---|---|
+| synthetic 3.7M rows, 500 categorical genes, no cell index | 1.62 s | 0.23 s |
+| the same with 200k string cell ids, cell index, 1M cap | 7.2 s | 1.25 s |
+| P7513 Xenium, 2 partitions (8.4M rows, UInt64 ids, cell index) | 10.8 s | 1.8 s |
+| P7513 MERSCOPE, 2 partitions (14.7M rows, cell index) | 18.2 s | 2.8 s |
+
+The P7513 rows include the dask/zarr reads. The real-store outputs matched the
+frozen build exactly, both uncapped and with a 500k cap.
+
+The `original_assignment` instance-key fallback in
+`_resolve_points_columns_for` applies only to a platform spec with
+`assignment_instance_key_fallback` (Atera). Canonical MerXen Xenium/MERSCOPE
+points that carry only `original_assignment` keep `assignment_col=None`, so
+their cache identity is unchanged. `build_cell_index` is also off for every
+lazy platform.
+
+## Determinate progress and chunked layer creation (M10b)
+
+The shared progress bar is determinate whenever a stage reports counts, and
+busy otherwise. Counts come from the Atera streaming pass (files), the Atera
+sample-cache restore (bytes), the Atera lazy gene reads and wide viewport reads
+(files), the Xenium/MERSCOPE eager build and the paired build (partition reads
+over both passes), multi-segmentation mask loads and multi-image pyramid builds.
+Workers report through a thread-safe reporter that keeps values monotonic and
+forwards at most about 10 updates per second. When several stages report at
+once, the bar stays with the first stage that got a total until that stage
+ends; the other stages' counts appear in the label only, so the bar never jumps
+between stages with different totals. Stores (or Xenium+MERSCOPE pairs) of at
+least 5M points create their gene layers over Qt event-loop turns (QTimer
+chain, 15 ms apart): one turn builds a layer's arrays and napari layer without
+adding it, the next adds it (napari slices it, vispy uploads and draws it), and
+a final turn orders the layers and fills the Gene inspector. The bar reports
+`k/14 layers` (`k/28` for a pair). A chain stops only when its dataset's gene
+state is torn down or replaced, not when a dataset switch merely starts.
+
+Gene layers are `FastPoints` (`fast_points.py`), a napari `Points` subclass
+that removes two per-point costs napari pays far more often than the points
+change:
+
+* napari's vispy layer turns every point's symbol into a string on each data
+  update (`[str(x) for x in layer._view_symbol]`): about 3.5 s of the 4.4 s it
+  took to show an 11M-point layer. Gene layers use one symbol, so
+  `FastPoints` hands vispy one symbol, which vispy broadcasts.
+* napari clears a layer's extent after every asynchronous slice and the next
+  draw recomputes it as a min/max over all points (about 0.2 s per 13M-point
+  layer, 3 to 4 times per layer during a build). `FastPoints` caches the data
+  extent per data array and drops it whenever napari changes the points.
+
+Bar values sampled every 100 ms in the real viewer on this Mac. "Gap" is the
+longest interval between two 100 ms samples, so it is how long the Qt thread
+was blocked.
+
+| run | what the bar showed | layer creation | longest gap while the layers were created |
+|---|---|---|---|
+| Atera AUTO (171.8M), empty transcript cache (M10b, before FastPoints) | 1/409 to 409/409 files over 13 s, then busy while saving and grouping, then 0/14 to 13/14 layers | about 15 s | 2.5 s (formerly one freeze of about 15 s) |
+| Atera AUTO, warm cache (M10b) | 0 B to 2.9 GB restored, busy grouping (6 s), 0/14 to 13/14 layers | about 15 s | 2.4 s |
+| Atera AUTO, warm cache (now) | 0/14 to 14/14 layers | 7.8 s | 0.49 s (most turns 0.35 s) |
+| P7513 Xenium, empty transcript cache (M10b) | 1/4 to 4/4 partition reads, 1/14 to 13/14 layers | about 10 s | 1.6 s |
+| P7513 Xenium, empty transcript cache (now) | 1/4 to 4/4 partition reads, 0/14 to 14/14 layers | 4.3 s | 0.45 s |
+
+Each turn is still above 200 ms. A build turn takes 0.3 to 0.37 s at Atera
+AUTO (the arrays of a group of about 12M points, plus the extent), and an add
+turn takes about 0.13 s plus the repaint. Every repaint also draws the layers
+that are already shown, which is about 0.15 to 0.2 s with the 40M-point
+all-genes view on. Going lower would mean splitting one gene group across
+several napari layers. The longer Xenium gaps (1.7 s and 2.2 s) come earlier,
+while the dataset opens and its image layers are added, and they did not
+change.

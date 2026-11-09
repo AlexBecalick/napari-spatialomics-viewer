@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Utility helpers for the Xenium/MERSCOPE Napari comparison viewer."""
+"""Utility helpers for the Xenium/MERSCOPE/Atera Napari comparison viewer."""
 
 from __future__ import annotations
 
@@ -8,17 +8,28 @@ import json
 import logging
 import os
 import re
+import threading
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from hashlib import blake2s
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
 import zarr
 from shapely.geometry import GeometryCollection, LineString, MultiLineString, MultiPolygon, Point, Polygon, box, mapping, shape
 from shapely.ops import linemerge, polygonize, unary_union
+
+from .platforms import (
+    ATERA_ROOT_ATTR,
+    GENE_SELECTION_SLOT_CAP,
+    PIXEL_TRANSFORM_MERSCOPE_AFFINE,
+    PIXEL_TRANSFORM_SPEC_FILE,
+    find_platform_spec,
+    find_spec_path,
+    platform_spec,
+)
 
 try:
     from skimage.draw import polygon as draw_polygon
@@ -32,6 +43,10 @@ DERIVED_CACHE_ATTR = "napari_compare_derived_cache"
 CELLPOSE_SHAPE_KEY = "MOSAIK_cellpose"
 CELLPOSE_LABEL_KEY = "MOSAIK_cellpose_labels"
 CELLPOSE_QUANTIFICATION_TABLE_KEY = "table_MOSAIK_cellpose_image_quantification"
+#: zarr attribute marking a viewer label cache (or a MerXen vendor-label alias).
+LABEL_CACHE_ATTR = "napari_compare_label_cache"
+#: ``source`` of a MerXen-managed alias hardlinked to vendor label payloads.
+VENDOR_LABELS_SOURCE = "vendor_labels"
 CELLPOSE_VALUE_BINS = 256
 CELLPOSE_VALUE_CLIP_PERCENTILES = (1.0, 99.0)
 TRANSPARENT_RGBA = (0.0, 0.0, 0.0, 0.0)
@@ -243,8 +258,8 @@ def _read_zarr_string_list(array_like) -> list[str]:
     return [str(value) for value in values]
 
 
-def _cellpose_quantification_table(root):
-    return root[f"tables/{CELLPOSE_QUANTIFICATION_TABLE_KEY}"]
+def _cellpose_quantification_table(root, table_key: str | None = None):
+    return root[f"tables/{table_key or CELLPOSE_QUANTIFICATION_TABLE_KEY}"]
 
 
 def _cellpose_quantification_features_from_table(table) -> list[CellposeQuantificationFeature]:
@@ -278,19 +293,23 @@ def _cellpose_quantification_features_from_table(table) -> list[CellposeQuantifi
     ]
 
 
+_QUANTIFICATION_REQUIRED_PARTS = (
+    "obs/label_id",
+    "var/image_key",
+    "var/channel",
+    "var/statistic",
+    "X",
+)
+
+
 def cellpose_quantification_table_available(zarr_path: str | Path) -> bool:
     """Return whether the hard-coded Cellpose value-overlay inputs are present."""
     try:
         root = open_zarr_group_unconsolidated(zarr_path)
         table = _cellpose_quantification_table(root)
-        required = (
-            "obs/label_id",
-            "var/image_key",
-            "var/channel",
-            "var/statistic",
-            "X",
+        has_required_table_parts = all(
+            _zarr_path_exists(table, key) for key in _QUANTIFICATION_REQUIRED_PARTS
         )
-        has_required_table_parts = all(_zarr_path_exists(table, key) for key in required)
         has_region = _zarr_path_exists(root, f"labels/{CELLPOSE_LABEL_KEY}") or _zarr_path_exists(
             root,
             f"shapes/{CELLPOSE_SHAPE_KEY}",
@@ -300,10 +319,154 @@ def cellpose_quantification_table_available(zarr_path: str | Path) -> bool:
         return False
 
 
-def cellpose_quantification_features(zarr_path: str | Path) -> list[CellposeQuantificationFeature]:
-    """List available Cellpose image-statistic quantification columns."""
+@dataclass(frozen=True)
+class MaskQuantification:
+    """A per-cell image-statistics table and the mask it was measured on.
+
+    ``label_key`` is the label element whose pixel values are the table's
+    ``obs/label_id`` values. For a MerXen vendor-label store it is the managed
+    alias (``atera_cell_boundaries_labels``), never the vendor element named by
+    the table's ``mask_label_key``.
+    """
+
+    table_key: str
+    shape_key: str
+    label_key: str
+
+    @property
+    def is_cellpose(self) -> bool:
+        return self.table_key == CELLPOSE_QUANTIFICATION_TABLE_KEY
+
+    @property
+    def display_name(self) -> str:
+        """User-facing name: ``Cellpose`` or ``Per-cell image statistics (<mask>)``."""
+        if self.is_cellpose:
+            return "Cellpose"
+        return f"Per-cell image statistics ({self.shape_key})"
+
+
+CELLPOSE_MASK_QUANTIFICATION = MaskQuantification(
+    table_key=CELLPOSE_QUANTIFICATION_TABLE_KEY,
+    shape_key=CELLPOSE_SHAPE_KEY,
+    label_key=CELLPOSE_LABEL_KEY,
+)
+
+
+def _read_group_attributes(path: Path) -> dict:
+    """Attributes of a zarr v3 (``zarr.json``) or v2 (``.zattrs``) group, or ``{}``."""
+    for name, nested in (("zarr.json", True), (".zattrs", False)):
+        payload = _read_json_mapping(Path(path) / name)
+        if payload is None:
+            continue
+        attrs = payload.get("attributes") if nested else payload
+        if isinstance(attrs, dict):
+            return attrs
+    return {}
+
+
+def vendor_label_alias_markers(zarr_path: str | Path) -> dict[str, dict]:
+    """``{label_key: marker}`` for every label carrying a vendor-labels alias marker.
+
+    MerXen links vendor label rasters (for example Atera ``cell_labels``) into
+    ``<shape>_labels`` aliases and marks them with the viewer's label-cache
+    attribute plus ``source: vendor_labels``. Such aliases are hardlinked
+    payloads: the viewer must never delete, rewrite or re-mark them. Reads JSON
+    metadata only.
+    """
+    labels_dir = Path(zarr_path) / "labels"
+    out: dict[str, dict] = {}
+    try:
+        children = sorted(p for p in labels_dir.iterdir() if p.is_dir())
+    except OSError:
+        return out
+    for child in children:
+        if is_derived_cache_key(child.name):
+            continue
+        marker = _read_group_attributes(child).get(LABEL_CACHE_ATTR)
+        if isinstance(marker, dict) and marker.get("source") == VENDOR_LABELS_SOURCE:
+            out[child.name] = dict(marker)
+    return out
+
+
+def is_vendor_label_marker(marker: Any) -> bool:
+    """Whether a label-cache marker describes a MerXen-managed vendor-label alias."""
+    return isinstance(marker, Mapping) and marker.get("source") == VENDOR_LABELS_SOURCE
+
+
+def hidden_vendor_label_keys(markers: Mapping[str, Mapping]) -> set[str]:
+    """Vendor label elements already shown through a complete alias (hide them)."""
+    return {
+        str(marker["source_label_key"])
+        for key, marker in markers.items()
+        if marker.get("complete") and marker.get("source_label_key")
+        and str(marker.get("source_label_key")) != str(key)
+    }
+
+
+def _quantification_label_key(zarr_path: Path, shape_key: str) -> str:
+    """The label element whose pixels carry ``shape_key``'s instance ids.
+
+    A complete vendor-label alias marked for ``shape_key`` wins; otherwise the
+    viewer's own ``<shape>_labels`` name (rasterized on demand).
+    """
+    for key, marker in vendor_label_alias_markers(zarr_path).items():
+        if marker.get("complete") and marker.get("source_shape_key") == str(shape_key):
+            return key
+    return f"{shape_key}_labels"
+
+
+def discover_mask_quantification(zarr_path: str | Path | None) -> MaskQuantification | None:
+    """Find the per-cell image-statistics table of a store.
+
+    The MOSAIK Cellpose table is tried first (identical to
+    :func:`cellpose_quantification_table_available`). Otherwise the first table,
+    in key order, whose ``uns['mask_image_quantification']`` names a shape that
+    is present in the store and which has the label-id, var metadata and ``X``
+    parts. Only metadata is read.
+    """
+    if zarr_path is None:
+        return None
+    if cellpose_quantification_table_available(zarr_path):
+        return CELLPOSE_MASK_QUANTIFICATION
+    try:
+        root = open_zarr_group_unconsolidated(zarr_path)
+        if "tables" not in root:
+            return None
+        tables = root["tables"]
+        shapes = set(root["shapes"].group_keys()) if "shapes" in root else set()
+        from anndata.io import read_elem
+
+        for table_key in sorted(tables.group_keys()):
+            table = tables[table_key]
+            try:
+                if "uns" not in table or "mask_image_quantification" not in table["uns"]:
+                    continue
+                meta = read_elem(table["uns"]["mask_image_quantification"])
+            except Exception:
+                continue
+            shape_key = meta.get("shape_key") if isinstance(meta, Mapping) else None
+            if not isinstance(shape_key, str) or shape_key not in shapes:
+                continue
+            if not all(_zarr_path_exists(table, part) for part in _QUANTIFICATION_REQUIRED_PARTS):
+                continue
+            return MaskQuantification(
+                table_key=str(table_key),
+                shape_key=shape_key,
+                label_key=_quantification_label_key(Path(zarr_path), shape_key),
+            )
+    except Exception:
+        log.debug("Cannot discover a mask quantification table in %s", zarr_path, exc_info=True)
+    return None
+
+
+def cellpose_quantification_features(
+    zarr_path: str | Path, table_key: str | None = None
+) -> list[CellposeQuantificationFeature]:
+    """List the image-statistic quantification columns (Cellpose by default)."""
     root = open_zarr_group_unconsolidated(zarr_path)
-    return _cellpose_quantification_features_from_table(_cellpose_quantification_table(root))
+    return _cellpose_quantification_features_from_table(
+        _cellpose_quantification_table(root, table_key)
+    )
 
 
 def cellpose_quantification_channel_labels(
@@ -341,19 +504,23 @@ def resolve_cellpose_quantification_feature(
     zarr_path: str | Path,
     channel: str,
     statistic: str,
+    table_key: str | None = None,
 ) -> CellposeQuantificationFeature:
     """Resolve a channel (image-qualified when shared) and statistic."""
-    return _resolve_cellpose_feature(cellpose_quantification_features(zarr_path), channel, statistic)
+    return _resolve_cellpose_feature(
+        cellpose_quantification_features(zarr_path, table_key), channel, statistic
+    )
 
 
 def load_cellpose_quantification_values(
     zarr_path: str | Path,
     channel: str,
     statistic: str,
+    table_key: str | None = None,
 ) -> CellposeQuantificationValues:
-    """Load label ids and one selected Cellpose quantification column."""
+    """Load label ids and one selected quantification column (Cellpose by default)."""
     root = open_zarr_group_unconsolidated(zarr_path)
-    table = _cellpose_quantification_table(root)
+    table = _cellpose_quantification_table(root, table_key)
     feature = _resolve_cellpose_feature(
         _cellpose_quantification_features_from_table(table), channel, statistic
     )
@@ -366,6 +533,21 @@ def load_cellpose_quantification_values(
             f"{label_ids.shape[0]} labels vs {values.shape[0]} values."
         )
     return CellposeQuantificationValues(feature=feature, label_ids=label_ids, values=values)
+
+
+def cellpose_cell_mean_intensities(
+    zarr_path, label_id, table_key: str | None = None
+) -> list[tuple[str, float | None]]:
+    """Read only one quantification row, retaining image-qualified channel names."""
+    root = open_zarr_group_unconsolidated(zarr_path)
+    table = _cellpose_quantification_table(root, table_key)
+    features = _cellpose_quantification_features_from_table(table)
+    labels = cellpose_quantification_channel_labels(features)
+    matches = np.flatnonzero(np.asarray(table["obs/label_id"][:]).astype(str) == str(label_id))
+    row = np.asarray(table["X"][int(matches[0]), :]) if matches.size else None
+    return [(label, float(row[feature.column_index])
+             if row is not None and np.isfinite(row[feature.column_index]) else None)
+            for label, feature in zip(labels, features) if feature.statistic == "mean"]
 
 
 def cellpose_value_clip_range(
@@ -487,11 +669,17 @@ def pick_default_shape_key(shape_keys: Iterable[str]) -> str | None:
 _FRIENDLY_LAYER_TYPE_LABELS = {"labels": "Segmentation", "cell_types": "Cell types"}
 
 
+#: Display names for platform segmentation keys the generic shortening reads badly.
+_SEGMENTATION_DISPLAY_NAMES = {"atera_nucleus": "Nucleus"}
+
+
 def _pretty_segmentation_key(key: str) -> str:
     """Shorten a segmentation element key for display (MOSAIK_proseg -> Proseg)."""
     text = str(key)
     if text.endswith("_labels"):
         text = text[: -len("_labels")]
+    if text in _SEGMENTATION_DISPLAY_NAMES:
+        return _SEGMENTATION_DISPLAY_NAMES[text]
     if text.startswith("MOSAIK_"):
         text = text[len("MOSAIK_"):]
     text = text.replace("_", " ").strip()
@@ -502,11 +690,9 @@ def make_layer_name(dataset: str, layer_type: str, key: str, channel: str | None
     """Build a standardized layer name for this viewer."""
     if str(layer_type) == "image":
         label = str(channel if channel is not None else key)
-        if str(dataset).upper() == "XENIUM" and label == "DAPI":
-            label = {
-                "morphology_focus": "DAPI Xenium",
-                "post_xenium_if": "DAPI Post Xenium-IF",
-            }.get(str(key), label)
+        spec = find_platform_spec(dataset)
+        if spec is not None:
+            label = spec.channel_alias(str(key), label) or label
         return " | ".join(["Image", label])
     friendly = _FRIENDLY_LAYER_TYPE_LABELS.get(str(layer_type))
     if friendly is not None:
@@ -2019,12 +2205,152 @@ def _resolve_merscope_micron_to_mosaic(
     return None
 
 
+SPEC_FILE_PIXEL_SIZE_KEYS = ("pixel_size", "microns_per_pixel")
+
+
+def read_spec_file_pixel_size(path: str | Path, *, platform: str = "XENIUM") -> float | None:
+    """Return ``pixel_size`` (or ``microns_per_pixel``) in um from a JSON spec file.
+
+    Returns ``None`` (with a warning when the file exists) for a missing,
+    unreadable or implausible value.
+    """
+    path = Path(path)
+    if not path.is_file():
+        return None
+    try:
+        spec = json.loads(path.read_text())
+    except Exception as exc:
+        log.warning("[%s] Failed to parse spec file %s (%s)", platform, path, exc)
+        return None
+    if not isinstance(spec, dict):
+        log.warning("[%s] Spec file %s is not a JSON object", platform, path)
+        return None
+    for key in SPEC_FILE_PIXEL_SIZE_KEYS:
+        if key in spec:
+            value = _positive_float(spec[key])
+            if value is None:
+                log.warning("[%s] Spec file %s has an unusable %s=%r", platform, path, key, spec[key])
+                return None
+            return value
+    return None
+
+
+def _positive_float(value) -> float | None:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if np.isfinite(out) and out > 0 else None
+
+
+def _atera_root_attr_pixel_size(zarr_path: Path) -> float | None:
+    """``merxen_atera.experiment.pixel_size`` from the root attributes, if usable."""
+    root = _read_json_mapping(zarr_path / "zarr.json")
+    attrs = root.get("attributes") if isinstance(root, dict) else None
+    if not isinstance(attrs, dict):
+        attrs = _read_json_mapping(zarr_path / ".zattrs") or {}
+    atera = attrs.get(ATERA_ROOT_ATTR)
+    experiment = atera.get("experiment") if isinstance(atera, dict) else None
+    if not isinstance(experiment, dict):
+        return None
+    return _positive_float(experiment.get("pixel_size"))
+
+
+def _shapes_global_um_per_px(zarr_path: Path, shapes_key: str) -> float | None:
+    """1 / scale of ``shapes/<key>``'s isotropic ``global`` transform (metadata only)."""
+    attrs = _zarr_element_attributes(zarr_path, "shapes", shapes_key)
+    if attrs is None:
+        return None
+    try:
+        matrix = _global_xy_affine_from_ngff(
+            attrs.get("coordinateTransformations"), source=f"shapes/{shapes_key} in {zarr_path}"
+        )
+    except ValueError:
+        return None
+    if matrix is None:
+        return None
+    sx, sy = float(matrix[0, 0]), float(matrix[1, 1])
+    if abs(matrix[0, 1]) > 1e-9 or abs(matrix[1, 0]) > 1e-9 or sx <= 0 or sy <= 0:
+        return None
+    if abs(sx - sy) > 1e-6 * max(sx, sy):
+        return None
+    return _positive_float(1.0 / sx)
+
+
+def _resolve_spec_file_um_per_px(
+    ds: str,
+    spec_path: str | Path | None,
+    zarr_path: str | Path | None,
+) -> float:
+    spec = platform_spec(ds)
+    path = Path(spec_path) if spec_path else None
+    mpp = read_spec_file_pixel_size(path, platform=spec.name) if path is not None else None
+    if mpp is not None:
+        log.info("[%s] Pixel size %s um from %s", spec.name, mpp, path)
+        return mpp
+    if spec.name == "ATERA" and path is not None:
+        log.warning(
+            "[ATERA] Explicit spec file %s is %s; looking for the store's own sidecar.",
+            path,
+            "unreadable or has no usable pixel_size" if path.is_file() else "missing",
+        )
+    if spec.name == "ATERA" and zarr_path is not None:
+        found = find_spec_path(zarr_path, spec.name)
+        if found is not None and found != path:
+            mpp = read_spec_file_pixel_size(found, platform=spec.name)
+            if mpp is not None:
+                log.info("[%s] Pixel size %s um from %s", spec.name, mpp, found)
+                return mpp
+
+    if spec.name != "ATERA":
+        mpp = float(spec.fallback_um_per_px)
+        log.warning(
+            "[%s] Spec file missing/unreadable; using fallback pixel_size=%s um.",
+            spec.name,
+            mpp,
+        )
+        return mpp
+
+    # ATERA: never fall back silently to a hard-coded value.
+    if zarr_path is not None:
+        store = Path(zarr_path)
+        mpp = _atera_root_attr_pixel_size(store)
+        if mpp is not None:
+            log.warning(
+                "[ATERA] No experiment.spatial found; using pixel_size=%s um from the root "
+                "%s attributes of %s.",
+                mpp,
+                ATERA_ROOT_ATTR,
+                store,
+            )
+            return mpp
+        shapes_key = spec.original_cell_shape_key
+        mpp = _shapes_global_um_per_px(store, shapes_key) if shapes_key else None
+        if mpp is not None:
+            log.warning(
+                "[ATERA] No experiment.spatial or %s pixel_size found; using %s um/px from the "
+                "'global' scale of shapes/%s in %s.",
+                ATERA_ROOT_ATTR,
+                mpp,
+                shapes_key,
+                store,
+            )
+            return mpp
+    raise ValueError(
+        "ATERA pixel size unknown: no experiment.spatial sidecar, no "
+        f"{ATERA_ROOT_ATTR}.experiment.pixel_size attribute and no usable 'global' scale on "
+        f"shapes/{spec.original_cell_shape_key}"
+        + (f" in {zarr_path}" if zarr_path is not None else " (no store path given)")
+    )
+
+
 def resolve_dataset_mask_affine(
     dataset_name: str,
     merscope_transform_path: str | Path | None = None,
     xenium_spec_path: str | Path | None = None,
     *,
     zarr_path: str | Path | None = None,
+    spec_path: str | Path | None = None,
 ) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
     """Resolve pixel->micron affine transform for a dataset.
 
@@ -2033,10 +2359,20 @@ def resolve_dataset_mask_affine(
     transformation of ``shapes/merscope_cell_boundaries`` in ``zarr_path``;
     its inverse (translation included) is returned. Only when neither is usable
     does it fall back to a 0.108 um/px scale with no translation.
-    """
-    ds = str(dataset_name).upper()
 
-    if ds == "MERSCOPE":
+    For spec-file platforms (XENIUM, ATERA) the isotropic pixel size comes from
+    ``spec_path`` (``xenium_spec_path`` is a compatibility alias), reading
+    ``pixel_size`` or ``microns_per_pixel``. XENIUM falls back to 0.2125 um
+    with a warning. ATERA looks for its ``experiment.spatial`` sidecar in or
+    beside ``zarr_path``, then the root ``merxen_atera`` attributes, then the
+    ``global`` scale of ``shapes/atera_cell_boundaries`` (each with a warning),
+    and raises ``ValueError`` when none is available.
+    """
+    spec = find_platform_spec(dataset_name)
+    if spec is None:
+        raise ValueError(f"Unknown dataset: {dataset_name}")
+
+    if spec.pixel_transform == PIXEL_TRANSFORM_MERSCOPE_AFFINE:
         matrix = _resolve_merscope_micron_to_mosaic(merscope_transform_path, zarr_path)
         if matrix is not None:
             inv = np.linalg.inv(matrix)
@@ -2047,39 +2383,82 @@ def resolve_dataset_mask_affine(
         mpp = float(MERSCOPE_FALLBACK_UM_PER_PX)
         return (mpp, 0.0, 0.0), (0.0, mpp, 0.0)
 
-    if ds == "XENIUM":
-        mpp = None
-        path = Path(xenium_spec_path) if xenium_spec_path else None
-        if path is not None and path.exists():
-            try:
-                spec = json.loads(path.read_text())
-                if "pixel_size" in spec:
-                    mpp = float(spec["pixel_size"])
-            except Exception as exc:
-                log.warning("[XENIUM] Failed to parse spec file %s (%s)", path, exc)
-
-        if mpp is None:
-            mpp = 0.2125
-            log.warning(
-                "[XENIUM] Spec file missing/unreadable; using fallback pixel_size=%s um.",
-                mpp,
-            )
-
+    if spec.pixel_transform == PIXEL_TRANSFORM_SPEC_FILE:
+        path = spec_path if spec_path is not None else xenium_spec_path
+        mpp = _resolve_spec_file_um_per_px(spec.name, path, zarr_path)
         return (float(mpp), 0.0, 0.0), (0.0, float(mpp), 0.0)
 
     raise ValueError(f"Unknown dataset: {dataset_name}")
 
 
-def _iter_point_partitions(points_obj, cols: list[str]):
+#: Partitions read ahead of the one being processed by the eager build.
+_POINT_PARTITION_READ_AHEAD = 1
+
+
+def _iter_point_partitions(
+    points_obj,
+    cols: list[str],
+    *,
+    cancel_check: Callable[[], bool] | None = None,
+    read_ahead: int | None = None,
+    progress: Callable[[int, int], None] | None = None,
+):
+    """Yield the non-empty pandas partitions of ``points_obj[cols]`` in order.
+
+    ``progress(done, n_partitions)`` is called as each partition (empty ones
+    included) has been read, before it is handed out.
+
+    A dask frame's next ``read_ahead`` partitions are computed on one helper
+    thread while the caller processes the current one, so reading overlaps the
+    (vectorised) processing; at most ``read_ahead + 1`` partitions are held.
+    ``cancel_check`` is polled before each partition is handed out, and
+    closing the generator cancels the queued reads.
+    """
     work = points_obj[cols]
     if hasattr(work, "to_delayed"):
-        for part in work.to_delayed():
-            pdf = part.compute()
-            if len(pdf) > 0:
-                yield pdf
+        parts = list(work.to_delayed())
+        n_parts = len(parts)
+        depth = _POINT_PARTITION_READ_AHEAD if read_ahead is None else max(0, int(read_ahead))
+        if depth == 0 or len(parts) <= 1:
+            for index, part in enumerate(parts):
+                _check_transcript_cancelled(cancel_check)
+                pdf = part.compute()
+                if progress is not None:
+                    progress(index + 1, n_parts)
+                if len(pdf) > 0:
+                    yield pdf
+            return
+        from collections import deque
+        from concurrent.futures import ThreadPoolExecutor
+
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="points-read-ahead")
+        pending: deque = deque()
+        next_part = 0
+        handed = 0
+        try:
+            while next_part < len(parts) and len(pending) <= depth:
+                pending.append(executor.submit(parts[next_part].compute))
+                next_part += 1
+            while pending:
+                _check_transcript_cancelled(cancel_check)
+                pdf = pending.popleft().result()
+                if next_part < len(parts) and len(pending) < depth:
+                    pending.append(executor.submit(parts[next_part].compute))
+                    next_part += 1
+                handed += 1
+                if progress is not None:
+                    progress(handed, n_parts)
+                if len(pdf) > 0:
+                    yield pdf
+        finally:
+            for future in pending:
+                future.cancel()
+            executor.shutdown(wait=True, cancel_futures=True)
         return
 
     pdf = to_pandas(work)
+    if progress is not None:
+        progress(1, 1)
     if len(pdf) > 0:
         yield pdf
 
@@ -2155,6 +2534,85 @@ def is_control_gene(name: object) -> bool:
     return any(pattern in text for pattern in _CONTROL_GENE_PATTERNS)
 
 
+#: Atera transcript column flagging a real gene (False for control probes and
+#: codewords).  It is the authority for the control set when present; the name
+#: rule (:func:`is_control_gene`) is only cross-checked against it.
+IS_GENE_COLUMN = "is_gene"
+
+
+def accumulate_is_gene_flags(flags: dict[str, bool], names, is_gene) -> None:
+    """Fold one partition's ``(feature name, is_gene)`` rows into ``flags``.
+
+    A feature counts as a real gene only if every one of its rows says so, so a
+    feature with any ``is_gene == False`` row (or a missing flag) is a control.
+    """
+    names = np.asarray(names, dtype=object)
+    values = pd.Series(is_gene).astype("boolean").fillna(False).to_numpy(dtype=bool)
+    if names.size == 0:
+        return
+    keep = pd.notna(names)
+    names = names[keep].astype(str)
+    values = values[keep]
+    if names.size == 0:
+        return
+    unique, inverse = np.unique(names, return_inverse=True)
+    # A per-feature all(): one False row makes the feature a control.
+    gene_all = np.ones(len(unique), dtype=bool)
+    np.logical_and.at(gene_all, inverse, values)
+    for name, flag in zip(unique.tolist(), gene_all.tolist(), strict=True):
+        text = str(name)
+        flags[text] = bool(flags.get(text, True) and flag)
+
+
+def control_genes_from_is_gene(
+    names: Iterable[str],
+    is_gene_flags: Mapping[str, bool] | None,
+    *,
+    source: str = "",
+) -> set[str]:
+    """Return the control features of ``names``, preferring an ``is_gene`` flag.
+
+    With ``is_gene_flags`` (Atera points carry ``is_gene``) a feature is a control
+    exactly when it is flagged ``False``; a name the flags do not cover falls back
+    to :func:`is_control_gene`.  Every disagreement between the flag and the name
+    rule is logged once as a warning so a new control family, or a gene whose name
+    merely looks like a control, is visible rather than silently misfiled.
+    Without flags this is the name rule alone (Xenium/MERSCOPE behaviour).
+    """
+    names = [str(name) for name in names]
+    if not is_gene_flags:
+        return {name for name in names if is_control_gene(name)}
+    controls: set[str] = set()
+    flag_only: list[str] = []
+    name_only: list[str] = []
+    for name in names:
+        by_name = is_control_gene(name)
+        flag = is_gene_flags.get(name)
+        if flag is None:
+            if by_name:
+                controls.add(name)
+            continue
+        if not flag:
+            controls.add(name)
+            if not by_name:
+                flag_only.append(name)
+        elif by_name:
+            name_only.append(name)
+    if flag_only or name_only:
+        where = f" in {source}" if source else ""
+        log.warning(
+            "is_gene disagrees with the control-name rule%s: %d feature(s) flagged "
+            "is_gene=False with a gene-like name (treated as controls, e.g. %s); "
+            "%d flagged is_gene=True with a control-like name (treated as genes, e.g. %s)",
+            where,
+            len(flag_only),
+            sorted(flag_only)[:5],
+            len(name_only),
+            sorted(name_only)[:5],
+        )
+    return controls
+
+
 def _hex_to_rgba(value: str, alpha: float) -> tuple[float, float, float, float]:
     text = str(value).lstrip("#")
     r = int(text[0:2], 16) / 255.0
@@ -2213,6 +2671,71 @@ def assign_gene_visuals(
         symbol = GENE_MARKER_SYMBOLS[i % len(GENE_MARKER_SYMBOLS)]
         visuals[name] = GeneVisual(rgba=palette[i], symbol=symbol)
     return visuals
+
+
+class GeneSlotAllocator:
+    """Colour slots for the genes shown in selection mode.
+
+    Selection mode draws at most ``cap`` genes at once, each as a ``disc`` in
+    one of ``cap`` maximally distinct (glasbey) colours. A newly selected gene
+    takes the lowest free slot, so a freed colour is reused before a new one is
+    handed out and the palette never grows past ``cap``. ``allocate`` returns
+    ``None`` once every slot is taken; callers show a status instead.
+    """
+
+    SYMBOL = "disc"
+
+    def __init__(self, cap: int = GENE_SELECTION_SLOT_CAP, alpha: float = 1.0):
+        self.cap = max(1, int(cap))
+        self._palette = gene_palette_rgba(self.cap, alpha=alpha)
+        self._slot_of: dict[str, int] = {}
+
+    def __len__(self) -> int:
+        return len(self._slot_of)
+
+    def __contains__(self, gene: object) -> bool:
+        return str(gene) in self._slot_of
+
+    @property
+    def full(self) -> bool:
+        return len(self._slot_of) >= self.cap
+
+    @property
+    def genes(self) -> list[str]:
+        """Allocated genes in slot order."""
+        return sorted(self._slot_of, key=self._slot_of.__getitem__)
+
+    def slot_of(self, gene: object) -> int | None:
+        return self._slot_of.get(str(gene))
+
+    def allocate(self, gene: object) -> int | None:
+        """Give ``gene`` the lowest free slot (idempotent); ``None`` when full."""
+        gene = str(gene)
+        if gene in self._slot_of:
+            return self._slot_of[gene]
+        if self.full:
+            return None
+        used = set(self._slot_of.values())
+        slot = next(i for i in range(self.cap) if i not in used)
+        self._slot_of[gene] = slot
+        return slot
+
+    def release(self, gene: object) -> int | None:
+        """Free ``gene``'s slot and return it (``None`` if it had none)."""
+        return self._slot_of.pop(str(gene), None)
+
+    def clear(self) -> None:
+        self._slot_of.clear()
+
+    def slot_rgba(self, slot: int) -> tuple[float, float, float, float]:
+        return self._palette[int(slot) % self.cap]
+
+    def visual(self, gene: object) -> GeneVisual | None:
+        """The slot colour + disc for an allocated ``gene``, else ``None``."""
+        slot = self.slot_of(gene)
+        if slot is None:
+            return None
+        return GeneVisual(rgba=self.slot_rgba(slot), symbol=self.SYMBOL)
 
 
 # -- Cell-type marker reference ------------------------------------------------
@@ -2711,6 +3234,48 @@ def resolve_cell_type_marker_reference(
     )
 
 
+def _read_marker_table_parts(group) -> Any:
+    """Read only the marker-bearing parts of one AnnData zarr group.
+
+    Never reads ``X``, ``obsm`` or ``layers``: an Atera ``table_original`` holds
+    millions of cells by ~18k genes, so a full ``ad.read_zarr`` would load
+    gigabytes to look for a few hundred marker rows. ``uns`` contributes only
+    the marker entry, and ``obs`` / ``var`` are read only when their column order
+    lists ``broad_cell_type``. Returns an object with ``uns`` / ``obs`` / ``var``
+    (``None`` for parts not read), or ``None`` when the table has no marker data.
+    """
+    from types import SimpleNamespace
+
+    from anndata.io import read_elem
+
+    uns: dict[str, Any] = {}
+    try:
+        uns_group = group["uns"]
+    except KeyError:
+        uns_group = None
+    if uns_group is not None:
+        try:
+            marker = uns_group[CELL_TYPE_MARKER_UNS_KEY]
+        except KeyError:
+            marker = None
+        if marker is not None:
+            uns[CELL_TYPE_MARKER_UNS_KEY] = read_elem(marker)
+    frames: dict[str, Any] = {"obs": None, "var": None}
+    for name in frames:
+        try:
+            frame_group = group[name]
+        except KeyError:
+            continue
+        columns = frame_group.attrs.get("column-order", [])
+        if isinstance(columns, str):
+            columns = [columns]
+        if CELL_TYPE_BROAD_COL in list(columns):
+            frames[name] = read_elem(frame_group)
+    if not uns and frames["obs"] is None and frames["var"] is None:
+        return None
+    return SimpleNamespace(uns=uns, obs=frames["obs"], var=frames["var"])
+
+
 def _resolve_marker_table(source: Any):
     """Return the AnnData table carrying the marker reference, or ``None``."""
     if source is None:
@@ -2722,30 +3287,23 @@ def _resolve_marker_table(source: Any):
     # not present" warnings for otherwise valid stores.  Direct reads also let
     # us stop as soon as the small dedicated marker-reference table is found.
     if isinstance(source, (str, Path)):
-        import anndata as ad
-
         path = Path(source)
         root = open_zarr_group_unconsolidated(path)
         if "tables" not in root:
             return None
-        table_keys = list(root["tables"].group_keys())
+        tables_group = root["tables"]
+        table_keys = list(tables_group.group_keys())
         preferred = [CELL_TYPE_MARKER_UNS_KEY, "table"]
         ordered_keys = list(dict.fromkeys([*preferred, *table_keys]))
         for key in ordered_keys:
             if key not in table_keys:
                 continue
             try:
-                table = ad.read_zarr(str(path / "tables" / key))
+                table = _read_marker_table_parts(tables_group[key])
             except Exception as exc:
                 log.warning("Could not read marker candidate table %s in %s: %s", key, path, exc)
                 continue
-            uns = getattr(table, "uns", {})
-            obs = getattr(table, "obs", None)
-            var = getattr(table, "var", None)
-            has_uns = isinstance(uns, Mapping) and CELL_TYPE_MARKER_UNS_KEY in uns
-            has_obs = obs is not None and CELL_TYPE_BROAD_COL in getattr(obs, "columns", [])
-            has_var = var is not None and CELL_TYPE_BROAD_COL in getattr(var, "columns", [])
-            if has_uns or has_obs or has_var:
+            if table is not None:
                 return table
         return None
     tables = getattr(source, "tables", None)
@@ -2847,7 +3405,7 @@ CELL_TYPE_SOURCES: tuple[CellTypeSource, ...] = (
         key="original",
         label="Original segmentation",
         clustering_tables=("table_original_clustering_squidpy",),
-        mask_shape_keys=("merscope_cell_boundaries", "cell_boundaries"),
+        mask_shape_keys=("merscope_cell_boundaries", "cell_boundaries", "atera_cell_boundaries"),
     ),
     *(
         CellTypeSource(
@@ -3004,7 +3562,10 @@ def cell_type_shape_key_for_source(zarr_path: Any, source_key: str) -> str | Non
         metadata = analysis_source_metadata(zarr_path, source_key)
         return metadata["shape"] if metadata else None
     try:
-        shapes = open_zarr_group_unconsolidated(zarr_path)["shapes"]
+        root = open_zarr_group_unconsolidated(zarr_path)
+        shapes = root["shapes"]
+        # Exact candidates only: a merxen_schema fallback would resolve
+        # 'original' to xenium_cell_boundaries on MerXen-native Xenium stores.
         return next((key for key in source.mask_shape_keys if key in shapes), None)
     except Exception:
         return None
@@ -3344,6 +3905,10 @@ def cell_ids_as_int64(values: Iterable[Any]) -> tuple[np.ndarray, np.ndarray]:
     The historical name is retained for callers. Small ids use int64; unsigned
     ids above its maximum use uint64. A mixture of negative and large unsigned
     ids uses Python integers rather than overflowing either numpy dtype.
+
+    Cell-type and UMAP joins also preserve exact ids above ``2**63``;
+    regression fixtures exercise this separately from the lazy transcript
+    engine's assignment joins.
     """
     arr = np.asarray(values, dtype=object)
     parsed = [0] * len(arr)
@@ -3730,6 +4295,10 @@ class CellTranscriptIndex:
     gene_codes: np.ndarray
     gene_names: tuple[str, ...]
     slices: dict[str, tuple[int, int]]
+    #: ``gene_names`` as one object array, built on first use and reused by
+    #: every :meth:`transcripts_for` call (never serialised: the transcript
+    #: cache stores the fields above as ``.npy``).
+    _gene_name_array: np.ndarray | None = field(default=None, init=False, repr=False, compare=False)
 
     @classmethod
     def empty(cls) -> "CellTranscriptIndex":
@@ -3749,7 +4318,10 @@ class CellTranscriptIndex:
                 np.empty((0,), dtype=object),
             )
         start, end = span
-        names = np.asarray(self.gene_names, dtype=object)
+        names = self._gene_name_array
+        if names is None or len(names) != len(self.gene_names):
+            names = np.asarray(self.gene_names, dtype=object)
+            self._gene_name_array = names
         return self.coords_yx[start:end], names[self.gene_codes[start:end]]
 
 
@@ -3789,6 +4361,12 @@ class GenePointStore:
     #: passes as the renderer.  It is intentionally independent of render
     #: sampling so cell summaries remain exact when the point view is capped.
     cell_transcript_index: CellTranscriptIndex | None = None
+    #: Capped all-genes view (Atera): gene -> (fg_cap_end, bg_cap_end), group
+    #: relative.  Each of a gene's foreground and background runs starts with
+    #: the rows of a nested sub-sample, so the overview draws the prefixes
+    #: ``fg_start:fg_cap_end`` and ``fg_end:bg_cap_end``.  ``None``: the
+    #: overview draws whole runs (Xenium/MERSCOPE, or an uncapped sample).
+    overview_offsets: dict[str, tuple[int, int]] | None = None
 
     def gene_symbol(self, gene: str) -> str | None:
         entry = self.gene_offsets.get(str(gene))
@@ -3850,6 +4428,170 @@ def _check_transcript_cancelled(cancel_check: Callable[[], bool] | None) -> None
         raise TranscriptBuildCancelled("Transcript build cancelled")
 
 
+#: numpy's ``Generator.hypergeometric`` refuses ``ngood`` or ``nbad`` at or
+#: above this population size.
+_HYPERGEOMETRIC_LIMIT = 10**9
+
+
+def _exact_factorize(series: pd.Series) -> tuple[np.ndarray, pd.Series] | None:
+    """Dense codes for ``series`` whose uniques map exactly like its rows.
+
+    Returns ``(codes, uniques)``: ``codes`` is int64 with ``-1`` for missing
+    values and ``uniques`` is a Series of the column's own dtype, so any
+    elementwise conversion (``astype("string")``, :func:`normalize_cell_key`)
+    applied to ``uniques`` and gathered by ``codes`` equals that conversion
+    applied row by row.  That holds only where values that hash equal also
+    convert equal, so mixed object columns (``1`` vs ``True``), decimals and
+    other unusual dtypes return ``None`` and the caller converts per row.
+    Floats are factorised on their bit patterns, keeping ``0.0`` and ``-0.0``
+    apart.
+    """
+    dtype = series.dtype
+    if isinstance(dtype, pd.CategoricalDtype):
+        codes = series.cat.codes.to_numpy(dtype=np.int64)
+        return codes, pd.Series(dtype.categories)
+    if isinstance(dtype, np.dtype) and dtype.kind == "f":
+        values = series.to_numpy()
+        missing = np.isnan(values)
+        bits = values.view(np.int64 if values.dtype.itemsize == 8 else np.int32 if values.dtype.itemsize == 4 else np.int16)
+        codes = np.full(len(values), -1, dtype=np.int64)
+        present = np.flatnonzero(~missing)
+        if len(present):
+            sub_codes, first = _first_occurrence_codes(bits[present])
+            codes[present] = sub_codes
+            uniques = values[present[first]]
+        else:
+            uniques = values[:0]
+        return codes, pd.Series(uniques, dtype=dtype)
+    exact = (
+        isinstance(dtype, pd.StringDtype)
+        or (isinstance(dtype, np.dtype) and dtype.kind in "iub")
+        or (isinstance(dtype, pd.api.extensions.ExtensionDtype)
+            and getattr(dtype, "kind", "") in "iub" and not isinstance(dtype, np.dtype))
+    )
+    if not exact and isinstance(dtype, pd.ArrowDtype):
+        exact = pd.api.types.is_string_dtype(dtype) or pd.api.types.is_integer_dtype(dtype)
+    if not exact and dtype == object:
+        exact = pd.api.types.infer_dtype(series, skipna=True) in {"string", "integer", "empty"}
+    if not exact:
+        return None
+    codes, uniques = pd.factorize(series, use_na_sentinel=True)
+    return np.asarray(codes, dtype=np.int64), pd.Series(uniques, dtype=dtype)
+
+
+def _first_occurrence_codes(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Codes in first-occurrence order and each unique's first row."""
+    codes, uniques = pd.factorize(values)
+    first = np.full(len(uniques), len(values), dtype=np.int64)
+    np.minimum.at(first, codes, np.arange(len(values), dtype=np.int64))
+    return np.asarray(codes, dtype=np.int64), first
+
+
+@dataclass
+class _PartitionArrays:
+    """One partition's valid rows, with genes and cells as small local vocabularies."""
+
+    x: np.ndarray                    # float32, valid rows
+    y: np.ndarray                    # float32, valid rows
+    gene_codes: np.ndarray           # int64 into ``gene_vocab``
+    gene_vocab: np.ndarray           # sorted unique ``str`` gene names (numpy U)
+    background: np.ndarray           # bool, valid rows
+    #: int64 into ``cell_vocab`` for assigned rows with a non-empty key, else
+    #: -1; ``None`` without an assignment column.
+    cell_codes: np.ndarray | None
+    cell_vocab: np.ndarray | None    # object array of normalised cell keys
+
+
+def _sorted_string_vocab(series: pd.Series) -> tuple[np.ndarray, np.ndarray]:
+    """``(codes, vocab)``: rows coded into the sorted ``str`` names (-1 = NA).
+
+    ``vocab`` equals ``np.unique`` of ``series.astype("string")`` rows cast to
+    ``str``, without converting every row.
+    """
+    factorized = _exact_factorize(series)
+    if factorized is None:
+        raw_codes, uniques = pd.factorize(series.astype("string"), use_na_sentinel=True)
+        raw_codes = np.asarray(raw_codes, dtype=np.int64)
+        uniques = pd.Series(uniques, dtype="string")
+    else:
+        raw_codes, uniques = factorized
+    text = uniques.astype("string").to_numpy(dtype=object)
+    if len(text) == 0:
+        return raw_codes, np.zeros(0, dtype=str)
+    vocab, lut = np.unique(text.astype(str), return_inverse=True)
+    codes = np.where(raw_codes >= 0, lut.reshape(-1)[np.maximum(raw_codes, 0)], -1)
+    return codes.astype(np.int64, copy=False), vocab
+
+
+def _assignment_codes(series: pd.Series) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``(codes, vocab, assigned)`` for an assignment column.
+
+    ``assigned`` is :func:`assignment_mask` per row; ``codes`` index the
+    normalised cell keys ``vocab`` for assigned rows whose
+    :func:`normalize_cell_key` is non-empty, else -1.  Both are computed on the
+    column's distinct values.
+    """
+    numeric = pd.api.types.is_numeric_dtype(series)
+    factorized = _exact_factorize(series)
+    if factorized is None:
+        assigned = assignment_mask(series).to_numpy(dtype=bool, copy=False)
+        values = series.to_numpy(dtype=object)
+        keys = np.full(len(series), "", dtype=object)
+        positions = np.flatnonzero(assigned)
+        keys[positions] = [normalize_cell_key(value) for value in values[positions]]
+        raw_codes, uniques = pd.factorize(keys)
+        vocab = np.asarray(uniques, dtype=object)
+        codes = np.asarray(raw_codes, dtype=np.int64)
+        empty = np.flatnonzero(vocab == "")
+        if len(empty):
+            codes[codes == int(empty[0])] = -1
+        return codes, vocab, assigned
+    raw_codes, uniques = factorized
+    if numeric:
+        assigned_rows = assignment_mask(series).to_numpy(dtype=bool, copy=False)
+        assigned_unique = None
+    else:
+        as_str = uniques.astype("string")
+        bad_values = {"", "0", "-1", "nan", "None", "<NA>"}
+        assigned_unique = (as_str.notna() & ~as_str.isin(bad_values)).to_numpy(dtype=bool)
+        assigned_rows = None
+    unique_values = uniques.to_numpy(dtype=object)
+    keys = np.asarray([normalize_cell_key(value) for value in unique_values], dtype=object)
+    if len(keys):
+        key_codes, vocab = pd.factorize(keys)
+        key_codes = np.asarray(key_codes, dtype=np.int64)
+        vocab = np.asarray(vocab, dtype=object)
+        empty = np.flatnonzero(vocab == "")
+        if len(empty):
+            key_codes[key_codes == int(empty[0])] = -1
+        if assigned_unique is not None:
+            key_codes[~assigned_unique] = -1
+        codes = np.where(raw_codes >= 0, key_codes[np.maximum(raw_codes, 0)], -1)
+    else:
+        vocab = np.zeros(0, dtype=object)
+        codes = np.full(len(series), -1, dtype=np.int64)
+    if assigned_rows is not None:
+        codes = np.where(assigned_rows, codes, -1)
+    else:
+        assigned_rows = np.zeros(len(raw_codes), dtype=bool)
+        present = raw_codes >= 0
+        assigned_rows[present] = assigned_unique[raw_codes[present]]
+    return codes.astype(np.int64, copy=False), vocab, assigned_rows
+
+
+def _status_unassigned(series: pd.Series) -> np.ndarray:
+    """``series.astype("string").fillna("unknown") != "assigned"`` per row."""
+    factorized = _exact_factorize(series)
+    if factorized is None:
+        return (series.astype("string").fillna("unknown") != "assigned").to_numpy(dtype=bool)
+    codes, uniques = factorized
+    other = (uniques.astype("string").fillna("unknown") != "assigned").to_numpy(dtype=bool)
+    out = np.ones(len(codes), dtype=bool)  # missing -> "unknown" -> not assigned
+    present = codes >= 0
+    out[present] = other[codes[present]]
+    return out
+
+
 def _point_partition_arrays(
     pdf: pd.DataFrame,
     *,
@@ -3859,40 +4601,137 @@ def _point_partition_arrays(
     assignment_col: str | None,
     background_col: str | None,
     status_col: str | None = None,
-):
-    """Return compact valid arrays for one transcript partition."""
+    gene_coding: tuple[np.ndarray, np.ndarray] | None = None,
+) -> _PartitionArrays | None:
+    """Return compact valid arrays for one transcript partition.
+
+    Genes and cell ids are converted once per distinct value, never per row.
+    ``gene_coding`` reuses a ``_sorted_string_vocab`` of ``pdf[gene_col]``.
+    """
     x_all = pdf[x_col].to_numpy(dtype=np.float32, copy=False)
     y_all = pdf[y_col].to_numpy(dtype=np.float32, copy=False)
-    gene_all = pdf[gene_col].astype("string").to_numpy(dtype=object)
-    good = np.isfinite(x_all) & np.isfinite(y_all) & pd.notna(gene_all)
+    gene_codes_all, gene_vocab = (
+        gene_coding if gene_coding is not None else _sorted_string_vocab(pdf[gene_col])
+    )
+    good = np.isfinite(x_all) & np.isfinite(y_all) & (gene_codes_all >= 0)
     if not np.any(good):
         return None
 
+    has_assignment = assignment_col is not None and assignment_col in pdf.columns
+    cell_codes_all = cell_vocab = assigned_all = None
+    if has_assignment:
+        cell_codes_all, cell_vocab, assigned_all = _assignment_codes(pdf[assignment_col])
+
     if background_col is not None and background_col in pdf.columns:
         background_all = pdf[background_col].to_numpy(dtype=bool, copy=False)
-    elif assignment_col is not None and assignment_col in pdf.columns:
-        background_all = ~assignment_mask(pdf[assignment_col]).to_numpy(dtype=bool, copy=False)
+    elif has_assignment:
+        background_all = ~assigned_all
     else:
         background_all = np.zeros(len(pdf), dtype=bool)
     if status_col is not None:
         # Rendering's unassigned group includes excluded transcripts. Their
         # scientific background flag remains false in the original points.
-        background_all = background_all | (pdf[status_col].astype("string").fillna("unknown") != "assigned").to_numpy(dtype=bool)
+        background_all = background_all | _status_unassigned(pdf[status_col])
 
-    assignment_all = None
-    assigned_all = None
-    if assignment_col is not None and assignment_col in pdf.columns:
-        assignment_all = pdf[assignment_col].to_numpy(dtype=object)
-        assigned_all = assignment_mask(pdf[assignment_col]).to_numpy(dtype=bool, copy=False)
-
-    return (
-        np.ascontiguousarray(x_all[good]),
-        np.ascontiguousarray(y_all[good]),
-        gene_all[good].astype(str),
-        np.ascontiguousarray(background_all[good]),
-        None if assignment_all is None else assignment_all[good],
-        None if assigned_all is None else np.ascontiguousarray(assigned_all[good]),
+    return _PartitionArrays(
+        x=np.ascontiguousarray(x_all[good]),
+        y=np.ascontiguousarray(y_all[good]),
+        gene_codes=gene_codes_all[good],
+        gene_vocab=gene_vocab,
+        background=np.ascontiguousarray(background_all[good]),
+        cell_codes=None if cell_codes_all is None else cell_codes_all[good],
+        cell_vocab=cell_vocab,
     )
+
+
+class _StreamingSampler:
+    """Exact uniform ``render_count``-of-``total`` sample, partition by partition.
+
+    While numpy accepts every sequential hypergeometric draw (each partition's
+    ``ngood`` and ``nbad`` below 1e9) this replays the historical sampler draw
+    for draw, so the output is unchanged.  Otherwise (``total`` minus the first
+    partition at or above 1e9, which made numpy raise) positions are drawn once
+    over the whole stream and split by partition offsets.
+    """
+
+    def __init__(self, partition_counts: Sequence[int], render_count: int, random_state: int):
+        counts = [int(c) for c in partition_counts]
+        self.total = int(sum(counts))
+        self.render_count = int(render_count)
+        self.random_state = int(random_state)
+        self.uses_hypergeometric = self.hypergeometric_accepts(counts)
+        self._rng = np.random.default_rng(self.random_state)
+        self._remaining_source = self.total
+        self._remaining_sample = self.render_count
+        self._offset = 0
+        self._positions: np.ndarray | None = None
+        if not self.uses_hypergeometric and 0 < self.render_count < self.total:
+            from .atera_transcripts import sample_global_positions
+
+            self._positions = sample_global_positions(self.total, self.render_count, self.random_state)
+
+    @staticmethod
+    def hypergeometric_accepts(partition_counts: Sequence[int]) -> bool:
+        """Whether every sequential draw stays inside numpy's limits."""
+        remaining = int(sum(int(c) for c in partition_counts))
+        for count in partition_counts:
+            count = int(count)
+            if count >= _HYPERGEOMETRIC_LIMIT or remaining - count >= _HYPERGEOMETRIC_LIMIT:
+                return False
+            remaining -= count
+        return True
+
+    def take(self, part_count: int) -> np.ndarray:
+        """Sorted kept row positions within the next partition of ``part_count`` rows."""
+        part_count = int(part_count)
+        if self._remaining_sample == self._remaining_source:
+            keep = np.arange(part_count, dtype=np.int64)
+        elif self._remaining_sample <= 0:
+            keep = np.empty((0,), dtype=np.int64)
+        elif self._positions is not None:
+            lo = int(np.searchsorted(self._positions, self._offset, side="left"))
+            hi = int(np.searchsorted(self._positions, self._offset + part_count, side="left"))
+            keep = self._positions[lo:hi] - self._offset
+        else:
+            rng = self._rng
+            take = int(
+                rng.hypergeometric(
+                    ngood=part_count,
+                    nbad=max(0, self._remaining_source - part_count),
+                    nsample=self._remaining_sample,
+                )
+            )
+            keep = (
+                np.sort(rng.choice(part_count, size=take, replace=False))
+                if take > 0
+                else np.empty((0,), dtype=np.int64)
+            )
+        self._offset += part_count
+        self._remaining_source -= part_count
+        self._remaining_sample -= int(len(keep))
+        return keep
+
+
+def _scatter_cell_rows(
+    codes: np.ndarray,
+    positions: np.ndarray,
+    cell_write: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Destination slots for rows grouped by cell code, stable in row order.
+
+    Advances ``cell_write`` (each cell's next free slot) in place and returns
+    ``(dest, src)`` index arrays.
+    """
+    order = np.argsort(codes, kind="stable")
+    codes_sorted = codes[order]
+    src = positions[order]
+    n = len(codes_sorted)
+    starts = np.flatnonzero(np.r_[True, codes_sorted[1:] != codes_sorted[:-1]])
+    sizes = np.diff(np.r_[starts, n])
+    rank = np.arange(n, dtype=np.int64) - np.repeat(starts, sizes)
+    dest = cell_write[codes_sorted] + rank
+    cell_write[codes_sorted[starts]] += sizes
+    return dest, src
 
 
 def build_gene_point_groups(
@@ -3911,15 +4750,31 @@ def build_gene_point_groups(
     build_cell_index: bool = False,
     cancel_check: Callable[[], bool] | None = None,
     status_col: str | None = None,
+    is_gene_col: str | None = None,
+    progress: Callable[[int, int], None] | None = None,
 ) -> GenePointStore:
     """Read all transcripts into a symbol-grouped, gene-sorted point store.
+
+    ``progress(done, total)`` counts partitions over both streaming passes
+    (``total`` is twice the partition count).
 
     ``background`` is taken from ``background_col`` (bool) if present, else from
     ``assignment_col`` (unassigned == not :func:`assignment_mask`), else all
     foreground. If the total exceeds ``max_points`` a uniform random subsample is
     taken (this preserves per-gene proportions in expectation).
+
+    ``is_gene_col`` (Atera's ``is_gene``) makes the store's ``control_genes`` the
+    features flagged not-a-gene, cross-checked against the name rule by
+    :func:`control_genes_from_is_gene`.  Without it controls are name-only.
+
+    Both streaming passes are vectorised: genes and cell ids are converted
+    once per distinct value per partition and mapped to global codes through
+    small lookup tables, so no Python runs per transcript.
     """
     cols = [x_col, y_col, gene_col]
+    if is_gene_col is not None and is_gene_col not in cols:
+        cols.append(is_gene_col)
+    is_gene_flags: dict[str, bool] | None = {} if is_gene_col is not None else None
     if background_col is not None:
         cols.append(background_col)
     if assignment_col is not None and assignment_col not in cols:
@@ -3927,22 +4782,8 @@ def build_gene_point_groups(
     if status_col is not None and status_col not in cols:
         cols.append(status_col)
 
-    # Pass 1 retains only small aggregate dictionaries.  In particular, it does
-    # not keep a Python string object for every transcript and it lets us size
-    # all output arrays exactly before the second streaming pass.
-    source_gene_counts: dict[str, int] = {}
-    source_status_counts: dict[str, int] | None = {} if status_col else None
-    cell_counts: dict[str, int] = {}
-    total_source = 0
-    for pdf in _iter_point_partitions(points_obj, cols):
-        _check_transcript_cancelled(cancel_check)
-        if status_col is not None:
-            # Status totals describe the complete source, independent of the
-            # render cap and coordinate filtering used for the point layers.
-            for status, count in pdf[status_col].value_counts(dropna=False).items():
-                key = str(status) if pd.notna(status) else "unknown"
-                source_status_counts[key] = source_status_counts.get(key, 0) + int(count)
-        arrays = _point_partition_arrays(
+    def partition_arrays(pdf, gene_coding=None):
+        return _point_partition_arrays(
             pdf,
             x_col=x_col,
             y_col=y_col,
@@ -3950,27 +4791,67 @@ def build_gene_point_groups(
             assignment_col=assignment_col,
             background_col=background_col,
             status_col=status_col,
+            gene_coding=gene_coding,
         )
+
+    # Pass 1 retains only small aggregate dictionaries.  In particular, it does
+    # not keep a Python string object for every transcript and it lets us size
+    # all output arrays exactly before the second streaming pass.
+    source_gene_counts: dict[str, int] = {}
+    source_status_counts: dict[str, int] | None = {} if status_col else None
+    cell_counts: dict[str, int] = {}
+    partition_counts: list[int] = []
+    total_source = 0
+    def pass_progress(offset: int):
+        if progress is None:
+            return None
+
+        def report(done: int, n: int) -> None:
+            progress(offset * int(n) + int(done), 2 * int(n))
+
+        return report
+
+    for pdf in _iter_point_partitions(points_obj, cols, cancel_check=cancel_check, progress=pass_progress(0)):
+        _check_transcript_cancelled(cancel_check)
+        gene_coding = _sorted_string_vocab(pdf[gene_col])
+        if is_gene_flags is not None:
+            # Raw rows, before coordinate filtering: the flag is per feature.
+            codes_all, vocab = gene_coding
+            flags = pd.Series(pdf[is_gene_col]).astype("boolean").fillna(False).to_numpy(dtype=bool)
+            present = codes_all >= 0
+            if np.any(present):
+                gene_all = np.ones(len(vocab), dtype=bool)
+                np.logical_and.at(gene_all, codes_all[present], flags[present])
+                seen = np.bincount(codes_all[present], minlength=len(vocab)) > 0
+                for name, flag in zip(vocab[seen].tolist(), gene_all[seen].tolist(), strict=True):
+                    text = str(name)
+                    is_gene_flags[text] = bool(is_gene_flags.get(text, True) and flag)
+        if status_col is not None:
+            # Status totals describe the complete source, independent of the
+            # render cap and coordinate filtering used for the point layers.
+            for status, count in pdf[status_col].value_counts(dropna=False).items():
+                key = str(status) if pd.notna(status) else "unknown"
+                source_status_counts[key] = source_status_counts.get(key, 0) + int(count)
+        arrays = partition_arrays(pdf, gene_coding)
         if arrays is None:
             continue
-        _x, _y, genes_part, _bg, assignment_part, assigned_part = arrays
-        total_source += int(len(genes_part))
-        names, counts = np.unique(genes_part, return_counts=True)
-        for name, count in zip(names.tolist(), counts.tolist(), strict=True):
+        part_count = int(len(arrays.gene_codes))
+        partition_counts.append(part_count)
+        total_source += part_count
+        counts = np.bincount(arrays.gene_codes, minlength=len(arrays.gene_vocab))
+        present = np.flatnonzero(counts)
+        for name, count in zip(arrays.gene_vocab[present].tolist(), counts[present].tolist(), strict=True):
             text = str(name)
             source_gene_counts[text] = source_gene_counts.get(text, 0) + int(count)
 
-        if build_cell_index and assignment_part is not None and assigned_part is not None:
-            assigned_values = assignment_part[assigned_part]
-            keys = np.fromiter(
-                (normalize_cell_key(value) for value in assigned_values),
-                dtype=object,
-                count=int(len(assigned_values)),
-            )
-            keys = keys[keys != ""]
-            if len(keys):
-                unique_keys, key_counts = np.unique(keys, return_counts=True)
-                for key, count in zip(unique_keys.tolist(), key_counts.tolist(), strict=True):
+        if build_cell_index and arrays.cell_codes is not None:
+            cell_local = arrays.cell_codes[arrays.cell_codes >= 0]
+            if len(cell_local):
+                local_counts = np.bincount(cell_local, minlength=len(arrays.cell_vocab))
+                used = np.flatnonzero(local_counts)
+                keys = arrays.cell_vocab[used]
+                order = np.argsort(keys.astype(str), kind="stable")
+                for key, count in zip(keys[order].tolist(), local_counts[used][order].tolist(), strict=True):
                     text = str(key)
                     cell_counts[text] = cell_counts.get(text, 0) + int(count)
 
@@ -4011,93 +4892,51 @@ def build_gene_point_groups(
 
     # Pass 2 fills fixed-size outputs.  Sequential hypergeometric allocation
     # selects an exact uniform sample without ever materialising the uncapped
-    # coordinate set in memory.
-    rng = np.random.default_rng(int(random_state))
-    remaining_source = int(total_source)
-    remaining_sample = int(render_count)
+    # coordinate set in memory (a global position draw above numpy's limit).
+    sampler = _StreamingSampler(partition_counts, render_count, random_state)
     render_cursor = 0
-    for pdf in _iter_point_partitions(points_obj, cols):
+    for pdf in _iter_point_partitions(points_obj, cols, cancel_check=cancel_check, progress=pass_progress(1)):
         _check_transcript_cancelled(cancel_check)
-        arrays = _point_partition_arrays(
-            pdf,
-            x_col=x_col,
-            y_col=y_col,
-            gene_col=gene_col,
-            assignment_col=assignment_col,
-            background_col=background_col,
-            status_col=status_col,
-        )
+        arrays = partition_arrays(pdf)
         if arrays is None:
             continue
-        x_part, y_part, genes_part, bg_part, assignment_part, assigned_part = arrays
-        part_count = int(len(genes_part))
-        part_gene_codes = np.fromiter(
-            (gene_to_code[str(name)] for name in genes_part),
-            dtype=gene_code_dtype,
-            count=part_count,
+        part_count = int(len(arrays.gene_codes))
+        gene_lut = np.fromiter(
+            (gene_to_code.get(str(name), 0) for name in arrays.gene_vocab.tolist()),
+            dtype=np.int64,
+            count=len(arrays.gene_vocab),
         )
+        part_gene_codes = gene_lut[arrays.gene_codes].astype(gene_code_dtype, copy=False)
 
-        if remaining_sample == remaining_source:
-            keep = np.arange(part_count, dtype=np.int64)
-        elif remaining_sample <= 0:
-            keep = np.empty((0,), dtype=np.int64)
-        else:
-            take = int(
-                rng.hypergeometric(
-                    ngood=part_count,
-                    nbad=max(0, remaining_source - part_count),
-                    nsample=remaining_sample,
-                )
-            )
-            keep = (
-                np.sort(rng.choice(part_count, size=take, replace=False))
-                if take > 0
-                else np.empty((0,), dtype=np.int64)
-            )
+        keep = sampler.take(part_count)
         take = int(len(keep))
         if take:
             end = render_cursor + take
-            render_x[render_cursor:end] = x_part[keep]
-            render_y[render_cursor:end] = y_part[keep]
-            render_gene_codes[render_cursor:end] = part_gene_codes[keep]
-            render_background[render_cursor:end] = bg_part[keep]
+            if take == part_count:
+                render_x[render_cursor:end] = arrays.x
+                render_y[render_cursor:end] = arrays.y
+                render_gene_codes[render_cursor:end] = part_gene_codes
+                render_background[render_cursor:end] = arrays.background
+            else:
+                render_x[render_cursor:end] = arrays.x[keep]
+                render_y[render_cursor:end] = arrays.y[keep]
+                render_gene_codes[render_cursor:end] = part_gene_codes[keep]
+                render_background[render_cursor:end] = arrays.background[keep]
             render_cursor = end
-        remaining_source -= part_count
-        remaining_sample -= take
 
-        if build_cell_index and assignment_part is not None and assigned_part is not None and cell_keys:
-            assigned_positions = np.flatnonzero(assigned_part)
+        if build_cell_index and arrays.cell_codes is not None and cell_keys:
+            assigned_positions = np.flatnonzero(arrays.cell_codes >= 0)
             if len(assigned_positions):
-                normalized = np.fromiter(
-                    (normalize_cell_key(assignment_part[pos]) for pos in assigned_positions),
-                    dtype=object,
-                    count=int(len(assigned_positions)),
+                cell_lut = np.fromiter(
+                    (cell_code_by_key.get(str(key), -1) for key in arrays.cell_vocab.tolist()),
+                    dtype=np.int64,
+                    count=len(arrays.cell_vocab),
                 )
-                valid_keys = normalized != ""
-                assigned_positions = assigned_positions[valid_keys]
-                normalized = normalized[valid_keys]
-                if len(assigned_positions):
-                    codes = np.fromiter(
-                        (cell_code_by_key[str(key)] for key in normalized),
-                        dtype=np.int64,
-                        count=int(len(normalized)),
-                    )
-                    order = np.argsort(codes, kind="stable")
-                    codes_sorted = codes[order]
-                    positions_sorted = assigned_positions[order]
-                    starts = np.concatenate(
-                        ([0], np.flatnonzero(np.diff(codes_sorted) != 0) + 1)
-                    )
-                    ends = np.concatenate((starts[1:], [len(codes_sorted)]))
-                    for start, end in zip(starts.tolist(), ends.tolist(), strict=True):
-                        code = int(codes_sorted[start])
-                        count = int(end - start)
-                        dest = int(cell_write[code])
-                        src = positions_sorted[start:end]
-                        cell_coords[dest:dest + count, 0] = y_part[src]
-                        cell_coords[dest:dest + count, 1] = x_part[src]
-                        cell_gene_codes[dest:dest + count] = part_gene_codes[src]
-                        cell_write[code] += count
+                codes = cell_lut[arrays.cell_codes[assigned_positions]]
+                dest, src = _scatter_cell_rows(codes, assigned_positions, cell_write)
+                cell_coords[dest, 0] = arrays.y[src]
+                cell_coords[dest, 1] = arrays.x[src]
+                cell_gene_codes[dest] = part_gene_codes[src]
 
     if render_cursor != render_count:
         raise RuntimeError(
@@ -4116,11 +4955,67 @@ def build_gene_point_groups(
             slices=slices,
         )
 
-    # Stable gene visuals + integer codes over the alphabetical gene panel. When
-    # a marker reference is supplied, colours + symbols come from the broad
-    # cell-type scheme; otherwise each gene falls back to the deterministic
-    # rainbow (symbol == alphabetical index % 14), preserving legacy behaviour.
-    unique_names = list(source_genes)
+    control_genes = control_genes_from_is_gene(
+        source_genes, is_gene_flags, source=f"column {is_gene_col!r}" if is_gene_col else ""
+    )
+    return assemble_gene_point_store(
+        list(source_genes),
+        render_x,
+        render_y,
+        render_gene_codes,
+        render_background,
+        gene_visuals=gene_visuals,
+        reference=reference,
+        alpha=alpha,
+        control_genes=control_genes,
+        sampled=sampled,
+        source_gene_counts=source_gene_counts,
+        source_total_points=total_source,
+        source_status_counts=source_status_counts,
+        cell_transcript_index=cell_index,
+    )
+
+
+def assemble_gene_point_store(
+    genes: Sequence[str],
+    render_x: np.ndarray,
+    render_y: np.ndarray,
+    render_gene_codes: np.ndarray,
+    render_background: np.ndarray,
+    *,
+    gene_visuals: Mapping[str, GeneVisual] | None = None,
+    reference: Mapping[str, Any] | None = None,
+    alpha: float = 1.0,
+    control_genes: set[str] | None = None,
+    sampled: bool = False,
+    source_gene_counts: dict[str, int] | None = None,
+    source_total_points: int | None = None,
+    source_status_counts: dict[str, int] | None = None,
+    cell_transcript_index: CellTranscriptIndex | None = None,
+    overview_prefix: int | None = None,
+) -> GenePointStore:
+    """Group compact per-point arrays into a :class:`GenePointStore` (vectorised).
+
+    ``genes`` is the alphabetical panel; ``render_gene_codes`` index it.
+    ``render_background`` marks unassigned points (drawn after the assigned
+    ones of each gene).  Used by :func:`build_gene_point_groups` and by the
+    Atera whole-slide load, which streams its arrays itself.
+
+    ``overview_prefix``: the first that many input rows form the capped
+    all-genes view's sub-sample.  The sort is stable, so they lead each
+    gene's foreground and background runs; their ends are recorded in
+    ``overview_offsets``.  ``None`` (or every row) records nothing.
+    """
+    unique_names = [str(g) for g in genes]
+    render_count = int(len(render_gene_codes))
+    lead_fg = lead_bg = None
+    if overview_prefix is not None and 0 <= int(overview_prefix) < render_count:
+        lead = int(overview_prefix)
+        lead_codes = np.asarray(render_gene_codes[:lead])
+        lead_background = np.asarray(render_background[:lead], dtype=bool)
+        lead_fg = np.bincount(lead_codes[~lead_background], minlength=len(unique_names))
+        lead_bg = np.bincount(lead_codes[lead_background], minlength=len(unique_names))
+        del lead_codes, lead_background
     if gene_visuals is None:
         if reference is not None:
             gene_visuals = build_cell_type_gene_visuals(
@@ -4140,72 +5035,87 @@ def build_gene_point_groups(
         ],
         dtype=np.int64,
     )
-    symbol_idx_per_point = symbol_idx_by_code[render_gene_codes]
-    used_symbol_idx = np.unique(symbol_idx_per_point)
+    n_names = len(unique_names)
+    # Symbols are per gene, so group, used groups and sort keys are computed per
+    # gene code and gathered once per point.
+    if render_count:
+        code_counts = np.bincount(render_gene_codes, minlength=n_names)
+    else:
+        code_counts = np.zeros(n_names, dtype=np.int64)
+    used_symbol_idx = np.unique(symbol_idx_by_code[code_counts > 0]) if n_names else np.zeros(0, np.int64)
     sidx_to_group = np.full(len(GENE_MARKER_SYMBOLS), -1, dtype=np.int64)
     for group_index, sidx in enumerate(used_symbol_idx):
         sidx_to_group[int(sidx)] = group_index
-    group_per_point = sidx_to_group[symbol_idx_per_point]
+    group_by_code = sidx_to_group[symbol_idx_by_code] if n_names else np.zeros(0, np.int64)
     group_symbols = [GENE_MARKER_SYMBOLS[int(sidx)] for sidx in used_symbol_idx]
 
-    # Sort primary by group, then gene code, then background (foreground first).
-    bucket = (
-        group_per_point.astype(np.uint64) * np.uint64(max(1, 2 * len(unique_names)))
-        + render_gene_codes.astype(np.uint64) * np.uint64(2)
-        + render_background.astype(np.uint64)
-    )
-    order = np.argsort(bucket, kind="stable")
+    # Sort primary by group, then gene code, then background (foreground
+    # first).  The (group, code) order is a per-code rank, so the sort key is
+    # rank * 2 + background; under 2**16 it is a uint16 radix sort.
+    rank_order = np.lexsort((np.arange(n_names), group_by_code)) if n_names else np.zeros(0, np.int64)
+    rank_by_code = np.empty(n_names, dtype=np.int64)
+    rank_by_code[rank_order] = np.arange(n_names)
+    key_dtype = np.uint16 if 2 * max(1, n_names) <= np.iinfo(np.uint16).max + 1 else np.uint32
+    if render_count:
+        sort_key = rank_by_code.astype(key_dtype)[render_gene_codes]
+        sort_key *= key_dtype(2)
+        sort_key += np.asarray(render_background, dtype=bool).astype(key_dtype)
+        order = np.argsort(sort_key, kind="stable")
+        del sort_key
+    else:
+        order = np.zeros(0, dtype=np.int64)
     coords = np.empty((render_count, 2), dtype=np.float32)
     coords[:, 0] = render_y[order]
     coords[:, 1] = render_x[order]
     codes_sorted = render_gene_codes[order]
-    bg_sorted = render_background[order]
-    group_sorted = group_per_point[order]
-    del order, bucket, render_x, render_y, render_background, group_per_point, symbol_idx_per_point
+    bg_sorted = np.asarray(render_background, dtype=bool)[order]
+    del order
 
     code_to_rgba = np.array(
         [gene_visuals[name].rgba for name in unique_names], dtype=np.float32
-    )
+    ).reshape(-1, 4)
     colors_all = code_to_rgba[codes_sorted]
 
     n = coords.shape[0]
-    # Per-group coord/colour slices (views into the sorted arrays). group_sorted
-    # is non-decreasing, so np.unique gives each group's start in order.
-    _uniq_groups, group_starts = np.unique(group_sorted, return_index=True)
-    group_ends = list(group_starts[1:]) + [n]
+    # Per-group coord/colour slices (views into the sorted arrays). Groups are
+    # contiguous in rank order, so each group's start is a cumulative count.
+    group_sizes = np.zeros(len(group_symbols), dtype=np.int64)
+    if n_names and len(group_symbols):
+        np.add.at(group_sizes, group_by_code[code_counts > 0], code_counts[code_counts > 0])
+    group_starts = np.concatenate(([0], np.cumsum(group_sizes)[:-1])) if len(group_sizes) else np.zeros(0, np.int64)
     group_coords = []
     group_colors = []
     for gi in range(len(group_symbols)):
         gs = int(group_starts[gi])
-        ge = int(group_ends[gi])
+        ge = gs + int(group_sizes[gi])
         group_coords.append(coords[gs:ge])
         group_colors.append(colors_all[gs:ge])
 
-    # Per-gene contiguous ranges (relative to their group array). Each gene code
-    # is one contiguous run in ``codes_sorted`` (each code maps to one group and
-    # is code-sorted within it), but the runs are ordered by (group, code) rather
-    # than by code value, so run boundaries must come from actual value changes
-    # -- NOT from a code-sorted np.unique index.
-    if n > 0:
-        change = np.flatnonzero(np.diff(codes_sorted) != 0) + 1
-        block_starts = np.concatenate(([0], change))
-        block_ends = np.concatenate((change, [n]))
-    else:
-        block_starts = np.empty(0, dtype=np.int64)
-        block_ends = np.empty(0, dtype=np.int64)
+    # Per-gene contiguous ranges (relative to their group array), in rank order.
+    fg_counts = np.zeros(n_names, dtype=np.int64)
+    if n:
+        fg_counts = np.bincount(codes_sorted[~bg_sorted], minlength=n_names)
     gene_offsets: dict[str, tuple[int, int, int, int]] = {}
     gene_counts: dict[str, int] = {}
-    for bi in range(len(block_starts)):
-        cs = int(block_starts[bi])
-        ce = int(block_ends[bi])
-        g = int(group_sorted[cs])
+    overview_offsets: dict[str, tuple[int, int]] | None = None if lead_fg is None else {}
+    cursor = 0
+    for code in rank_order.tolist():
+        count = int(code_counts[code])
+        if count == 0:
+            continue
+        g = int(group_by_code[code])
         gstart = int(group_starts[g])
-        fg_count = int(np.count_nonzero(~bg_sorted[cs:ce]))
-        name = unique_names[int(codes_sorted[cs])]
-        gene_offsets[name] = (g, cs - gstart, cs + fg_count - gstart, ce - gstart)
-        gene_counts[name] = ce - cs
+        name = unique_names[code]
+        cs = cursor
+        ce = cursor + count
+        gene_offsets[name] = (g, cs - gstart, cs + int(fg_counts[code]) - gstart, ce - gstart)
+        gene_counts[name] = count
+        if overview_offsets is not None:
+            fg_start_rel = cs - gstart
+            fg_end_rel = fg_start_rel + int(fg_counts[code])
+            overview_offsets[name] = (fg_start_rel + int(lead_fg[code]), fg_end_rel + int(lead_bg[code]))
+        cursor = ce
 
-    control_genes = {name for name in unique_names if is_control_gene(name)}
     return GenePointStore(
         group_symbols=group_symbols,
         group_coords=group_coords,
@@ -4213,14 +5123,15 @@ def build_gene_point_groups(
         gene_offsets=gene_offsets,
         gene_counts=gene_counts,
         genes=list(unique_names),
-        control_genes=control_genes,
+        control_genes=set(control_genes or ()),
         total_points=n,
         sampled=sampled,
         source_gene_counts=source_gene_counts,
-        source_total_points=total_source,
+        source_total_points=source_total_points,
         source_status_counts=source_status_counts,
         gene_visuals=dict(gene_visuals),
-        cell_transcript_index=cell_index,
+        cell_transcript_index=cell_transcript_index,
+        overview_offsets=overview_offsets,
     )
 
 
@@ -4422,6 +5333,189 @@ def build_cell_transcript_index(
         build_cell_index=True,
     )
     return store.cell_transcript_index or CellTranscriptIndex.empty()
+
+
+def cell_transcript_index_from_arrays(
+    cell_ids,
+    x,
+    y,
+    codes,
+    names: Sequence[str],
+) -> CellTranscriptIndex:
+    """A :class:`CellTranscriptIndex` from compact per-row arrays.
+
+    ``codes`` index ``names`` (negative codes are dropped); only the names
+    that occur are kept, re-coded densely.  Rows are grouped by cell id
+    (stable, so each cell keeps its read order).  Cell ids keep every digit of
+    the uint64 range.
+    """
+    cell_ids = np.asarray(cell_ids)
+    codes = np.asarray(codes, dtype=np.int64)
+    x = np.asarray(x, dtype=np.float32)
+    y = np.asarray(y, dtype=np.float32)
+    if not (len(cell_ids) == len(codes) == len(x) == len(y)):
+        raise ValueError("cell_ids, x, y and codes must have one entry per row")
+    valid = codes >= 0
+    if not valid.all():
+        cell_ids, codes, x, y = cell_ids[valid], codes[valid], x[valid], y[valid]
+    if len(codes) == 0:
+        return CellTranscriptIndex.empty()
+    used, dense = np.unique(codes, return_inverse=True)
+    gene_names = tuple(str(names[int(i)]) for i in used)
+    n_names = len(gene_names)
+    dtype = np.uint8 if n_names <= 2**8 else np.uint16 if n_names <= 2**16 else np.uint32
+    order = np.argsort(cell_ids, kind="stable")
+    sorted_ids = cell_ids[order]
+    starts = np.flatnonzero(np.r_[True, sorted_ids[1:] != sorted_ids[:-1]])
+    ends = np.r_[starts[1:], len(sorted_ids)]
+    slices = {
+        normalize_cell_key(int(sorted_ids[s]) if np.issubdtype(sorted_ids.dtype, np.integer) else sorted_ids[s]):
+            (int(s), int(e))
+        for s, e in zip(starts, ends)
+    }
+    return CellTranscriptIndex(
+        coords_yx=np.column_stack([y[order], x[order]]).astype(np.float32, copy=False),
+        gene_codes=dense[order].astype(dtype),
+        gene_names=gene_names,
+        slices=slices,
+    )
+
+
+@dataclass(frozen=True)
+class TableCellCounts:
+    """One cell's row of a table's count matrix (genes only, highest first)."""
+
+    instance_id: int
+    genes: tuple[str, ...]
+    counts: tuple[int, ...]
+
+    @property
+    def total(self) -> int:
+        return int(sum(self.counts))
+
+    def ranked(self) -> list[tuple[str, int]]:
+        return list(zip(self.genes, self.counts))
+
+
+@dataclass
+class _TableRowLookup:
+    stamp: tuple
+    var_names: np.ndarray  # object
+    sorted_ids: np.ndarray
+    sorted_rows: np.ndarray
+    sparse: bool
+    #: ``X`` (dense) or ``(indptr, indices, data)`` zarr arrays, opened once.
+    matrix: Any = None
+
+
+_TABLE_LOOKUPS: dict[tuple[str, str], _TableRowLookup] = {}
+_TABLE_LOOKUPS_LOCK = threading.Lock()
+
+
+def _table_stamp(table_dir: Path) -> tuple:
+    stamp = []
+    for part in ("zarr.json", "obs/zarr.json", "var/zarr.json", "X/zarr.json"):
+        try:
+            st = os.stat(table_dir / part)
+            stamp.append((part, st.st_size, st.st_mtime_ns))
+        except OSError:
+            stamp.append((part, None, None))
+    return tuple(stamp)
+
+
+def _table_row_lookup(zarr_path: str | Path, table_key: str) -> _TableRowLookup:
+    key = (str(Path(zarr_path).resolve()), str(table_key))
+    stamp = _table_stamp(Path(zarr_path) / "tables" / str(table_key))
+    with _TABLE_LOOKUPS_LOCK:
+        cached = _TABLE_LOOKUPS.get(key)
+    if cached is not None and cached.stamp == stamp:
+        return cached
+    table = open_zarr_group_unconsolidated(zarr_path)["tables"][str(table_key)]
+    attrs = dict(table.attrs)
+    spatial = attrs.get("spatialdata_attrs") if isinstance(attrs.get("spatialdata_attrs"), Mapping) else {}
+    instance_key = str(attrs.get("instance_key") or spatial.get("instance_key") or "instance_id")
+    obs = table["obs"]
+    if instance_key in obs:
+        raw_ids = obs[instance_key]
+        if isinstance(raw_ids, zarr.Group):  # categorical
+            categories = np.asarray(raw_ids["categories"][:])
+            codes = np.asarray(raw_ids["codes"][:], dtype=np.int64)
+            raw = np.where(codes >= 0, categories[np.clip(codes, 0, None)], None)
+        else:
+            raw = np.asarray(raw_ids[:])
+    else:
+        index_name = str(dict(obs.attrs).get("_index", "_index"))
+        raw = np.asarray(obs[index_name][:])
+    ids, valid = cell_ids_as_int64(raw) if raw.dtype.kind not in "iu" else (raw, np.ones(len(raw), dtype=bool))
+    rows = np.flatnonzero(valid)
+    ids = np.asarray(ids)[rows]
+    order = np.argsort(ids, kind="stable")
+    var = table["var"]
+    var_index = str(dict(var.attrs).get("_index", "_index"))
+    var_names = np.asarray(_read_zarr_string_list(var[var_index]), dtype=object)
+    x_node = table["X"]
+    encoding = str(dict(x_node.attrs).get("encoding-type", "array"))
+    sparse = encoding == "csr_matrix"
+    lookup = _TableRowLookup(
+        stamp=stamp,
+        var_names=var_names,
+        sorted_ids=ids[order],
+        sorted_rows=rows[order],
+        sparse=sparse,
+        matrix=(x_node["indptr"], x_node["indices"], x_node["data"]) if sparse else x_node,
+    )
+    with _TABLE_LOOKUPS_LOCK:
+        _TABLE_LOOKUPS[key] = lookup
+    return lookup
+
+
+def table_cell_gene_counts(
+    zarr_path: str | Path, table_key: str, instance_id: Any
+) -> TableCellCounts | None:
+    """One cell's gene counts from ``tables/<table_key>/X``, reading one row.
+
+    The var names and an ``instance_id -> row`` lookup are cached per table
+    (invalidated when its metadata changes); a CSR matrix is read through
+    ``indptr`` so only that row's slice of ``data`` / ``indices`` is decoded.
+    Control features (by the name rule) are dropped; Atera's ``X`` holds
+    genes only, so these are gene transcripts.  ``None`` when the cell is not
+    in the table.
+    """
+    target = cell_id_to_int(instance_id)
+    if target is None:
+        return None
+    lookup = _table_row_lookup(zarr_path, table_key)
+    ids = lookup.sorted_ids
+    if ids.dtype.kind == "u" and target < 0:
+        return None
+    try:
+        probe = np.asarray([target], dtype=ids.dtype)[0] if ids.dtype != object else target
+    except OverflowError:
+        return None
+    pos = int(np.searchsorted(ids, probe))
+    if pos >= len(ids) or ids[pos] != probe:
+        return None
+    row = int(lookup.sorted_rows[pos])
+    if lookup.sparse:
+        indptr, indices, data = lookup.matrix
+        start, end = (int(v) for v in np.asarray(indptr[row : row + 2]))
+        columns = np.asarray(indices[start:end], dtype=np.int64)
+        values = np.asarray(data[start:end])
+    else:
+        dense = np.asarray(lookup.matrix[row, :]).ravel()
+        columns = np.flatnonzero(dense)
+        values = dense[columns]
+    counts = np.rint(np.asarray(values, dtype=np.float64)).astype(np.int64)
+    keep = counts > 0
+    columns, counts = columns[keep], counts[keep]
+    names = lookup.var_names[columns]
+    pairs = [(str(n), int(c)) for n, c in zip(names, counts) if not is_control_gene(str(n))]
+    pairs.sort(key=lambda item: (-item[1], item[0]))
+    return TableCellCounts(
+        instance_id=int(target),
+        genes=tuple(p[0] for p in pairs),
+        counts=tuple(p[1] for p in pairs),
+    )
 
 
 def ranked_gene_counts(genes) -> list[tuple[str, int]]:

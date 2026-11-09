@@ -317,6 +317,18 @@ def test_resolve_contract_rejects_incomplete_or_mismatched_pairs(
         resolve_paired_data_contract(moving, fixed)
 
 
+@pytest.mark.parametrize(
+    "roles",
+    [{"moving": "ATERA", "fixed": "XENIUM"}, {"moving": "MERSCOPE", "fixed": "ATERA"}],
+)
+def test_resolve_contract_rejects_atera_roles(roles) -> None:
+    moving, fixed = deepcopy(_pair())
+    moving.attrs["merxen_alignment"]["roles"] = roles
+
+    with pytest.raises(PairedDataContractError, match="moving MERSCOPE and fixed Xenium roles"):
+        resolve_paired_data_contract(moving, fixed)
+
+
 def test_resolve_contract_rejects_incomplete_artifact() -> None:
     moving, fixed = _pair()
     moving.attrs["merxen_alignment"]["artifacts"][

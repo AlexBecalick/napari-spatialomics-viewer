@@ -93,3 +93,9 @@ def test_xenium_session_options_and_overlay(store, monkeypatch):
     ctrl._publish_cellpose_value_options()
     assert published[-1] == ([], [], False)
     assert app is not None
+
+
+def test_inspector_reads_stored_means_with_image_identity(store):
+    result = U.cellpose_cell_mean_intensities(store, 1)
+    assert dict(result) == {'morphology_focus: DAPI': 10., 'post_xenium_if: DAPI': 100.}
+    assert all(value is None for _, value in U.cellpose_cell_mean_intensities(store, 999))

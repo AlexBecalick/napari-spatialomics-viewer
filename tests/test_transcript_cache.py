@@ -424,3 +424,15 @@ def test_aligned_assignment_cache_fingerprints_both_points_trees(tmp_path):
     assert after_assignments.coordinate_points_key == "transcripts_aligned"
     assert TranscriptCacheRequest.create(dataset,"transcripts","x","y","gene",
         cache_root=tmp_path / "cache", coordinate_points_key="../transcripts") is None
+
+
+def test_is_gene_column_is_part_of_the_cache_identity_only_when_set(tmp_path):
+    dataset, _part = _source_store(tmp_path)
+    cache_root = tmp_path / "cache"
+    plain = _request(dataset, cache_root)
+    # Name-only builds keep their existing address.
+    assert _request(dataset, cache_root, is_gene_col=None).digest == plain.digest
+    flagged = _request(dataset, cache_root, is_gene_col="is_gene")
+    assert flagged.is_gene_col == "is_gene"
+    assert flagged.digest != plain.digest
+    assert flagged.family_digest != plain.family_digest

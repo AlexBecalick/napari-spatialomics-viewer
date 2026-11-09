@@ -8,6 +8,10 @@ centroids and shapes. The viewer converts napari `(y, x)` shape vertices to
 GeoJSON `[x, y]` coordinates, but it does not scale, rotate, flip, normalize, or
 otherwise transform coordinates.
 
+These tools work on MERSCOPE and Xenium datasets. They are disabled for Atera
+stores, and their tooltips say why: the MerXen export is defined only for
+MERSCOPE and Xenium.
+
 ## Core Concepts
 
 MerXen uses these annotation roles:
