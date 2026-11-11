@@ -254,6 +254,95 @@ def test_native_control_panel_opens_hitl_tab_without_console(widget, qapp):
     assert expanded == [True]
 
 
+@pytest.fixture
+def friendly_widget(widget, source):
+    import spatialdata as sd
+    from test_atera_platform import _controller
+
+    store, _, _ = source
+    widget._viewer.layers.clear()
+    controller = _controller(widget._viewer)
+    controller.datasets = {"ATERA": controller._build_dataset_config("ATERA", store)}
+    loaded = controller._add_image_layers(
+        "ATERA",
+        sd.read_zarr(store, selection=("images",)),
+        (0.5, 0.0, 0.0),
+        (0.0, 0.5, 0.0),
+        build_cache=False,
+    )
+    assert loaded["layers"] == 1
+    widget._restore_layers()
+    return widget
+
+
+def test_native_image_check_uses_source_identity_with_friendly_or_renamed_layers(
+    friendly_widget, source
+):
+    image = friendly_widget._viewer.layers["Image | DAPI"]
+    assert image.metadata["spatialdata_image_source"]["image_key"] == "morphology_focus"
+    assert image.metadata["spatialdata_image_source"]["store_path"] == str(
+        source[0].resolve()
+    )
+    friendly_widget._require_native_image()
+    image.name = "My renamed nuclear stain"
+    image.translate = (0.25, 0.25)  # native half-pixel centre convention
+    friendly_widget._require_native_image()
+
+
+@pytest.mark.parametrize(
+    "change", ["rotate", "shift", "scale", "platform", "image_key", "store", "frame"]
+)
+def test_native_image_check_still_rejects_changed_frames_and_wrong_sources(
+    friendly_widget, source, change
+):
+    image = friendly_widget._viewer.layers["Image | DAPI"]
+    metadata = image.metadata["spatialdata_image_source"]
+    if change == "rotate":
+        image.rotate = 15
+    elif change == "shift":
+        image.translate = (10, 0)
+    elif change == "scale":
+        image.scale = (2, 2)
+    elif change == "platform":
+        metadata["platform"] = "XENIUM"
+    elif change == "image_key":
+        metadata["image_key"] = "another_image"
+    elif change == "store":
+        metadata["store_path"] = str(source[0].parent / "another.zarr")
+    else:
+        metadata["coordinate_frame"] = "aligned"
+    with pytest.raises(ValueError):
+        friendly_widget._require_native_image()
+
+
+def test_friendly_native_image_can_prepare_the_selected_annotation_crops(
+    friendly_widget, source, qapp, monkeypatch
+):
+    from qtpy.QtWidgets import QMessageBox
+
+    setup = source[2]
+    (setup.parent / "hitl_export_settings.json").write_text(
+        json.dumps(
+            {
+                "model_channels": ["DAPI"],
+                "input_normalization": "joint",
+                "transcript_density": None,
+            }
+        )
+    )
+    monkeypatch.setattr(
+        QMessageBox, "warning", lambda *args: pytest.fail(str(args[-1]))
+    )
+    friendly_widget._layer.add(
+        CropRectangle(64, 64, 320, 480).vertices(), shape_type="rectangle"
+    )
+    wait_for(qapp, lambda: friendly_widget._save_button.isEnabled())
+    friendly_widget._save_button.click()
+    wait_for(qapp, lambda: friendly_widget._session.package is not None)
+    assert friendly_widget._annotate_button.isEnabled()
+    assert friendly_widget._session.package.crops[0].shape == (320, 480)
+
+
 def test_overlapping_crops_keep_unique_estimate_but_cannot_be_saved(widget, qapp):
     widget._layer.data = [
         CropRectangle(64, 64, 320, 480).vertices(),

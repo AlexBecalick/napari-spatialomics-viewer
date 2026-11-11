@@ -49,9 +49,9 @@ def load_annotation_export_settings(setup_path: Path) -> AnnotationExportSetting
     companion = setup_path.parent / "hitl_export_settings.json"
     manifest = setup_path.parent / "manifest.json"
     if companion.is_file():
-        values = json.loads(companion.read_text())
+        values = json.loads(companion.read_text(encoding="utf-8"))
     elif manifest.is_file():
-        values = json.loads(manifest.read_text())
+        values = json.loads(manifest.read_text(encoding="utf-8"))
     else:
         raise ValueError(
             "This crop setup needs hitl_export_settings.json. Prepare it with "
@@ -84,7 +84,9 @@ def validate_local_density(
     """Check the portable raster manifest, recipe and native image geometry."""
     record = embedded_density_record(path)
     if record is None:
-        record = json.loads((path / "transcript_density.json").read_text())
+        record = json.loads(
+            (path / "transcript_density.json").read_text(encoding="utf-8")
+        )
     expected = settings.density
     if expected is None:
         raise ValueError("The crop setup does not select a density channel.")
@@ -183,7 +185,7 @@ def upgrade_legacy_annotation_package(
     from .hitl_annotation_session import package_file
 
     original = original.resolve()
-    old = json.loads((original / "manifest.json").read_text())
+    old = json.loads((original / "manifest.json").read_text(encoding="utf-8"))
     if old.get("evaluation_eligible") is not False or any(
         row.get("split") != "pilot_train" for row in old["crops"]
     ):
@@ -202,11 +204,11 @@ def upgrade_legacy_annotation_package(
     try:
         for name in ("raw", "model_input", "context", "masks", "receipts"):
             (staging / name).mkdir()
-        (staging / "annotation-guide.md").write_text(_GUIDE)
+        (staging / "annotation-guide.md").write_text(_GUIDE, encoding="utf-8")
         shutil.copy2(original / "roi_context.json", staging / "roi_context.json")
         old_review = {}
         if (original / "review.tsv").is_file():
-            with (original / "review.tsv").open(newline="") as stream:
+            with (original / "review.tsv").open(newline="", encoding="utf-8") as stream:
                 old_review = {
                     row["crop_id"]: row
                     for row in csv.DictReader(stream, delimiter="\t")
@@ -255,8 +257,10 @@ def upgrade_legacy_annotation_package(
             evaluation_eligible=False,
             origin_manifest_sha256=file_sha256(original / "manifest.json"),
         )
-        (staging / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-        with (staging / "review.tsv").open("w", newline="") as stream:
+        (staging / "manifest.json").write_text(
+            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        )
+        with (staging / "review.tsv").open("w", newline="", encoding="utf-8") as stream:
             writer = csv.DictWriter(
                 stream,
                 fieldnames=["crop_id", "status", "reason", "minutes", "notes"],
@@ -280,7 +284,8 @@ def upgrade_legacy_annotation_package(
                 },
                 indent=2,
             )
-            + "\n"
+            + "\n",
+            encoding="utf-8",
         )
         staging.rename(output)
     except BaseException:
@@ -355,9 +360,9 @@ def export_local_annotation_package(
     try:
         for name in ("raw", "model_input", "context", "masks", "receipts"):
             (staging / name).mkdir()
-        (staging / "annotation-guide.md").write_text(_GUIDE)
+        (staging / "annotation-guide.md").write_text(_GUIDE, encoding="utf-8")
         (staging / "roi_context.json").write_text(
-            json.dumps(asdict(context), indent=2) + "\n"
+            json.dumps(asdict(context), indent=2) + "\n", encoding="utf-8"
         )
         save_crop_regions(staging / "selected_regions.geojson", context, rectangles_yx)
         tiles = [_tile_for(box, context) for box in boxes]
@@ -530,7 +535,9 @@ def export_local_annotation_package(
             "transfer_relative_path": f"annotations/{package_id}/",
             "crops": rows,
         }
-        (staging / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        (staging / "manifest.json").write_text(
+            json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
+        )
         (staging / "training-template.json").write_text(
             json.dumps(
                 {
@@ -547,9 +554,10 @@ def export_local_annotation_package(
                 },
                 indent=2,
             )
-            + "\n"
+            + "\n",
+            encoding="utf-8",
         )
-        with (staging / "review.tsv").open("w", newline="") as stream:
+        with (staging / "review.tsv").open("w", newline="", encoding="utf-8") as stream:
             writer = csv.writer(stream, delimiter="\t")
             writer.writerow(["crop_id", "status", "reason", "minutes", "notes"])
             writer.writerows([[row["crop_id"], "pending", "", "", ""] for row in rows])
