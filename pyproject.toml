@@ -27,7 +27,9 @@ dependencies = [
   "pyobjc-framework-Cocoa; sys_platform == 'darwin'",
   "qtpy",
   "shapely",
+  "scikit-image",
   "spatialdata>=0.8.0,<0.9",
+  "tifffile",
   "xarray",
   "zarr>=3",
 ]
@@ -52,6 +54,7 @@ napari_compare_xenium_merscope = [
   "resources/cell_type_marker_references/*.csv",
   "resources/cell_type_marker_references/*.json",
   "resources/cell_type_marker_references/*.md",
+  "resources/cellpose_annotation_runner.txt",
 ]
 
 [tool.setuptools.packages.find]

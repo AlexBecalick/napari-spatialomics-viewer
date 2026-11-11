@@ -866,17 +866,60 @@ or MerXen installation is required in the viewer environment.
    missing/false masks will change the final manually annotated count. Stores
    without native Cellpose masks show that the estimate is unavailable rather
    than substituting vendor masks.
-6. Click **Save crop regions…** to write a new GeoJSON outside the source store.
-   Existing region files are preserved. Export that GeoJSON with MerXen's
-   rectangle-enabled `cellpose-hitl-export`, then copy the resulting annotation
-   package to the laptop for offline correction in the separate Cellpose GUI.
+6. Click **Save areas and prepare annotation**. The viewer creates a fresh
+   `hitl-<timestamp>-<id>/` folder beside the SpatialData Zarr, containing the
+   crop images, current Cellpose masks, prepared training arrays and guide.
+   Keep `hitl_export_settings.json` beside the loaded `roi_context.json` (an
+   existing pilot's `manifest.json` is also supported). For three-channel Atera,
+   copy the matching existing `transcript_density.zarr` with its manifest; the
+   viewer finds it beside the store/setup or asks you to select it. It checks
+   the density recipe and native grid without regenerating transcript density.
+7. Select a crop and press **Annotate cell masks**. The first time, choose the
+   Python executable in a separate **Cellpose 4.2.1.1** GUI environment using
+   **Choose Cellpose environment…**. MerXen provides its generated
+   `requirements/requirements.hitl-gui.lock` for installing that environment.
+   The viewer stays in its own environment; drawing works offline on CPU.
+8. Correct every visible cell in the launched Cellpose window, following the
+   package's `annotation-guide.md`. Press **Ctrl+S**, even if no edit was needed,
+   then close Cellpose. The crop turns **green** only after a successful native
+   mask save. Closing without saving or a failed write leaves it pending.
+   The viewer selects the next unfinished crop and prompts you to continue.
+9. At completion, the viewer shows the saved folder and its relative server
+   destination: **`annotations/<package-id>/` under `MERXEN_HITL_ROOT`**. Copy
+   the whole folder unchanged. MerXen can then start at **`train_cellpose`**
+   with `training-template.json`, species and a unique custom model name.
+   The model is saved under `models/<unique-model-name>/` and can be selected
+   by name in future runs without training again.
+
+For Atera, channel order is **DAPI, 18S RNA, transcript density** when the setup
+selects density (standard Gaussian σ 0.15 µm). Two-stain packages keep an empty
+third model slot. Annotation never changes the source Zarr or original masks.
+Model inputs retain the original full-tile normalization; do not replace them
+with display images or train inside the drawing GUI.
+
+Use **Open annotation package…** to resume after restarting, or to annotate an
+automatically selected MerXen pilot. This works without loading the full sample.
+Older packages are copied into a new managed folder with existing mask edits
+preserved; open/save each crop once to establish verified completion. Keep
+uncertainty notes in `review.tsv`; the viewer preserves them. Keep one editing
+window per crop and close it before reopening the same crop.
+
+See MerXen's [managed annotation and training guide](https://github.com/bourdenxlab/MerXen/blob/feature/atera-support/docs/hitl/managed-annotation-training.md)
+for environment setup, server transfer, train→segment parameters and named-model
+reuse. Newly trained models remain candidates until evaluated independently.
+
+**Save regions only…** retains the remote-export option: write a new GeoJSON,
+export it with MerXen's rectangle-enabled `cellpose-hitl-export`, then open the
+resulting package in this tab. Use **Start new crop selection** to create another
+package; exported selections are locked to preserve their training inputs.
 
 The saved GeoJSON carries native-pixel coordinates, source/grid identity and
 `merxen_hitl_regions_version: 2`. Use the corresponding MerXen exporter with
 rectangle support; older square-only exporters refuse these rectangles.
 Selection never changes the source data, existing masks or training inputs.
-Selections are retained per store while switching datasets in the running
-viewer. Save them before closing the application.
+Unexported selections are retained per store while switching datasets in the
+running viewer. Save them before closing. Exported packages retain progress
+on disk and can be reopened later.
 
 ## Data Assumptions
 

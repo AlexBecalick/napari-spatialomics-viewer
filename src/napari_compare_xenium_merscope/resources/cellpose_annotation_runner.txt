@@ -1,0 +1,146 @@
+"""Standalone Cellpose launcher copied into each managed annotation package.
+
+Runs in the user's separate Cellpose environment. The viewer and MerXen consume
+only numeric masks and JSON receipts, never the pickle-based GUI output.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import logging
+import os
+import sys
+import uuid
+from datetime import datetime, timezone
+from importlib.metadata import version
+from pathlib import Path
+
+import numpy as np
+
+
+def digest(path: Path) -> str:
+    value = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            value.update(block)
+    return value.hexdigest()
+
+
+def atomic_json(path: Path, payload: dict) -> None:
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps(payload, indent=2) + "\n")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--package", type=Path, required=True)
+    parser.add_argument("--crop", required=True)
+    parser.add_argument("--session", required=True)
+    arguments = parser.parse_args()
+    if version("cellpose") != "4.2.1.1":
+        raise RuntimeError("This annotation workflow requires Cellpose 4.2.1.1.")
+    root = arguments.package.resolve()
+    manifest_path = root / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    row = next(row for row in manifest["crops"] if row["crop_id"] == arguments.crop)
+    image = root / f"{arguments.crop}.tif"
+    segment = root / f"{arguments.crop}_seg.npy"
+    if image.resolve().parent != root or segment.resolve().parent != root:
+        raise ValueError("Crop files must stay inside the annotation package.")
+    image_sha = digest(image)
+    if image_sha != row["files_sha256"][image.name]:
+        raise ValueError("The crop image differs from its original manifest.")
+    expected_shape = (
+        row["bbox_y0_y1_x0_x1"][1] - row["bbox_y0_y1_x0_x1"][0],
+        row["bbox_y0_y1_x0_x1"][3] - row["bbox_y0_y1_x0_x1"][2],
+    )
+
+    from cellpose.gui import guiparts, io
+    from cellpose.gui.gui import MainW
+    from qtpy.QtWidgets import QApplication, QMessageBox
+
+    original_save_sets = io._save_sets
+
+    def managed_save(parent) -> None:
+        captured = []
+        numpy_save = np.save
+
+        def observed_save(file, data, *args, **kwargs):
+            result = numpy_save(file, data, *args, **kwargs)
+            if isinstance(file, (str, os.PathLike)) and Path(file).resolve() == segment:
+                captured.append(np.asarray(data["masks"]).copy())
+            return result
+
+        # Cellpose catches np.save failures internally. Observing a successful
+        # write prevents an old prefill from being mistaken for a new save.
+        try:
+            np.save = observed_save
+            original_save_sets(parent)
+        finally:
+            np.save = numpy_save
+        if not captured or Path(parent.filename).resolve() != image:
+            return
+        try:
+            masks = captured[-1]
+            if (
+                masks.shape != expected_shape
+                or masks.dtype.kind not in "iu"
+                or np.any(masks < 0)
+            ):
+                raise ValueError(
+                    "Save native-size integer masks for this crop. "
+                    "Restored or resized masks cannot be returned."
+                )
+            if digest(image) != image_sha:
+                raise ValueError("The original crop image was changed.")
+            for folder in ("masks", "receipts"):
+                directory = root / folder
+                if not directory.resolve().is_relative_to(root):
+                    raise ValueError("Annotation outputs must stay inside the package.")
+                directory.mkdir(exist_ok=True)
+            numeric = root / "masks" / f"{arguments.crop}.npz"
+            temporary = numeric.with_name(f".{numeric.name}.{uuid.uuid4().hex}.tmp")
+            try:
+                with temporary.open("xb") as stream:
+                    np.savez_compressed(stream, masks=masks)
+                os.replace(temporary, numeric)
+            finally:
+                temporary.unlink(missing_ok=True)
+            receipt = {
+                "schema_version": 1,
+                "package_id": manifest["package_id"],
+                "crop_id": arguments.crop,
+                "manifest_sha256": digest(manifest_path),
+                "session_nonce": arguments.session,
+                "saved_at": datetime.now(timezone.utc).isoformat(),
+                "cellpose_version": version("cellpose"),
+                "image_sha256": image_sha,
+                "seg_sha256": digest(segment),
+                "masks_sha256": digest(numeric),
+                "cell_count": int(np.count_nonzero(np.unique(masks))),
+            }
+            atomic_json(root / "receipts" / f"{arguments.crop}.json", receipt)
+            parent.statusBar().showMessage(
+                "Masks saved. You can close Cellpose and return to the viewer."
+            )
+        except (OSError, ValueError, KeyError) as error:
+            QMessageBox.warning(parent, "Annotation save needs attention", str(error))
+
+    io._save_sets = managed_save
+    app = QApplication.instance() or QApplication(sys.argv)
+    app.setStyle("Fusion")
+    app.setPalette(guiparts.DarkPalette())
+    window = MainW(image=str(image), logger=logging.getLogger("cellpose-annotation"))
+    window.setWindowTitle(f"Annotate {arguments.crop} — save masks, then close")
+    window.show()
+    sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()
