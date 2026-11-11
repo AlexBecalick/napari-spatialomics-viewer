@@ -870,10 +870,12 @@ or MerXen installation is required in the viewer environment.
    `hitl-<timestamp>-<id>/` folder beside the SpatialData Zarr, containing the
    crop images, current Cellpose masks, prepared training arrays and guide.
    Keep `hitl_export_settings.json` beside the loaded `roi_context.json` (an
-   existing pilot's `manifest.json` is also supported). For three-channel Atera,
-   copy the matching existing `transcript_density.zarr` with its manifest; the
-   viewer finds it beside the store/setup or asks you to select it. It checks
-   the density recipe and native grid without regenerating transcript density.
+   existing pilot's `manifest.json` is also supported). Current MerXen Atera
+   outputs contain the density image and display pyramids inside SpatialData.
+   The viewer loads **Transcript density** automatically and HITL uses that
+   embedded image without asking for another file. For older stores, matching
+   separate `transcript_density.zarr` discovery/the file picker remain available.
+   Both paths verify the density recipe/grid and avoid regenerating density.
 7. Select a crop and press **Annotate cell masks**. The first time, choose the
    Python executable in a separate **Cellpose 4.2.1.1** GUI environment using
    **Choose Cellpose environment…**. MerXen provides its generated

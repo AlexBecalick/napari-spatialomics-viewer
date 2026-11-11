@@ -266,6 +266,38 @@ def test_atera_session_smoke(qapp, atera_store):
     assert added["Image | 18S"] == "green"
 
 
+def test_embedded_density_is_discovered_and_auto_loaded_as_a_red_image(qapp, store_copy, monkeypatch):
+    import spatialdata as sd
+    from spatialdata.models import Image2DModel
+    from spatialdata.transformations import get_transformation
+
+    images = sd.read_zarr(store_copy, selection=("images",))
+    morphology = images.images["morphology_focus"]
+    base = U.get_scale0_dataarray(morphology)
+    images.images["atera_transcript_density"] = Image2DModel.parse(
+        np.ones((1, *base.shape[-2:]), np.float32), dims=("c", "y", "x"),
+        c_coords=["transcript_density"],
+        transformations=get_transformation(morphology, get_all=True),
+    )
+    images.write_element("atera_transcript_density")
+    images.write_consolidated_metadata()
+    ctrl = _controller(skip_images=False)
+    session = _activate(ctrl, store_copy)
+    assert ("atera_transcript_density", "transcript_density") in session.image_channels
+    ctrl._add_image_layers("ATERA", session.images_sdata,
+        session.x_transform, session.y_transform, build_cache=False)
+    density = next(entry for entry in ctrl.viewer.added_images
+                   if entry["name"] == "Image | Transcript density")
+    assert density["colormap"] == "red"
+    assert density["visible"]
+    loads = []
+    ctrl._image_keys = session.image_keys
+    monkeypatch.setattr(ctrl, "load_images_on_demand", loads.append)
+    monkeypatch.setattr(ctrl, "_startup_segmentation_keys", lambda: [])
+    ctrl._start_startup_autoload("ATERA")
+    assert loads == ["ATERA"]
+
+
 def test_atera_labels_mode_lists_each_raster_once(qapp, atera_store):
     ctrl = _controller(segmentation_source="labels")
     session = _activate(ctrl, atera_store)

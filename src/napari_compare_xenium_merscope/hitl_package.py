@@ -17,6 +17,7 @@ import spatialdata as sd
 import tifffile
 from skimage.measure import label
 
+from .density_image import embedded_density_record
 from .hitl_annotation_session import (
     AnnotationPackage,
     file_sha256,
@@ -81,7 +82,9 @@ def validate_local_density(
     path: Path, context: HitlCropContext, settings: AnnotationExportSettings
 ) -> dict[str, Any]:
     """Check the portable raster manifest, recipe and native image geometry."""
-    record = json.loads((path / "transcript_density.json").read_text())
+    record = embedded_density_record(path)
+    if record is None:
+        record = json.loads((path / "transcript_density.json").read_text())
     expected = settings.density
     if expected is None:
         raise ValueError("The crop setup does not select a density channel.")
@@ -107,6 +110,7 @@ def find_local_density(
 ) -> Path | None:
     """Find an existing raster by local convention or the original setup hint."""
     candidates = [
+        source,
         source.parent / "transcript_density.zarr",
         source.parent / "transcript_density" / "transcript_density.zarr",
         setup_path.parent / "transcript_density.zarr",
@@ -114,7 +118,12 @@ def find_local_density(
     if settings.density and settings.density.get("raster_path"):
         candidates.append(Path(settings.density["raster_path"]))
     return next(
-        (path for path in candidates if (path / "transcript_density.json").is_file()),
+        (
+            path
+            for path in candidates
+            if embedded_density_record(path) is not None
+            or (path / "transcript_density.json").is_file()
+        ),
         None,
     )
 
@@ -295,6 +304,8 @@ def export_local_annotation_package(
     """
     source = Path(source).resolve()
     context.validate_store(source, context.platform)
+    if density_path is None and embedded_density_record(source) is not None:
+        density_path = source
     boxes = validate_crop_rectangles(context, rectangles_yx)
     if not boxes:
         raise ValueError("Select at least one crop.")
