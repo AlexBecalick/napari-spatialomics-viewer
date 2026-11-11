@@ -257,6 +257,19 @@ def test_package_can_be_annotated_without_loading_full_spatialdata(widget, manag
     assert widget._session is None
 
 
+def test_legacy_upgrade_never_converts_evaluation_crops_into_training(managed, source):
+    path = managed.root / "manifest.json"
+    values = json.loads(path.read_text())
+    values.pop("managed_annotation_version")
+    values["evaluation_eligible"] = True
+    path.write_text(json.dumps(values))
+    before = list(managed.root.parent.glob("hitl-*"))
+    with pytest.raises(ValueError, match="held-out"):
+        upgrade_legacy_annotation_package(managed.root, managed.root.parent, source[1])
+    assert list(managed.root.parent.glob("hitl-*")) == before
+    assert json.loads(path.read_text())["evaluation_eligible"] is True
+
+
 @pytest.mark.skipif(
     not os.environ.get("MERXEN_TEST_CELLPOSE_PYTHON"),
     reason="Separate Cellpose GUI environment is optional",
