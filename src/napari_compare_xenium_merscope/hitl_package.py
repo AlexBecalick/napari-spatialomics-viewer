@@ -175,6 +175,13 @@ def upgrade_legacy_annotation_package(
 
     original = original.resolve()
     old = json.loads((original / "manifest.json").read_text())
+    if old.get("evaluation_eligible") is not False or any(
+        row.get("split") != "pilot_train" for row in old["crops"]
+    ):
+        raise ValueError(
+            "Only training-pilot packages can be upgraded. "
+            "Keep held-out evaluation crops separate."
+        )
     old_context = HitlCropContext.read(original / "roi_context.json")
     if old_context != context:
         raise ValueError("The older package belongs to a different source/grid.")
