@@ -198,7 +198,7 @@ def test_real_click_drag_updates_list_count_target_and_saved_regions(
     assert "#21633d" in widget._target.styleSheet()
     path = tmp_path / "selected.geojson"
     monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a, **k: (str(path), ""))
-    widget._save_button.click()
+    widget._regions_button.click()
     assert json.loads(path.read_text())["features"][0]["geometry"]["coordinates"][0][
         2
     ] == [544, 384]
