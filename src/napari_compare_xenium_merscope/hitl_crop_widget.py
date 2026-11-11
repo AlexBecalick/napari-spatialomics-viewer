@@ -291,14 +291,30 @@ class HitlCropWidget(QWidget):
 
     def _require_native_image(self) -> None:
         context = self._session.context
+        found_native = False
         for layer in self._viewer.layers:
-            if (
-                not isinstance(layer, Image)
-                or context.image_key not in layer.name
+            if not isinstance(layer, Image):
+                continue
+            source = layer.metadata.get("spatialdata_image_source")
+            if source is not None:
+                if (
+                    not isinstance(source, dict)
+                    or source.get("image_key") != context.image_key
+                    or source.get("platform") != context.platform
+                    or source.get("coordinate_frame") != "native"
+                    or not source.get("store_path")
+                    or Path(source["store_path"]).resolve() != self._store.resolve()
+                ):
+                    continue
+            elif (
+                context.image_key not in layer.name
                 or context.platform not in layer.name.upper()
                 or "aligned" in layer.name.lower()
             ):
+                # Keep the original programmatic layer naming convention;
+                # normal viewer layers use their explicit backing identity.
                 continue
+            found_native = True
             data = layer.data[0] if layer.multiscale else layer.data
             shape = np.asarray(data.shape[-3:-1] if layer.rgb else data.shape[-2:])
             if layer.ndim != 2:
@@ -319,6 +335,11 @@ class HitlCropWidget(QWidget):
                 abs(matrix - np.diag(expected)) <= np.diag(expected / shape) + 1e-8
             ) and np.all(abs(origin) <= expected):
                 return
+        if found_native:
+            raise ValueError(
+                "The morphology image is rotated, shifted or scaled away from "
+                "the native crop grid. Reset the dataset rotation and image transform."
+            )
         raise ValueError(
             "Load the native morphology image from the Images tab. "
             "Crops require a standalone, unshifted micron view."
@@ -532,7 +553,7 @@ class HitlCropWidget(QWidget):
 
     def open_annotation_package(self, root: Path) -> None:
         """Resume a complete local package and restore verified saved progress."""
-        values = json.loads((root / "manifest.json").read_text())
+        values = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
         if values.get("managed_annotation_version") is None:
             context = HitlCropContext.read(root / "roi_context.json")
             if self._store is not None:
@@ -709,7 +730,8 @@ class HitlCropWidget(QWidget):
             runner.write_text(
                 files("napari_compare_xenium_merscope")
                 .joinpath("resources/cellpose_annotation_runner.txt")
-                .read_text()
+                .read_text(encoding="utf-8"),
+                encoding="utf-8",
             )
             log_path = runtime / f"{crop.crop_id}-{nonce}.log"
             environment = dict(os.environ)
@@ -805,7 +827,7 @@ class HitlCropWidget(QWidget):
     def _synchronize_review(self, package: AnnotationPackage, timed_crop=None) -> None:
         completed = annotation_progress(package)
         review = package.root / "review.tsv"
-        with review.open(newline="") as stream:
+        with review.open(newline="", encoding="utf-8") as stream:
             reader = csv.DictReader(stream, delimiter="\t")
             rows = list(reader)
             fields = reader.fieldnames or []
@@ -827,7 +849,7 @@ class HitlCropWidget(QWidget):
         if not review.resolve().is_relative_to(package.root):
             raise ValueError("The review sheet must stay inside its package.")
         temporary = review.with_name(f".review-{uuid.uuid4().hex}.tsv.tmp")
-        with temporary.open("w", newline="") as stream:
+        with temporary.open("w", newline="", encoding="utf-8") as stream:
             writer = csv.DictWriter(
                 stream,
                 fieldnames=fields,

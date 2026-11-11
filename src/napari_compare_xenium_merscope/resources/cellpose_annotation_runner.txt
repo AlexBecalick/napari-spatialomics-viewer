@@ -31,7 +31,7 @@ def digest(path: Path) -> str:
 def atomic_json(path: Path, payload: dict) -> None:
     temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
-        temporary.write_text(json.dumps(payload, indent=2) + "\n")
+        temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
@@ -47,7 +47,7 @@ def main() -> None:
         raise RuntimeError("This annotation workflow requires Cellpose 4.2.1.1.")
     root = arguments.package.resolve()
     manifest_path = root / "manifest.json"
-    manifest = json.loads(manifest_path.read_text())
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     row = next(row for row in manifest["crops"] if row["crop_id"] == arguments.crop)
     image = root / f"{arguments.crop}.tif"
     segment = root / f"{arguments.crop}_seg.npy"

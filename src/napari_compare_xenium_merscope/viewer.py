@@ -213,6 +213,7 @@ from .manual_registration_store import (
 from .manual_registration_widget import ManualRegistrationWidget
 from .spatialdata_explorer import SpatialDataExplorerWidget
 from .hitl_crop_widget import HitlCropWidget
+from .hitl_crops import SpatialImageSource
 from .cell_groups import (
     CELL_GROUP_SHAPE_KEY,
     CellGroup,
@@ -9864,6 +9865,22 @@ class ComparisonViewerController(AteraTranscriptMixin):
                         opacity=self.args.image_opacity,
                         visible=chan_visible,
                     )
+                    dataset_config = self.datasets.get(ds)
+                    store_path = (
+                        dataset_config.zarr_path
+                        if dataset_config is not None
+                        else getattr(sdata, "path", None)
+                    )
+                    source = SpatialImageSource(
+                        store_path=(
+                            str(Path(store_path).resolve()) if store_path is not None else ""
+                        ),
+                        platform=str(ds).upper(),
+                        image_key=image_key,
+                        channel=str(chan_name),
+                        coordinate_frame="aligned" if aligned_transform is not None else "native",
+                    )
+                    add_kwargs["metadata"] = {"spatialdata_image_source": source}
                     if multiscale:
                         add_kwargs["multiscale"] = True
 

@@ -108,6 +108,39 @@ def test_local_export_has_gui_prefills_model_arrays_and_transfer_location(manage
     assert settings.channels == ("DAPI",)
 
 
+def test_local_export_writes_utf8_guide_when_macos_app_has_ascii_locale(source):
+    store, _, setup = source
+    code = """
+import locale
+import sys
+from pathlib import Path
+from napari_compare_xenium_merscope.hitl_crops import CropRectangle, HitlCropContext
+from napari_compare_xenium_merscope.hitl_package import (
+    AnnotationExportSettings, export_local_annotation_package,
+)
+assert locale.getpreferredencoding(False).lower() in {
+    'ascii', 'us-ascii', 'ansi_x3.4-1968',
+}
+package = export_local_annotation_package(
+    Path(sys.argv[1]), HitlCropContext.read(Path(sys.argv[2])),
+    [CropRectangle(64, 64, 320, 480).vertices()],
+    AnnotationExportSettings(('DAPI',), 'joint', None, None),
+)
+print(package.root)
+"""
+    environment = dict(os.environ)
+    environment.update(LC_ALL="C", LANG="C", PYTHONUTF8="0", PYTHONCOERCECLOCALE="0")
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(store), str(setup)],
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    package = open_annotation_package(Path(result.stdout.strip().splitlines()[-1]))
+    assert "5 µm" in (package.root / "annotation-guide.md").read_text(encoding="utf-8")
+
+
 def test_normalization_handles_constant_channels_and_keeps_complete_halo_statistics():
     plane = np.arange(512 * 768, dtype=np.float32).reshape(512, 768)
     normalized = normalize_model_plane(plane)
@@ -259,6 +292,11 @@ def test_legacy_upgrade_preserves_edited_gui_file_and_original_package(managed, 
     manifest_path.write_text(json.dumps(values))
     segment = managed.root / "crop_001_seg.npy"
     segment.write_bytes(b"existing mask edits must stay intact")
+    (managed.root / "review.tsv").write_text(
+        "crop_id\tstatus\treason\tminutes\tnotes\n"
+        "crop_001\tpending\t\t\tBoundary uncertain over 5 µm\n",
+        encoding="utf-8",
+    )
     before = {
         str(path.relative_to(managed.root)): file_sha256(path)
         for path in managed.root.rglob("*")
@@ -270,6 +308,7 @@ def test_legacy_upgrade_preserves_edited_gui_file_and_original_package(managed, 
     )
     assert upgraded.root != managed.root
     assert (upgraded.root / "crop_001_seg.npy").read_bytes() == segment.read_bytes()
+    assert "5 µm" in (upgraded.root / "review.tsv").read_text(encoding="utf-8")
     assert not annotation_progress(upgraded)
     assert before == {
         str(path.relative_to(managed.root)): file_sha256(path)

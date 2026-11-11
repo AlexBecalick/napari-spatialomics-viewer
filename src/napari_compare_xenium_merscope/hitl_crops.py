@@ -13,8 +13,19 @@ import re
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Literal, TypedDict
 
 import numpy as np
+
+
+class SpatialImageSource(TypedDict):
+    """Backing SpatialData identity of a displayed image, independent of its name."""
+
+    store_path: str
+    platform: str
+    image_key: str
+    channel: str
+    coordinate_frame: Literal["native", "aligned"]
 
 
 @dataclass(frozen=True)
@@ -72,7 +83,7 @@ class HitlCropContext:
     @classmethod
     def read(cls, path: str | Path) -> HitlCropContext:
         """Read a portable roi_context.json produced by MerXen."""
-        return cls(**json.loads(Path(path).read_text()))
+        return cls(**json.loads(Path(path).read_text(encoding="utf-8")))
 
     def validate_store(self, path: Path, platform: str) -> None:
         """Refuse setup files belonging to another source or platform."""
@@ -233,5 +244,5 @@ def save_crop_regions(
         "merxen_hitl_context": asdict(context),
         "features": features,
     }
-    with Path(path).open("x") as stream:
+    with Path(path).open("x", encoding="utf-8") as stream:
         stream.write(json.dumps(payload, indent=2, allow_nan=False) + "\n")

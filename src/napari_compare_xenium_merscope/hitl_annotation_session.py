@@ -67,7 +67,7 @@ def open_annotation_package(root: Path) -> AnnotationPackage:
     """Read a managed package and validate its IDs and immutable input hashes."""
     root = Path(root).resolve()
     manifest_path = root / "manifest.json"
-    manifest = json.loads(manifest_path.read_text())
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("managed_annotation_version") != 1:
         raise ValueError(
             "Choose a package created by Save areas and prepare annotation."
@@ -124,7 +124,7 @@ def validate_saved_annotation(
     """Check the save receipt, image identity, GUI output and numeric mask."""
     root, crop_id = package.root, crop.crop_id
     receipt_path = package_file(root, f"receipts/{crop_id}.json")
-    receipt = json.loads(receipt_path.read_text())
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     if (
         receipt.get("schema_version") != 1
         or receipt.get("package_id") != package.package_id
