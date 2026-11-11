@@ -6,6 +6,7 @@ import csv
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -34,6 +35,7 @@ from napari_compare_xenium_merscope.hitl_normalization import normalize_model_pl
 from napari_compare_xenium_merscope.hitl_package import (
     AnnotationExportSettings,
     export_local_annotation_package,
+    find_local_density,
     load_annotation_export_settings,
     upgrade_legacy_annotation_package,
     validate_local_density,
@@ -129,7 +131,10 @@ def test_normalization_handles_constant_channels_and_keeps_complete_halo_statist
     assert not normalize_model_plane(np.ones((256, 256))).values.any()
 
 
-def test_atera_export_uses_existing_density_as_third_native_channel(source, tmp_path):
+@pytest.mark.parametrize("storage", ["separate", "embedded"])
+def test_atera_export_uses_existing_density_as_third_native_channel(
+    source, tmp_path, storage
+):
     original, context, _ = source
     data = sd.read_zarr(original)
     rows, columns = np.indices((context.height, context.width), dtype=np.float32)
@@ -174,6 +179,31 @@ def test_atera_export_uses_existing_density_as_third_native_channel(source, tmp_
     settings = AnnotationExportSettings(
         ("DAPI", "18S", "transcript_density"), "per_channel", record, None
     )
+    if storage == "embedded":
+        images = sd.read_zarr(source_path, selection=("images",))
+        images.images["atera_transcript_density"] = sd.read_zarr(density_path).images[
+            "atera_transcript_density"
+        ]
+        images.write_element("atera_transcript_density")
+        binding = {
+            "schema_version": 1,
+            "image_key": "atera_transcript_density",
+            "record": record,
+            "payload_fingerprint": "copied-timestamps-not-required-locally",
+        }
+        binding["binding_sha256"] = hashlib.sha256(
+            json.dumps(binding, sort_keys=True).encode()
+        ).hexdigest()
+        images.attrs["merxen_transcript_density"] = binding
+        images.write_attrs()
+        images.write_consolidated_metadata()
+        context = replace(context, source_metadata_sha256=file_sha256(metadata))
+        shutil.rmtree(density_path)
+        assert (
+            find_local_density(source_path, tmp_path / "setup.json", settings)
+            == source_path
+        )
+        density_path = None
     package = export_local_annotation_package(
         source_path,
         context,
@@ -188,10 +218,11 @@ def test_atera_export_uses_existing_density_as_third_native_channel(source, tmp_
         model[2], normalize_model_plane(density_values[0]).values[64:384, 64:544]
     )
     assert package.manifest["model_channels"] == ["DAPI", "18S", "transcript_density"]
-    record["profile"]["sigma_um"] = 0.5
-    (density_path / "transcript_density.json").write_text(json.dumps(record))
-    with pytest.raises(ValueError, match="does not match"):
-        validate_local_density(density_path, context, settings)
+    if storage == "separate":
+        record["profile"]["sigma_um"] = 0.5
+        (density_path / "transcript_density.json").write_text(json.dumps(record))
+        with pytest.raises(ValueError, match="does not match"):
+            validate_local_density(density_path, context, settings)
 
 
 def test_save_receipt_accepts_unchanged_masks_but_refuses_stale_or_changed_files(

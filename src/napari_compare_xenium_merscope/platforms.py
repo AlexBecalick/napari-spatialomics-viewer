@@ -140,9 +140,13 @@ PLATFORM_SPECS: tuple[PlatformSpec, ...] = (
         ),
         startup_shape_keys=("atera_cell_boundaries",),
         inspector_shape_preference=("proseg", "cellpose", "atera_cell_boundaries", "cell"),
+        image_channel_aliases=(
+            (("atera_transcript_density", "transcript_density"), "Transcript density"),
+        ),
         image_channel_colormaps=(
             ("DAPI", "blue"),
             ("18S", "green"),
+            ("transcript_density", "red"),
             ("ATP1A1/CD45/E-Cadherin", "magenta"),
             ("alphaSMA/Vimentin", "yellow"),
         ),
