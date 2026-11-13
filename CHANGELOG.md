@@ -14,10 +14,26 @@ are that section.
 
 ## [Unreleased]
 
-Version 0.4.0 was set in `pyproject.toml` but never released or tagged; the
-entries below, including the manual-registration work first written up as
-0.4.0, go into the next release. Builds and saved files that report 0.4.0 come
-from `main` between 0.3.0 and that release.
+## [0.5.0] - 2026-11-13
+
+Manual landmark registration, standalone 10x Atera stores, hand-curated cell
+groups and human-in-the-loop Cellpose annotation, and the first release made
+from this changelog. Version 0.4.0 was set in `pyproject.toml` but never
+released; its manual-registration work ships here. Builds and saved files that
+report 0.4.0 come from `main` between 0.3.0 and this release.
+
+### Highlights
+
+- **Manual registration.** Place landmark pairs between two MerXen tissue images in a new tab, with live residuals, draft saving and a read-only result view.
+- **Atera stores.** Open whole-transcriptome 10x Atera stores standalone, at about 1.4 billion transcripts and 18k genes, with lazy transcripts, a searchable gene inspector and saved atlas predictions.
+- **Cell groups.** Click Cellpose cells into named groups and export them with their per-channel statistics.
+- **HITL segmentation crops.** Draw crops with live cell estimates, then annotate and track Cellpose correction packages for MerXen training.
+- **Versioned releases.** `--version`, this changelog, and releases published from it ([versioning](docs/versioning.md)).
+
+### Upgrading
+
+- The new manual-registration and HITL features need recent MerXen outputs (see Requirements). Existing MERSCOPE, Xenium and paired stores open as before.
+- A developer install (`pip install -e .`) reports its version from the install metadata: re-run it after pulling so `--version` shows 0.5.0.
 
 ### Added
 
@@ -83,6 +99,7 @@ from `main` between 0.3.0 and that release.
 ### Requirements
 
 - Manual registration needs stores written by a MerXen version with the manual-registration workflows, schema version 1. The viewer refuses newer schema versions.
+- HITL region GeoJSON (`merxen_hitl_regions_version: 2`) holds rectangles: export it with MerXen's rectangle-enabled `cellpose-hitl-export`; older square-only exporters refuse it.
 
 ### Limitations
 
@@ -167,7 +184,8 @@ SpatialData datasets.
 - Launch without a dataset and select data through the Dataset loader.
 - Native desktop packages for macOS, Windows, and Linux.
 
-[Unreleased]: https://github.com/AlexBecalick/napari-spatialomics-viewer/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/AlexBecalick/napari-spatialomics-viewer/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/AlexBecalick/napari-spatialomics-viewer/compare/v0.3.0...v0.5.0
 [0.3.0]: https://github.com/AlexBecalick/napari-spatialomics-viewer/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/AlexBecalick/napari-spatialomics-viewer/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/AlexBecalick/napari-spatialomics-viewer/releases/tag/v0.1.0

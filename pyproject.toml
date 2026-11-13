@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "napari-compare-xenium-merscope"
-version = "0.4.0"
+version = "0.5.0"
 description = "Standalone Napari viewer for comparing Xenium and MERSCOPE SpatialData outputs, and for viewing Atera stores"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -67,7 +67,7 @@ where = ["src"]
 # then rewrites the compare links. Everything else reads the installed package
 # metadata, so these are the only places the number is written.
 [tool.bumpversion]
-current_version = "0.4.0"
+current_version = "0.5.0"
 parse = "(?P<major>0|[1-9]\\d*)\\.(?P<minor>0|[1-9]\\d*)\\.(?P<patch>0|[1-9]\\d*)"
 serialize = ["{major}.{minor}.{patch}"]
 # The release branch carries uncommitted [Unreleased] edits when bumping;
