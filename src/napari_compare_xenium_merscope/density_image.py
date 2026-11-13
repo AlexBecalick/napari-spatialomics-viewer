@@ -30,9 +30,9 @@ def embedded_density_record(path: Path) -> dict[str, Any] | None:
     digest = hashlib.sha256(json.dumps(signed, sort_keys=True).encode()).hexdigest()
     if (
         binding.get("schema_version") != 1
-        or binding.get("image_key") != DENSITY_IMAGE_KEY
+        or binding.get("image_key") not in {DENSITY_IMAGE_KEY, "xenium_transcript_density"}
         or binding.get("binding_sha256") != digest
-        or not (path / "images" / DENSITY_IMAGE_KEY).is_dir()
+        or not (path / "images" / binding["image_key"]).is_dir()
     ):
         raise ValueError("Embedded transcript density is incomplete or inconsistent.")
     record: dict[str, Any] = binding["record"]

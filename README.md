@@ -1111,3 +1111,8 @@ Rotation is set to 0° and disabled while a manual-registration session is open;
 registration layers are never rotated by this control.
 Source images, coordinates, and Zarr stores are never modified. Region drawing
 follows the rotated display while selecting cells in their original coordinate frame.
+
+Xenium stores prepared by MerXen can include a red **Transcript density** image
+as an annotation guide. The **HITL seg crops** setup remains DAPI + 18S RNA;
+viewing density does not add it to the model inputs. Download the complete store
+to retain its embedded crop setup and density pyramids.
