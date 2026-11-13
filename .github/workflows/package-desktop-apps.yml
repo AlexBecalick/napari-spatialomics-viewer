@@ -1,36 +1,121 @@
 name: Package desktop applications
-
+# Builds the desktop packages and publishes releases (docs/versioning.md).
+#
+# A release PR raises the version with bump-my-version and turns CHANGELOG.md's
+# [Unreleased] section into the release's section. When it is merged into main,
+# this workflow builds every platform from that commit, tags it vX.Y.Z and
+# publishes a GitHub release whose notes are the release's CHANGELOG section,
+# with the installers and SHA256SUMS.txt attached. A push to main whose version
+# is already tagged (or has no CHANGELOG section) builds nothing.
+#
+# workflow_dispatch builds every platform without publishing (test builds), or,
+# on main with an untagged release version, re-runs a failed release.
 on:
-  workflow_dispatch:        # manual test builds (no release is created)
   push:
-    tags:
-      - "v*"                # pushing a version tag builds and publishes a release
+    branches: [main]
+    paths: [pyproject.toml]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: package-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  verify-version:
-    name: Verify tag matches package version
+  plan:
+    name: Plan the release
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.version.outputs.publish }}
+      build: ${{ steps.version.outputs.build }}
+      target: ${{ steps.target.outputs.target }}
     steps:
       - uses: actions/checkout@v5
-      # Builds read the version from the installed package metadata (i.e. from
-      # pyproject.toml), not from the tag. Fail fast if a tag is pushed that
-      # disagrees with pyproject, which would otherwise mislabel every artifact.
-      - name: Compare tag against pyproject version
-        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Release version
+        id: version
         run: |
-          pkg="$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")"
-          if [ "v$pkg" != "${{ github.ref_name }}" ]; then
-            echo "Tag ${{ github.ref_name }} does not match pyproject version v$pkg" >&2
-            exit 1
+          version="$(python3 scripts/ci/changelog.py versions)"
+          mapfile -t tags < <(git tag --list 'v[0-9]*')
+          status="$(python3 scripts/ci/changelog.py status --tags "${tags[@]}")"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          publish=false
+          if [[ "$GITHUB_REF" == "refs/heads/main" && "$status" == "release" ]]; then
+            publish=true
           fi
-          echo "Tag ${{ github.ref_name }} matches pyproject version v$pkg"
+          build=false
+          if [[ "$publish" == "true" || "$GITHUB_EVENT_NAME" == "workflow_dispatch" ]]; then
+            build=true
+          fi
+          echo "publish=${publish}" >> "$GITHUB_OUTPUT"
+          echo "build=${build}" >> "$GITHUB_OUTPUT"
+          echo "Version ${version}: ${status}; publish=${publish}, build=${build}"
+      - name: Check the release
+        if: steps.version.outputs.publish == 'true'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # Newer than every earlier release tag, and a well-formed changelog
+          # with a section for this version.
+          mapfile -t tags < <(git tag --list 'v[0-9]*')
+          python3 scripts/ci/changelog.py versions --newer-than-tags "${tags[@]}"
+          python3 scripts/ci/changelog.py validate
+          # Relative links (docs/...) would break in a release body: point them
+          # at the tagged tree.
+          {
+            python3 scripts/ci/changelog.py notes "$VERSION" \
+              --link-base "https://github.com/${GITHUB_REPOSITORY}/blob/v${VERSION}"
+            cat <<NOTES
+
+          ### Downloads
+
+          Self-contained installers include Python and the viewer dependencies:
+
+          - macOS Apple Silicon: \`Napari-Compare-Xenium-MERSCOPE-${VERSION}-macOS-arm64.dmg\`
+          - macOS Intel: \`Napari-Compare-Xenium-MERSCOPE-${VERSION}-macOS-x86_64.dmg\`
+          - Windows x86-64: \`Napari-Compare-Xenium-MERSCOPE-${VERSION}-Windows-x86_64-Setup.exe\`
+          - Debian/Ubuntu Linux amd64: \`napari-compare-xenium-merscope_${VERSION}_amd64.deb\`
+          - \`SHA256SUMS.txt\` for verifying downloads (\`sha256sum -c SHA256SUMS.txt --ignore-missing\`).
+
+          macOS builds are ad-hoc signed, without Apple Developer ID signing or notarization. macOS may require Gatekeeper approval to open the app.
+
+          **Full changelog:** [CHANGELOG.md](https://github.com/${GITHUB_REPOSITORY}/blob/v${VERSION}/CHANGELOG.md)
+          NOTES
+          } > "$RUNNER_TEMP/notes.md"
+          cat "$RUNNER_TEMP/notes.md"
+      - name: Upload release notes
+        if: steps.version.outputs.publish == 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          name: release-notes
+          path: ${{ runner.temp }}/notes.md
+          if-no-files-found: error
+      - name: Release commit
+        id: target
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          # Build and tag the commit on main that set this version (the merged
+          # release PR), also when a manual re-run starts from a later main.
+          # --first-parent: a merge commit, not a release-branch commit behind it.
+          target=""
+          if [[ "${{ steps.version.outputs.publish }}" == "true" ]]; then
+            target="$(git log -1 --first-parent --format=%H -S "version = \"${VERSION}\"" -- pyproject.toml)"
+          fi
+          echo "target=${target:-$GITHUB_SHA}" >> "$GITHUB_OUTPUT"
 
   macos-package:
     name: macOS ${{ matrix.architecture }} disk image
-    needs: verify-version
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -43,6 +128,8 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.plan.outputs.target }}
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -68,11 +155,14 @@ jobs:
 
   windows-installer:
     name: Windows installer
-    needs: verify-version
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
     runs-on: windows-2025
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.plan.outputs.target }}
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -114,11 +204,14 @@ jobs:
 
   linux-package:
     name: Linux package
-    needs: verify-version
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.plan.outputs.target }}
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -185,35 +278,42 @@ jobs:
 
   release:
     name: Publish GitHub release
-    # Only publish when a version tag was pushed; manual runs still build and
-    # upload workflow artifacts above without creating a release.
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [verify-version, macos-package, windows-installer, linux-package]
+    # Only for a merged release PR (or a re-run of one) on main; test builds
+    # stop after uploading their workflow artifacts above.
+    if: needs.plan.outputs.publish == 'true'
+    needs: [plan, macos-package, windows-installer, linux-package]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     permissions:
-      contents: write        # required to create the release and upload assets
+      contents: write        # required to create the tag, the release and assets
     steps:
-      - uses: actions/checkout@v5
-      - name: Download build artifacts
+      - name: Download build artifacts and release notes
         uses: actions/download-artifact@v6
         with:
           path: dist-artifacts
       - name: Generate SHA-256 checksums
         run: |
+          mv dist-artifacts/release-notes/notes.md notes.md
+          rmdir dist-artifacts/release-notes
           cd dist-artifacts
           # Checksum each packaged file (dmg/exe/deb) into one SHA256SUMS.txt
-          # using basenames, replacing the manual step. The subshell makes
-          # sha256sum record the basename rather than the download subfolder.
+          # using basenames. The subshell makes sha256sum record the basename
+          # rather than the download subfolder.
           find . -type f | sort | while read -r f; do
             ( cd "$(dirname "$f")" && sha256sum "$(basename "$f")" )
           done > ../SHA256SUMS.txt
           cat ../SHA256SUMS.txt
-      - name: Publish release
-        uses: softprops/action-gh-release@v2
-        with:
-          body_path: docs/releases/${{ github.ref_name }}.md
-          files: |
-            dist-artifacts/**/*
-            SHA256SUMS.txt
-          generate_release_notes: true
-          fail_on_unmatched_files: true
+      - name: Tag and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          TARGET: ${{ needs.plan.outputs.target }}
+        run: |
+          mapfile -t files < <(find dist-artifacts -type f | sort)
+          gh release create "v${VERSION}" \
+            --target "$TARGET" \
+            --title "v${VERSION}" \
+            --notes-file notes.md \
+            --latest \
+            "${files[@]}" SHA256SUMS.txt

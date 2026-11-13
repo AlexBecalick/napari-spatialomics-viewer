@@ -21,3 +21,16 @@ def test_bundle_current_requires_matching_environment_manifest(tmp_path, monkeyp
     assert launcher.macos_bundle_is_current(bundle)
     manifest_path.write_text(json.dumps({**expected, "version": "2"}), encoding="utf-8")
     assert not launcher.macos_bundle_is_current(bundle)
+
+
+def test_version_flag_prints_the_package_version_without_launching(monkeypatch, capsys):
+    import napari_compare_xenium_merscope
+
+    monkeypatch.setattr(launcher.sys, "argv", ["napari-compare-xenium-merscope", "--version"])
+    monkeypatch.setattr(
+        launcher, "ensure_macos_app_bundle", lambda: (_ for _ in ()).throw(AssertionError("bundle built"))
+    )
+    launcher.main()
+    assert capsys.readouterr().out.strip() == (
+        f"napari-compare-xenium-merscope {napari_compare_xenium_merscope.__version__}"
+    )

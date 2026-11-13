@@ -85,12 +85,14 @@ conda environment or run `pip install`.
   command under `/usr/bin`, and a desktop-menu entry with the project icon.
 
 Run the workflow manually from the repository's **Actions** page to obtain its
-downloadable artifacts. It does not create a GitHub Release or publish the
-installers automatically. Native packages are built and smoke-tested on their
-target operating systems; PyInstaller is not a cross-compiler.
+downloadable artifacts as a test build; that does not publish a release. Native
+packages are built and smoke-tested on their target operating systems;
+PyInstaller is not a cross-compiler.
 
-Pushing a version tag such as `v0.3.0` builds these same installers and publishes
-a GitHub Release with checksums and release notes. See [RELEASING.md](RELEASING.md).
+Merging a release PR into `main` builds these same installers, tags the release
+and publishes it on GitHub with checksums and its [CHANGELOG](CHANGELOG.md)
+section as the notes. See [versioning and releases](docs/versioning.md).
+`napari-compare-xenium-merscope --version` prints the installed version.
 
 For local package builds, first install the pinned build environment:
 
@@ -1091,6 +1093,11 @@ platform-prefixed columns such as `xenium_pial_boundary_geojson`,
 ```bash
 pytest
 ```
+
+Every pull request that changes what users run adds an entry under
+`## [Unreleased]` in [CHANGELOG.md](CHANGELOG.md); CI checks this (label a PR
+`skip-changelog` when users would notice nothing). See
+[versioning and releases](docs/versioning.md).
 
 The Atera tests use a small synthetic store (`tests/atera_stores.py`). A few
 read-only checks against a real MerXen Atera store run only when

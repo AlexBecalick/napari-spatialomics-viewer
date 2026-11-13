@@ -19237,6 +19237,13 @@ def apply_startup_store_detection(
     return out, initial
 
 
+def version_text() -> str:
+    """What ``--version`` prints: the program name and the installed version."""
+    from . import __version__
+
+    return f"napari-compare-xenium-merscope {__version__}"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="napari-compare-xenium-merscope",
@@ -19245,6 +19252,7 @@ def parse_args() -> argparse.Namespace:
             "(Atera stores open standalone)."
         ),
     )
+    parser.add_argument("--version", action="version", version=version_text())
     parser.add_argument("--merscope-zarr", default=None, type=Path, help="Path to MERSCOPE .zarr output")
     parser.add_argument("--xenium-zarr", default=None, type=Path, help="Path to Xenium .zarr output")
     parser.add_argument(
