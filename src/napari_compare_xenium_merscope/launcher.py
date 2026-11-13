@@ -123,6 +123,13 @@ def install_macos_app_bundle() -> None:
 
 
 def main() -> None:
+    if "--version" in sys.argv[1:]:
+        # Answer before building or re-entering the macOS bundle, and without
+        # importing napari.
+        from . import __version__
+
+        print(f"napari-compare-xenium-merscope {__version__}")
+        return
     if sys.platform != "darwin":
         from .viewer import main as viewer_main
 
