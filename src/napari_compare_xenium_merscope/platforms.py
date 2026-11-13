@@ -117,7 +117,9 @@ PLATFORM_SPECS: tuple[PlatformSpec, ...] = (
         image_channel_aliases=(
             (("morphology_focus", "DAPI"), "DAPI Xenium"),
             (("post_xenium_if", "DAPI"), "DAPI Post Xenium-IF"),
+            (("xenium_transcript_density", "transcript_density"), "Transcript density"),
         ),
+        image_channel_colormaps=(("transcript_density", "red"),),
         paired_role="fixed",
         marker_shape_keys=("xenium_cell_boundaries",),
     ),
