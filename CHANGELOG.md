@@ -17,6 +17,7 @@ are that section.
 ### Fixed
 
 - Clicking a cell in a store that has images but no transcript points opens the cell inspector with an empty transcript list, instead of reporting a transcript inspection error.
+- Release builds are no longer stopped by the test suite crashing on the build machines before packaging. Pull requests and pushes to `main` now run the tests on Linux, macOS (Apple Silicon and Intel) and Windows, with the same dependency versions as the installers.
 
 ## [0.5.0] - 2026-11-13
 
