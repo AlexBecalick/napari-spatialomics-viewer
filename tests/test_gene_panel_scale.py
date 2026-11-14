@@ -34,8 +34,10 @@ from napari_compare_xenium_merscope.utils import (
 #: CI machines are slower than a developer laptop; the measured local numbers
 #: (populate + first show of 24.7k rows ~0.05 s, a keystroke ~5 ms) are far below
 #: these bounds, which only catch a return to per-row widgets (224 s before).
+#: GitHub's Intel macOS runner took 0.11 s for the first keystroke (which
+#: matches nearly every row), so the keystroke bound leaves room for that.
 POPULATE_BUDGET_S = 1.5
-KEYSTROKE_BUDGET_S = 0.1
+KEYSTROKE_BUDGET_S = 0.5
 
 
 @pytest.fixture(scope="module")
