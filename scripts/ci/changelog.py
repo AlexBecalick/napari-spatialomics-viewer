@@ -69,9 +69,10 @@ USER_FACING_PREFIXES = (
 
 # Versions that pyproject.toml carried but that were never released (no tag, no
 # CHANGELOG section). The current version may be one of these; the release
-# workflow skips it, and CHANGELOG.md must never gain a section for it. 0.5.0's
-# release build failed in the test suite; its work was released as 0.5.1.
-NEVER_RELEASED = frozenset({"0.4.0", "0.5.0"})
+# workflow skips it, and CHANGELOG.md must never gain a section for it. The
+# 0.5.0 and 0.5.1 release builds failed in the test suite; their work was
+# released as 0.5.2.
+NEVER_RELEASED = frozenset({"0.4.0", "0.5.0", "0.5.1"})
 
 
 @dataclass(frozen=True)
