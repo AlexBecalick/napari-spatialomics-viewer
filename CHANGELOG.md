@@ -14,6 +14,10 @@ are that section.
 
 ## [Unreleased]
 
+### Fixed
+
+- Clicking a cell in a store that has images but no transcript points opens the cell inspector with an empty transcript list, instead of reporting a transcript inspection error.
+
 ## [0.5.0] - 2026-11-13
 
 Manual landmark registration, standalone 10x Atera stores, hand-curated cell

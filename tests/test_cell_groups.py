@@ -159,8 +159,11 @@ def ctrl(tmp_path, qapp):
         {"geometry": [_square(0, 0), _square(20, 0), two_part]}, index=[10, 20, 30]
     )
     controller.active_dataset = "MERSCOPE"
+    # A click with picking off opens the cell inspector, whose background
+    # worker reads `points`: without it the worker raised, and its error
+    # reached Qt during a later test's event processing and aborted the run.
     controller._active_sdata = types.SimpleNamespace(
-        shapes={U.CELLPOSE_SHAPE_KEY: cellpose}, images={}, labels={}
+        shapes={U.CELLPOSE_SHAPE_KEY: cellpose}, images={}, labels={}, points={}
     )
     return controller
 
