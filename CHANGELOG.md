@@ -14,15 +14,15 @@ are that section.
 
 ## [Unreleased]
 
-## [0.5.1] - 2026-11-14
+## [0.5.2] - 2026-11-14
 
 Manual landmark registration, standalone 10x Atera stores, hand-curated cell
 groups and human-in-the-loop Cellpose annotation, and the first release made
 from this changelog. Version 0.4.0 was set in `pyproject.toml` but never
 released; its manual-registration work ships here. Builds and saved files that
-report 0.4.0 come from `main` between 0.3.0 and this release. Version 0.5.0 was
-prepared but never released, because its installer builds stopped in the test
-suite; this release is that work with the fixes.
+report 0.4.0 come from `main` between 0.3.0 and this release. Versions 0.5.0
+and 0.5.1 were prepared but never released, because their installer builds
+stopped in the test suite; this release is that work with the fixes.
 
 ### Highlights
 
@@ -35,7 +35,7 @@ suite; this release is that work with the fixes.
 ### Upgrading
 
 - The new manual-registration and HITL features need recent MerXen outputs (see Requirements). Existing MERSCOPE, Xenium and paired stores open as before.
-- A developer install (`pip install -e .`) reports its version from the install metadata: re-run it after pulling so `--version` shows 0.5.1.
+- A developer install (`pip install -e .`) reports its version from the install metadata: re-run it after pulling so `--version` shows 0.5.2.
 
 ### Added
 
@@ -188,8 +188,8 @@ SpatialData datasets.
 - Launch without a dataset and select data through the Dataset loader.
 - Native desktop packages for macOS, Windows, and Linux.
 
-[Unreleased]: https://github.com/AlexBecalick/napari-spatialomics-viewer/compare/v0.5.1...HEAD
-[0.5.1]: https://github.com/AlexBecalick/napari-spatialomics-viewer/compare/v0.3.0...v0.5.1
+[Unreleased]: https://github.com/AlexBecalick/napari-spatialomics-viewer/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/AlexBecalick/napari-spatialomics-viewer/compare/v0.3.0...v0.5.2
 [0.3.0]: https://github.com/AlexBecalick/napari-spatialomics-viewer/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/AlexBecalick/napari-spatialomics-viewer/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/AlexBecalick/napari-spatialomics-viewer/releases/tag/v0.1.0
