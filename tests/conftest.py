@@ -25,10 +25,8 @@ def _give_offscreen_qt_windows_fonts() -> None:
     itself runs on the native platform with the system fonts. Qt picks its
     default family from whatever the directory holds, so it gets only the
     Segoe UI files (or the whole system font directory if they are missing).
-    Must run before the first QApplication, which conftest import guarantees.
+    Must run before the first QApplication.
     """
-    if sys.platform != "win32" or os.environ.get("QT_QPA_PLATFORM", "offscreen") != "offscreen":
-        return
     if "QT_QPA_FONTDIR" in os.environ:
         return
     system_fonts = Path(os.environ.get("WINDIR", r"C:\Windows")) / "Fonts"
@@ -42,7 +40,28 @@ def _give_offscreen_qt_windows_fonts() -> None:
     os.environ["QT_QPA_FONTDIR"] = str(font_dir)
 
 
-_give_offscreen_qt_windows_fonts()
+def _native_sized_windows_test_app():
+    """The run's QApplication on offscreen Windows, with the native UI font.
+
+    Offscreen Qt gives the default font 12 pt, while the viewer on Windows
+    gets the system UI font, Segoe UI 9 pt; at 12 pt every text line is half
+    as tall again and the window-height tests measure a window no user sees.
+    An application font only lasts as long as its application, so this one is
+    created here and kept for the run; the test modules' ``qapp`` fixtures
+    (``QApplication.instance() or QApplication([])``) reuse it.
+    """
+    if sys.platform != "win32" or os.environ.get("QT_QPA_PLATFORM", "offscreen") != "offscreen":
+        return None
+    _give_offscreen_qt_windows_fonts()
+    from qtpy.QtGui import QFont
+    from qtpy.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    app.setFont(QFont("Segoe UI", 9))
+    return app
+
+
+_WINDOWS_TEST_APP = _native_sized_windows_test_app()
 
 
 _qt_text_setup: list[str] = []
