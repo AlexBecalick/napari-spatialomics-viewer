@@ -88,7 +88,12 @@ process existed and was never tagged. It is listed in `NEVER_RELEASED` in
 [`scripts/ci/changelog.py`](../scripts/ci/changelog.py), which lets `main`
 carry it until the next release (0.5.0 by a minor bump) and refuses a
 changelog section for it. Builds and saved files stamped 0.4.0 come from `main`
-between 0.3.0 and 0.5.0 and do not identify a commit.
+between 0.3.0 and 0.5.1 and do not identify a commit.
+
+`0.5.0` is listed there too: its release PR was merged, but the release
+workflow stopped in the test suite before building, so nothing was tagged. The
+same work, with the fixes, was released as 0.5.1, whose section took over
+0.5.0's. Builds stamped 0.5.0 come from `main` between those two merges.
 
 ## Changelog entries
 

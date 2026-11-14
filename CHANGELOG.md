@@ -14,18 +14,15 @@ are that section.
 
 ## [Unreleased]
 
-### Fixed
-
-- Clicking a cell in a store that has images but no transcript points opens the cell inspector with an empty transcript list, instead of reporting a transcript inspection error.
-- Release builds are no longer stopped by the test suite crashing on the build machines before packaging. Pull requests and pushes to `main` now run the tests on Linux, macOS (Apple Silicon and Intel) and Windows, with the same dependency versions as the installers.
-
-## [0.5.0] - 2026-11-13
+## [0.5.1] - 2026-11-14
 
 Manual landmark registration, standalone 10x Atera stores, hand-curated cell
 groups and human-in-the-loop Cellpose annotation, and the first release made
 from this changelog. Version 0.4.0 was set in `pyproject.toml` but never
 released; its manual-registration work ships here. Builds and saved files that
-report 0.4.0 come from `main` between 0.3.0 and this release.
+report 0.4.0 come from `main` between 0.3.0 and this release. Version 0.5.0 was
+prepared but never released, because its installer builds stopped in the test
+suite; this release is that work with the fixes.
 
 ### Highlights
 
@@ -38,7 +35,7 @@ report 0.4.0 come from `main` between 0.3.0 and this release.
 ### Upgrading
 
 - The new manual-registration and HITL features need recent MerXen outputs (see Requirements). Existing MERSCOPE, Xenium and paired stores open as before.
-- A developer install (`pip install -e .`) reports its version from the install metadata: re-run it after pulling so `--version` shows 0.5.0.
+- A developer install (`pip install -e .`) reports its version from the install metadata: re-run it after pulling so `--version` shows 0.5.1.
 
 ### Added
 
@@ -92,6 +89,7 @@ report 0.4.0 come from `main` between 0.3.0 and this release.
 - pyarrow is a declared dependency and is bundled in the installers.
 - napari is pinned below 0.8.
 - Releases are made from this changelog: merging a release PR tags `vX.Y.Z`, builds the installers and publishes the release with this file's section as its notes. Patch versions are now released and tagged like any other ([versioning](docs/versioning.md)).
+- Pull requests and pushes to `main` run the tests on Linux, macOS (Apple Silicon and Intel) and Windows, with the same dependency versions as the installers, so a platform-specific failure shows up before a release.
 
 ### Fixed
 
@@ -100,6 +98,7 @@ report 0.4.0 come from `main` between 0.3.0 and this release.
 - Gene-inspector and Atera controls no longer clip at the panel's 240 px minimum width or sit under the macOS overlay scrollbar.
 - The stored-means cell is named by its source (for example "Atera cell" or "Cellpose cell") on every platform.
 - HITL crop preparation recognises native image sources independently of display names, and writes package text as UTF-8.
+- Clicking a cell in a store that has images but no transcript points opens the cell inspector with an empty transcript list, instead of reporting a transcript inspection error.
 
 ### Requirements
 
@@ -189,8 +188,8 @@ SpatialData datasets.
 - Launch without a dataset and select data through the Dataset loader.
 - Native desktop packages for macOS, Windows, and Linux.
 
-[Unreleased]: https://github.com/AlexBecalick/napari-spatialomics-viewer/compare/v0.5.0...HEAD
-[0.5.0]: https://github.com/AlexBecalick/napari-spatialomics-viewer/compare/v0.3.0...v0.5.0
+[Unreleased]: https://github.com/AlexBecalick/napari-spatialomics-viewer/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/AlexBecalick/napari-spatialomics-viewer/compare/v0.3.0...v0.5.1
 [0.3.0]: https://github.com/AlexBecalick/napari-spatialomics-viewer/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/AlexBecalick/napari-spatialomics-viewer/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/AlexBecalick/napari-spatialomics-viewer/releases/tag/v0.1.0
