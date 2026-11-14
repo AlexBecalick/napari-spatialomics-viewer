@@ -709,9 +709,13 @@ def test_docks_allow_small_window_and_keep_status_and_scale_visible(qapp):
     window.resize(1100, 800)
     window.show()
     qapp.processEvents()
-    # Hidden registration controls must not force a tall window on other tabs.
-    assert window.minimumSizeHint().height() < 600
-    for height in (650, 900, 600):
+    # Hidden registration controls must not force a tall window on other tabs
+    # (they would add hundreds of pixels). The exact minimum follows the
+    # platform's font: about 586 px on macOS, 601 px with Linux's DejaVu Sans.
+    minimum = window.minimumSizeHint().height()
+    assert minimum < 640
+    small = max(600, minimum)
+    for height in (650, 900, small):
         window.resize(1000, height)
         qapp.processEvents()
         bar.reposition()
@@ -721,8 +725,8 @@ def test_docks_allow_small_window_and_keep_status_and_scale_visible(qapp):
         assert panel.rect().contains(panel._status_label.geometry())
     panel._tab_stack.setCurrentIndex(panel._registration_tab_index)
     qapp.processEvents()
-    window.resize(1000, 600)
+    window.resize(1000, small)
     qapp.processEvents()
-    assert window.height() == 600
+    assert window.height() == small
     window.close()
     window.deleteLater()

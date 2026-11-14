@@ -108,6 +108,10 @@ def test_local_export_has_gui_prefills_model_arrays_and_transfer_location(manage
     assert settings.channels == ("DAPI",)
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="LC_ALL=C gives an ASCII preferred encoding only on POSIX; Windows keeps its code page",
+)
 def test_local_export_writes_utf8_guide_when_macos_app_has_ascii_locale(source):
     store, _, setup = source
     code = """
