@@ -11,6 +11,12 @@ from pathlib import Path
 
 import pytest
 
+# The test modules all default Qt to offscreen, but this file is imported first
+# and on Windows creates the QApplication below: without this default it would
+# start on the native platform, whose windows the runner's 1024x768 screen
+# limits (a release build failed on that when QT_QPA_PLATFORM was unset).
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
 # Windows UI fonts: Segoe UI as the native viewer uses it, and Segoe UI Symbol
 # for glyphs such as the gene markers.
 _WINDOWS_TEST_FONTS = ("segoeui.ttf", "segoeuib.ttf", "segoeuii.ttf", "segoeuiz.ttf", "seguisym.ttf")
