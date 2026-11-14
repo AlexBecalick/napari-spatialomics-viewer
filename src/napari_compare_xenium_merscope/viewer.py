@@ -14629,6 +14629,10 @@ class ComparisonViewerController(AteraTranscriptMixin):
                           else "transcripts" if "transcripts" in sdata.points else
                           next((str(k) for k in sdata.points if not str(k).startswith("transcripts_pciseq_")), ""))
         points_key = str((metadata or branch).get("points") or default_points)
+        if not points_key:
+            # An image-only store has no transcript points: the cell has no
+            # transcripts to list, which is not an inspection failure.
+            return self._empty_cell_transcript_index()
         try:
             _, points, x, y, _ = self._resolve_points_columns_for(sdata, points_key)
             gene = resolve_gene_column(points)

@@ -677,6 +677,14 @@ def test_pciseq_inspection_follows_cell_type_tab_independently(qapp, monkeypatch
     assert ctrl._inspection_transcript_index('TEST', 900, shape, index).transcripts_for(900)[1].size == 0
 
 
+def test_a_store_without_transcript_points_inspects_cells_with_no_transcripts(qapp):
+    ctrl = _controller(qapp)
+    ctrl._active_sdata.points.clear()  # an image-only store
+    shape = _demo_gdf().geometry.iloc[0]
+    index = ctrl._inspection_transcript_index('TEST', 202, shape, ctrl._empty_cell_transcript_index())
+    assert index.transcripts_for(202)[1].size == 0
+
+
 def test_selected_colour_level_is_reflected_in_inspector(qapp):
     ctrl = _controller(qapp)
     state = ctrl._cell_type_state('TEST')

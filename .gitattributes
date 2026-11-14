@@ -1,0 +1,4 @@
+# Test fixtures are compared byte for byte (the manual-registration golden
+# file's SHA-256 is pinned): keep them exactly as committed, so a Windows
+# checkout with core.autocrlf does not turn their LF line endings into CRLF.
+tests/data/** -text
