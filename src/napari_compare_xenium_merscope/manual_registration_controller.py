@@ -124,8 +124,10 @@ DISABLED_PAIR_COLOUR = "#9e9e9e"
 REFERENCE_COLORMAP = "green"
 MOVING_COLORMAP = "magenta"
 OTHER_CHANNEL_COLORMAP = "gray"
-CONTRAST_PERCENTILES = (0.5, 99.5)
+CONTRAST_PERCENTILES = (1.0, 99.9)
 CONTRAST_MAX_PIXELS = 4_000_000
+CONTRAST_TILES = 32
+CONTRAST_TILE_PX = 512
 PREVIEW_MIN_ENABLED = 3
 UNDO_LIMIT = 500
 SESSION_KEYS = (
@@ -201,6 +203,95 @@ def contrast_limits_from_level(
     if nonzero.size == 0:
         return (0.0, 1.0)
     low, high = (float(v) for v in np.percentile(nonzero, percentiles))
+    if not high > low:
+        high = low + 1.0
+    return (low, high)
+
+
+def contrast_limits_from_tissue_tiles(
+    level0_cyx: Any,
+    coarse_cyx: Any,
+    channel_index: int,
+    *,
+    percentiles: tuple[float, float] = CONTRAST_PERCENTILES,
+    n_tiles: int = CONTRAST_TILES,
+    tile_px: int = CONTRAST_TILE_PX,
+    seed: int = 0,
+    cancel_check: Callable[[], bool] | None = None,
+) -> tuple[float, float]:
+    """Return display contrast limits of one channel from full-resolution tissue tiles.
+
+    A coarse pyramid level averages blocks of tens of thousands of pixels, which removes the
+    bright tail and makes the default contrast saturate sparse bright structures. The limits
+    here are instead the ``percentiles`` of the non-zero pixels of up to ``n_tiles`` tiles of
+    ``tile_px`` squared read at full resolution. Tile centres are drawn (deterministically, from
+    ``seed``) among the non-zero pixels of the coarse level, so they lie on tissue (zero is
+    padding or background). Tiles are read one at a time.
+
+    Falls back to ``contrast_limits_from_level`` on the coarse level when level 0 cannot be read.
+
+    Args:
+        level0_cyx: The finest ``(c, y, x)`` DataArray level.
+        coarse_cyx: A coarse ``(c, y, x)`` DataArray level of the same image.
+        channel_index: Index of the channel.
+        percentiles: Lower and upper percentile.
+        n_tiles: Maximum number of tiles.
+        tile_px: Tile edge in level-0 pixels.
+        seed: Seed of the tile-centre draw.
+        cancel_check: Polled between tiles; a true value raises ``RegistrationLoadCancelled``.
+
+    Returns:
+        ``(low, high)`` with ``high > low``; ``(0.0, 1.0)`` when no tile pixel is non-zero.
+
+    Raises:
+        RegistrationLoadCancelled: If ``cancel_check`` became true.
+    """
+
+    def check() -> None:
+        if cancel_check is not None and cancel_check():
+            raise RegistrationLoadCancelled()
+
+    try:
+        coarse_plane = coarse_cyx.isel(c=channel_index)
+        coarse_height, coarse_width = (int(v) for v in coarse_plane.shape)
+        step = max(1, math.ceil(math.sqrt(coarse_height * coarse_width / CONTRAST_MAX_PIXELS)))
+        sampled = np.asarray(coarse_plane.data[::step, ::step])
+        tissue = np.argwhere(np.isfinite(sampled) & (sampled != 0))
+        if tissue.size == 0:
+            return (0.0, 1.0)
+        plane0 = level0_cyx.isel(c=channel_index)
+        height0, width0 = (int(v) for v in plane0.shape)
+        rng = np.random.default_rng(seed)
+        chosen = rng.choice(len(tissue), size=min(n_tiles, len(tissue)), replace=False)
+        edge = min(tile_px, height0, width0)
+        pooled: list[np.ndarray] = []
+        for index in chosen:
+            check()
+            row, col = tissue[index]
+            # Centre of the sampled coarse pixel, scaled to level 0.
+            centre_y = (row * step + step / 2) * height0 / coarse_height
+            centre_x = (col * step + step / 2) * width0 / coarse_width
+            y0 = int(min(max(centre_y - edge / 2, 0), height0 - edge))
+            x0 = int(min(max(centre_x - edge / 2, 0), width0 - edge))
+            tile = np.asarray(plane0.data[y0 : y0 + edge, x0 : x0 + edge]).ravel()
+            if tile.dtype.kind == "f":
+                tile = tile[np.isfinite(tile)]
+            tile = tile[tile != 0]
+            if tile.size:
+                pooled.append(tile)
+    except RegistrationLoadCancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001 - any store/dask read failure has the same fallback
+        log.warning(
+            "Full-resolution contrast read failed (%s: %s); using the coarsest level.",
+            type(exc).__name__,
+            exc,
+        )
+        return contrast_limits_from_level(coarse_cyx, channel_index)
+    if not pooled:
+        return (0.0, 1.0)
+    values = np.concatenate(pooled)
+    low, high = (float(v) for v in np.percentile(values, percentiles))
     if not high > low:
         high = low + 1.0
     return (low, high)
@@ -776,7 +867,9 @@ class ManualRegistrationController:
                     f"Image {key!r} has {n_channels} channels but the store lists {names}."
                 )
             for index, channel in enumerate(names):
-                contrast[(role, channel)] = contrast_limits_from_level(levels[role][-1], index)
+                contrast[(role, channel)] = contrast_limits_from_tissue_tiles(
+                    levels[role][0], levels[role][-1], index, cancel_check=cancel_check
+                )
                 check()
         if descriptor.kind == "result":
             if descriptor.result is None:
