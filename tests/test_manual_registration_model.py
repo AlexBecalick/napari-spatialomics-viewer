@@ -1436,6 +1436,15 @@ def _bad_checks():
         "bad suggestion": edit(lambda p: p["suggestions"][0].update(reference_xy_px=[1.0])),
         "bad snap": edit(lambda p: p["pairs"]["4"].update(snap_moving_xy_px=[1.0])),
         "bad labelling source": edit(lambda p: p.update(labelling_source="elsewhere")),
+        "schema version zero": edit(lambda p: p.update(schema_version=0)),
+        "negative schema version": edit(lambda p: p.update(schema_version=-1)),
+        "missing algorithm": edit(lambda p: p.pop("algorithm")),
+        "null status": edit(lambda p: p.update(status=None)),
+        "missing channel roles": edit(lambda p: p.pop("channel_roles")),
+        "missing hyperparameters": edit(lambda p: p["field"].pop("hyperparameters")),
+        "missing rigid loo": edit(lambda p: p["field"].pop("rigid_loo_um")),
+        "missing verdict counts": edit(lambda p: p["field"].pop("verdict_counts")),
+        "missing loo vector": edit(lambda p: p["pairs"]["1"].pop("loo_vector_moving_um")),
         "unknown class count": edit(lambda p: p["field"]["class_counts"].update(weird=1)),
     }
 

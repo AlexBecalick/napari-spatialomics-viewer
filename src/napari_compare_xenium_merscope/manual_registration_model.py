@@ -1648,6 +1648,11 @@ def _parse_pair_check(pair_id: int, rec: Any) -> PairCheck:
         co_weight = _finite_or_none(_req(clicks_only, "weight", co_where), f"{co_where}.weight")
         co_loo = _finite(_req(clicks_only, "loo_um", co_where), f"{co_where}.loo_um")
         co_p = _finite(_req(clicks_only, "p_value", co_where), f"{co_where}.p_value")
+    vector = _req(rec, "loo_vector_moving_um", where)
+    if not isinstance(vector, (list, tuple)) or len(vector) != 2:
+        raise _check_error(where, "loo_vector_moving_um is not [dx, dy]")
+    for component in vector:
+        _finite(component, f"{where}.loo_vector_moving_um")
     snap_raw = _req(rec, "snap_moving_xy_px", where)
     snap: tuple[float, float] | None = None
     if snap_raw is not None:
@@ -1711,8 +1716,11 @@ def parse_check_attr(
         raise _check_error("check", "schema_version is missing or invalid")
     if version > SCHEMA_VERSION:
         raise _unsupported("landmark check", int(version))
+    if version < 1:
+        raise _check_error("check", f"schema_version {version!r} is below 1")
 
     where = "check"
+    _validate_check_envelope(payload)
     field_block = _req(payload, "field", where)
     loo = _req(field_block, "loo_um", "field")
     clicks_only_loo = _req(field_block, "loo_um_clicks_only", "field")
@@ -1795,6 +1803,53 @@ def parse_check_attr(
         pairs=pairs,
         suggestions=tuple(suggestions),
     )
+
+
+def _validate_check_envelope(payload: Mapping[str, Any]) -> None:
+    """Require the C3 keys the viewer does not display, with nulls only where C3 allows them."""
+    where = "check"
+    for key in (
+        "status",
+        "dataset_name",
+        "labelling_status",
+        "preset_version",
+        "settings_digest",
+    ):
+        if not isinstance(_req(payload, key, where), str):
+            raise _check_error(where, f"{key} is not text")
+    written_by = _req(payload, "written_by", where)
+    for key in ("software", "version"):
+        if not isinstance(_req(written_by, key, "written_by"), str):
+            raise _check_error("written_by", f"{key} is not text")
+    roles = _req(payload, "channel_roles", where)
+    if roles is not None:
+        for key in ("reference", "moving"):
+            if not isinstance(_req(roles, key, "channel_roles"), Mapping):
+                raise _check_error("channel_roles", f"{key} is not an object")
+    algorithm = _req(payload, "algorithm", where)
+    if not isinstance(algorithm, Mapping):
+        raise _check_error("algorithm", "is not an object")
+    if not isinstance(_req(algorithm, "landmark_field", "algorithm"), str):
+        raise _check_error("algorithm", "landmark_field is not text")
+    image_evidence = _req(algorithm, "image_evidence", "algorithm")
+    if image_evidence is not None and not isinstance(image_evidence, str):
+        raise _check_error("algorithm", "image_evidence is not text or null")
+    _req(payload, "outputs", where)
+    field_block = _req(payload, "field", where)
+    hyper = _req(field_block, "hyperparameters", "field")
+    for key in ("long_length_um", "long_signal_um", "short_length_um", "short_signal_um"):
+        _req(hyper, key, "field.hyperparameters")
+    if not isinstance(_req(hyper, "noise_um", "field.hyperparameters"), Mapping):
+        raise _check_error("field.hyperparameters", "noise_um is not an object")
+    for key in ("rigid_loo_um", "sd_um"):
+        _req(field_block, key, "field")
+    _finite(_req(field_block, "outlier_p", "field"), "field.outlier_p")
+    counts = _req(field_block, "verdict_counts", "field")
+    if not isinstance(counts, Mapping):
+        raise _check_error("field.verdict_counts", "is not an object")
+    for name, count in counts.items():
+        if name not in CHECK_VERDICTS or not _is_int(count):
+            raise _check_error("field.verdict_counts", f"bad entry {name!r}: {count!r}")
 
 
 def check_currentness(
