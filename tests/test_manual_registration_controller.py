@@ -1836,6 +1836,46 @@ def test_a_late_check_result_of_an_earlier_session_is_ignored(prepared_store, tm
     assert controller._check is None
 
 
+def test_a_late_store_check_refresh_of_an_earlier_session_is_ignored(prepared_store, tmp_path):
+    payload = labelled_store(prepared_store)
+    viewer, host, widget, controller = make_env(tmp_path / "app_late_store", deferred=True)
+    assert controller.load_store(prepared_store)
+    host.run_pending()
+    stores.write_check_attr(prepared_store, matching_check(payload))
+    widget.refresh_check_requested.emit()  # no file loaded: re-reads the store attribute
+    late = host.pending[-1]
+    assert host.worker_keys[-1] == "registration_check"
+    host.pending.remove(late)
+    late_attrs = late[0]()  # the old read saw the check
+    zarr_json = prepared_store / "zarr.json"  # the next session starts without the check
+    document = json.loads(zarr_json.read_text())
+    document["attributes"].pop("merxen_manual_registration_check")
+    zarr_json.write_text(json.dumps(document))
+    assert controller.load_store(prepared_store)
+    host.run_pending()
+    descriptor_before = controller.session.descriptor
+    late[1](late_attrs)
+    assert controller.session.descriptor is descriptor_before
+    assert controller._check is None
+    assert table_headers(widget) == RIGID_HEADERS
+
+
+def test_cancelling_background_work_frees_the_check_buttons(prepared_store, tmp_path):
+    payload = labelled_store(prepared_store)
+    viewer, host, widget, controller = make_env(tmp_path / "app_cancel", deferred=True)
+    assert controller.load_store(prepared_store)
+    host.run_pending()
+    check_file = stores.write_check_file(tmp_path / "x_check.json", matching_check(payload))
+    widget.check_file_chosen.emit(str(check_file))
+    assert not widget._load_check_button.isEnabled()
+    controller.cancel_background()
+    host.drop_pending(keys=["registration_check"])
+    assert widget._load_check_button.isEnabled()
+    assert widget._refresh_check_button.isEnabled()
+    widget.refresh_check_requested.emit()
+    assert host.worker_keys[-1] == "registration_check" and len(host.pending) == 1
+
+
 def test_the_check_is_forgotten_when_the_session_ends(ctrl, widget, labelled):
     stores.write_check_attr(labelled.path, matching_check(labelled.payload))
     load(ctrl, labelled.path)

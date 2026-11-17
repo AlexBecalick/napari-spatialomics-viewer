@@ -2648,6 +2648,11 @@ class ManualRegistrationController:
         """Cancel a running load; its late callbacks are ignored (saves are not cancelled)."""
         self._load_cancel.set()
         self._load_generation += 1
+        # A cancelled check worker never calls back, so its busy state is cleared here; a late
+        # callback of a surviving session cannot arrive (the host drops the cancelled task).
+        self._check_busy = False
+        if self._widget is not None:
+            self._widget.set_check_busy(False)
 
     def deactivate(self) -> None:
         """End the session (idempotent): flush the draft, remove layers, restore keys."""
