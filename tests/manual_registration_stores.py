@@ -10,6 +10,8 @@ attributes is the placeholder ``"<synthetic>"``.
 
 from __future__ import annotations
 
+import copy
+import json
 import warnings
 from collections.abc import Sequence
 from pathlib import Path
@@ -18,6 +20,7 @@ from typing import Any
 import numpy as np
 
 from napari_compare_xenium_merscope.manual_registration_model import (
+    CHECK_ATTR,
     LABELLING_ATTR,
     LABELLING_SCHEMA,
     RESULT_ATTR,
@@ -41,6 +44,7 @@ GRID_DIGEST = "sha256:" + "1" * 64
 CONTENT_DIGEST = "sha256:" + "2" * 64
 CREATED_AT = "2026-11-02T10:15:00Z"
 PLACEHOLDER = "<synthetic>"
+CHECK_EXAMPLE_PATH = Path(__file__).parent / "data" / "manual_registration_check_example_v1.json"
 
 
 def synthetic_image(shape_yx: tuple[int, int], n_channels: int, *, seed: int) -> np.ndarray:
@@ -379,6 +383,49 @@ def result_attr(
     }
 
 
+def check_payload(
+    *,
+    labelling_content_sha256: str,
+    pair_ids: Sequence[int],
+    store_content_digest: str = CONTENT_DIGEST,
+    classes: dict[int, str] | None = None,
+    with_details: bool = False,
+) -> dict[str, Any]:
+    """Return a landmark-check payload (C3) for the given pair ids.
+
+    It starts from the committed example (pair 1 is the template of every pair) so the shape
+    stays the one MerXen writes; ``classes`` overrides the class of single pairs.
+    """
+    example = json.loads(CHECK_EXAMPLE_PATH.read_text(encoding="utf-8"))
+    payload = copy.deepcopy(example)
+    template = example["pairs"]["1"]
+    payload["labelling_content_sha256"] = labelling_content_sha256
+    payload["store_content_digest"] = store_content_digest
+    payload["pairs"] = {}
+    for pair_id in pair_ids:
+        record = copy.deepcopy(template)
+        record["class"] = (classes or {}).get(int(pair_id), "ok")
+        payload["pairs"][str(int(pair_id))] = record
+    if with_details:
+        payload["details"] = {"timings_s": {"total": 1.5}}
+    return payload
+
+
+def write_check_attr(path: Path, payload: dict[str, Any]) -> None:
+    """Write the landmark-check root attribute of a prepared store."""
+    write_root_attr(path, CHECK_ATTR, payload)
+
+
+def write_check_file(path: Path, payload: dict[str, Any]) -> Path:
+    """Write a check JSON the way MerXen does (canonical JSON plus a newline)."""
+    path = Path(path)
+    path.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True) + "\n",
+        encoding="utf-8",
+    )
+    return path
+
+
 def write_root_attr(path: Path, key: str, payload: dict[str, Any]) -> None:
     """Write one root attribute of a Zarr group (other keys are kept)."""
     import zarr
@@ -463,11 +510,16 @@ def build_result_store(
     moving_shape_yx: tuple[int, int] = MOVING_SHAPE_YX,
     reference_channels: Sequence[str] = REFERENCE_CHANNELS,
     moving_channels: Sequence[str] = MOVING_CHANNELS,
+    materialization: dict[str, Any] | None = None,
+    field: dict[str, Any] | None = None,
 ) -> Path:
     """Write a synthetic result store (cropped reference + registered moving, result attrs).
 
     ``preset``/``run_label`` reach both ``STORE_ATTR`` and ``RESULT_ATTR``; the shapes and channels
-    drive the images and ``STORE_ATTR`` alike. Other keywords are rejected (``TypeError``).
+    drive the images and ``STORE_ATTR`` alike. ``materialization`` is written to both image
+    records of ``STORE_ATTR`` (C4; the images themselves stay full size, which is enough for the
+    placement tests) and ``field`` to ``RESULT_ATTR`` (C5). Other keywords are rejected
+    (``TypeError``).
     """
     from spatialdata.transformations import Affine
 
@@ -489,25 +541,24 @@ def build_result_store(
         synthetic_image(cropped, len(moving_channels), seed=37), moving_channels, transformation
     )
     _write_images(path, {"reference": reference, "moving_registered": registered})
-    write_root_attr(
-        path,
-        STORE_ATTR,
-        result_store_attr(
-            crop=crop,
-            preset=preset,
-            run_label=run_label,
-            reference_shape_yx=reference_shape_yx,
-            moving_shape_yx=moving_shape_yx,
-            reference_channels=reference_channels,
-            moving_channels=moving_channels,
-        ),
+    store_attr = result_store_attr(
+        crop=crop,
+        preset=preset,
+        run_label=run_label,
+        reference_shape_yx=reference_shape_yx,
+        moving_shape_yx=moving_shape_yx,
+        reference_channels=reference_channels,
+        moving_channels=moving_channels,
     )
+    if materialization is not None:
+        for role in ("reference", "moving"):
+            store_attr["images"][role]["materialization"] = dict(materialization)
+    write_root_attr(path, STORE_ATTR, store_attr)
     rows = default_result_landmarks() if landmarks is None else list(landmarks)
-    write_root_attr(
-        path,
-        RESULT_ATTR,
-        result_attr(landmarks=rows, crop=crop, preset=preset, run_label=run_label),
-    )
+    result = result_attr(landmarks=rows, crop=crop, preset=preset, run_label=run_label)
+    if field is not None:
+        result["field"] = copy.deepcopy(field)
+    write_root_attr(path, RESULT_ATTR, result)
     return path
 
 

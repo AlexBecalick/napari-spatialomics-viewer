@@ -23,6 +23,7 @@ from typing import Any
 import zarr
 
 from .manual_registration_model import (
+    CHECK_ATTR,
     LABELLING_ATTR,
     LABELLING_SCHEMA,
     MIN_LANDMARK_PAIRS,
@@ -108,6 +109,28 @@ def read_root_attrs(path: Path) -> dict[str, Any]:
     if (path / ".zgroup").exists():
         return {}
     raise NotARegistrationStore(f"{path.name} is not a Zarr store")
+
+
+def read_check_attr(path: Path) -> dict[str, Any] | None:
+    """Return the store's landmark-check root attribute verbatim, or None (metadata only)."""
+    value = read_root_attrs(path).get(CHECK_ATTR)
+    return dict(value) if isinstance(value, dict) else None
+
+
+def read_check_file(path: Path) -> dict[str, Any]:
+    """Read a ``*_check.json`` written by ``merxen manual-registration-check``.
+
+    Raises:
+        OSError: If the file cannot be read.
+        ValueError: If it is not a JSON object.
+    """
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"{Path(path).name} is not a text file: {exc}") from exc
+    if not isinstance(data, dict):
+        raise ValueError(f"{Path(path).name} does not hold a JSON object")
+    return data
 
 
 def read_store_descriptor(path: Path) -> StoreDescriptor:

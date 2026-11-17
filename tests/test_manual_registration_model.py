@@ -1330,3 +1330,273 @@ def test_golden_examples_parse_and_digest(golden):
     np.testing.assert_allclose(
         rebuilt["coarse"]["matrix_xy"], labelling["coarse"]["matrix_xy"], atol=1e-6
     )
+
+
+# ---------------------------------------------------------------------------------------------
+# MerXen landmark check (C3), result-store materialization (C4)
+# ---------------------------------------------------------------------------------------------
+
+CHECK_EXAMPLE_PATH = Path(__file__).parent / "data" / "manual_registration_check_example_v1.json"
+CHECK_EXAMPLE_SHA256 = "1db10ac4327e1291403c19f7e62c0dfbb383dc487f94cc541e25efd9a72a9f84"
+
+
+def _check_example() -> dict:
+    return json.loads(CHECK_EXAMPLE_PATH.read_text(encoding="utf-8"))
+
+
+def test_check_example_file_is_pinned_canonical_json():
+    raw = CHECK_EXAMPLE_PATH.read_bytes()
+    assert hashlib.sha256(raw).hexdigest() == CHECK_EXAMPLE_SHA256
+    assert len(raw) == 3533
+    assert raw.endswith(b"\n")
+    assert raw.decode("ascii") == canonical_json(json.loads(raw)) + "\n"
+
+
+def test_parse_check_example():
+    check = M.parse_check_attr(_check_example())
+    assert (check.source, check.path, check.labelling_source) == ("store", None, "store")
+    assert sorted(check.pairs) == [1, 2, 3, 4, 5]
+    assert {i: p.robust_class for i, p in check.pairs.items()} == {
+        1: "ok",
+        2: "kept_confirmed",
+        3: "check",
+        4: "likely_misclick",
+        5: "disabled",
+    }
+    assert {i: p.verdict for i, p in check.pairs.items()} == {
+        1: "confirmed",
+        2: "confirmed",
+        3: "inconclusive",
+        4: "contradicted",
+        5: "not_checked",
+    }
+    assert check.loo_median_um == 34.5 and check.loo_p90_um == 97.25
+    assert check.loo_clicks_only_median_um == 42.5
+    assert (check.n_clicks, check.n_windows, check.labelling_revision) == (4, 12, 3)
+    assert check.class_counts["likely_misclick"] == 1
+    assert check.pairs[3].rigid_loo_um is None
+    assert check.pairs[4].snap_moving_xy_px == (41210.5, 20117.25)
+    assert check.pairs[5].weight is None and check.pairs[5].used is False
+    assert [s["rank"] for s in check.suggestions] == [1, 2]
+    assert check.suggestions[0]["reference_xy_px"] == (6000.0, 9000.5)
+
+
+def test_check_shows_the_lower_p_and_weight():
+    pairs = M.parse_check_attr(_check_example()).pairs
+    assert (pairs[3].shown_p_value, pairs[3].shown_weight) == (0.00015, 0.25)
+    assert (pairs[4].shown_p_value, pairs[4].shown_weight) == (8.4e-15, 0.0625)
+    assert (pairs[1].shown_p_value, pairs[1].shown_weight) == (0.41, 1.125)
+    assert pairs[5].shown_weight is None  # both weights are null
+
+
+def test_check_without_clicks_only_block_shows_final_values():
+    payload = _check_example()
+    payload["pairs"]["1"]["clicks_only"] = None
+    payload["field"]["loo_um_clicks_only"] = None
+    check = M.parse_check_attr(payload)
+    assert (check.pairs[1].shown_p_value, check.pairs[1].shown_weight) == (0.52, 1.25)
+    assert check.loo_clicks_only_median_um is None
+
+
+def test_check_file_details_key_is_ignored():
+    payload = _check_example()
+    plain = M.parse_check_attr(payload, source="file", path="x_check.json")
+    payload["details"] = {"field_model": {"anything": [1, 2]}}
+    payload["some_future_key"] = 1
+    assert M.parse_check_attr(payload, source="file", path="x_check.json") == plain
+    assert plain.source == "file" and plain.path == "x_check.json"
+
+
+def test_check_newer_schema_version_is_unsupported():
+    payload = {**_check_example(), "schema_version": 2}
+    with pytest.raises(UnsupportedSchemaVersion, match="newer"):
+        M.parse_check_attr(payload)
+
+
+def _bad_checks():
+    def edit(fn):
+        payload = _check_example()
+        fn(payload)
+        return payload
+
+    return {
+        "wrong schema": edit(lambda p: p.update(schema="other")),
+        "no schema version": edit(lambda p: p.pop("schema_version")),
+        "unknown class": edit(lambda p: p["pairs"]["1"].update({"class": "weird"})),
+        "unknown verdict": edit(lambda p: p["pairs"]["1"].update(verdict="weird")),
+        "non-decimal key": edit(lambda p: p["pairs"].update({"a1": p["pairs"].pop("1")})),
+        "signed key": edit(lambda p: p["pairs"].update({"-1": p["pairs"].pop("1")})),
+        "nan loo": edit(lambda p: p["pairs"]["1"].update(loo_um=float("nan"))),
+        "infinite p": edit(lambda p: p["pairs"]["1"].update(p_value=float("inf"))),
+        "null p": edit(lambda p: p["pairs"]["1"].update(p_value=None)),
+        "missing pairs": edit(lambda p: p.pop("pairs")),
+        "missing pair key": edit(lambda p: p["pairs"]["1"].pop("verdict")),
+        "pairs not an object": edit(lambda p: p.update(pairs=[])),
+        "missing field": edit(lambda p: p.pop("field")),
+        "bad suggestion": edit(lambda p: p["suggestions"][0].update(reference_xy_px=[1.0])),
+        "bad snap": edit(lambda p: p["pairs"]["4"].update(snap_moving_xy_px=[1.0])),
+        "bad labelling source": edit(lambda p: p.update(labelling_source="elsewhere")),
+        "unknown class count": edit(lambda p: p["field"]["class_counts"].update(weird=1)),
+    }
+
+
+@pytest.mark.parametrize("name", sorted(_bad_checks()))
+def test_check_malformed_content_raises_check_attr_error(name):
+    with pytest.raises(M.CheckAttrError):
+        M.parse_check_attr(_bad_checks()[name])
+    assert issubclass(M.CheckAttrError, ValueError)
+
+
+def test_check_non_object_raises_check_attr_error():
+    with pytest.raises(M.CheckAttrError):
+        M.parse_check_attr([])  # type: ignore[arg-type]
+
+
+def test_check_currentness_needs_both_digests():
+    check = M.parse_check_attr(_check_example())
+    ok, reason = M.check_currentness(
+        check,
+        content_sha256=check.labelling_content_sha256,
+        store_content_digest=check.store_content_digest,
+    )
+    assert (ok, reason) == (True, "")
+    ok, reason = M.check_currentness(
+        check, content_sha256="sha256:" + "9" * 64, store_content_digest=check.store_content_digest
+    )
+    assert not ok
+    assert reason == (
+        "The landmarks changed since the check was run (revision 3). Save, upload and run "
+        "merxen manual-registration-check again."
+    )
+    for digest in ("sha256:" + "9" * 64, None):
+        ok, reason = M.check_currentness(
+            check, content_sha256=check.labelling_content_sha256, store_content_digest=digest
+        )
+        assert not ok
+        assert reason == (
+            "This check belongs to another preparation of the images "
+            "(store content digest differs)."
+        )
+
+
+def _residual_row(pair_id: int) -> M.ResidualRow:
+    return M.ResidualRow(
+        id=pair_id,
+        colour="#ffffff",
+        enabled=True,
+        used=True,
+        outlier=False,
+        outside_crop=False,
+        fit_um=1.0,
+        loo_um=2.0,
+    )
+
+
+def test_apply_check_to_rows_merges_by_id():
+    check = M.parse_check_attr(_check_example())
+    rows = [_residual_row(i) for i in (4, 3, 99)]
+    merged = M.apply_check_to_rows(rows, check)
+    assert [r.id for r in merged] == [4, 3, 99]
+    four, three, unknown = merged
+    assert (four.p_value, four.weight, four.robust_class) == (8.4e-15, 0.0625, "likely_misclick")
+    assert (four.robust_loo_um, four.verdict, four.rigid_loo_um) == (85.0, "contradicted", 310.0)
+    assert (four.final_p_value, four.clicks_only_p_value) == (0.03, 8.4e-15)
+    assert (three.p_value, three.weight, three.rigid_loo_um) == (0.00015, 0.25, None)
+    # an id the check does not know keeps the plain fit values and no check values
+    assert unknown == rows[2]
+    assert unknown.p_value is None and unknown.robust_class is None
+    assert four.fit_um == 1.0 and four.loo_um == 2.0  # the live fit stays
+
+
+def test_descriptor_carries_the_check_attribute_of_prepared_stores():
+    payload = _check_example()
+    d = parse_store_descriptor(
+        Path("x.zarr"),
+        {STORE_ATTR: prepared_store_attr(), M.CHECK_ATTR: payload},
+    )
+    assert d.check == payload and d.check is not payload
+    assert parse_store_descriptor(Path("x.zarr"), {STORE_ATTR: prepared_store_attr()}).check is None
+    # a malformed value never blocks loading the store; it is parsed (and refused) later
+    d = parse_store_descriptor(
+        Path("x.zarr"), {STORE_ATTR: prepared_store_attr(), M.CHECK_ATTR: "junk"}
+    )
+    assert d.check is None
+    d = parse_store_descriptor(
+        Path("x.zarr"), {STORE_ATTR: prepared_store_attr(), M.CHECK_ATTR: {"schema": "bad"}}
+    )
+    assert d.check == {"schema": "bad"}
+    with pytest.raises(M.CheckAttrError):
+        M.parse_check_attr(d.check)
+
+
+def _result_attr_with_materialization(record):
+    attr = result_store_attr()
+    for role in ("reference", "moving"):
+        attr["images"][role]["materialization"] = record
+    return attr
+
+
+@pytest.mark.parametrize("factor", [1, 4, 16])
+def test_result_descriptor_places_preview_levels_by_pixel_centre(factor):
+    p = 0.34511
+    record = {"mode": "preview" if factor > 1 else "full", "level_factor": factor}
+    record["pixel_size_um"] = p * factor
+    d = parse_store_descriptor(
+        Path("r.zarr"),
+        {STORE_ATTR: _result_attr_with_materialization(record), M.RESULT_ATTR: RESULT_ATTR_MIN},
+    )
+    x0, y0 = 1024, 512  # the crop of result_store_attr()
+    half = (factor - 1) / 2
+    expected = np.array(
+        [[p * factor, 0, p * (y0 + half)], [0, p * factor, p * (x0 + half)], [0, 0, 1]]
+    )
+    for role in ("reference", "moving"):
+        assert np.allclose(d.images[role].base_affine_rc, expected)
+        # informative only: the record's own pixel size stays the reference level-0 size
+        assert d.images[role].pixel_size_um == p
+
+
+def test_result_descriptor_without_materialization_equals_factor_one():
+    p = 0.34511
+    plain = parse_store_descriptor(
+        Path("r.zarr"), {STORE_ATTR: result_store_attr(), M.RESULT_ATTR: RESULT_ATTR_MIN}
+    )
+    full = parse_store_descriptor(
+        Path("r.zarr"),
+        {
+            STORE_ATTR: _result_attr_with_materialization(
+                {"mode": "full", "level_factor": 1, "pixel_size_um": p}
+            ),
+            M.RESULT_ATTR: RESULT_ATTR_MIN,
+        },
+    )
+    for role in ("reference", "moving"):
+        assert np.array_equal(plain.images[role].base_affine_rc, full.images[role].base_affine_rc)
+
+
+@pytest.mark.parametrize(
+    "record",
+    [
+        {"mode": "preview", "level_factor": 0, "pixel_size_um": 1.0},
+        {"mode": "preview", "level_factor": 2.5, "pixel_size_um": 1.0},
+        {"mode": "preview", "level_factor": True, "pixel_size_um": 1.0},
+        {"mode": "preview", "level_factor": "4", "pixel_size_um": 1.0},
+        {"mode": "tiny", "level_factor": 4, "pixel_size_um": 1.0},
+        {"level_factor": 4, "pixel_size_um": 1.0},
+        {"mode": "preview", "pixel_size_um": 1.0},
+        "preview",
+    ],
+)
+def test_result_descriptor_rejects_a_malformed_materialization(record):
+    with pytest.raises(NotARegistrationStore, match="materialization is missing or invalid"):
+        parse_store_descriptor(
+            Path("r.zarr"),
+            {STORE_ATTR: _result_attr_with_materialization(record), M.RESULT_ATTR: RESULT_ATTR_MIN},
+        )
+
+
+def test_prepared_descriptor_ignores_materialization_records():
+    attr = prepared_store_attr()
+    attr["images"]["reference"]["materialization"] = {"mode": "bad"}
+    d = parse_store_descriptor(Path("p.zarr"), {STORE_ATTR: attr})
+    assert np.allclose(d.images["reference"].base_affine_rc, np.diag([0.34511, 0.34511, 1.0]))
