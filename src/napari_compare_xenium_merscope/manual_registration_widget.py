@@ -135,7 +135,13 @@ def _fmt_p(value: float | None) -> str:
     return "<1e-4" if value < 1e-4 else f"{value:.2g}"
 
 
-def _flags(row: ResidualRow, *, off_text: str, check_mode: bool = False) -> str:
+def _flags(
+    row: ResidualRow,
+    *,
+    off_text: str,
+    check_mode: bool = False,
+    outlier_text: str = "rigid outlier",
+) -> str:
     """Return the flag text of a table row (rigid-fit outlier flags, or the check's class)."""
     parts = []
     if check_mode and row.robust_class is not None:
@@ -147,7 +153,7 @@ def _flags(row: ResidualRow, *, off_text: str, check_mode: bool = False) -> str:
         if text and row.robust_class != "disabled":
             parts.append(text)
     elif row.outlier:
-        parts.append("⚠ rigid outlier")
+        parts.append(f"⚠ {outlier_text}")
     if row.outside_crop:
         parts.append("✂ outside crop")
     if not row.enabled:
@@ -1039,7 +1045,7 @@ class ManualRegistrationWidget(QWidget):
                         QTableWidgetItem(_fmt(row.fit_um)),
                         QTableWidgetItem(_fmt(row.affine_um)),
                         QTableWidgetItem(_fmt(row.final_um)),
-                        QTableWidgetItem(_flags(row, off_text="held out")),
+                        QTableWidgetItem(_flags(row, off_text="held out", outlier_text="outlier")),
                     ]
                     for c, item in enumerate(items):
                         item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)

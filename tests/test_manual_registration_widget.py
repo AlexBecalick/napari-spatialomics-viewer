@@ -450,6 +450,10 @@ def test_table_content(widget):
     rt = w._result_table
     assert rt.item(0, 4).text() == "3.00" and rt.item(0, 5).text() == "–"
     assert rt.item(0, 6).text() == "held out"
+    flagged = [ResidualRow(1, "#123456", True, True, True, False, 1.0, 2.0, 3.0, None)]
+    w.set_result(flagged, "ok")
+    # a result table keeps its own wording: the rigid fit's hint text is for the prepared table
+    assert w._result_table.item(0, 6).text() == "⚠ outlier"
     assert w._result_banner.text() == "ok"
     assert [k for k, c in w._overlay_checks.items() if c.isChecked()] == [
         "reference_landmarks",
