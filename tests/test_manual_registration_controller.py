@@ -2165,3 +2165,67 @@ def test_tissue_tiles_never_straddle_a_stored_chunk_boundary():
     for rows, cols in reads:
         assert rows.start // chunk == (rows.stop - 1) // chunk
         assert cols.start // chunk == (cols.stop - 1) // chunk
+
+
+def test_tissue_tiles_read_at_most_the_chunk_cap_of_distinct_chunks():
+    import xarray as xr
+
+    from napari_compare_xenium_merscope.manual_registration_controller import (
+        CONTRAST_MAX_CHUNKS,
+    )
+
+    size, chunk, block = 2048, 256, 32
+    rng = np.random.default_rng(1)
+    full = rng.integers(50, 400, (1, size, size)).astype(np.uint16)
+    coarse = full.reshape(1, size // block, block, size // block, block).mean(axis=(2, 4))
+    coarse_array = xr.DataArray(coarse, dims=("c", "y", "x"))
+    reads: list = []
+    plane = _LoggedPlane(full[0], reads)
+    plane.chunks = ((chunk,) * (size // chunk), (chunk,) * (size // chunk))
+    level0 = SimpleNamespace(isel=lambda c: plane)
+
+    contrast_limits_from_tissue_tiles(level0, coarse_array, 0, n_tiles=32, tile_px=128)
+
+    assert len(reads) == 32
+    touched = {(rows.start // chunk, cols.start // chunk) for rows, cols in reads}
+    assert 1 < len(touched) <= CONTRAST_MAX_CHUNKS
+    per_chunk = [
+        sum(1 for rows, cols in reads if (rows.start // chunk, cols.start // chunk) == key)
+        for key in touched
+    ]
+    assert max(per_chunk) - min(per_chunk) <= 1
+
+
+def test_tissue_tiles_prefer_the_chunks_with_the_most_tissue():
+    import xarray as xr
+
+    size, chunk, block = 2048, 256, 32
+    full = np.zeros((1, size, size), dtype=np.uint16)
+    # Eight fully covered chunks plus one lightly covered chunk elsewhere.
+    for index in range(8):
+        full[0, 0:chunk, index * chunk : (index + 1) * chunk] = 500
+    full[0, 1024 : 1024 + 64, 1024 : 1024 + 64] = 500
+    coarse = full.reshape(1, size // block, block, size // block, block).mean(axis=(2, 4))
+    coarse_array = xr.DataArray(coarse, dims=("c", "y", "x"))
+    reads: list = []
+    plane = _LoggedPlane(full[0], reads)
+    plane.chunks = ((chunk,) * (size // chunk), (chunk,) * (size // chunk))
+    level0 = SimpleNamespace(isel=lambda c: plane)
+
+    contrast_limits_from_tissue_tiles(level0, coarse_array, 0, n_tiles=32, tile_px=128)
+
+    assert {(rows.start // chunk, cols.start // chunk) for rows, cols in reads} == {
+        (0, col) for col in range(8)
+    }
+
+
+def test_tissue_tiles_without_chunks_are_treated_as_one_chunk():
+    import xarray as xr
+
+    full = np.full((1, 1024, 1024), 300, dtype=np.uint16)
+    coarse_array = xr.DataArray(np.full((1, 32, 32), 300.0), dims=("c", "y", "x"))
+    level0 = xr.DataArray(full, dims=("c", "y", "x"))
+    assert contrast_limits_from_tissue_tiles(level0, coarse_array, 0, n_tiles=8, tile_px=128) == (
+        300.0,
+        301.0,
+    )

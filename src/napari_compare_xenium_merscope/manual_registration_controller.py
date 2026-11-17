@@ -130,6 +130,7 @@ CONTRAST_MAX_PIXELS = 4_000_000
 CONTRAST_TILES = 32
 CONTRAST_TILE_PX = 512
 CONTRAST_TILE_BATCH = 8
+CONTRAST_MAX_CHUNKS = 8
 PREVIEW_MIN_ENABLED = 3
 UNDO_LIMIT = 500
 SESSION_KEYS = (
@@ -241,8 +242,13 @@ def contrast_limits_from_tissue_tiles(
     here are instead the ``percentiles`` of the non-zero pixels of up to ``n_tiles`` tiles of
     ``tile_px`` squared read at full resolution. Tile centres are drawn (deterministically, from
     ``seed``) among the non-zero pixels of the coarse level, so they lie on tissue (zero is
-    padding or background). Tiles are read in batches of ``CONTRAST_TILE_BATCH`` (one dask
-    compute per batch), each snapped inside a single stored chunk.
+    padding or background). Reading a tile decompresses a whole stored chunk (about 32 MB on
+    the prepared stores), so the tiles are confined to at most ``CONTRAST_MAX_CHUNKS`` level-0
+    chunks: the chunks holding the most coarse-level tissue pixels (ties broken by the seeded
+    generator), with about ``n_tiles`` divided evenly among them (fewer where a chunk has too
+    few tissue pixels to place its share). Each tile is snapped inside its chunk. Arrays
+    without chunks count as one chunk. Tiles are read in batches of ``CONTRAST_TILE_BATCH``
+    (one dask compute per batch).
 
     Falls back to ``contrast_limits_from_level`` on the coarse level when level 0 cannot be read.
 
@@ -278,22 +284,45 @@ def contrast_limits_from_tissue_tiles(
         plane0 = level0_cyx.isel(c=channel_index)
         height0, width0 = (int(v) for v in plane0.shape)
         rng = np.random.default_rng(seed)
-        chosen = rng.choice(len(tissue), size=min(n_tiles, len(tissue)), replace=False)
         edge = min(tile_px, height0, width0)
         # Snap each tile inside one stored chunk: a tile straddling a chunk boundary would
         # decompress up to four chunks (tens of MB each) instead of one.
         chunks = getattr(plane0.data, "chunks", None) or ((height0,), (width0,))
         row_bounds = np.cumsum((0, *(int(v) for v in chunks[0])))
         col_bounds = np.cumsum((0, *(int(v) for v in chunks[1])))
+        # Centre of each sampled coarse pixel, scaled to level 0.
+        centres_y = (tissue[:, 0] * step + step / 2) * height0 / coarse_height
+        centres_x = (tissue[:, 1] * step + step / 2) * width0 / coarse_width
+        chunk_rows = np.clip(np.searchsorted(row_bounds, centres_y, side="right") - 1, 0, None)
+        chunk_cols = np.clip(np.searchsorted(col_bounds, centres_x, side="right") - 1, 0, None)
+        chunk_rows = np.minimum(chunk_rows, len(row_bounds) - 2)
+        chunk_cols = np.minimum(chunk_cols, len(col_bounds) - 2)
+        chunk_ids = chunk_rows * (len(col_bounds) - 1) + chunk_cols
+        unique_ids, counts = np.unique(chunk_ids, return_counts=True)
+        # Most tissue first; the random key only orders chunks with equal counts. A stored
+        # chunk is decompressed whole, so spreading the tiles over many chunks costs far more
+        # than it adds in representativeness.
+        order = np.lexsort((rng.random(len(unique_ids)), -counts))[:CONTRAST_MAX_CHUNKS]
+        members = [rng.permutation(np.flatnonzero(chunk_ids == unique_ids[i])) for i in order]
+        quota = [0] * len(members)
+        wanted = min(n_tiles, sum(len(m) for m in members))
+        # Round-robin keeps the shares within one tile of each other and moves the share of a
+        # chunk that has too few tissue pixels to the others.
+        while wanted > 0:
+            progressed = False
+            for i, pool in enumerate(members):
+                if wanted > 0 and quota[i] < len(pool):
+                    quota[i] += 1
+                    wanted -= 1
+                    progressed = True
+            if not progressed:
+                break
         boxes: list[tuple[int, int]] = []
-        for index in chosen:
-            row, col = tissue[index]
-            # Centre of the sampled coarse pixel, scaled to level 0.
-            centre_y = (row * step + step / 2) * height0 / coarse_height
-            centre_x = (col * step + step / 2) * width0 / coarse_width
-            y0 = _snap_tile_start(centre_y, edge, row_bounds, height0)
-            x0 = _snap_tile_start(centre_x, edge, col_bounds, width0)
-            boxes.append((y0, x0))
+        for pool, share in zip(members, quota, strict=True):
+            for index in pool[:share]:
+                y0 = _snap_tile_start(centres_y[index], edge, row_bounds, height0)
+                x0 = _snap_tile_start(centres_x[index], edge, col_bounds, width0)
+                boxes.append((y0, x0))
         pooled: list[np.ndarray] = []
         # Each tile read decompresses at least one whole stored chunk (tens of MB on real
         # stores). One compute per batch lets dask read a chunk shared by several tiles once
