@@ -49,6 +49,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
+import dask
 import numpy as np
 import pandas as pd
 from napari.layers import Image, Points, Shapes
@@ -124,8 +125,12 @@ DISABLED_PAIR_COLOUR = "#9e9e9e"
 REFERENCE_COLORMAP = "green"
 MOVING_COLORMAP = "magenta"
 OTHER_CHANNEL_COLORMAP = "gray"
-CONTRAST_PERCENTILES = (0.5, 99.5)
+CONTRAST_PERCENTILES = (1.0, 99.9)
 CONTRAST_MAX_PIXELS = 4_000_000
+CONTRAST_TILES = 32
+CONTRAST_TILE_PX = 512
+CONTRAST_TILE_BATCH = 8
+CONTRAST_MAX_CHUNKS = 8
 PREVIEW_MIN_ENABLED = 3
 UNDO_LIMIT = 500
 SESSION_KEYS = (
@@ -201,6 +206,151 @@ def contrast_limits_from_level(
     if nonzero.size == 0:
         return (0.0, 1.0)
     low, high = (float(v) for v in np.percentile(nonzero, percentiles))
+    if not high > low:
+        high = low + 1.0
+    return (low, high)
+
+
+def _snap_tile_start(centre: float, edge: int, bounds: np.ndarray, size: int) -> int:
+    """Return the tile start nearest ``centre`` that keeps the tile inside one stored chunk.
+
+    A chunk smaller than ``edge`` cannot hold the tile; the start is then only clamped to the
+    image.
+    """
+    index = int(np.clip(np.searchsorted(bounds, centre, side="right") - 1, 0, len(bounds) - 2))
+    lower, upper = int(bounds[index]), int(bounds[index + 1])
+    if upper - lower < edge:
+        return int(min(max(centre - edge / 2, 0), size - edge))
+    return int(min(max(centre - edge / 2, lower), upper - edge))
+
+
+def contrast_limits_from_tissue_tiles(
+    level0_cyx: Any,
+    coarse_cyx: Any,
+    channel_index: int,
+    *,
+    percentiles: tuple[float, float] = CONTRAST_PERCENTILES,
+    n_tiles: int = CONTRAST_TILES,
+    tile_px: int = CONTRAST_TILE_PX,
+    seed: int = 0,
+    cancel_check: Callable[[], bool] | None = None,
+) -> tuple[float, float]:
+    """Return display contrast limits of one channel from full-resolution tissue tiles.
+
+    A coarse pyramid level averages blocks of tens of thousands of pixels, which removes the
+    bright tail and makes the default contrast saturate sparse bright structures. The limits
+    here are instead the ``percentiles`` of the non-zero pixels of up to ``n_tiles`` tiles of
+    ``tile_px`` squared read at full resolution. Tile centres are drawn (deterministically, from
+    ``seed``) among the non-zero pixels of the coarse level, so they lie on tissue (zero is
+    padding or background). Reading a tile decompresses a whole stored chunk (about 32 MB on
+    the prepared stores), so the tiles are confined to at most ``CONTRAST_MAX_CHUNKS`` level-0
+    chunks: the chunks holding the most coarse-level tissue pixels (ties broken by the seeded
+    generator), with about ``n_tiles`` divided evenly among them (fewer where a chunk has too
+    few tissue pixels to place its share). Each tile is snapped inside its chunk. Arrays
+    without chunks count as one chunk. Tiles are read in batches of ``CONTRAST_TILE_BATCH``
+    (one dask compute per batch).
+
+    Falls back to ``contrast_limits_from_level`` on the coarse level when level 0 cannot be read.
+
+    Args:
+        level0_cyx: The finest ``(c, y, x)`` DataArray level.
+        coarse_cyx: A coarse ``(c, y, x)`` DataArray level of the same image.
+        channel_index: Index of the channel.
+        percentiles: Lower and upper percentile.
+        n_tiles: Maximum number of tiles.
+        tile_px: Tile edge in level-0 pixels.
+        seed: Seed of the tile-centre draw.
+        cancel_check: Polled between tile batches; a true value raises ``RegistrationLoadCancelled``.
+
+    Returns:
+        ``(low, high)`` with ``high > low``; ``(0.0, 1.0)`` when no tile pixel is non-zero.
+
+    Raises:
+        RegistrationLoadCancelled: If ``cancel_check`` became true.
+    """
+
+    def check() -> None:
+        if cancel_check is not None and cancel_check():
+            raise RegistrationLoadCancelled()
+
+    try:
+        coarse_plane = coarse_cyx.isel(c=channel_index)
+        coarse_height, coarse_width = (int(v) for v in coarse_plane.shape)
+        step = max(1, math.ceil(math.sqrt(coarse_height * coarse_width / CONTRAST_MAX_PIXELS)))
+        sampled = np.asarray(coarse_plane.data[::step, ::step])
+        tissue = np.argwhere(np.isfinite(sampled) & (sampled != 0))
+        if tissue.size == 0:
+            return (0.0, 1.0)
+        plane0 = level0_cyx.isel(c=channel_index)
+        height0, width0 = (int(v) for v in plane0.shape)
+        rng = np.random.default_rng(seed)
+        edge = min(tile_px, height0, width0)
+        # Snap each tile inside one stored chunk: a tile straddling a chunk boundary would
+        # decompress up to four chunks (tens of MB each) instead of one.
+        chunks = getattr(plane0.data, "chunks", None) or ((height0,), (width0,))
+        row_bounds = np.cumsum((0, *(int(v) for v in chunks[0])))
+        col_bounds = np.cumsum((0, *(int(v) for v in chunks[1])))
+        # Centre of each sampled coarse pixel, scaled to level 0.
+        centres_y = (tissue[:, 0] * step + step / 2) * height0 / coarse_height
+        centres_x = (tissue[:, 1] * step + step / 2) * width0 / coarse_width
+        chunk_rows = np.clip(np.searchsorted(row_bounds, centres_y, side="right") - 1, 0, None)
+        chunk_cols = np.clip(np.searchsorted(col_bounds, centres_x, side="right") - 1, 0, None)
+        chunk_rows = np.minimum(chunk_rows, len(row_bounds) - 2)
+        chunk_cols = np.minimum(chunk_cols, len(col_bounds) - 2)
+        chunk_ids = chunk_rows * (len(col_bounds) - 1) + chunk_cols
+        unique_ids, counts = np.unique(chunk_ids, return_counts=True)
+        # Most tissue first; the random key only orders chunks with equal counts. A stored
+        # chunk is decompressed whole, so spreading the tiles over many chunks costs far more
+        # than it adds in representativeness.
+        order = np.lexsort((rng.random(len(unique_ids)), -counts))[:CONTRAST_MAX_CHUNKS]
+        members = [rng.permutation(np.flatnonzero(chunk_ids == unique_ids[i])) for i in order]
+        quota = [0] * len(members)
+        wanted = min(n_tiles, sum(len(m) for m in members))
+        # Round-robin keeps the shares within one tile of each other and moves the share of a
+        # chunk that has too few tissue pixels to the others.
+        while wanted > 0:
+            progressed = False
+            for i, pool in enumerate(members):
+                if wanted > 0 and quota[i] < len(pool):
+                    quota[i] += 1
+                    wanted -= 1
+                    progressed = True
+            if not progressed:
+                break
+        boxes: list[tuple[int, int]] = []
+        for pool, share in zip(members, quota, strict=True):
+            for index in pool[:share]:
+                y0 = _snap_tile_start(centres_y[index], edge, row_bounds, height0)
+                x0 = _snap_tile_start(centres_x[index], edge, col_bounds, width0)
+                boxes.append((y0, x0))
+        pooled: list[np.ndarray] = []
+        # Each tile read decompresses at least one whole stored chunk (tens of MB on real
+        # stores). One compute per batch lets dask read a chunk shared by several tiles once
+        # and decompress on several threads; cancellation is polled between batches.
+        for start in range(0, len(boxes), CONTRAST_TILE_BATCH):
+            check()
+            batch = boxes[start : start + CONTRAST_TILE_BATCH]
+            lazy_tiles = [plane0.data[y0 : y0 + edge, x0 : x0 + edge] for y0, x0 in batch]
+            for tile_array in dask.compute(*lazy_tiles):
+                tile = np.asarray(tile_array).ravel()
+                if tile.dtype.kind == "f":
+                    tile = tile[np.isfinite(tile)]
+                tile = tile[tile != 0]
+                if tile.size:
+                    pooled.append(tile)
+    except RegistrationLoadCancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001 - any store/dask read failure has the same fallback
+        log.warning(
+            "Full-resolution contrast read failed (%s: %s); using the coarsest level.",
+            type(exc).__name__,
+            exc,
+        )
+        return contrast_limits_from_level(coarse_cyx, channel_index)
+    if not pooled:
+        return (0.0, 1.0)
+    values = np.concatenate(pooled)
+    low, high = (float(v) for v in np.percentile(values, percentiles))
     if not high > low:
         high = low + 1.0
     return (low, high)
@@ -776,7 +926,9 @@ class ManualRegistrationController:
                     f"Image {key!r} has {n_channels} channels but the store lists {names}."
                 )
             for index, channel in enumerate(names):
-                contrast[(role, channel)] = contrast_limits_from_level(levels[role][-1], index)
+                contrast[(role, channel)] = contrast_limits_from_tissue_tiles(
+                    levels[role][0], levels[role][-1], index, cancel_check=cancel_check
+                )
                 check()
         if descriptor.kind == "result":
             if descriptor.result is None:

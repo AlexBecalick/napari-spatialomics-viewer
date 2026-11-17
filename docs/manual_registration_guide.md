@@ -36,6 +36,8 @@ per-cell statistic and annotation tools are disabled, display rotation is set to
 disabled, and the layer list cannot delete or reorder layers. Channels of the two images are in the
 layer list; show or hide them there.
 
+The default contrast of each channel is set from full-resolution tissue pixels: the 1st and 99.9th percentiles of the non-zero pixels in a sample of tiles read at full resolution, so sparse bright structures such as tangles stay visible. napari's layer controls still adjust it.
+
 ## 3. The Manual registration tab
 
 | Section | What it does |

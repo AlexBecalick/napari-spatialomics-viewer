@@ -25,6 +25,10 @@ are that section.
 
 - The live landmark fit is labelled as a rigid (similarity) fit: the columns read **Rigid fit µm** and **Rigid LOO µm**, the flag reads `rigid outlier`, and the status line says that bent sections make edge pairs look like outliers. The landmark table needs a little less height at minimum.
 
+### Fixed
+
+- **Manual registration contrast no longer saturates bright channels.** The default contrast limits came from the coarsest pyramid level, whose block averaging removes the bright tail, so channels such as AF568 and AF647 clipped about 5 % of tissue pixels (10 % in dense regions). They now come from the 1st and 99.9th percentiles of tissue tiles read at full resolution. napari's layer controls still adjust them.
+
 ## [0.5.2] - 2026-11-14
 
 Manual landmark registration, standalone 10x Atera stores, hand-curated cell
