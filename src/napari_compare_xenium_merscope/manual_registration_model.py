@@ -40,6 +40,25 @@ SCHEMA_VERSION = 1
 STORE_ATTR = "merxen_manual_registration_store"
 LABELLING_ATTR = "merxen_manual_registration"
 RESULT_ATTR = "merxen_manual_registration_result"
+CHECK_ATTR = "merxen_manual_registration_check"
+CHECK_SCHEMA = "merxen.manual_registration.check"
+CHECK_VERDICTS = ("confirmed", "contradicted", "ridge", "inconclusive", "not_checked")
+CHECK_CLASSES = ("ok", "kept_confirmed", "check", "likely_misclick", "excluded", "disabled")
+CLASS_FLAG_TEXT = {
+    "ok": "",
+    "kept_confirmed": "kept: image confirms",
+    "check": "check",
+    "likely_misclick": "likely misclick",
+    "excluded": "excluded",
+    "disabled": "off",
+}
+VERDICT_SHORT = {
+    "confirmed": "confirmed",
+    "contradicted": "contradicted",
+    "ridge": "ridge",
+    "inconclusive": "?",
+    "not_checked": "\u2013",
+}
 STORE_SCHEMA = "merxen.manual_registration.store"
 LABELLING_SCHEMA = "merxen.manual_registration.labelling"
 RESULT_SCHEMA = "merxen.manual_registration.result"
@@ -58,6 +77,11 @@ ROLES = ("reference", "moving")
 DISPLAY_MODES = ("reference", "moving", "both")
 SERIAL_SECTION_FLOOR_HINT_UM = 30.0  # outlier floor of the serial_section preset
 SAME_SECTION_FLOOR_UM = 10.0  # outlier floor of the same_section preset
+NO_CHECK_TEXT = (
+    "No robust check for these landmarks. The flags come from a rigid (similarity) fit, which "
+    "cannot bend, so pairs near the edges of a bent section look like outliers. Save, run "
+    "merxen manual-registration-check and load its JSON."
+)
 
 # Converts between (x, y) and napari (row, col). Never mutate.
 SWAP: np.ndarray = np.array([[0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64)
@@ -77,6 +101,10 @@ class NotARegistrationStore(ValueError):
 
 class UnsupportedSchemaVersion(ValueError):
     """A payload was written with a newer schema version than this viewer reads."""
+
+
+class CheckAttrError(ValueError):
+    """A MerXen landmark check (attribute or file) is malformed."""
 
 
 class LabellingMismatch(ValueError):
@@ -317,6 +345,7 @@ class StoreDescriptor:
     labelling: dict[str, Any] | None  # LABELLING_ATTR verbatim (prepared only)
     result: dict[str, Any] | None  # RESULT_ATTR verbatim (result only)
     warnings: tuple[str, ...] = ()
+    check: dict[str, Any] | None = None  # CHECK_ATTR verbatim (prepared only); parsed lazily
 
 
 def pair_colour(pair_id: int, seed: int) -> str:
@@ -438,6 +467,18 @@ class ResidualRow:
     loo_um: float  # NaN when unavailable
     affine_um: float | None = None  # result mode only
     final_um: float | None = None  # result mode only
+    # Filled from a current MerXen check (``apply_check_to_rows``); None without one.
+    robust_loo_um: float | None = None
+    p_value: float | None = None  # shown p (lower of the landmarks-only and final fields)
+    weight: float | None = None  # shown weight (lower of the two fields)
+    verdict: str | None = None
+    robust_class: str | None = None
+    rigid_loo_um: float | None = None
+    # The two fields behind the shown p and weight (for the cell tooltips).
+    final_p_value: float | None = None
+    clicks_only_p_value: float | None = None
+    final_weight: float | None = None
+    clicks_only_weight: float | None = None
 
 
 @dataclass(frozen=True)
@@ -1377,6 +1418,20 @@ def _role_record(images: Any, role: str) -> dict[str, Any]:
     return dict(rec)
 
 
+def _materialization_factor(record: Mapping[str, Any]) -> int:
+    """Return the level factor of a result image record (1 when it has no materialization)."""
+    rec = record.get("materialization")
+    if rec is None:
+        return 1
+    factor = rec.get("level_factor") if isinstance(rec, dict) else None
+    mode = rec.get("mode") if isinstance(rec, dict) else None
+    if not _is_int(factor) or factor < 1 or mode not in ("full", "preview"):
+        raise NotARegistrationStore(
+            "store attribute images.<role>.materialization is missing or invalid"
+        )
+    return int(factor)
+
+
 def parse_store_descriptor(path: Path, root_attrs: Mapping[str, Any]) -> StoreDescriptor:
     """Build a ``StoreDescriptor`` from the root attributes of a store.
 
@@ -1433,8 +1488,15 @@ def parse_store_descriptor(path: Path, root_attrs: Mapping[str, Any]) -> StoreDe
         if kind == "prepared":
             base = np.diag([px, px, 1.0])
         else:
+            factor = _materialization_factor(records[role])
+            # napari pixel-centre convention; equals the plain crop offset for factor 1.
+            half = (factor - 1) / 2.0
             base = np.array(
-                [[p_ref, 0.0, p_ref * origin_y], [0.0, p_ref, p_ref * origin_x], [0.0, 0.0, 1.0]]
+                [
+                    [p_ref * factor, 0.0, p_ref * (origin_y + half)],
+                    [0.0, p_ref * factor, p_ref * (origin_x + half)],
+                    [0.0, 0.0, 1.0],
+                ]
             )
         images[role] = RoleImage(
             role=role,
@@ -1448,8 +1510,12 @@ def parse_store_descriptor(path: Path, root_attrs: Mapping[str, Any]) -> StoreDe
 
     labelling: dict[str, Any] | None = None
     result: dict[str, Any] | None = None
+    check: dict[str, Any] | None = None
     if kind == "prepared":
         grid_digest = sa.get("grid_digest")
+        raw_check = root_attrs.get(CHECK_ATTR)
+        if isinstance(raw_check, dict):
+            check = json.loads(json.dumps(raw_check))
         lab = root_attrs.get(LABELLING_ATTR)
         if lab is not None:
             if not isinstance(lab, dict):
@@ -1482,4 +1548,396 @@ def parse_store_descriptor(path: Path, root_attrs: Mapping[str, Any]) -> StoreDe
         labelling=labelling,
         result=result,
         warnings=tuple(warnings),
+        check=check,
     )
+
+
+# ----------------------------------------------------------------------------------------------
+# MerXen landmark check (display only: the viewer never computes it)
+# ----------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PairCheck:
+    """The check of one landmark pair, as MerXen wrote it."""
+
+    id: int
+    enabled: bool
+    used: bool
+    weight: float | None  # final field
+    loo_um: float
+    p_value: float  # final field
+    clicks_only_weight: float | None
+    clicks_only_loo_um: float | None
+    clicks_only_p_value: float | None
+    shown_p_value: float  # lower of p_value and clicks_only_p_value
+    shown_weight: float | None  # lower of the non-null weights
+    rigid_loo_um: float | None
+    rigid_outlier: bool
+    verdict: str
+    image_offset_um: float | None
+    snap_moving_xy_px: tuple[float, float] | None
+    robust_class: str
+
+
+@dataclass(frozen=True)
+class CheckResult:
+    """A parsed MerXen landmark check (from the store attribute or a check file)."""
+
+    source: str  # "store" | "file"
+    path: str | None  # the check file, for source "file"
+    labelling_source: str  # where MerXen read the labelling: "store" | "file"
+    labelling_content_sha256: str
+    store_content_digest: str
+    labelling_revision: int
+    written_at: str
+    preset: str
+    loo_median_um: float
+    loo_p90_um: float
+    loo_clicks_only_median_um: float | None
+    n_clicks: int
+    n_windows: int
+    class_counts: dict[str, int]
+    pairs: dict[int, PairCheck]
+    suggestions: tuple[dict[str, Any], ...]
+
+
+def _check_error(where: str, what: str) -> CheckAttrError:
+    return CheckAttrError(f"{where}: {what}")
+
+
+def _req(obj: Any, key: str, where: str) -> Any:
+    if not isinstance(obj, Mapping) or key not in obj:
+        raise _check_error(where, f"missing key {key!r}")
+    return obj[key]
+
+
+def _finite(value: Any, where: str) -> float:
+    if not _is_number(value):
+        raise _check_error(where, f"{value!r} is not a finite number")
+    try:
+        number = float(value)
+    except OverflowError:
+        # A hand-edited integer beyond the float range is malformed, not fatal.
+        raise _check_error(where, "is a number too large to read") from None
+    if not math.isfinite(number):
+        raise _check_error(where, f"{value!r} is not a finite number")
+    return number
+
+
+def _finite_or_none(value: Any, where: str) -> float | None:
+    return None if value is None else _finite(value, where)
+
+
+def _flag(value: Any, where: str) -> bool:
+    if not isinstance(value, bool):
+        raise _check_error(where, f"{value!r} is not true or false")
+    return value
+
+
+def _parse_pair_check(pair_id: int, rec: Any) -> PairCheck:
+    where = f"pairs.{pair_id}"
+    if not isinstance(rec, Mapping):
+        raise _check_error(where, "is not an object")
+    verdict = _req(rec, "verdict", where)
+    robust_class = _req(rec, "class", where)
+    if verdict not in CHECK_VERDICTS:
+        raise _check_error(where, f"unknown verdict {verdict!r}")
+    if robust_class not in CHECK_CLASSES:
+        raise _check_error(where, f"unknown class {robust_class!r}")
+    weight = _finite_or_none(_req(rec, "weight", where), f"{where}.weight")
+    p_value = _finite(_req(rec, "p_value", where), f"{where}.p_value")
+    loo_um = _finite(_req(rec, "loo_um", where), f"{where}.loo_um")
+    clicks_only = _req(rec, "clicks_only", where)
+    co_weight = co_loo = co_p = None
+    if clicks_only is not None:
+        co_where = f"{where}.clicks_only"
+        co_weight = _finite_or_none(_req(clicks_only, "weight", co_where), f"{co_where}.weight")
+        co_loo = _finite(_req(clicks_only, "loo_um", co_where), f"{co_where}.loo_um")
+        co_p = _finite(_req(clicks_only, "p_value", co_where), f"{co_where}.p_value")
+    vector = _req(rec, "loo_vector_moving_um", where)
+    if not isinstance(vector, (list, tuple)) or len(vector) != 2:
+        raise _check_error(where, "loo_vector_moving_um is not [dx, dy]")
+    for component in vector:
+        _finite(component, f"{where}.loo_vector_moving_um")
+    snap_raw = _req(rec, "snap_moving_xy_px", where)
+    snap: tuple[float, float] | None = None
+    if snap_raw is not None:
+        if not isinstance(snap_raw, (list, tuple)) or len(snap_raw) != 2:
+            raise _check_error(where, "snap_moving_xy_px is not [x, y]")
+        snap = (
+            _finite(snap_raw[0], f"{where}.snap_moving_xy_px"),
+            _finite(snap_raw[1], f"{where}.snap_moving_xy_px"),
+        )
+    weights = [w for w in (weight, co_weight) if w is not None]
+    return PairCheck(
+        id=pair_id,
+        enabled=_flag(_req(rec, "enabled", where), f"{where}.enabled"),
+        used=_flag(_req(rec, "used", where), f"{where}.used"),
+        weight=weight,
+        loo_um=loo_um,
+        p_value=p_value,
+        clicks_only_weight=co_weight,
+        clicks_only_loo_um=co_loo,
+        clicks_only_p_value=co_p,
+        shown_p_value=min(p_value, co_p) if co_p is not None else p_value,
+        shown_weight=min(weights) if weights else None,
+        rigid_loo_um=_finite_or_none(_req(rec, "rigid_loo_um", where), f"{where}.rigid_loo_um"),
+        rigid_outlier=_flag(_req(rec, "rigid_outlier", where), f"{where}.rigid_outlier"),
+        verdict=str(verdict),
+        image_offset_um=_finite_or_none(
+            _req(rec, "image_offset_um", where), f"{where}.image_offset_um"
+        ),
+        snap_moving_xy_px=snap,
+        robust_class=str(robust_class),
+    )
+
+
+def parse_check_attr(
+    payload: Mapping[str, Any], *, source: str = "store", path: str | None = None
+) -> CheckResult:
+    """Parse a MerXen landmark check (the store attribute, or a check file).
+
+    A check file is the attribute payload plus a ``details`` key, which (like any other unknown
+    key) is ignored. Nothing is computed here: ``shown_p_value`` and ``shown_weight`` select the
+    lower of the two values MerXen wrote.
+
+    Args:
+        payload: The decoded JSON object.
+        source: ``"store"`` (the root attribute) or ``"file"`` (a loaded check file).
+        path: The check file, for ``source="file"``.
+
+    Returns:
+        The parsed check.
+
+    Raises:
+        UnsupportedSchemaVersion: The check has a schema version above 1.
+        CheckAttrError: The content is malformed.
+    """
+    if not isinstance(payload, Mapping):
+        raise _check_error("check", "is not an object")
+    if payload.get("schema") != CHECK_SCHEMA:
+        raise _check_error("check", f"unknown schema {payload.get('schema')!r}")
+    version = payload.get("schema_version")
+    if not _is_int(version):
+        raise _check_error("check", "schema_version is missing or invalid")
+    if version > SCHEMA_VERSION:
+        raise _unsupported("landmark check", int(version))
+    if version < 1:
+        raise _check_error("check", f"schema_version {version!r} is below 1")
+
+    where = "check"
+    _validate_check_envelope(payload)
+    field_block = _req(payload, "field", where)
+    loo = _req(field_block, "loo_um", "field")
+    clicks_only_loo = _req(field_block, "loo_um_clicks_only", "field")
+    class_counts_raw = _req(field_block, "class_counts", "field")
+    if not isinstance(class_counts_raw, Mapping):
+        raise _check_error("field.class_counts", "is not an object")
+    class_counts: dict[str, int] = {}
+    for name, count in class_counts_raw.items():
+        if name not in CHECK_CLASSES or not _is_int(count):
+            raise _check_error("field.class_counts", f"bad entry {name!r}: {count!r}")
+        class_counts[name] = int(count)
+
+    pairs_raw = _req(payload, "pairs", where)
+    if not isinstance(pairs_raw, Mapping):
+        raise _check_error("pairs", "is not an object")
+    pairs: dict[int, PairCheck] = {}
+    for key, rec in pairs_raw.items():
+        if not isinstance(key, str) or not key.isdecimal():
+            raise _check_error("pairs", f"key {key!r} is not a decimal pair id")
+        pairs[int(key)] = _parse_pair_check(int(key), rec)
+
+    suggestions_raw = _req(payload, "suggestions", where)
+    if not isinstance(suggestions_raw, list) or not all(
+        isinstance(item, Mapping) for item in suggestions_raw
+    ):
+        raise _check_error("suggestions", "is not a list of objects")
+    suggestions: list[dict[str, Any]] = []
+    for item in suggestions_raw:
+        ref = _req(item, "reference_xy_px", "suggestions")
+        if not isinstance(ref, (list, tuple)) or len(ref) != 2:
+            raise _check_error("suggestions", "reference_xy_px is not [x, y]")
+        predicted = _req(item, "predicted_moving_xy_px", "suggestions")
+        if not isinstance(predicted, (list, tuple)) or len(predicted) != 2:
+            raise _check_error("suggestions", "predicted_moving_xy_px is not [x, y]")
+        for component in predicted:
+            _finite(component, "suggestions.predicted_moving_xy_px")
+        ellipse = _req(item, "ellipse_um", "suggestions")
+        for key in ("major", "minor", "angle_deg"):
+            _finite(_req(ellipse, key, "suggestions.ellipse_um"), f"ellipse_um.{key}")
+        _finite(_req(item, "weight", "suggestions"), "suggestions.weight")
+        region = _req(item, "region", "suggestions")
+        if region not in ("grey_matter", "other"):
+            raise _check_error("suggestions", f"unknown region {region!r}")
+        suggestions.append(
+            {
+                "rank": int(_finite(_req(item, "rank", "suggestions"), "suggestions.rank")),
+                "reference_xy_px": (
+                    _finite(ref[0], "suggestions.reference_xy_px"),
+                    _finite(ref[1], "suggestions.reference_xy_px"),
+                ),
+                "sd_um": _finite(_req(item, "sd_um", "suggestions"), "suggestions.sd_um"),
+                "region": region,
+            }
+        )
+
+    labelling_source = _req(payload, "labelling_source", where)
+    if labelling_source not in ("store", "file"):
+        raise _check_error(where, f"unknown labelling_source {labelling_source!r}")
+    for key in ("labelling_content_sha256", "store_content_digest", "written_at", "preset"):
+        if not isinstance(_req(payload, key, where), str):
+            raise _check_error(where, f"{key} is not text")
+    revision = _req(payload, "labelling_revision", where)
+    if not _is_int(revision):
+        raise _check_error(where, "labelling_revision is not an integer")
+    n_clicks = _req(field_block, "n_clicks", "field")
+    n_windows = _req(field_block, "n_windows", "field")
+    if not _is_int(n_clicks) or not _is_int(n_windows):
+        raise _check_error("field", "n_clicks and n_windows must be integers")
+
+    return CheckResult(
+        source=source,
+        path=path,
+        labelling_source=str(labelling_source),
+        labelling_content_sha256=payload["labelling_content_sha256"],
+        store_content_digest=payload["store_content_digest"],
+        labelling_revision=int(revision),
+        written_at=payload["written_at"],
+        preset=payload["preset"],
+        loo_median_um=_finite(_req(loo, "median", "field.loo_um"), "field.loo_um.median"),
+        loo_p90_um=_finite(_req(loo, "p90", "field.loo_um"), "field.loo_um.p90"),
+        loo_clicks_only_median_um=(
+            None
+            if clicks_only_loo is None
+            else _finite(
+                _req(clicks_only_loo, "median", "field.loo_um_clicks_only"),
+                "field.loo_um_clicks_only.median",
+            )
+        ),
+        n_clicks=int(n_clicks),
+        n_windows=int(n_windows),
+        class_counts=class_counts,
+        pairs=pairs,
+        suggestions=tuple(suggestions),
+    )
+
+
+def _validate_check_envelope(payload: Mapping[str, Any]) -> None:
+    """Require the C3 keys the viewer does not display, with nulls only where C3 allows them."""
+    where = "check"
+    for key in (
+        "status",
+        "dataset_name",
+        "labelling_status",
+        "preset_version",
+        "settings_digest",
+    ):
+        if not isinstance(_req(payload, key, where), str):
+            raise _check_error(where, f"{key} is not text")
+    written_by = _req(payload, "written_by", where)
+    for key in ("software", "version"):
+        if not isinstance(_req(written_by, key, "written_by"), str):
+            raise _check_error("written_by", f"{key} is not text")
+    roles = _req(payload, "channel_roles", where)
+    if roles is not None:
+        for key in ("reference", "moving"):
+            if not isinstance(_req(roles, key, "channel_roles"), Mapping):
+                raise _check_error("channel_roles", f"{key} is not an object")
+    algorithm = _req(payload, "algorithm", where)
+    if not isinstance(algorithm, Mapping):
+        raise _check_error("algorithm", "is not an object")
+    if not isinstance(_req(algorithm, "landmark_field", "algorithm"), str):
+        raise _check_error("algorithm", "landmark_field is not text")
+    image_evidence = _req(algorithm, "image_evidence", "algorithm")
+    if image_evidence is not None and not isinstance(image_evidence, str):
+        raise _check_error("algorithm", "image_evidence is not text or null")
+    outputs = _req(payload, "outputs", where)
+    for key in ("json", "png"):
+        if not isinstance(_req(outputs, key, "outputs"), str):
+            raise _check_error("outputs", f"{key} is not text")
+    field_block = _req(payload, "field", where)
+    hyper = _req(field_block, "hyperparameters", "field")
+    for key in ("long_length_um", "long_signal_um"):
+        _finite(_req(hyper, key, "field.hyperparameters"), f"field.hyperparameters.{key}")
+    # C3 lets only the short component be null (clicks alone fit one component).
+    for key in ("short_length_um", "short_signal_um"):
+        _finite_or_none(_req(hyper, key, "field.hyperparameters"), f"field.hyperparameters.{key}")
+    noise = _req(hyper, "noise_um", "field.hyperparameters")
+    for key in ("click", "window"):
+        _finite(_req(noise, key, "field.hyperparameters.noise_um"), f"noise_um.{key}")
+    _req(field_block, "sd_um", "field")
+    for block_name in ("rigid_loo_um", "loo_um"):
+        block = _req(field_block, block_name, "field")
+        for stat in ("median", "p90", "max"):
+            _finite(_req(block, stat, f"field.{block_name}"), f"field.{block_name}.{stat}")
+    class_counts = _req(field_block, "class_counts", "field")
+    missing = [name for name in CHECK_CLASSES if name not in class_counts]
+    if missing:
+        raise _check_error("field.class_counts", f"missing classes {missing}")
+    _finite(_req(field_block, "outlier_p", "field"), "field.outlier_p")
+    counts = _req(field_block, "verdict_counts", "field")
+    if not isinstance(counts, Mapping):
+        raise _check_error("field.verdict_counts", "is not an object")
+    for name, count in counts.items():
+        if name not in CHECK_VERDICTS or not _is_int(count):
+            raise _check_error("field.verdict_counts", f"bad entry {name!r}: {count!r}")
+
+
+def check_currentness(
+    check: CheckResult, *, content_sha256: str, store_content_digest: str | None
+) -> tuple[bool, str]:
+    """Say whether a check still describes the open labelling and store.
+
+    Args:
+        check: The parsed check.
+        content_sha256: Content digest of the in-memory labelling.
+        store_content_digest: ``content_digest`` of the store attribute, if it has one.
+
+    Returns:
+        ``(True, "")`` when both digests match, else ``(False, reason)``.
+    """
+    if check.labelling_content_sha256 != content_sha256:
+        return (
+            False,
+            f"The landmarks, crops or coarse alignment changed since the check was run (revision "
+            f"{check.labelling_revision}). Save, upload and run merxen "
+            "manual-registration-check again.",
+        )
+    if check.store_content_digest != store_content_digest:
+        return (
+            False,
+            "This check belongs to another preparation of the images "
+            "(store content digest differs).",
+        )
+    return True, ""
+
+
+def apply_check_to_rows(rows: Sequence[ResidualRow], check: CheckResult) -> tuple[ResidualRow, ...]:
+    """Merge a (current) check into the live rows by pair id.
+
+    A row whose id is not in the check keeps None in the check fields.
+    """
+    merged: list[ResidualRow] = []
+    for row in rows:
+        pair = check.pairs.get(row.id)
+        if pair is None:
+            merged.append(row)
+            continue
+        merged.append(
+            replace(
+                row,
+                robust_loo_um=pair.loo_um,
+                p_value=pair.shown_p_value,
+                weight=pair.shown_weight,
+                verdict=pair.verdict,
+                robust_class=pair.robust_class,
+                rigid_loo_um=pair.rigid_loo_um,
+                final_p_value=pair.p_value,
+                clicks_only_p_value=pair.clicks_only_p_value,
+                final_weight=pair.weight,
+                clicks_only_weight=pair.clicks_only_weight,
+            )
+        )
+    return tuple(merged)

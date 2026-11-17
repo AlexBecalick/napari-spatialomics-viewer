@@ -14,6 +14,17 @@ are that section.
 
 ## [Unreleased]
 
+### Added
+
+- **Landmark check in the Manual registration tab.** The landmark table shows MerXen's robust check when one is current: leave-one-out residual, p-value, weight, image verdict and a class per pair (likely misclick, check, kept: image confirms). It reads the check from the prepared store or from a `*_check.json` that `merxen manual-registration-check` wrote, so labelling on another machine works: **Load check file…** reads the file and **Refresh check** reads it (or the store) again without reopening the store. The check applies only while the landmarks, crops and coarse alignment are unchanged.
+- **Suggested landmarks.** A hidden-by-default layer on the reference that numbers the places where one more landmark would help most, taken from the check.
+- **Preview result stores.** Result stores with a materialization record (a coarser pyramid level) are placed correctly. Older viewers misplace them.
+- **Field line in the result banner** for results written by a bending-field run.
+
+### Changed
+
+- The live landmark fit is labelled as a rigid (similarity) fit: the columns read **Rigid fit µm** and **Rigid LOO µm**, the flag reads `rigid outlier`, and the status line says that bent sections make edge pairs look like outliers. The landmark table needs a little less height at minimum.
+
 ## [0.5.2] - 2026-11-14
 
 Manual landmark registration, standalone 10x Atera stores, hand-curated cell

@@ -369,6 +369,7 @@ def test_load_prepared_creates_tagged_layers(ctrl, viewer, host, prepared_store)
         "Moving crop",
         "Moving landmarks",
         "Reference landmarks",
+        "Suggested landmarks",
     ]
     expected_meta = {
         "Reference | DAPI": ("reference", "image", "DAPI"),
@@ -380,6 +381,7 @@ def test_load_prepared_creates_tagged_layers(ctrl, viewer, host, prepared_store)
         "Moving crop": ("moving", "crop", None),
         "Moving landmarks": ("moving", "landmarks", None),
         "Reference landmarks": ("reference", "landmarks", None),
+        "Suggested landmarks": ("reference", "overlay", None),
     }
     for layer in viewer.layers:
         role, kind, channel = expected_meta[layer.name]
@@ -640,7 +642,7 @@ def test_enable_toggle_held_out_and_undo(loaded, viewer, widget):
     place_truth_pairs(loaded, viewer, MOVING_POINTS[:4])
     rows = []
     original = widget.set_rows
-    widget.set_rows = lambda r: (rows.append(r), original(r))
+    widget.set_rows = lambda r, **kw: (rows.append(r), original(r, **kw))
     summaries = []
     original_summary = widget.set_fit_summary
     widget.set_fit_summary = lambda s: (summaries.append(s), original_summary(s))
@@ -656,7 +658,7 @@ def test_enable_toggle_held_out_and_undo(loaded, viewer, widget):
 def test_live_fit_uses_evaluate_landmarks(loaded, viewer, widget, monkeypatch, prepared_store):
     rows_seen, summaries = [], []
     original_rows, original_summary = widget.set_rows, widget.set_fit_summary
-    widget.set_rows = lambda r: (rows_seen.append(r), original_rows(r))
+    widget.set_rows = lambda r, **kw: (rows_seen.append(r), original_rows(r, **kw))
     widget.set_fit_summary = lambda s: (summaries.append(s), original_summary(s))
     points = MOVING_POINTS[:3]
 
@@ -1559,3 +1561,437 @@ def test_store_builders_match_golden_examples(prepared_store):
     state = labelling_from_attrs(payload, descriptor)
     assert [p.id for p in state.pairs] == [1, 2] and state.pairs[1].enabled is False
     assert state.load_warnings == ()
+
+
+# ---------------------------------------------------------------------------------------------
+# MerXen landmark check (C3), preview result stores (C4), field banner (C5)
+# ---------------------------------------------------------------------------------------------
+
+CHECK_HEADERS = ["#", "", "On", "LOO µm", "p", "Weight", "Image", "Flags"]
+RIGID_HEADERS = ["#", "", "On", "Rigid fit µm", "Rigid LOO µm", "Flags"]
+
+
+def labelled_store(path, *, n_pairs=10, revision=2):
+    """Write a labelling of ``n_pairs`` pairs into a prepared store; return its payload."""
+    pairs = [
+        {"id": i + 1, "reference_xy_px": ref, "moving_xy_px": mov}
+        for i, (ref, mov) in enumerate(grid_pairs(n_pairs))
+    ]
+    payload = stores.labelling_payload(pairs=pairs, revision=revision, status="finished")
+    stores.write_root_attr(path, LABELLING_ATTR, payload)
+    return payload
+
+
+def matching_check(payload, **kwargs):
+    return stores.check_payload(
+        labelling_content_sha256=payload["content_sha256"],
+        pair_ids=[p["id"] for p in payload["landmarks"]["pairs"]],
+        **kwargs,
+    )
+
+
+def table_headers(widget):
+    table = widget._table
+    return [table.horizontalHeaderItem(c).text() for c in range(table.columnCount())]
+
+
+@pytest.fixture
+def labelled(prepared_store):
+    payload = labelled_store(prepared_store)
+    return SimpleNamespace(path=prepared_store, payload=payload)
+
+
+def load(ctrl, path):
+    assert ctrl.load_store(path)
+    ctrl.flush_pending_updates()
+    return ctrl
+
+
+def test_check_attr_with_matching_digests_shows_the_check(ctrl, widget, labelled):
+    stores.write_check_attr(
+        labelled.path,
+        matching_check(labelled.payload, classes={2: "likely_misclick", 3: "check"}),
+    )
+    load(ctrl, labelled.path)
+    assert ctrl.state.loaded_content_sha == labelled.payload["content_sha256"]
+    assert table_headers(widget) == CHECK_HEADERS
+    table = widget._table
+    # pair 1: p and weight are the lower of the final and landmarks-only fields
+    assert [table.item(0, c).text() for c in (0, 3, 4, 5, 6, 7)] == [
+        "1",
+        "23.50",
+        "0.41",
+        "1.12",
+        "confirmed",
+        "",
+    ]
+    assert table.item(1, 7).text() == "⚠ likely misclick"
+    assert table.item(2, 7).text() == "? check"
+    status = widget._check_status_label.text()
+    assert status.startswith("Robust check (store, 2026-11-18T09:00:00Z, cortex_serial):")
+    assert (
+        "LOO median 34 µm (clicks only 42 µm), p90 97 µm; 1 to check, 1 likely misclicks" in status
+    )
+    assert "12 tissue windows." in status
+    assert ctrl.has_unsaved_changes() is False
+
+
+def test_without_a_check_the_table_is_the_rigid_fit(ctrl, widget, labelled):
+    load(ctrl, labelled.path)
+    assert table_headers(widget) == RIGID_HEADERS
+    text = widget._check_status_label.text()
+    assert text.startswith("No robust check for these landmarks.")
+    assert "rigid (similarity) fit, which cannot bend" in text
+    assert "merxen manual-registration-check" in text
+    assert widget._summary_label.text().startswith("Rigid (similarity) fit on")
+
+
+def test_load_check_file_shows_the_check_with_the_file_name(ctrl, widget, labelled, tmp_path):
+    load(ctrl, labelled.path)
+    check_file = stores.write_check_file(
+        tmp_path / "SYN1_cortex_serial_check.json",
+        matching_check(labelled.payload, with_details=True),
+    )
+    widget.check_file_chosen.emit(str(check_file))
+    assert table_headers(widget) == CHECK_HEADERS
+    assert "Robust check (SYN1_cortex_serial_check.json," in widget._check_status_label.text()
+    assert widget._check_dialog_dir == str(tmp_path)
+    assert ctrl.has_unsaved_changes() is False
+
+
+def test_stale_check_file_keeps_rigid_mode_until_refreshed(ctrl, widget, labelled, tmp_path):
+    load(ctrl, labelled.path)
+    stale = matching_check(labelled.payload)
+    stale["labelling_content_sha256"] = "sha256:" + "9" * 64
+    check_file = stores.write_check_file(tmp_path / "SYN1_cortex_serial_check.json", stale)
+    widget.check_file_chosen.emit(str(check_file))
+    assert table_headers(widget) == RIGID_HEADERS
+    assert widget._check_status_label.text().startswith(
+        "The landmarks, crops or coarse alignment changed since the check was run (revision 3)."
+    )
+    # a newer file of the same name; Refresh reads it again
+    stores.write_check_file(check_file, matching_check(labelled.payload))
+    widget.refresh_check_requested.emit()
+    assert table_headers(widget) == CHECK_HEADERS
+    assert "SYN1_cortex_serial_check.json" in widget._check_status_label.text()
+
+
+def test_check_for_another_preparation_is_not_applied(ctrl, widget, labelled):
+    stores.write_check_attr(
+        labelled.path, matching_check(labelled.payload, store_content_digest="sha256:" + "7" * 64)
+    )
+    load(ctrl, labelled.path)
+    assert table_headers(widget) == RIGID_HEADERS
+    assert "another preparation of the images" in widget._check_status_label.text()
+
+
+def test_editing_a_pair_makes_the_check_stale(ctrl, widget, labelled):
+    stores.write_check_attr(labelled.path, matching_check(labelled.payload))
+    load(ctrl, labelled.path)
+    assert table_headers(widget) == CHECK_HEADERS
+    widget.pair_enabled_changed.emit(1, False)
+    assert table_headers(widget) == RIGID_HEADERS
+    assert (
+        "The landmarks, crops or coarse alignment changed since the check was run"
+        in widget._check_status_label.text()
+    )
+    widget.pair_enabled_changed.emit(1, True)  # undone by hand: the digests match again
+    assert table_headers(widget) == CHECK_HEADERS
+    # adding a pair changes the labelling too
+    ctrl._widget.landmark_mode_changed.emit(True)
+    ctrl.state.add_pair((10.0, 20.0), (30.0, 40.0))
+    ctrl._content_changed()
+    assert table_headers(widget) == RIGID_HEADERS
+
+
+def test_refresh_reads_the_store_attribute_without_touching_the_labelling(
+    ctrl, widget, labelled, host
+):
+    load(ctrl, labelled.path)
+    assert table_headers(widget) == RIGID_HEADERS
+    state_before = ctrl.state
+    revision_before = state_before.revision
+    sha_before = state_before.content_sha256()
+    stores.write_check_attr(labelled.path, matching_check(labelled.payload))
+    widget.refresh_check_requested.emit()
+    assert host.worker_keys[-1] == "registration_check"
+    assert table_headers(widget) == CHECK_HEADERS
+    assert "Robust check (store," in widget._check_status_label.text()
+    assert ctrl.state is state_before
+    assert (state_before.revision, state_before.content_sha256()) == (revision_before, sha_before)
+    assert ctrl.has_unsaved_changes() is False
+    assert ctrl.session.descriptor.check is not None
+    # the labelling on disk is exactly what it was
+    assert on_disk_labelling(labelled.path) == labelled.payload
+    # removing the attribute and refreshing returns to the rigid fit
+    import zarr
+
+    del zarr.open_group(str(labelled.path), mode="a").attrs["merxen_manual_registration_check"]
+    widget.refresh_check_requested.emit()
+    assert table_headers(widget) == RIGID_HEADERS
+
+
+def test_refresh_picks_up_a_new_store_content_digest(ctrl, widget, labelled):
+    stores.write_check_attr(
+        labelled.path, matching_check(labelled.payload, store_content_digest="sha256:" + "7" * 64)
+    )
+    load(ctrl, labelled.path)
+    assert table_headers(widget) == RIGID_HEADERS
+    attr = read_root_attrs(labelled.path)[STORE_ATTR]
+    stores.write_root_attr(
+        labelled.path, STORE_ATTR, {**attr, "content_digest": "sha256:" + "7" * 64}
+    )
+    widget.refresh_check_requested.emit()
+    assert table_headers(widget) == CHECK_HEADERS
+
+
+def test_malformed_store_attribute_gives_a_note_and_the_rigid_fit(ctrl, widget, labelled, host):
+    stores.write_check_attr(labelled.path, {"schema": "merxen.manual_registration.check"})
+    load(ctrl, labelled.path)
+    assert table_headers(widget) == RIGID_HEADERS
+    assert "the landmark check could not be read:" in widget._check_status_label.text()
+    assert "the landmark check could not be read:" in host.statuses[-1]
+    assert widget._table.rowCount() == 10
+
+
+def test_newer_check_schema_gives_an_update_note(ctrl, widget, labelled, host):
+    stores.write_check_attr(
+        labelled.path, {**matching_check(labelled.payload), "schema_version": 2}
+    )
+    load(ctrl, labelled.path)
+    assert table_headers(widget) == RIGID_HEADERS
+    assert "written by a newer MerXen" in widget._check_status_label.text()
+    assert "update this viewer" in host.statuses[-1]
+
+
+def test_malformed_or_missing_check_file_keeps_the_previous_check(ctrl, widget, labelled, tmp_path):
+    stores.write_check_attr(labelled.path, matching_check(labelled.payload))
+    load(ctrl, labelled.path)
+    assert table_headers(widget) == CHECK_HEADERS
+    for name, content in (("bad.json", "{not json"), ("list.json", "[]"), ("empty.json", "{}")):
+        path = tmp_path / name
+        path.write_text(content, encoding="utf-8")
+        widget.check_file_chosen.emit(str(path))
+        assert table_headers(widget) == CHECK_HEADERS  # the previous check stays
+        assert "the landmark check could not be read:" in widget._check_status_label.text()
+    widget.check_file_chosen.emit(str(tmp_path / "missing_check.json"))
+    assert table_headers(widget) == CHECK_HEADERS
+    assert "could not be read" in widget._check_status_label.text()
+    # a good file clears the note
+    good = stores.write_check_file(tmp_path / "good_check.json", matching_check(labelled.payload))
+    widget.check_file_chosen.emit(str(good))
+    assert "could not be read" not in widget._check_status_label.text()
+    newer = tmp_path / "newer_check.json"
+    newer.write_text(
+        json.dumps({**matching_check(labelled.payload), "schema_version": 2}), encoding="utf-8"
+    )
+    widget.check_file_chosen.emit(str(newer))
+    assert "written by a newer MerXen" in widget._check_status_label.text()
+    assert table_headers(widget) == CHECK_HEADERS
+
+
+def test_check_workers_are_disabled_while_running_and_stale_results_are_ignored(
+    prepared_store, tmp_path
+):
+    payload = labelled_store(prepared_store)
+    viewer, host, widget, controller = make_env(tmp_path / "app_deferred", deferred=True)
+    assert controller.load_store(prepared_store)
+    host.run_pending()
+    controller.flush_pending_updates()
+    check_file = stores.write_check_file(
+        tmp_path / "SYN1_cortex_serial_check.json", matching_check(payload)
+    )
+    widget.check_file_chosen.emit(str(check_file))
+    assert host.worker_keys[-1] == "registration_check" and len(host.pending) == 1
+    assert not widget._load_check_button.isEnabled()
+    assert not widget._refresh_check_button.isEnabled()
+    widget.refresh_check_requested.emit()  # ignored while a worker runs
+    assert len(host.pending) == 1
+    assert table_headers(widget) == RIGID_HEADERS
+    host.run_pending()
+    assert table_headers(widget) == CHECK_HEADERS
+    assert widget._load_check_button.isEnabled() and widget._refresh_check_button.isEnabled()
+
+    # a read that finishes after the session was replaced is dropped
+    widget.refresh_check_requested.emit()
+    assert len(host.pending) == 1
+    assert controller.load_store(prepared_store)
+    host.drop_pending(keys=["registration_check"])
+    host.run_pending()
+    controller.flush_pending_updates()
+    assert table_headers(widget) == RIGID_HEADERS  # the new session starts without a file check
+    assert widget._load_check_button.isEnabled()
+
+
+def test_a_late_check_result_of_an_earlier_session_is_ignored(prepared_store, tmp_path):
+    payload = labelled_store(prepared_store)
+    viewer, host, widget, controller = make_env(tmp_path / "app_late", deferred=True)
+    assert controller.load_store(prepared_store)
+    host.run_pending()
+    check_file = stores.write_check_file(tmp_path / "x_check.json", matching_check(payload))
+    widget.check_file_chosen.emit(str(check_file))
+    late = host.pending[-1]
+    host.pending.remove(late)
+    assert controller.load_store(prepared_store)
+    host.run_pending()
+    late[1](late[0]())  # the old session's worker calls back
+    assert table_headers(widget) == RIGID_HEADERS
+    assert controller._check is None
+
+
+def test_a_late_store_check_refresh_of_an_earlier_session_is_ignored(prepared_store, tmp_path):
+    payload = labelled_store(prepared_store)
+    viewer, host, widget, controller = make_env(tmp_path / "app_late_store", deferred=True)
+    assert controller.load_store(prepared_store)
+    host.run_pending()
+    stores.write_check_attr(prepared_store, matching_check(payload))
+    widget.refresh_check_requested.emit()  # no file loaded: re-reads the store attribute
+    late = host.pending[-1]
+    assert host.worker_keys[-1] == "registration_check"
+    host.pending.remove(late)
+    late_attrs = late[0]()  # the old read saw the check
+    zarr_json = prepared_store / "zarr.json"  # the next session starts without the check
+    document = json.loads(zarr_json.read_text())
+    document["attributes"].pop("merxen_manual_registration_check")
+    zarr_json.write_text(json.dumps(document))
+    assert controller.load_store(prepared_store)
+    host.run_pending()
+    descriptor_before = controller.session.descriptor
+    late[1](late_attrs)
+    assert controller.session.descriptor is descriptor_before
+    assert controller._check is None
+    assert table_headers(widget) == RIGID_HEADERS
+
+
+def test_cancelling_background_work_frees_the_check_buttons(prepared_store, tmp_path):
+    payload = labelled_store(prepared_store)
+    viewer, host, widget, controller = make_env(tmp_path / "app_cancel", deferred=True)
+    assert controller.load_store(prepared_store)
+    host.run_pending()
+    check_file = stores.write_check_file(tmp_path / "x_check.json", matching_check(payload))
+    widget.check_file_chosen.emit(str(check_file))
+    assert not widget._load_check_button.isEnabled()
+    controller.cancel_background()
+    host.drop_pending(keys=["registration_check"])
+    assert widget._load_check_button.isEnabled()
+    assert widget._refresh_check_button.isEnabled()
+    widget.refresh_check_requested.emit()
+    assert host.worker_keys[-1] == "registration_check" and len(host.pending) == 1
+
+
+def test_the_check_is_forgotten_when_the_session_ends(ctrl, widget, labelled):
+    stores.write_check_attr(labelled.path, matching_check(labelled.payload))
+    load(ctrl, labelled.path)
+    assert ctrl._check is not None
+    ctrl.deactivate()
+    assert ctrl._check is None and ctrl._check_raw is None
+
+
+def test_suggestions_layer_is_hidden_and_follows_the_check(ctrl, viewer, widget, labelled):
+    stores.write_check_attr(labelled.path, matching_check(labelled.payload))
+    load(ctrl, labelled.path)
+    layer = viewer.layers["Suggested landmarks"]
+    assert layer.visible is False
+    assert layer.metadata[LAYER_METADATA_KEY]["role"] == "reference"
+    assert layer.data.shape == (2, 2)
+    # napari (row, col) = (y, x) of the reference px; ranks are the labels
+    assert layer.data.tolist() == [[9000.5, 6000.0], [41000.0, 52000.0]]
+    assert list(layer.features["label"]) == ["1", "2"]
+    assert [str(s) for s in layer.symbol] == ["diamond", "diamond"]
+    assert to_hex(layer.face_color[0]) == "#ffd400"
+    assert layer_affine(layer) == pytest.approx(layer_affine(viewer.layers["Reference landmarks"]))
+    assert widget._suggestions_check.isEnabled() and not widget._suggestions_check.isChecked()
+    widget._suggestions_check.setChecked(True)
+    assert layer.visible is True
+    layer.visible = False  # the layer's own eye is mirrored by the checkbox
+    assert widget._suggestions_check.isChecked() is False
+    widget._suggestions_check.setChecked(True)
+    # a stale check empties the layer and disables the checkbox
+    widget.pair_enabled_changed.emit(1, False)
+    assert len(layer.data) == 0
+    assert not widget._suggestions_check.isEnabled()
+    widget.pair_enabled_changed.emit(1, True)
+    assert len(layer.data) == 2
+
+
+def test_suggestions_layer_is_empty_without_a_check(ctrl, viewer, widget, labelled):
+    load(ctrl, labelled.path)
+    assert len(viewer.layers["Suggested landmarks"].data) == 0
+    assert not widget._suggestions_check.isEnabled()
+
+
+PREVIEW = {"mode": "preview", "level_factor": 4, "pixel_size_um": 2.0}
+
+
+def test_preview_result_store_is_placed_by_pixel_centre(result_template, tmp_path):
+    path = tmp_path / "SYN1_preview.zarr"
+    stores.build_result_store(path, materialization=PREVIEW)
+    viewer, host, widget, controller = make_env(tmp_path / "app_preview")
+    assert controller.load_store(path)
+    controller.flush_pending_updates()
+    p, factor = P_R, 4
+    crop = stores.RESULT_CROP
+    half = (factor - 1) / 2
+    expected = np.array(
+        [
+            [p * factor, 0, p * (crop["y0"] + half)],
+            [0, p * factor, p * (crop["x0"] + half)],
+            [0, 0, 1],
+        ]
+    )
+    for name in ("Reference | DAPI", "Registered moving | DAPI", "Registered moving | AF647"):
+        assert layer_affine(viewer.layers[name]) == pytest.approx(expected)
+    # the overlays stay diag(p) on full-frame px
+    for name in ("Reference landmarks", "Registered moving landmarks", "Landmark-fit positions"):
+        assert layer_affine(viewer.layers[name]) == pytest.approx(np.diag([p, p, 1.0]))
+    ref = viewer.layers["Reference landmarks"]
+    assert np.asarray(ref.data_to_world(ref.data[0])) == pytest.approx([150.0, 250.0])
+
+
+def test_result_store_without_materialization_keeps_todays_placement(result_loaded):
+    viewer = result_loaded.viewer
+    assert layer_affine(viewer.layers["Reference | DAPI"]) == pytest.approx(
+        np.array([[0.5, 0, 64], [0, 0.5, 32], [0, 0, 1]])
+    )
+
+
+def test_result_store_with_a_malformed_materialization_is_refused(tmp_path, host, ctrl):
+    path = tmp_path / "SYN1_bad.zarr"
+    stores.build_result_store(path, materialization={"mode": "preview", "level_factor": 0})
+    assert ctrl.load_store(path) is False
+    assert "materialization is missing or invalid" in host.statuses[-1]
+
+
+FIELD = {
+    "model": "robust_gp",
+    "loo_um": {"median": 34.5, "p90": 97.25, "max": 183.5},
+    "class_counts": {"check": 1, "likely_misclick": 2, "ok": 5},
+    "materialize": {"mode": "preview", "level_factor": 4, "pixel_size_um": 2.0},
+}
+
+
+def test_result_banner_has_a_field_line_for_field_runs():
+    result = stores.result_attr(landmarks=stores.default_result_landmarks())
+    assert len(result_banner(result).splitlines()) == 3
+    result["field"] = None
+    assert len(result_banner(result).splitlines()) == 3
+    result["field"] = FIELD
+    lines = result_banner(result).splitlines()
+    assert len(lines) == 4
+    assert lines[3] == (
+        "Field: robust GP · LOO median 34.50 µm (p90 97.25) · 1 to check, 2 likely misclicks · "
+        "preview 2.00 µm/px"
+    )
+    result["field"] = {"model": "robust_gp"}
+    assert result_banner(result).splitlines()[3] == (
+        "Field: robust GP · LOO median n/a µm (p90 n/a) · n/a to check, n/a likely misclicks · "
+        "n/a n/a µm/px"
+    )
+
+
+def test_result_store_shows_the_field_line(tmp_path):
+    path = tmp_path / "SYN1_field.zarr"
+    stores.build_result_store(path, materialization=PREVIEW, field=FIELD)
+    viewer, host, widget, controller = make_env(tmp_path / "app_field")
+    assert controller.load_store(path)
+    assert "Field: robust GP · LOO median 34.50 µm" in widget._result_banner.text()
