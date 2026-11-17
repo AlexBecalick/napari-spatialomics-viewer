@@ -90,10 +90,10 @@ hint, not a verdict, and use the check below to decide.
 
 `merxen manual-registration-check` fits a field that can bend (a robust Gaussian-process model of
 your clicks plus image evidence) and reports, for every pair, how well the others predict it. The
-viewer only displays that report; it never computes it. The check applies only while the landmarks
-are exactly those it was run on, so the table switches to the check columns (**LOO µm**, **p**,
+viewer only displays that report; it never computes it. The check applies only while the saved
+labelling (landmarks, crops and coarse alignment) is exactly what it was run on, so the table switches to the check columns (**LOO µm**, **p**,
 **Weight**, **Image** and **Flags**) while the check is current and back to the rigid-fit columns
-as soon as you edit a pair.
+as soon as you edit a pair, a crop or the coarse alignment.
 
 **Viewer on another machine than MerXen** (for example labelling on a laptop):
 
@@ -116,8 +116,11 @@ labelling.
 **Viewer and MerXen on the same machine:** run the check on the store itself and press **Refresh
 check**. It reads the check again from the store (or from the last loaded file) without reopening
 the store. The same button picks up a newer file of the same name after you run the check again.
+Once you have loaded a check file in this session, Refresh re-reads that file and never the store:
+reopen the store (or load the new file) to see a check written on the store.
 
-After you change a landmark the check is stale and the status line says so. Save, upload and run
+After you change a landmark, a crop or the coarse alignment the check is stale and the status line
+says so. Save, upload and run
 the check again.
 
 The columns:
