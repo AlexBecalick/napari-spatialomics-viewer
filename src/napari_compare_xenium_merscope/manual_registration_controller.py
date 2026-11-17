@@ -210,6 +210,19 @@ def contrast_limits_from_level(
     return (low, high)
 
 
+def _snap_tile_start(centre: float, edge: int, bounds: np.ndarray, size: int) -> int:
+    """Return the tile start nearest ``centre`` that keeps the tile inside one stored chunk.
+
+    A chunk smaller than ``edge`` cannot hold the tile; the start is then only clamped to the
+    image.
+    """
+    index = int(np.clip(np.searchsorted(bounds, centre, side="right") - 1, 0, len(bounds) - 2))
+    lower, upper = int(bounds[index]), int(bounds[index + 1])
+    if upper - lower < edge:
+        return int(min(max(centre - edge / 2, 0), size - edge))
+    return int(min(max(centre - edge / 2, lower), upper - edge))
+
+
 def contrast_limits_from_tissue_tiles(
     level0_cyx: Any,
     coarse_cyx: Any,
@@ -229,7 +242,7 @@ def contrast_limits_from_tissue_tiles(
     ``tile_px`` squared read at full resolution. Tile centres are drawn (deterministically, from
     ``seed``) among the non-zero pixels of the coarse level, so they lie on tissue (zero is
     padding or background). Tiles are read in batches of ``CONTRAST_TILE_BATCH`` (one dask
-    compute per batch).
+    compute per batch), each snapped inside a single stored chunk.
 
     Falls back to ``contrast_limits_from_level`` on the coarse level when level 0 cannot be read.
 
@@ -267,14 +280,19 @@ def contrast_limits_from_tissue_tiles(
         rng = np.random.default_rng(seed)
         chosen = rng.choice(len(tissue), size=min(n_tiles, len(tissue)), replace=False)
         edge = min(tile_px, height0, width0)
+        # Snap each tile inside one stored chunk: a tile straddling a chunk boundary would
+        # decompress up to four chunks (tens of MB each) instead of one.
+        chunks = getattr(plane0.data, "chunks", None) or ((height0,), (width0,))
+        row_bounds = np.cumsum((0, *(int(v) for v in chunks[0])))
+        col_bounds = np.cumsum((0, *(int(v) for v in chunks[1])))
         boxes: list[tuple[int, int]] = []
         for index in chosen:
             row, col = tissue[index]
             # Centre of the sampled coarse pixel, scaled to level 0.
             centre_y = (row * step + step / 2) * height0 / coarse_height
             centre_x = (col * step + step / 2) * width0 / coarse_width
-            y0 = int(min(max(centre_y - edge / 2, 0), height0 - edge))
-            x0 = int(min(max(centre_x - edge / 2, 0), width0 - edge))
+            y0 = _snap_tile_start(centre_y, edge, row_bounds, height0)
+            x0 = _snap_tile_start(centre_x, edge, col_bounds, width0)
             boxes.append((y0, x0))
         pooled: list[np.ndarray] = []
         # Each tile read decompresses at least one whole stored chunk (tens of MB on real

@@ -2145,3 +2145,23 @@ def test_tissue_tile_contrast_reads_in_batches_and_polls_between_them():
 
     contrast_limits_from_tissue_tiles(level0, coarse, 0, n_tiles=24, cancel_check=cancel_check)
     assert len(calls) == 3  # 24 tiles in batches of CONTRAST_TILE_BATCH (8)
+
+
+def test_tissue_tiles_never_straddle_a_stored_chunk_boundary():
+    import xarray as xr
+
+    size, chunk, block = 1024, 256, 32
+    full = np.full((1, size, size), 500, dtype=np.uint16)
+    coarse = full.reshape(1, size // block, block, size // block, block).mean(axis=(2, 4))
+    coarse_array = xr.DataArray(coarse, dims=("c", "y", "x"))
+    reads: list = []
+    plane = _LoggedPlane(full[0], reads)
+    plane.chunks = ((chunk,) * (size // chunk), (chunk,) * (size // chunk))
+    level0 = SimpleNamespace(isel=lambda c: plane)
+
+    contrast_limits_from_tissue_tiles(level0, coarse_array, 0, n_tiles=32, tile_px=128)
+
+    assert len(reads) == 32
+    for rows, cols in reads:
+        assert rows.start // chunk == (rows.stop - 1) // chunk
+        assert cols.start // chunk == (cols.stop - 1) // chunk
