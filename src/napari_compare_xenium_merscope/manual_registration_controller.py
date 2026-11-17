@@ -49,6 +49,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
+import dask
 import numpy as np
 import pandas as pd
 from napari.layers import Image, Points, Shapes
@@ -128,6 +129,7 @@ CONTRAST_PERCENTILES = (1.0, 99.9)
 CONTRAST_MAX_PIXELS = 4_000_000
 CONTRAST_TILES = 32
 CONTRAST_TILE_PX = 512
+CONTRAST_TILE_BATCH = 8
 PREVIEW_MIN_ENABLED = 3
 UNDO_LIMIT = 500
 SESSION_KEYS = (
@@ -226,7 +228,8 @@ def contrast_limits_from_tissue_tiles(
     here are instead the ``percentiles`` of the non-zero pixels of up to ``n_tiles`` tiles of
     ``tile_px`` squared read at full resolution. Tile centres are drawn (deterministically, from
     ``seed``) among the non-zero pixels of the coarse level, so they lie on tissue (zero is
-    padding or background). Tiles are read one at a time.
+    padding or background). Tiles are read in batches of ``CONTRAST_TILE_BATCH`` (one dask
+    compute per batch).
 
     Falls back to ``contrast_limits_from_level`` on the coarse level when level 0 cannot be read.
 
@@ -238,7 +241,7 @@ def contrast_limits_from_tissue_tiles(
         n_tiles: Maximum number of tiles.
         tile_px: Tile edge in level-0 pixels.
         seed: Seed of the tile-centre draw.
-        cancel_check: Polled between tiles; a true value raises ``RegistrationLoadCancelled``.
+        cancel_check: Polled between tile batches; a true value raises ``RegistrationLoadCancelled``.
 
     Returns:
         ``(low, high)`` with ``high > low``; ``(0.0, 1.0)`` when no tile pixel is non-zero.
@@ -264,21 +267,30 @@ def contrast_limits_from_tissue_tiles(
         rng = np.random.default_rng(seed)
         chosen = rng.choice(len(tissue), size=min(n_tiles, len(tissue)), replace=False)
         edge = min(tile_px, height0, width0)
-        pooled: list[np.ndarray] = []
+        boxes: list[tuple[int, int]] = []
         for index in chosen:
-            check()
             row, col = tissue[index]
             # Centre of the sampled coarse pixel, scaled to level 0.
             centre_y = (row * step + step / 2) * height0 / coarse_height
             centre_x = (col * step + step / 2) * width0 / coarse_width
             y0 = int(min(max(centre_y - edge / 2, 0), height0 - edge))
             x0 = int(min(max(centre_x - edge / 2, 0), width0 - edge))
-            tile = np.asarray(plane0.data[y0 : y0 + edge, x0 : x0 + edge]).ravel()
-            if tile.dtype.kind == "f":
-                tile = tile[np.isfinite(tile)]
-            tile = tile[tile != 0]
-            if tile.size:
-                pooled.append(tile)
+            boxes.append((y0, x0))
+        pooled: list[np.ndarray] = []
+        # Each tile read decompresses at least one whole stored chunk (tens of MB on real
+        # stores). One compute per batch lets dask read a chunk shared by several tiles once
+        # and decompress on several threads; cancellation is polled between batches.
+        for start in range(0, len(boxes), CONTRAST_TILE_BATCH):
+            check()
+            batch = boxes[start : start + CONTRAST_TILE_BATCH]
+            lazy_tiles = [plane0.data[y0 : y0 + edge, x0 : x0 + edge] for y0, x0 in batch]
+            for tile_array in dask.compute(*lazy_tiles):
+                tile = np.asarray(tile_array).ravel()
+                if tile.dtype.kind == "f":
+                    tile = tile[np.isfinite(tile)]
+                tile = tile[tile != 0]
+                if tile.size:
+                    pooled.append(tile)
     except RegistrationLoadCancelled:
         raise
     except Exception as exc:  # noqa: BLE001 - any store/dask read failure has the same fallback

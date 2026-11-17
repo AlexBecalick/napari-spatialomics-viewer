@@ -1313,6 +1313,21 @@ def test_prepare_session_cancel_raises(host, ctrl, prepared_store):
         ctrl.prepare_session(prepared_store, lambda: True)
 
 
+def test_prepare_session_forwards_cancel_check_to_the_contrast_read(
+    host, ctrl, prepared_store, monkeypatch
+):
+    received = []
+
+    def spy(level0, coarse, index, **kwargs):
+        received.append(kwargs.get("cancel_check"))
+        return (0.0, 1.0)
+
+    monkeypatch.setattr(controller_module, "contrast_limits_from_tissue_tiles", spy)
+    marker = lambda: False  # noqa: E731
+    ctrl.prepare_session(prepared_store, marker)
+    assert received and all(check is marker for check in received)
+
+
 def test_newer_load_supersedes_older(prepared_store, tmp_path, prepared_template):
     second = tmp_path / "second_prepared.zarr"
     shutil.copytree(prepared_template, second)
@@ -2076,3 +2091,57 @@ def test_tissue_tile_contrast_falls_back_to_coarse_level_when_level0_read_fails(
         limits = contrast_limits_from_tissue_tiles(level0, coarse, 0)
     assert limits == contrast_limits_from_level(coarse, 0)
     assert "chunk missing" in caplog.text
+
+
+class _LoggedPlane:
+    """A 2-D plane whose ``.data`` records every level-0 slice read from it."""
+
+    def __init__(self, array: np.ndarray, reads: list) -> None:
+        self.shape = array.shape
+        self._array = array
+        self._reads = reads
+
+    @property
+    def data(self):
+        return self
+
+    def __getitem__(self, key):
+        self._reads.append(key)
+        return self._array[key]
+
+
+def test_tissue_tiles_are_placed_on_off_origin_tissue_of_a_non_square_image():
+    import xarray as xr
+
+    height, width, block = 1024, 3072, 32
+    full = np.zeros((1, height, width), dtype=np.uint16)
+    # Tissue only in the bottom-right box, carrying a value found nowhere else.
+    box_y, box_x = slice(640, 1024), slice(2048, 3072)
+    full[0, box_y, box_x] = 777
+    coarse = full.reshape(1, height // block, block, width // block, block).mean(axis=(2, 4))
+    coarse_array = xr.DataArray(coarse, dims=("c", "y", "x"))
+    reads: list = []
+    plane = _LoggedPlane(full[0], reads)
+    level0 = SimpleNamespace(isel=lambda c: plane)
+
+    low, high = contrast_limits_from_tissue_tiles(level0, coarse_array, 0, n_tiles=16)
+
+    assert (low, high) == (777.0, 778.0)
+    assert len(reads) == 16
+    for rows, cols in reads:
+        # Every tile lies inside the image and reaches the tissue box on both axes.
+        assert 0 <= rows.start < rows.stop <= height and 0 <= cols.start < cols.stop <= width
+        assert rows.stop > box_y.start and cols.stop > box_x.start
+        assert full[0, rows, cols].any()
+
+
+def test_tissue_tile_contrast_reads_in_batches_and_polls_between_them():
+    level0, coarse, _ = _bright_tail_pyramid()
+    calls = []
+
+    def cancel_check() -> bool:
+        calls.append(1)
+        return False
+
+    contrast_limits_from_tissue_tiles(level0, coarse, 0, n_tiles=24, cancel_check=cancel_check)
+    assert len(calls) == 3  # 24 tiles in batches of CONTRAST_TILE_BATCH (8)
