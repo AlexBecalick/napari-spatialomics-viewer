@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import replace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -17,8 +18,13 @@ from napari_compare_xenium_merscope.manual_registration_model import (
     finish_allowed,
 )
 from napari_compare_xenium_merscope.manual_registration_widget import (
+    CHECK_COLOUR,
     SIGNAL_NAMES,
+    WARNING_COLOUR,
     ManualRegistrationWidget,
+    _flags,
+    _fmt,
+    _fmt_p,
 )
 
 
@@ -54,6 +60,45 @@ def make_rows():
         ResidualRow(3, "#ff0000", True, True, False, False, 0.5, 0.7),
         ResidualRow(5, "#00ff00", True, False, True, True, 42.0, 41.0),
         ResidualRow(9, "#0000ff", False, False, False, False, float("nan"), float("nan")),
+    ]
+
+
+def make_check_rows():
+    """Rows as ``apply_check_to_rows`` fills them (ids 3, 5 and 9 of ``make_rows``)."""
+    base = make_rows()
+    return [
+        replace(
+            base[0],
+            robust_loo_um=23.5,
+            p_value=0.52,
+            weight=1.25,
+            verdict="confirmed",
+            robust_class="ok",
+            final_p_value=0.52,
+            clicks_only_p_value=0.52,
+            final_weight=1.25,
+            clicks_only_weight=1.25,
+        ),
+        replace(
+            base[1],
+            robust_loo_um=85.0,
+            p_value=8.4e-15,
+            weight=0.0625,
+            verdict="contradicted",
+            robust_class="likely_misclick",
+            final_p_value=0.03,
+            clicks_only_p_value=8.4e-15,
+            final_weight=0.625,
+            clicks_only_weight=0.0625,
+        ),
+        replace(
+            base[2],
+            robust_loo_um=96.0,
+            p_value=0.00015,
+            weight=None,
+            verdict="not_checked",
+            robust_class="disabled",
+        ),
     ]
 
 
@@ -98,6 +143,12 @@ def test_setters_never_emit(widget):
     w.set_session("result", "PAIR1_serial_section")
     w.set_result(make_rows(), "banner")
     w.set_overlay_visibility("landmark_fit_positions", True)
+    w.set_rows(make_check_rows(), check_mode=True)
+    w.set_check_status("a status", is_current=True)
+    w.set_check_busy(True)
+    w.set_check_busy(False)
+    w.set_check_dialog_dir("/somewhere")
+    w.set_suggestions(True, True)
     w.set_session(None, "")
     assert rec.calls == []
 
@@ -364,7 +415,7 @@ def test_labels(widget):
     assert "at least 2 enabled pairs" in w._summary_label.text()
     w.set_fit_summary(make_summary(["first", "second"]))
     assert w._warnings_label.text() == "first\nsecond"
-    assert "Fit on 9 of 10 enabled pairs" in w._summary_label.text()
+    assert "Rigid (similarity) fit on 9 of 10 enabled pairs" in w._summary_label.text()
     assert "mirrored no" in w._summary_label.text()
 
     w.set_landmark_mode(False)
@@ -389,7 +440,7 @@ def test_table_content(widget):
     t = w._table
     assert [t.item(r, 0).text() for r in range(3)] == ["3", "5", "9"]
     assert t.item(0, 3).text() == "0.50" and t.item(2, 3).text() == "–"
-    assert t.item(1, 5).text() == "⚠ outlier ✂ outside crop"
+    assert t.item(1, 5).text() == "⚠ rigid outlier ✂ outside crop"
     assert t.item(2, 5).text() == "off"
     assert t.item(0, 1).background().color().name() == "#ff0000"
     assert t.item(0, 2).checkState() == 2 and t.item(2, 2).checkState() == 0
@@ -448,3 +499,222 @@ def test_registration_controls_fit_window_height(widget, qapp):
     assert widget.minimumSizeHint().height() <= 850
     assert widget._finish_button.mapTo(widget, widget._finish_button.rect().bottomLeft()).y() < widget.height()
     widget.close()
+
+
+RIGID_HEADERS = ["#", "", "On", "Rigid fit µm", "Rigid LOO µm", "Flags"]
+CHECK_HEADERS = ["#", "", "On", "LOO µm", "p", "Weight", "Image", "Flags"]
+
+
+def headers(widget):
+    table = widget._table
+    return [table.horizontalHeaderItem(c).text() for c in range(table.columnCount())]
+
+
+def texts(widget, row):
+    table = widget._table
+    return [table.item(row, c).text() for c in range(table.columnCount())]
+
+
+def test_table_columns_switch_with_the_mode(widget):
+    widget.set_session("prepared", "PAIR1")
+    assert headers(widget) == RIGID_HEADERS
+    widget.set_rows(make_check_rows(), check_mode=True)
+    assert headers(widget) == CHECK_HEADERS and widget._table.rowCount() == 3
+    widget.set_rows(make_rows())
+    assert headers(widget) == RIGID_HEADERS and widget._table.columnCount() == 6
+    widget.set_rows(make_check_rows(), check_mode=True)
+    widget.set_session(None, "")
+    assert headers(widget) == RIGID_HEADERS  # clearing the session returns to the rigid set
+
+
+def test_table_selection_survives_a_mode_switch(widget):
+    widget.set_session("prepared", "PAIR1")
+    widget.set_rows(make_rows())
+    widget._table.selectRow(1)
+    assert widget._selected_ids() == [5]
+    widget.set_rows(make_check_rows(), check_mode=True)
+    assert widget._selected_ids() == [5]
+    widget.set_rows(make_rows())
+    assert widget._selected_ids() == [5]
+
+
+def test_header_tooltips(widget):
+    widget.set_session("prepared", "PAIR1")
+
+    def tip(column):
+        return widget._table.horizontalHeaderItem(column).toolTip()
+
+    assert tip(4) == "leave-one-out residual of a similarity fit; large where the section bends"
+    widget.set_rows(make_check_rows(), check_mode=True)
+    assert tip(3) == (
+        "leave-one-out residual of MerXen's robust field (landmarks plus image evidence)"
+    )
+    assert tip(4).startswith("chance of a residual this large for a typical click")
+    assert tip(4).endswith("the lower of the landmarks-only and final fields")
+    assert tip(5).startswith("Student-t weight; low weights barely influence the field")
+    assert tip(5).endswith("the lower of the two fields")
+    assert tip(6) == "the image check of this click"
+    assert tip(7) == ""
+
+
+def test_check_table_content_and_cell_tooltips(widget):
+    widget.set_session("prepared", "PAIR1")
+    widget.set_rows(make_check_rows(), check_mode=True)
+    assert texts(widget, 0) == ["3", "", "", "23.50", "0.52", "1.25", "confirmed", ""]
+    assert texts(widget, 1) == [
+        "5",
+        "",
+        "",
+        "85.00",
+        "<1e-4",
+        "0.06",
+        "contradicted",
+        "⚠ likely misclick ✂ outside crop",
+    ]
+    assert texts(widget, 2) == ["9", "", "", "96.00", "0.00015", "–", "–", "off"]
+    table = widget._table
+    # both fields in the cell tooltips when they differ; none when they agree
+    assert table.item(1, 4).toolTip() == "final field: 0.03; landmarks only: <1e-4"
+    assert table.item(1, 5).toolTip() == "final field: 0.62; landmarks only: 0.06"
+    assert table.item(0, 4).toolTip() == "" and table.item(0, 5).toolTip() == ""
+
+
+def test_number_formats():
+    assert _fmt_p(0.41) == "0.41"
+    assert _fmt_p(0.00015) == "0.00015"
+    assert _fmt_p(0.0078) == "0.0078"
+    assert _fmt_p(1.0) == "1"
+    assert _fmt_p(9.99e-5) == "<1e-4"
+    assert _fmt_p(0.0) == "<1e-4"
+    assert _fmt_p(None) == "–" and _fmt_p(float("nan")) == "–"
+    assert _fmt(0.25) == "0.25" and _fmt(1.25) == "1.25" and _fmt(None) == "–"
+
+
+def test_none_values_show_an_en_dash(widget):
+    widget.set_session("prepared", "PAIR1")
+    # a row the check does not know keeps None everywhere
+    widget.set_rows(make_rows(), check_mode=True)
+    assert texts(widget, 0) == ["3", "", "", "–", "–", "–", "–", ""]
+
+
+def row_with(**changes):
+    return replace(make_rows()[0], **changes)
+
+
+def test_flags_in_rigid_mode():
+    assert _flags(row_with(), off_text="off") == ""
+    assert _flags(row_with(outlier=True), off_text="off") == "⚠ rigid outlier"
+    assert (
+        _flags(row_with(outlier=True, outside_crop=True, enabled=False), off_text="off")
+        == "⚠ rigid outlier ✂ outside crop off"
+    )
+
+
+def test_flags_in_check_mode_use_the_class():
+    def flags(**changes):
+        return _flags(row_with(**changes), off_text="off", check_mode=True)
+
+    assert flags(robust_class="ok") == ""
+    assert flags(robust_class="kept_confirmed") == "kept: image confirms"
+    assert flags(robust_class="check") == "? check"
+    assert flags(robust_class="likely_misclick") == "⚠ likely misclick"
+    assert flags(robust_class="excluded") == "excluded"
+    assert flags(robust_class="disabled", enabled=False) == "off"
+    assert flags(robust_class="check", outside_crop=True) == "? check ✂ outside crop"
+    # the rigid outlier flag plays no part in check mode
+    assert flags(robust_class="ok", outlier=True) == ""
+    # a pair the check does not know still shows that it is off
+    assert flags(enabled=False) == "off"
+
+
+def test_check_rows_are_coloured_by_class(widget):
+    widget.set_session("prepared", "PAIR1")
+    rows = [
+        row_with(id=1, robust_class="likely_misclick"),
+        row_with(id=2, robust_class="check"),
+        row_with(id=3, robust_class="ok"),
+        row_with(id=4, robust_class="likely_misclick", enabled=False),
+    ]
+    widget.set_rows(rows, check_mode=True)
+    table = widget._table
+
+    def colour(row):
+        return table.item(row, 3).foreground().color().name()
+
+    assert colour(0) == WARNING_COLOUR
+    assert colour(1) == CHECK_COLOUR == "#d08c00"
+    assert colour(2) != WARNING_COLOUR and colour(2) != CHECK_COLOUR
+    assert colour(3) == "#888888"  # a disabled pair stays grey
+
+
+def test_summary_starts_with_the_rigid_fit_label(widget):
+    widget.set_fit_summary(make_summary())
+    assert widget._summary_label.text().startswith("Rigid (similarity) fit on 9 of 10 enabled")
+
+
+def test_check_status_label(widget):
+    assert "No robust check" in widget._check_status_label.text()
+    widget.set_check_status("Robust check (store, now): fine", is_current=True)
+    assert widget._check_status_label.text() == "Robust check (store, now): fine"
+    assert WARNING_COLOUR not in widget._check_status_label.styleSheet()
+    widget.set_check_status("stale", is_current=False)
+    assert WARNING_COLOUR in widget._check_status_label.styleSheet()
+
+
+def test_load_check_file_emits_the_chosen_path(widget, monkeypatch, tmp_path):
+    widget.set_session("prepared", "PAIR1")
+    rec = Recorder(widget)
+    opened = []
+
+    def chosen(parent, title, directory, file_filter):
+        opened.append((directory, file_filter))
+        return str(tmp_path / "SYN1_cortex_serial_check.json"), file_filter
+
+    monkeypatch.setattr(
+        "napari_compare_xenium_merscope.manual_registration_widget.QFileDialog.getOpenFileName",
+        chosen,
+    )
+    widget.set_check_dialog_dir(str(tmp_path))
+    widget._load_check_button.click()
+    assert rec.pop() == [("check_file_chosen", (str(tmp_path / "SYN1_cortex_serial_check.json"),))]
+    assert opened == [(str(tmp_path), "MerXen check (*_check.json);;JSON (*.json)")]
+
+
+def test_cancelled_load_check_dialog_emits_nothing(widget, monkeypatch):
+    widget.set_session("prepared", "PAIR1")
+    rec = Recorder(widget)
+    monkeypatch.setattr(
+        "napari_compare_xenium_merscope.manual_registration_widget.QFileDialog.getOpenFileName",
+        lambda *args: ("", ""),
+    )
+    widget._load_check_button.click()
+    assert rec.pop() == []
+
+
+def test_refresh_check_emits_its_signal(widget):
+    widget.set_session("prepared", "PAIR1")
+    rec = Recorder(widget)
+    widget._refresh_check_button.click()
+    assert rec.pop() == [("refresh_check_requested", ())]
+
+
+def test_check_buttons_are_disabled_while_busy(widget):
+    widget.set_session("prepared", "PAIR1")
+    widget.set_check_busy(True)
+    assert not widget._load_check_button.isEnabled()
+    assert not widget._refresh_check_button.isEnabled()
+    widget.set_check_busy(False)
+    assert widget._load_check_button.isEnabled() and widget._refresh_check_button.isEnabled()
+
+
+def test_suggestions_checkbox(widget):
+    widget.set_session("prepared", "PAIR1")
+    rec = Recorder(widget)
+    assert not widget._suggestions_check.isEnabled()
+    widget.set_suggestions(True, False)
+    assert widget._suggestions_check.isEnabled() and not widget._suggestions_check.isChecked()
+    widget._suggestions_check.click()
+    assert rec.pop() == [("suggestions_visible_changed", (True,))]
+    widget.set_suggestions(False, True)  # nothing to show: unavailable and unchecked
+    assert not widget._suggestions_check.isEnabled() and not widget._suggestions_check.isChecked()
+    assert rec.pop() == []

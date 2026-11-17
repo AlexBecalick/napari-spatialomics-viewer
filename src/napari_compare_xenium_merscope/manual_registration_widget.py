@@ -20,6 +20,7 @@ from qtpy.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFrame,
     QGridLayout,
     QGroupBox,
@@ -35,13 +36,16 @@ from qtpy.QtWidgets import (
 )
 
 from .manual_registration_model import (
+    CLASS_FLAG_TEXT,
     CROP_MIN_SIZE_PX,
     CROP_SNAP_PX,
     DISPLAY_MODES,
     MIN_DRAWN_CROP_PX,
+    NO_CHECK_TEXT,
     ROLES,
     SAME_SECTION_FLOOR_UM,
     SERIAL_SECTION_FLOOR_HINT_UM,
+    VERDICT_SHORT,
     CoarseState,
     CropRect,
     FitSummary,
@@ -74,12 +78,16 @@ SIGNAL_NAMES: tuple[str, ...] = (
     "save_requested",
     "finish_requested",
     "overlay_changed",
+    "check_file_chosen",
+    "refresh_check_requested",
+    "suggestions_visible_changed",
 )
 
 NO_SESSION_TEXT = (
     "No registration store loaded. Dataset loader ▸ Manual Registration ▸ Load image data"
 )
 WARNING_COLOUR = "#e0a030"
+CHECK_COLOUR = "#d08c00"  # amber: rows MerXen's check asks the user to look at
 _GREY = QColor("#888888")
 _ROTATE_STEPS = (-90.0, -10.0, -1.0, -0.1, 0.1, 1.0, 10.0, 90.0)
 _ROTATE_LABELS = {
@@ -99,6 +107,18 @@ _OVERLAY_LABELS = {
     "landmark_fit_positions": ("Landmark-fit positions", False),
 }
 _CROP_FIELDS = ("x0", "y0", "x1", "y1")
+_RIGID_HEADERS = ("#", "", "On", "Rigid fit µm", "Rigid LOO µm", "Flags")
+_CHECK_HEADERS = ("#", "", "On", "LOO µm", "p", "Weight", "Image", "Flags")
+_HEADER_TOOLTIPS = {
+    "Rigid LOO µm": "leave-one-out residual of a similarity fit; large where the section bends",
+    "LOO µm": "leave-one-out residual of MerXen's robust field (landmarks plus image evidence)",
+    "p": (
+        "chance of a residual this large for a typical click (chi-square, 2 dof); "
+        "the lower of the landmarks-only and final fields"
+    ),
+    "Weight": "Student-t weight; low weights barely influence the field; the lower of the two fields",
+    "Image": "the image check of this click",
+}
 
 
 def _fmt(value: float | None) -> str:
@@ -108,10 +128,26 @@ def _fmt(value: float | None) -> str:
     return f"{value:.2f}"
 
 
-def _flags(row: ResidualRow, *, off_text: str) -> str:
+def _fmt_p(value: float | None) -> str:
+    """Format a p-value with two significant digits; below 1e-4 it reads ``<1e-4``."""
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return "–"
+    return "<1e-4" if value < 1e-4 else f"{value:.2g}"
+
+
+def _flags(row: ResidualRow, *, off_text: str, check_mode: bool = False) -> str:
+    """Return the flag text of a table row (rigid-fit outlier flags, or the check's class)."""
     parts = []
-    if row.outlier:
-        parts.append("⚠ outlier")
+    if check_mode and row.robust_class is not None:
+        text = CLASS_FLAG_TEXT.get(row.robust_class, row.robust_class)
+        if row.robust_class == "likely_misclick":
+            text = f"⚠ {text}"
+        elif row.robust_class == "check":
+            text = f"? {text}"
+        if text and row.robust_class != "disabled":
+            parts.append(text)
+    elif row.outlier:
+        parts.append("⚠ rigid outlier")
     if row.outside_crop:
         parts.append("✂ outside crop")
     if not row.enabled:
@@ -157,6 +193,9 @@ class ManualRegistrationWidget(QWidget):
     save_requested = Signal()
     finish_requested = Signal()
     overlay_changed = Signal(str, bool)  # key, visible (result mode)
+    check_file_chosen = Signal(str)  # path of a MerXen *_check.json
+    refresh_check_requested = Signal()
+    suggestions_visible_changed = Signal(bool)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -170,6 +209,8 @@ class ManualRegistrationWidget(QWidget):
         self._preview_available = False
         self._crop_drawing: str | None = None
         self._pending: tuple[str | None, int | None] = (None, None)
+        self._check_mode = False
+        self._check_dialog_dir = ""
         self._crop_shapes: dict[str, tuple[int, int] | None] = {r: None for r in ROLES}
         self._crop_values: dict[str, CropRect | None] = {r: None for r in ROLES}
         self._crop_outside: dict[str, int] = {r: 0 for r in ROLES}
@@ -404,13 +445,13 @@ class ManualRegistrationWidget(QWidget):
         self._landmark_button.toggled.connect(self._on_landmark_toggled)
         lay.addWidget(self._landmark_button)
 
-        self._table = QTableWidget(0, 6)
-        self._table.setHorizontalHeaderLabels(["#", "", "On", "Fit µm", "LOO µm", "Flags"])
+        self._table = QTableWidget(0, len(_RIGID_HEADERS))
+        self._apply_table_headers(check_mode=False)
         self._table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self._table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._table.verticalHeader().setVisible(False)
-        self._table.setMinimumHeight(90)
+        self._table.setMinimumHeight(60)
         self._table.cellClicked.connect(self._on_table_clicked)
         self._table.itemChanged.connect(self._on_table_item_changed)
         self._table.itemSelectionChanged.connect(self._update_delete_enabled)
@@ -462,7 +503,61 @@ class ManualRegistrationWidget(QWidget):
         self._warnings_label.setStyleSheet(f"color: {WARNING_COLOUR}")
         self._warnings_label.setVisible(False)
         lay.addWidget(self._warnings_label)
+
+        self._check_status_label = QLabel(NO_CHECK_TEXT)
+        self._check_status_label.setWordWrap(True)
+        lay.addWidget(self._check_status_label)
+        check_row = QHBoxLayout()
+        self._load_check_button = QPushButton("Load check file…")
+        self._load_check_button.setToolTip(
+            "Read a <dataset>_<preset>_check.json written by merxen manual-registration-check"
+        )
+        self._load_check_button.clicked.connect(lambda _=False: self._on_load_check_clicked())
+        self._refresh_check_button = QPushButton("Refresh check")
+        self._refresh_check_button.setToolTip(
+            "Read the check again from its file (or the store) without reopening the store"
+        )
+        self._refresh_check_button.clicked.connect(
+            lambda _=False: self._emit_plain(self.refresh_check_requested)
+        )
+        check_row.addWidget(self._load_check_button)
+        check_row.addWidget(self._refresh_check_button)
+        self._suggestions_check = QCheckBox("Suggested landmarks")
+        self._suggestions_check.setToolTip(
+            "Places on the reference where one more landmark would help most (from the check)"
+        )
+        self._suggestions_check.setEnabled(False)
+        self._suggestions_check.toggled.connect(self._on_suggestions_toggled)
+        check_row.addWidget(self._suggestions_check)
+        lay.addLayout(check_row)
         return self._landmark_box
+
+    def _apply_table_headers(self, *, check_mode: bool) -> None:
+        headers = _CHECK_HEADERS if check_mode else _RIGID_HEADERS
+        self._table.setColumnCount(len(headers))
+        self._table.setHorizontalHeaderLabels(list(headers))
+        for column, name in enumerate(headers):
+            header_item = self._table.horizontalHeaderItem(column)
+            if header_item is not None:
+                header_item.setToolTip(_HEADER_TOOLTIPS.get(name, ""))
+        self._check_mode = check_mode
+
+    def _on_load_check_clicked(self) -> None:
+        if self._suppress:
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load MerXen landmark check",
+            self._check_dialog_dir,
+            "MerXen check (*_check.json);;JSON (*.json)",
+        )
+        if path:
+            self.check_file_chosen.emit(str(path))
+
+    def _on_suggestions_toggled(self, checked: bool) -> None:
+        if self._suppress:
+            return
+        self.suggestions_visible_changed.emit(bool(checked))
 
     def _build_preview(self) -> QWidget:
         self._preview_button = QPushButton("Preview fit")
@@ -644,6 +739,8 @@ class ManualRegistrationWidget(QWidget):
                 self._busy_label.setVisible(False)
                 self._set_rows_impl([])
                 self._set_summary_impl(None)
+                self.set_check_status(NO_CHECK_TEXT)
+                self.set_suggestions(False, False)
                 self._result_table.setRowCount(0)
                 self._result_banner.setText("")
             self._display_buttons["moving"].setText(
@@ -706,11 +803,40 @@ class ManualRegistrationWidget(QWidget):
             self._pending = (role, next_id)
             self._update_prompt()
 
-    def _set_rows_impl(self, rows: Sequence[ResidualRow]) -> None:
+    def _check_items(self, row: ResidualRow) -> list[QTableWidgetItem]:
+        p_item = QTableWidgetItem(_fmt_p(row.p_value))
+        weight_item = QTableWidgetItem(_fmt(row.weight))
+        # The shown value is the lower of the two fields; say both when they differ.
+        if row.clicks_only_p_value is not None and row.clicks_only_p_value != row.final_p_value:
+            p_item.setToolTip(
+                f"final field: {_fmt_p(row.final_p_value)}; "
+                f"landmarks only: {_fmt_p(row.clicks_only_p_value)}"
+            )
+        if (
+            row.clicks_only_weight is not None
+            and row.final_weight is not None
+            and row.clicks_only_weight != row.final_weight
+        ):
+            weight_item.setToolTip(
+                f"final field: {_fmt(row.final_weight)}; "
+                f"landmarks only: {_fmt(row.clicks_only_weight)}"
+            )
+        verdict = VERDICT_SHORT.get(row.verdict, "–") if row.verdict else "–"
+        return [
+            QTableWidgetItem(_fmt(row.robust_loo_um)),
+            p_item,
+            weight_item,
+            QTableWidgetItem(verdict),
+            QTableWidgetItem(_flags(row, off_text="off", check_mode=True)),
+        ]
+
+    def _set_rows_impl(self, rows: Sequence[ResidualRow], check_mode: bool = False) -> None:
         selected = set(self._selected_ids())
         table = self._table
         table.blockSignals(True)
         try:
+            if check_mode != self._check_mode:
+                self._apply_table_headers(check_mode=check_mode)
             table.setRowCount(len(rows))
             for r, row in enumerate(rows):
                 id_item = QTableWidgetItem(str(row.id))
@@ -720,19 +846,28 @@ class ManualRegistrationWidget(QWidget):
                 on_item = QTableWidgetItem("")
                 on_item.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled | Qt.ItemIsSelectable)
                 on_item.setCheckState(Qt.Checked if row.enabled else Qt.Unchecked)
-                items = [
-                    id_item,
-                    swatch,
-                    on_item,
-                    QTableWidgetItem(_fmt(row.fit_um)),
-                    QTableWidgetItem(_fmt(row.loo_um)),
-                    QTableWidgetItem(_flags(row, off_text="off")),
-                ]
+                if check_mode:
+                    tail = self._check_items(row)
+                else:
+                    tail = [
+                        QTableWidgetItem(_fmt(row.fit_um)),
+                        QTableWidgetItem(_fmt(row.loo_um)),
+                        QTableWidgetItem(_flags(row, off_text="off")),
+                    ]
+                items = [id_item, swatch, on_item, *tail]
+                tint = None
+                if check_mode and row.enabled:
+                    if row.robust_class == "likely_misclick":
+                        tint = QColor(WARNING_COLOUR)
+                    elif row.robust_class == "check":
+                        tint = QColor(CHECK_COLOUR)
                 for c, item in enumerate(items):
                     if c != 2:
                         item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
                     if not row.enabled and c != 1:
                         item.setForeground(QBrush(_GREY))
+                    elif tint is not None and c != 1:
+                        item.setForeground(QBrush(tint))
                     table.setItem(r, c, item)
             table.clearSelection()
             for r, row in enumerate(rows):
@@ -746,10 +881,39 @@ class ManualRegistrationWidget(QWidget):
             table.blockSignals(False)
         self._update_delete_enabled()
 
-    def set_rows(self, rows: Sequence[ResidualRow]) -> None:
-        """Fill the landmark table (the selection is kept by pair id)."""
+    def set_rows(self, rows: Sequence[ResidualRow], *, check_mode: bool = False) -> None:
+        """Fill the landmark table (the selection is kept by pair id).
+
+        Args:
+            rows: The rows to show.
+            check_mode: ``True`` shows the columns of MerXen's robust check (the rows must come
+                from ``apply_check_to_rows``); ``False`` shows the live rigid-fit columns.
+        """
         with self._quiet():
-            self._set_rows_impl(rows)
+            self._set_rows_impl(rows, check_mode)
+
+    def set_check_status(self, text: str, *, is_current: bool = False) -> None:
+        """Show what the robust check says (or why it is not applied)."""
+        with self._quiet():
+            self._check_status_label.setText(text)
+            self._check_status_label.setStyleSheet("" if is_current else f"color: {WARNING_COLOUR}")
+            self._check_status_label.setVisible(bool(text))
+
+    def set_check_busy(self, busy: bool) -> None:
+        """Disable the check buttons while a check is being read."""
+        with self._quiet():
+            self._load_check_button.setEnabled(not busy)
+            self._refresh_check_button.setEnabled(not busy)
+
+    def set_check_dialog_dir(self, directory: str | None) -> None:
+        """Set the folder the Load check file dialog opens in."""
+        self._check_dialog_dir = directory or ""
+
+    def set_suggestions(self, available: bool, visible: bool) -> None:
+        """Enable the suggested-landmarks checkbox and show whether the layer is visible."""
+        with self._quiet():
+            self._suggestions_check.setEnabled(bool(available))
+            self._suggestions_check.setChecked(bool(visible and available))
 
     def _set_summary_impl(self, summary: FitSummary | None) -> None:
         if summary is None:
@@ -758,7 +922,7 @@ class ManualRegistrationWidget(QWidget):
             self._warnings_label.setVisible(False)
             return
         self._summary_label.setText(
-            f"Fit on {summary.n_used} of {summary.n_enabled} enabled pairs · "
+            f"Rigid (similarity) fit on {summary.n_used} of {summary.n_enabled} enabled pairs · "
             f"RMS {summary.rms_um:.2f} µm · scale ratio {summary.scale_ratio:.4f} · "
             f"rotation {summary.rotation_deg:.2f}° · "
             f"mirrored {'yes' if summary.reflected else 'no'} · "

@@ -57,8 +57,13 @@ from napari.utils.key_bindings import KeyBinding
 from qtpy.QtCore import QCoreApplication, QTimer
 
 from .manual_registration_model import (
+    CHECK_ATTR,
     LAYER_METADATA_KEY,
+    NO_CHECK_TEXT,
     ROLES,
+    STORE_ATTR,
+    CheckAttrError,
+    CheckResult,
     CoarseState,
     CropRect,
     LabellingMismatch,
@@ -69,6 +74,8 @@ from .manual_registration_model import (
     ResidualRow,
     StoreDescriptor,
     UnsupportedSchemaVersion,
+    apply_check_to_rows,
+    check_currentness,
     coarse_from_matrix,
     coarse_matrix_xy,
     evaluate_landmarks,
@@ -78,6 +85,7 @@ from .manual_registration_model import (
     labelling_to_attrs,
     napari_affine_rc,
     pair_colour,
+    parse_check_attr,
     parse_store_descriptor,
     points_outside_crop,
     utc_now,
@@ -86,6 +94,7 @@ from .manual_registration_store import (
     StoreBusyError,
     StoreChangedError,
     clear_local_draft,
+    read_check_file,
     read_local_draft,
     read_root_attrs,
     read_store_descriptor,
@@ -149,6 +158,8 @@ _OVERLAY_LAYERS = {
     "registered_landmarks": "Registered moving landmarks",
     "landmark_fit_positions": "Landmark-fit positions",
 }
+SUGGESTIONS_LAYER = "Suggested landmarks"
+SUGGESTION_COLOUR = "#ffd400"
 
 
 class RegistrationLoadCancelled(Exception):
@@ -347,7 +358,7 @@ def _fmt2(value: Any) -> str:
 
 
 def result_banner(result: dict[str, Any]) -> str:
-    """Return the three-line summary shown above the result table."""
+    """Return the summary shown above the result table (a fourth line for field runs)."""
 
     def text(value: Any) -> str:
         return "n/a" if value is None or value == "" else str(value)
@@ -359,6 +370,26 @@ def result_banner(result: dict[str, Any]) -> str:
 
     label = result.get("run_label")
     pearson = (result.get("tissue_qc") or {}).get("pearson") or {}
+    field_line = ""
+    field_block = result.get("field")
+    if isinstance(field_block, dict):
+        loo = field_block.get("loo_um") if isinstance(field_block.get("loo_um"), dict) else {}
+        counts = (
+            field_block.get("class_counts")
+            if isinstance(field_block.get("class_counts"), dict)
+            else {}
+        )
+        materialize = (
+            field_block.get("materialize")
+            if isinstance(field_block.get("materialize"), dict)
+            else {}
+        )
+        field_line = (
+            f"\nField: robust GP · LOO median {_fmt2(loo.get('median'))} µm "
+            f"(p90 {_fmt2(loo.get('p90'))}) · {text(counts.get('check'))} to check, "
+            f"{text(counts.get('likely_misclick'))} likely misclicks · "
+            f"{text(materialize.get('mode'))} {_fmt2(materialize.get('pixel_size_um'))} µm/px"
+        )
     return (
         f"{text(result.get('run_id'))} · preset {text(result.get('preset'))}"
         f"{f' ({label})' if label else ''}\n"
@@ -367,6 +398,7 @@ def result_banner(result: dict[str, Any]) -> str:
         f"Tissue Pearson: coarse {_fmt2(pearson.get('coarse'))} → "
         f"landmark {_fmt2(pearson.get('landmark'))} → affine {_fmt2(pearson.get('affine'))} "
         f"→ final {_fmt2(pearson.get('final'))}"
+        f"{field_line}"
     )
 
 
@@ -554,6 +586,10 @@ class ManualRegistrationController:
         self._load_generation = 0
         self._load_cancel = threading.Event()
         self._saving = False
+        self._check_raw: dict[str, Any] | None = None  # the store attribute, verbatim
+        self._check: CheckResult | None = None  # parsed; from the store or a loaded file
+        self._check_note = ""  # why a check could not be read (never fatal)
+        self._check_busy = False
         self._affine_timer: Any = None
         self._draft_timer: Any = None
 
@@ -626,6 +662,9 @@ class ManualRegistrationController:
             (widget.save_requested, self._on_save_requested),
             (widget.finish_requested, self._on_finish_requested),
             (widget.overlay_changed, self._on_overlay_changed),
+            (widget.check_file_chosen, self._on_check_file_chosen),
+            (widget.refresh_check_requested, self._on_refresh_check_requested),
+            (widget.suggestions_visible_changed, self._on_suggestions_visible_changed),
         )
         for signal, slot in wiring:
             signal.connect(slot)
@@ -843,6 +882,7 @@ class ManualRegistrationController:
         self._crop_restore_mode = None
         self._display_mode = "both"
         self._live_fit = None
+        self._reset_check(descriptor)
         self._viewer.grid.enabled = False
         if session.kind == "prepared":
             assert session.state is not None
@@ -885,6 +925,8 @@ class ManualRegistrationController:
             text = f"{run_id}: reference and registered moving image. F flicks; the table lists residuals."
         if session.notes:
             text += " " + " ".join(session.notes)
+        if self._check_note:
+            text += " " + self._check_note
         host.set_status(text)
 
     @staticmethod
@@ -1102,6 +1144,11 @@ class ManualRegistrationController:
             ),
             "reference",
         )
+        suggestions = self._new_points_layer(
+            SUGGESTIONS_LAYER, "reference", "overlay", reference_affine
+        )
+        suggestions.visible = False
+        self._add_controller_layer(suggestions, "reference")
 
     def _build_result_overlays(self, session: RegistrationSession) -> None:
         p_r = session.descriptor.images["reference"].pixel_size_um
@@ -1327,6 +1374,8 @@ class ManualRegistrationController:
             if self._session is not None and self._session.kind == "result":
                 if layer.name in _OVERLAY_LAYERS.values():
                     layer.events.visible.connect(self._on_overlay_layer_visible)
+            elif layer.name == SUGGESTIONS_LAYER:
+                layer.events.visible.connect(self._on_overlay_layer_visible)
 
     def _keep_markers_inactive(self, event: Any = None) -> None:
         if self._active_guard or self._session is None:
@@ -1589,9 +1638,16 @@ class ManualRegistrationController:
             return
         state = session.state
         fit = self._live_fit
+        is_current, status_text = self._check_status()
         if fit is not None:
-            widget.set_rows(fit.rows)
+            if is_current and self._check is not None:
+                widget.set_rows(apply_check_to_rows(fit.rows, self._check), check_mode=True)
+            else:
+                widget.set_rows(fit.rows, check_mode=False)
             widget.set_fit_summary(fit.summary)
+        widget.set_check_status(status_text, is_current=is_current)
+        widget.set_check_busy(self._check_busy)
+        self._sync_suggestions(is_current)
         n_enabled = len(state.enabled_pairs())
         widget.set_preview_available(n_enabled >= PREVIEW_MIN_ENABLED)
         for role in ROLES:
@@ -1625,6 +1681,8 @@ class ManualRegistrationController:
             return
         assert session.state is not None
         widget.set_session("prepared", session.descriptor.dataset_name)
+        if self._check is None or not self._check.path:
+            widget.set_check_dialog_dir(str(session.path.parent))
         widget.set_busy(self._saving)
         widget.set_coarse(session.state.coarse)
         widget.set_coarse_enabled(not self._preview)
@@ -2160,12 +2218,211 @@ class ManualRegistrationController:
         layer = getattr(event, "source", None)
         if layer is None or self._widget is None:
             return
+        if layer.name == SUGGESTIONS_LAYER:
+            try:
+                self._widget.set_suggestions(
+                    bool(self._suggestions_available()), bool(layer.visible)
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("manual registration: could not mirror suggestions visibility")
+            return
         for key, name in _OVERLAY_LAYERS.items():
             if layer.name == name:
                 try:
                     self._widget.set_overlay_visibility(key, bool(layer.visible))
                 except Exception:  # noqa: BLE001
                     log.exception("manual registration: could not mirror overlay visibility")
+
+    # ------------------------------------------------------------------ MerXen landmark check
+
+    def _reset_check(self, descriptor: StoreDescriptor) -> None:
+        """Start a session with the check of the store attribute (parsed lazily)."""
+        self._check_raw = descriptor.check
+        self._check = None
+        self._check_note = ""
+        self._check_busy = False
+        self._apply_check_state()
+
+    def _apply_check_state(self) -> None:
+        """Parse the store attribute into the session's check (never fatal)."""
+        self._check = None
+        self._check_note = ""
+        if self._check_raw is None:
+            return
+        try:
+            self._check = parse_check_attr(self._check_raw, source="store")
+        except UnsupportedSchemaVersion:
+            self._check_note = (
+                "The landmark check was written by a newer MerXen; update this viewer to read it."
+            )
+        except CheckAttrError as exc:
+            self._check_note = f"the landmark check could not be read: {exc}"
+
+    def _check_status(self) -> tuple[bool, str]:
+        """Return whether the check is current, and the text for the check status label."""
+        session = self._session
+        note = f"{self._check_note}\n" if self._check_note else ""
+        if session is None or session.state is None:
+            return False, note.strip()
+        check = self._check
+        if check is None:
+            return False, note + NO_CHECK_TEXT
+        is_current, reason = check_currentness(
+            check,
+            content_sha256=self._content_sha(),
+            store_content_digest=session.descriptor.store_attr.get("content_digest"),
+        )
+        if not is_current:
+            return False, note + reason
+        loo = f"{check.loo_median_um:.0f}"
+        clicks_only = (
+            "n/a"
+            if check.loo_clicks_only_median_um is None
+            else f"{check.loo_clicks_only_median_um:.0f}"
+        )
+        counts = check.class_counts
+        source = Path(check.path).name if check.path else "store"
+        return True, (
+            note
+            + f"Robust check ({source}, {check.written_at}, {check.preset}): LOO median {loo} µm "
+            f"(clicks only {clicks_only} µm), p90 {check.loo_p90_um:.0f} µm; "
+            f"{counts.get('check', 0)} to check, {counts.get('likely_misclick', 0)} likely "
+            f"misclicks; {check.n_windows} tissue windows."
+        )
+
+    def _suggestions_available(self) -> bool:
+        return bool(self._check is not None and self._check.suggestions and self._check_current())
+
+    def _check_current(self) -> bool:
+        session = self._session
+        if self._check is None or session is None or session.state is None:
+            return False
+        return check_currentness(
+            self._check,
+            content_sha256=self._content_sha(),
+            store_content_digest=session.descriptor.store_attr.get("content_digest"),
+        )[0]
+
+    def _sync_suggestions(self, is_current: bool) -> None:
+        """Fill the hidden-by-default suggestions layer from the current check (else empty)."""
+        layer = self._layers.get(SUGGESTIONS_LAYER)
+        if layer is None:
+            return
+        items = self._check.suggestions if (is_current and self._check is not None) else ()
+        coords = [(float(i["reference_xy_px"][1]), float(i["reference_xy_px"][0])) for i in items]
+        n = len(coords)
+        self._assign_points(
+            layer,
+            coords,
+            ["diamond"] * n,
+            [SUGGESTION_COLOUR] * n,
+            [str(i["rank"]) for i in items],
+            [0.8] * n,
+            [0.0] * n,
+        )
+        if self._widget is not None:
+            self._widget.set_suggestions(n > 0, bool(layer.visible))
+
+    @_slot()
+    def _on_suggestions_visible_changed(self, visible: bool) -> None:
+        layer = self._layers.get(SUGGESTIONS_LAYER)
+        if layer is not None:
+            layer.visible = bool(visible)
+
+    def _begin_check_job(self) -> bool:
+        if self._check_busy:
+            return False
+        self._check_busy = True
+        if self._widget is not None:
+            self._widget.set_check_busy(True)
+        return True
+
+    def _end_check_job(self) -> None:
+        self._check_busy = False
+        if self._widget is not None:
+            self._widget.set_check_busy(False)
+
+    @_slot(prepared=True)
+    def _on_check_file_chosen(self, path: str) -> None:
+        if not self._begin_check_job():
+            return
+        serial = self._session_serial
+        file_path = Path(path)
+        self._host.run_worker(
+            lambda: parse_check_attr(
+                read_check_file(file_path), source="file", path=str(file_path)
+            ),
+            lambda check: self._on_check_file_read(serial, file_path, check),
+            lambda exc: self._on_check_read_error(serial, exc),
+            key="registration_check",
+        )
+
+    def _on_check_file_read(self, serial: int, path: Path, check: CheckResult) -> None:
+        if not self._session_is_current(serial):
+            return
+        self._end_check_job()
+        # A stale file stays the source: the status says why, and Refresh picks up a newer file.
+        self._check = check
+        self._check_note = ""
+        if self._widget is not None:
+            self._widget.set_check_dialog_dir(str(path.parent))
+        self._push_widget_rows()
+
+    @_slot(prepared=True)
+    def _on_refresh_check_requested(self) -> None:
+        session = self._session
+        assert session is not None
+        if not self._begin_check_job():
+            return
+        serial = self._session_serial
+        check = self._check
+        if check is not None and check.source == "file" and check.path:
+            file_path = Path(check.path)
+            self._host.run_worker(
+                lambda: parse_check_attr(
+                    read_check_file(file_path), source="file", path=str(file_path)
+                ),
+                lambda new_check: self._on_check_file_read(serial, file_path, new_check),
+                lambda exc: self._on_check_read_error(serial, exc),
+                key="registration_check",
+            )
+            return
+        store_path = session.path
+        self._host.run_worker(
+            lambda: read_root_attrs(store_path),
+            lambda attrs: self._on_store_check_read(serial, attrs),
+            lambda exc: self._on_check_read_error(serial, exc),
+            key="registration_check",
+        )
+
+    def _on_store_check_read(self, serial: int, attrs: dict[str, Any]) -> None:
+        session = self._session
+        if not self._session_is_current(serial) or session is None:
+            return
+        self._end_check_job()
+        # Only the check and the store attribute change; the labelling is never touched.
+        raw = attrs.get(CHECK_ATTR)
+        store_attr = attrs.get(STORE_ATTR)
+        session.descriptor = dataclasses.replace(
+            session.descriptor,
+            check=dict(raw) if isinstance(raw, dict) else None,
+            store_attr=dict(store_attr) if isinstance(store_attr, dict) else {},
+        )
+        self._check_raw = session.descriptor.check
+        self._apply_check_state()
+        self._push_widget_rows()
+
+    def _on_check_read_error(self, serial: int, exc: BaseException) -> None:
+        if not self._session_is_current(serial):
+            return
+        self._end_check_job()
+        if isinstance(exc, UnsupportedSchemaVersion):
+            self._check_note = (
+                "The landmark check was written by a newer MerXen; update this viewer to read it."
+            )
+        else:
+            self._check_note = f"the landmark check could not be read: {exc}"
+        self._push_widget_rows()
 
     # ------------------------------------------------------------------ saving
 
@@ -2455,6 +2712,10 @@ class ManualRegistrationController:
         self._live_fit = None
         self._display_mode = "both"
         self._saving = False
+        self._check_raw = None
+        self._check = None
+        self._check_note = ""
+        self._check_busy = False
         if self._widget is not None:
             self._widget.set_busy(False)
             self._widget.set_session(None, "")
