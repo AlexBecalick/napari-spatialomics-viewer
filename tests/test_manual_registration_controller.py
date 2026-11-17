@@ -1667,7 +1667,7 @@ def test_stale_check_file_keeps_rigid_mode_until_refreshed(ctrl, widget, labelle
     widget.check_file_chosen.emit(str(check_file))
     assert table_headers(widget) == RIGID_HEADERS
     assert widget._check_status_label.text().startswith(
-        "The landmarks changed since the check was run (revision 3)."
+        "The landmarks, crops or coarse alignment changed since the check was run (revision 3)."
     )
     # a newer file of the same name; Refresh reads it again
     stores.write_check_file(check_file, matching_check(labelled.payload))
@@ -1691,7 +1691,10 @@ def test_editing_a_pair_makes_the_check_stale(ctrl, widget, labelled):
     assert table_headers(widget) == CHECK_HEADERS
     widget.pair_enabled_changed.emit(1, False)
     assert table_headers(widget) == RIGID_HEADERS
-    assert "The landmarks changed since the check was run" in widget._check_status_label.text()
+    assert (
+        "The landmarks, crops or coarse alignment changed since the check was run"
+        in widget._check_status_label.text()
+    )
     widget.pair_enabled_changed.emit(1, True)  # undone by hand: the digests match again
     assert table_headers(widget) == CHECK_HEADERS
     # adding a pair changes the labelling too

@@ -1445,6 +1445,26 @@ def _bad_checks():
         "missing rigid loo": edit(lambda p: p["field"].pop("rigid_loo_um")),
         "missing verdict counts": edit(lambda p: p["field"].pop("verdict_counts")),
         "missing loo vector": edit(lambda p: p["pairs"]["1"].pop("loo_vector_moving_um")),
+        "huge integer": edit(lambda p: p["pairs"]["1"].update(loo_um=10**400)),
+        "outputs null": edit(lambda p: p.update(outputs=None)),
+        "outputs json missing": edit(lambda p: p["outputs"].pop("json")),
+        "null rigid loo": edit(lambda p: p["field"].update(rigid_loo_um=None)),
+        "null long length": edit(
+            lambda p: p["field"]["hyperparameters"].update(long_length_um=None)
+        ),
+        "null click noise": edit(
+            lambda p: p["field"]["hyperparameters"]["noise_um"].update(click=None)
+        ),
+        "missing loo max": edit(lambda p: p["field"]["loo_um"].pop("max")),
+        "null loo max": edit(lambda p: p["field"]["loo_um"].update(max=None)),
+        "missing class count": edit(lambda p: p["field"]["class_counts"].pop("excluded")),
+        "suggestion without prediction": edit(
+            lambda p: p["suggestions"][0].pop("predicted_moving_xy_px")
+        ),
+        "suggestion without ellipse": edit(lambda p: p["suggestions"][0].pop("ellipse_um")),
+        "suggestion without weight": edit(lambda p: p["suggestions"][0].pop("weight")),
+        "suggestion null sd": edit(lambda p: p["suggestions"][0].update(sd_um=None)),
+        "suggestion null region": edit(lambda p: p["suggestions"][0].update(region=None)),
         "unknown class count": edit(lambda p: p["field"]["class_counts"].update(weird=1)),
     }
 
@@ -1474,7 +1494,7 @@ def test_check_currentness_needs_both_digests():
     )
     assert not ok
     assert reason == (
-        "The landmarks changed since the check was run (revision 3). Save, upload and run "
+        "The landmarks, crops or coarse alignment changed since the check was run (revision 3). Save, upload and run "
         "merxen manual-registration-check again."
     )
     for digest in ("sha256:" + "9" * 64, None):

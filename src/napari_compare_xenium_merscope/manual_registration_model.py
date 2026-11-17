@@ -1613,9 +1613,16 @@ def _req(obj: Any, key: str, where: str) -> Any:
 
 
 def _finite(value: Any, where: str) -> float:
-    if not _is_number(value) or not math.isfinite(float(value)):
+    if not _is_number(value):
         raise _check_error(where, f"{value!r} is not a finite number")
-    return float(value)
+    try:
+        number = float(value)
+    except OverflowError:
+        # A hand-edited integer beyond the float range is malformed, not fatal.
+        raise _check_error(where, "is a number too large to read") from None
+    if not math.isfinite(number):
+        raise _check_error(where, f"{value!r} is not a finite number")
+    return number
 
 
 def _finite_or_none(value: Any, where: str) -> float | None:
@@ -1752,6 +1759,18 @@ def parse_check_attr(
         ref = _req(item, "reference_xy_px", "suggestions")
         if not isinstance(ref, (list, tuple)) or len(ref) != 2:
             raise _check_error("suggestions", "reference_xy_px is not [x, y]")
+        predicted = _req(item, "predicted_moving_xy_px", "suggestions")
+        if not isinstance(predicted, (list, tuple)) or len(predicted) != 2:
+            raise _check_error("suggestions", "predicted_moving_xy_px is not [x, y]")
+        for component in predicted:
+            _finite(component, "suggestions.predicted_moving_xy_px")
+        ellipse = _req(item, "ellipse_um", "suggestions")
+        for key in ("major", "minor", "angle_deg"):
+            _finite(_req(ellipse, key, "suggestions.ellipse_um"), f"ellipse_um.{key}")
+        _finite(_req(item, "weight", "suggestions"), "suggestions.weight")
+        region = _req(item, "region", "suggestions")
+        if region not in ("grey_matter", "other"):
+            raise _check_error("suggestions", f"unknown region {region!r}")
         suggestions.append(
             {
                 "rank": int(_finite(_req(item, "rank", "suggestions"), "suggestions.rank")),
@@ -1759,8 +1778,8 @@ def parse_check_attr(
                     _finite(ref[0], "suggestions.reference_xy_px"),
                     _finite(ref[1], "suggestions.reference_xy_px"),
                 ),
-                "sd_um": _finite_or_none(item.get("sd_um"), "suggestions.sd_um"),
-                "region": item.get("region"),
+                "sd_um": _finite(_req(item, "sd_um", "suggestions"), "suggestions.sd_um"),
+                "region": region,
             }
         )
 
@@ -1834,15 +1853,29 @@ def _validate_check_envelope(payload: Mapping[str, Any]) -> None:
     image_evidence = _req(algorithm, "image_evidence", "algorithm")
     if image_evidence is not None and not isinstance(image_evidence, str):
         raise _check_error("algorithm", "image_evidence is not text or null")
-    _req(payload, "outputs", where)
+    outputs = _req(payload, "outputs", where)
+    for key in ("json", "png"):
+        if not isinstance(_req(outputs, key, "outputs"), str):
+            raise _check_error("outputs", f"{key} is not text")
     field_block = _req(payload, "field", where)
     hyper = _req(field_block, "hyperparameters", "field")
-    for key in ("long_length_um", "long_signal_um", "short_length_um", "short_signal_um"):
-        _req(hyper, key, "field.hyperparameters")
-    if not isinstance(_req(hyper, "noise_um", "field.hyperparameters"), Mapping):
-        raise _check_error("field.hyperparameters", "noise_um is not an object")
-    for key in ("rigid_loo_um", "sd_um"):
-        _req(field_block, key, "field")
+    for key in ("long_length_um", "long_signal_um"):
+        _finite(_req(hyper, key, "field.hyperparameters"), f"field.hyperparameters.{key}")
+    # C3 lets only the short component be null (clicks alone fit one component).
+    for key in ("short_length_um", "short_signal_um"):
+        _finite_or_none(_req(hyper, key, "field.hyperparameters"), f"field.hyperparameters.{key}")
+    noise = _req(hyper, "noise_um", "field.hyperparameters")
+    for key in ("click", "window"):
+        _finite(_req(noise, key, "field.hyperparameters.noise_um"), f"noise_um.{key}")
+    _req(field_block, "sd_um", "field")
+    for block_name in ("rigid_loo_um", "loo_um"):
+        block = _req(field_block, block_name, "field")
+        for stat in ("median", "p90", "max"):
+            _finite(_req(block, stat, f"field.{block_name}"), f"field.{block_name}.{stat}")
+    class_counts = _req(field_block, "class_counts", "field")
+    missing = [name for name in CHECK_CLASSES if name not in class_counts]
+    if missing:
+        raise _check_error("field.class_counts", f"missing classes {missing}")
     _finite(_req(field_block, "outlier_p", "field"), "field.outlier_p")
     counts = _req(field_block, "verdict_counts", "field")
     if not isinstance(counts, Mapping):
@@ -1868,7 +1901,7 @@ def check_currentness(
     if check.labelling_content_sha256 != content_sha256:
         return (
             False,
-            f"The landmarks changed since the check was run (revision "
+            f"The landmarks, crops or coarse alignment changed since the check was run (revision "
             f"{check.labelling_revision}). Save, upload and run merxen "
             "manual-registration-check again.",
         )
