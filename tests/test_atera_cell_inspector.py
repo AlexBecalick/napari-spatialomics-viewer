@@ -390,6 +390,290 @@ def test_cell_click_paints_table_counts_then_the_indexed_transcripts(qapp, atera
     assert "Gene transcripts:" in html and "Control features:" in html
 
 
+@pytest.fixture(scope="module")
+def mosaik_store(tmp_path_factory) -> Path:
+    return atera_stores.build_atera_latest_store(
+        tmp_path_factory.mktemp("atera_mosaik"), pixel_size=PS, with_mosaik=True)
+
+
+@pytest.fixture(scope="module")
+def mosaik_rows() -> "object":
+    """The kept rows of the MOSAIK store, with the MOSAIK assignment and background flag."""
+    tx = atera_stores.synthetic_transcripts()
+    atera_stores.add_mosaik_columns(tx)
+    return tx[tx["keep"]].copy()
+
+
+def _mosaik_click(ctrl, monkeypatch, original_cell: int, *, source: str = "proseg") -> dict:
+    """The final (exact-read) payload of clicking the twin of ``original_cell``."""
+    monkeypatch.setattr(ctrl, "_inspection_source", lambda _ds: source)
+    shape = ctrl._inspection_shape("ATERA")
+    cell_id, geometry = ctrl._shape_for_cell_id(
+        ctrl._active_sdata.shapes[shape], atera_stores.MOSAIK_PROSEG_IDS[original_cell])
+    return ctrl._lazy_cell_selection_display("ATERA", cell_id, geometry, "#ffffff")
+
+
+def _table_total(store, original_cell: int) -> int:
+    return U.table_cell_gene_counts(
+        store, "table_MOSAIK_proseg", atera_stores.MOSAIK_PROSEG_IDS[original_cell]).total
+
+
+def test_a_mosaik_cell_reads_its_own_assignment_not_the_original_id(
+        qapp, mosaik_store, mosaik_rows, monkeypatch):
+    """A clicked ProSeg cell's links run to its own transcripts.
+
+    MOSAIK ids are their own namespace: reading ``original_assignment`` with a
+    ProSeg id fetched a different original cell elsewhere, so every link shot
+    off to that cell as one long streak.
+    """
+    ctrl = _activate(mosaik_store, monkeypatch)
+    _forbid_scans(ctrl, monkeypatch)
+    monkeypatch.setattr(ctrl, "_inspection_source", lambda _ds: "proseg")
+    assert ctrl._inspection_shape("ATERA") == "MOSAIK_proseg"
+    segmentation = ctrl._lazy_cell_segmentation("ATERA")
+    assert segmentation["assignment_column"] == "assignment"
+    assert segmentation["background_column"] == "background"
+    assert segmentation["table"] == "table_MOSAIK_proseg"  # never the original cells' table
+
+    original = 1
+    mosaik_id = atera_stores.MOSAIK_PROSEG_IDS[original]
+    assert mosaik_id != original
+    gdf = ctrl._active_sdata.shapes["MOSAIK_proseg"]
+    cell_id, geometry = ctrl._shape_for_cell_id(gdf, mosaik_id)
+    applied = []
+    original_apply = ctrl._apply_cell_selection_payload
+
+    def record(generation, worker_key, payload, index, status=None):
+        applied.append(dict(payload))
+        return original_apply(generation, worker_key, payload, index, status=status)
+
+    monkeypatch.setattr(ctrl, "_apply_cell_selection_payload", record)
+    ctrl._add_cell_selection("ATERA", cell_id, geometry)
+
+    table, entry = applied
+    assert table["transcript_source"] == "table" and entry["transcript_source"] == "indexed"
+    # The first paint (table) and the exact read agree.
+    assert table["total"] == entry["total"] == _table_total(mosaik_store, original)
+    genes = mosaik_rows[(mosaik_rows["mosaik_assignment"] == mosaik_id) & mosaik_rows["is_gene"]]
+    coords = np.asarray(entry["coords_yx"])
+    assert len(coords) == len(genes)
+    xmin, ymin, xmax, ymax = geometry.bounds
+    assert np.all((coords[:, 1] >= xmin) & (coords[:, 1] <= xmax))
+    assert np.all((coords[:, 0] >= ymin) & (coords[:, 0] <= ymax))
+    links = ctrl._get_layer_by_name(V.CELL_INSPECTOR_LINKS_LAYER)
+    ends = np.concatenate([np.asarray(line) for line in links.data])
+    assert np.all((ends[:, 1] >= xmin) & (ends[:, 1] <= xmax))
+
+
+def test_a_mosaik_cell_drops_the_background_flagged_rows(qapp, mosaik_store, mosaik_rows, monkeypatch):
+    """ProSeg claims background rows for a cell but its count table excludes them."""
+    ctrl = _activate(mosaik_store, monkeypatch)
+    cell = atera_stores.MOSAIK_BACKGROUND_CELL
+    mosaik_id = atera_stores.MOSAIK_PROSEG_IDS[cell]
+    claimed = mosaik_rows[(mosaik_rows["mosaik_assignment"] == mosaik_id) & mosaik_rows["is_gene"]]
+    assert int(claimed["mosaik_background"].sum()) == atera_stores.MOSAIK_BACKGROUND_ROWS
+    payload = _mosaik_click(ctrl, monkeypatch, cell)
+    assert payload["transcript_source"] == "indexed"
+    assert payload["total"] == len(claimed) - atera_stores.MOSAIK_BACKGROUND_ROWS
+    assert payload["total"] == _table_total(mosaik_store, cell)
+    assert len(payload["coords_yx"]) == payload["total"]
+
+
+def test_a_mosaik_cell_with_transcripts_outside_its_polygon_matches_its_table_total(
+        qapp, mosaik_store, mosaik_rows, monkeypatch):
+    """ProSeg assigns transcripts outside the polygon, in another points file.
+
+    The polygon's own bounds only reach one tile, so a bounds-only file choice
+    undercounted such a cell against its table total.
+    """
+    cell = atera_stores.MOSAIK_OUTSIDE_CELL
+    mosaik_id = atera_stores.MOSAIK_PROSEG_IDS[cell]
+    engine = T.AteraTranscriptEngine.open(mosaik_store)
+    assert len(engine.files_in_window(_bounds(cell))) < len(engine.files_in_window((0.0, 0.0, 40.0, 40.0)))
+    rows = engine.read_cell(mosaik_id, _bounds(cell), assignment_column="assignment",
+                            background_column="background")
+    assert rows.n == _table_total(mosaik_store, cell)
+    ctrl = _activate(mosaik_store, monkeypatch)
+    payload = _mosaik_click(ctrl, monkeypatch, cell)
+    assert payload["transcript_source"] == "indexed"
+    assert payload["total"] == _table_total(mosaik_store, cell) == rows.n
+    # ... also when the original cells' tile map is on hand (it is not used).
+    cell_tiles = engine.build_cell_tile_map()
+    padded = engine.read_cell(mosaik_id, _bounds(cell), cell_tiles=cell_tiles,
+                              assignment_column="assignment", background_column="background")
+    assert padded.n == rows.n and not padded.used_cell_tiles
+
+
+def test_read_cell_with_a_background_column_needs_it_in_every_file(mosaik_store):
+    engine = T.AteraTranscriptEngine.open(mosaik_store)
+    mosaik_id = atera_stores.MOSAIK_PROSEG_IDS[3]
+    assert engine.read_cell(mosaik_id, _bounds(3), assignment_column="assignment",
+                            background_column="no_such_column") is None
+
+
+def test_a_mosaik_cell_shows_the_tables_control_counts(qapp, mosaik_store, mosaik_rows, monkeypatch):
+    """ProSeg leaves control rows unassigned: the controls come from the table's obs."""
+    ctrl = _activate(mosaik_store, monkeypatch)
+    payload = _mosaik_click(ctrl, monkeypatch, 1)
+    controls = mosaik_rows[(mosaik_rows["original_assignment"] == 1) & ~mosaik_rows["is_gene"]]
+    assert len(controls) > 0
+    assert payload["control_total"] == len(controls)
+    assert payload["control_features"] is None
+    assert U.table_cell_control_total(mosaik_store, "table_MOSAIK_proseg",
+                                      atera_stores.MOSAIK_PROSEG_IDS[1]) == len(controls)
+    assert U.table_cell_control_total(mosaik_store, "table_MOSAIK_proseg", 9999) is None
+    html = V._cell_summary_html(payload)
+    assert f"<b>Control features:</b> {len(controls):,}" in html and "features)" not in html
+
+
+def test_a_segmentation_without_assignment_ids_says_so_and_shows_nothing_else(
+        qapp, mosaik_store, monkeypatch):
+    ctrl = _activate(mosaik_store, monkeypatch)
+    payload = _mosaik_click(ctrl, monkeypatch, 1, source="proseg_mask")
+    segmentation = ctrl._lazy_cell_segmentation("ATERA")
+    assert segmentation["assignment_column"] is None and segmentation["table"] is None
+    assert payload["gene_rows"] == [] and payload["total"] == 0
+    assert len(payload["coords_yx"]) == 0
+    assert payload["transcript_note"] == (
+        "This segmentation has no per-transcript cell ids or count table; no counts are shown.")
+    assert "showing the table counts" not in payload["transcript_note"]
+
+
+def test_read_cell_by_another_column_ignores_the_original_cell_tile_map(mosaik_store, mosaik_rows):
+    engine = T.AteraTranscriptEngine.open(mosaik_store)
+    cell_tiles = engine.build_cell_tile_map()
+    mosaik_id = atera_stores.MOSAIK_PROSEG_IDS[3]
+    rows = engine.read_cell(mosaik_id, _bounds(3), cell_tiles=cell_tiles, assignment_column="assignment")
+    genes = mosaik_rows[(mosaik_rows["mosaik_assignment"] == mosaik_id) & mosaik_rows["is_gene"]]
+    assert rows is not None and not rows.used_cell_tiles
+    assert rows.n == len(genes)
+    assert engine.read_cell(3, _bounds(3), assignment_column="no_such_column") is None
+
+
+def test_switching_the_inspected_segmentation_never_reuses_the_other_ones_cell(
+        qapp, mosaik_store, monkeypatch):
+    """One controller, the same numeric id under ProSeg then the original cells.
+
+    Each source keeps its own segmentation resolution and its own cached read.
+    """
+    ctrl = _activate(mosaik_store, monkeypatch)
+    first = _mosaik_click_id(ctrl, monkeypatch, "proseg", 1)
+    second = _mosaik_click_id(ctrl, monkeypatch, "original", 1)
+    assert ctrl._lazy_cell_segmentation("ATERA")["assignment_column"] == "original_assignment"
+    assert ctrl._lazy_cell_counts_table("ATERA") == "table_original"
+    assert first["total_label"] == second["total_label"] == "Gene transcripts"
+    assert first["total"] == _table_total(mosaik_store, atera_stores.MOSAIK_PROSEG_IDS[1])
+    assert second["total"] == U.table_cell_gene_counts(mosaik_store, "table_original", 1).total
+    assert not np.array_equal(np.sort(np.asarray(first["coords_yx"]), axis=0),
+                              np.sort(np.asarray(second["coords_yx"]), axis=0))
+    sources = {key[1] for key in ctrl._inspection_indexes}
+    assert sources == {"proseg", "original"}
+    monkeypatch.setattr(ctrl, "_inspection_source", lambda _ds: "proseg")
+    assert ctrl._lazy_cell_segmentation("ATERA")["assignment_column"] == "assignment"
+    assert len(ctrl._lazy_cell_segmentations) == 2
+
+
+def _mosaik_click_id(ctrl, monkeypatch, source: str, cell_id: int) -> dict:
+    monkeypatch.setattr(ctrl, "_inspection_source", lambda _ds: source)
+    shape = ctrl._inspection_shape("ATERA")
+    cell, geometry = ctrl._shape_for_cell_id(ctrl._active_sdata.shapes[shape], cell_id)
+    return ctrl._lazy_cell_selection_display("ATERA", cell, geometry, "#ffffff")
+
+
+@pytest.fixture(scope="module")
+def schemaless_store(tmp_path_factory) -> Path:
+    return atera_stores.build_atera_latest_store(
+        tmp_path_factory.mktemp("atera_schemaless"), pixel_size=PS, with_schema=False)
+
+
+def test_a_store_without_a_merxen_schema_still_reads_the_original_cells_exactly(
+        qapp, schemaless_store, kept, monkeypatch):
+    ctrl = _activate(schemaless_store, monkeypatch)
+    segmentation = ctrl._lazy_cell_segmentation("ATERA")
+    assert segmentation["assignment_column"] == "original_assignment"
+    payload = _mosaik_click_id(ctrl, monkeypatch, "original", 3)
+    assert payload["transcript_source"] == "indexed"
+    assert len(payload["coords_yx"]) == int((kept["cell"] == 3).sum())
+
+
+@pytest.mark.parametrize("source", ["original", "proseg"])
+def test_a_failed_segmentation_read_is_not_cached(qapp, mosaik_store, kept, monkeypatch, source, caplog):
+    """A transient read error must not turn the exact read off for the session."""
+    ctrl = _activate(mosaik_store, monkeypatch)
+    real = V.open_zarr_group_unconsolidated
+    calls = []
+    failing = [True]
+
+    def flaky(path, *args, **kwargs):
+        calls.append(path)
+        if failing[0]:
+            raise OSError("store is being rewritten")
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(V, "open_zarr_group_unconsolidated", flaky)
+    cell = 3 if source == "original" else atera_stores.MOSAIK_PROSEG_IDS[3]
+    with caplog.at_level("WARNING"):
+        first = _mosaik_click_id(ctrl, monkeypatch, source, cell)
+    assert any(r.levelname == "WARNING" and "inspected segmentation" in r.getMessage() for r in caplog.records)
+    assert not ctrl.__dict__.get("_lazy_cell_segmentations")
+    if source == "original":
+        # Main's behaviour: the original cells keep their exact read.
+        assert first["transcript_source"] == "indexed"
+        assert len(first["coords_yx"]) == int((kept["cell"] == 3).sum())
+    else:
+        # Another segmentation must not borrow the original column.
+        assert first["transcript_source"] == "table"
+        assert "could not be read" in first["transcript_note"]
+    failing[0] = False
+    second = _mosaik_click_id(ctrl, monkeypatch, source, cell)
+    assert second["transcript_source"] == "indexed"
+    assert len(calls) >= 2
+    assert ctrl._lazy_cell_segmentation("ATERA")["failed"] is False
+
+
+def test_links_keep_their_width_when_a_second_cell_adds_lines(qapp):
+    """napari gives shapes added by a data swap width 1; links stay thin."""
+    from napari.components import ViewerModel
+
+    ctrl = V.ComparisonViewerController(ViewerModel(), {}, _args())
+    first = {"centroid_yx": (0.0, 0.0), "coords_yx": np.array([[1.0, 1.0], [2.0, 0.0]])}
+    second = {"centroid_yx": (10.0, 10.0), "coords_yx": np.array([[11.0, 11.0], [12.0, 9.0], [9.0, 9.0]])}
+    ctrl._update_cell_links_layer([first])
+    ctrl._update_cell_links_layer([first, second])
+    links = ctrl._get_layer_by_name(V.CELL_INSPECTOR_LINKS_LAYER)
+    assert len(links.data) == 5
+    assert np.allclose(links.edge_width, V.CELL_LINK_WIDTH)
+    assert np.allclose(links.edge_color, [1.0, 1.0, 1.0, 1.0])
+
+
+def test_paired_links_keep_their_width_when_a_second_cell_adds_lines(qapp):
+    from napari.components import ViewerModel
+
+    class Registry:
+        def __init__(self):
+            self.layers = {}
+
+        def layer_for(self, identity):
+            return self.layers.get(identity)
+
+        def register_layer(self, identity, layer):
+            self.layers[identity] = layer
+
+        def unload_layer(self, identity):
+            self.layers.pop(identity, None)
+
+    ctrl = V.ComparisonViewerController(ViewerModel(), {}, _args())
+    ctrl._paired_registry = Registry()
+    first = {"centroid_yx": (0.0, 0.0), "coords_yx": np.array([[1.0, 1.0], [2.0, 0.0]])}
+    second = {"centroid_yx": (10.0, 10.0), "coords_yx": np.array([[11.0, 11.0], [12.0, 9.0], [9.0, 9.0]])}
+    ctrl._update_paired_cell_links("XENIUM", [first])
+    ctrl._update_paired_cell_links("XENIUM", [first, second])
+    (links,) = ctrl._paired_registry.layers.values()
+    assert len(links.data) == 5
+    assert np.allclose(links.edge_width, V.CELL_LINK_WIDTH)
+    assert np.allclose(links.edge_color, [1.0, 1.0, 1.0, 1.0])
+
+
 def test_inspection_index_reuses_the_loaded_engine_and_map(qapp, atera_store, monkeypatch):
     ctrl = _activate(atera_store, monkeypatch)
     engine = T.AteraTranscriptEngine.open(atera_store)
@@ -400,9 +684,9 @@ def test_inspection_index_reuses_the_loaded_engine_and_map(qapp, atera_store, mo
     seen = []
     original = engine.read_cell
 
-    def spy(cell_id, bounds_um=None, *, cell_tiles=None, cancel=None):
+    def spy(cell_id, bounds_um=None, *, cell_tiles=None, **kwargs):
         seen.append((bounds_um, cell_tiles))
-        return original(cell_id, bounds_um, cell_tiles=cell_tiles, cancel=cancel)
+        return original(cell_id, bounds_um, cell_tiles=cell_tiles, **kwargs)
 
     monkeypatch.setattr(engine, "read_cell", spy)
     index = ctrl._inspection_transcript_index("ATERA", 3, None, ctrl._empty_cell_transcript_index())

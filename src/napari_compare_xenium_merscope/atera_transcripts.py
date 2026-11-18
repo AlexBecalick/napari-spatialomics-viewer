@@ -66,6 +66,10 @@ X_COLUMN = "x"
 Y_COLUMN = "y"
 GENE_COLUMN = "feature_name"
 ASSIGNMENT_COLUMN = "original_assignment"
+#: Window padding (um) for reads by a column other than ``original_assignment``.
+#: ProSeg assigns transcripts up to about 33 um outside a cell's polygon on a
+#: real store (median 1-2 um); 50 um clears that with room to spare.
+NON_ORIGINAL_READ_MARGIN_UM = 50.0
 #: Output key for ``feature_name`` (global codes into the vocabulary).
 CODE_KEY = "code"
 DEFAULT_READ_COLUMNS = (X_COLUMN, Y_COLUMN, GENE_COLUMN, ASSIGNMENT_COLUMN)
@@ -2093,6 +2097,8 @@ class AteraTranscriptEngine:
         *,
         cell_tiles: CellTileMap | None = None,
         cancel: Any = None,
+        assignment_column: str = ASSIGNMENT_COLUMN,
+        background_column: str | None = None,
     ) -> CellRows | None:
         """Every transcript assigned to ``cell_id``, in two phases per file.
 
@@ -2102,6 +2108,17 @@ class AteraTranscriptEngine:
         The files are the tiles of a valid ``cell_tiles`` map (exact), else
         the tiles whose box meets ``bounds_um = (xmin, ymin, xmax, ymax)``.
 
+        ``assignment_column`` names the segmentation whose ids ``cell_id``
+        belongs to (``original_assignment`` by default; a MOSAIK branch has its
+        own column, e.g. ``assignment``).  The cell -> tile map describes only
+        the original assignment, so other columns always read by ``bounds_um``
+        padded by :data:`NON_ORIGINAL_READ_MARGIN_UM`: ProSeg assigns
+        transcripts that lie outside the cell's polygon, so a bounds-only file
+        choice would miss the neighbouring tile of a cell near a tile edge.
+        ``background_column`` (a boolean points column) drops the rows flagged
+        as background, which ProSeg may still assign to a cell but its count
+        table excludes.
+
         ``None`` when the read cannot be exact: no validated index, no
         assignment column, neither a map nor bounds, or a file changed on disk
         since the engine opened (a stale index).
@@ -2109,8 +2126,21 @@ class AteraTranscriptEngine:
         index = self.index
         if not index.validated:
             return None
-        if not all(_column_index(m, ASSIGNMENT_COLUMN) is not None for m in index.metadata):
+        if not all(_column_index(m, assignment_column) is not None for m in index.metadata):
             return None
+        if background_column is not None and not all(
+            _column_index(m, background_column) is not None for m in index.metadata
+        ):
+            return None
+        if assignment_column != ASSIGNMENT_COLUMN:
+            cell_tiles = None
+            if bounds_um is not None:
+                # A padded window is simpler than a per-column cell -> tile map
+                # (a full scan of the points to build, per column and store) and
+                # exact for any transcript within the margin of its polygon.
+                margin = NON_ORIGINAL_READ_MARGIN_UM
+                xmin, ymin, xmax, ymax = (float(v) for v in bounds_um)
+                bounds_um = (xmin - margin, ymin - margin, xmax + margin, ymax + margin)
         try:
             cid = int(cell_id)
         except (TypeError, ValueError, OverflowError):
@@ -2150,7 +2180,7 @@ class AteraTranscriptEngine:
         def work(position: int) -> tuple[list[dict[str, np.ndarray]], int, int]:
             parquet_file = self._parquet(position)
             metadata = index.metadata[position]
-            column_index = _column_index(metadata, ASSIGNMENT_COLUMN)
+            column_index = _column_index(metadata, assignment_column)
             hits: list[tuple[int, np.ndarray]] = []
             scanned = 0
             for rg in range(metadata.num_row_groups):
@@ -2165,7 +2195,7 @@ class AteraTranscriptEngine:
                     except (TypeError, ValueError):
                         pass
                 scanned += 1
-                column = _read_row_group(parquet_file, rg, [ASSIGNMENT_COLUMN]).column(0)
+                column = _read_row_group(parquet_file, rg, [assignment_column]).column(0)
                 try:
                     target = pa.scalar(cid, type=column.type)
                 except (OverflowError, pa.ArrowInvalid, pa.ArrowTypeError):
@@ -2176,9 +2206,15 @@ class AteraTranscriptEngine:
                     hits.append((rg, rows))
             out = []
             for rg, rows in hits:
-                table = _read_row_group(parquet_file, rg, [X_COLUMN, Y_COLUMN, GENE_COLUMN]).take(pa.array(rows))
+                wanted_columns = [X_COLUMN, Y_COLUMN, GENE_COLUMN]
+                if background_column is not None:
+                    wanted_columns.append(background_column)
+                table = _read_row_group(parquet_file, rg, wanted_columns).take(pa.array(rows))
                 codes = index.global_codes(position, table.column(GENE_COLUMN))
                 keep = codes >= 0
+                if background_column is not None:
+                    is_background = pc.fill_null(table.column(background_column), False)
+                    keep &= ~np.asarray(is_background.to_numpy(zero_copy_only=False), dtype=bool)
                 out.append({
                     "x": np.asarray(table.column(X_COLUMN).to_numpy(), dtype=np.float32)[keep],
                     "y": np.asarray(table.column(Y_COLUMN).to_numpy(), dtype=np.float32)[keep],
@@ -2225,6 +2261,8 @@ def indexed_cell_transcripts(
     *,
     cell_tiles: CellTileMap | None = None,
     cancel: Any = None,
+    assignment_column: str = ASSIGNMENT_COLUMN,
+    background_column: str | None = None,
 ):
     """A one-cell :class:`~.utils.CellTranscriptIndex` from :meth:`AteraTranscriptEngine.read_cell`.
 
@@ -2233,7 +2271,14 @@ def indexed_cell_transcripts(
     """
     from .utils import cell_transcript_index_from_arrays
 
-    rows = engine.read_cell(cell_id, bounds_um, cell_tiles=cell_tiles, cancel=cancel)
+    rows = engine.read_cell(
+        cell_id,
+        bounds_um,
+        cell_tiles=cell_tiles,
+        cancel=cancel,
+        assignment_column=assignment_column,
+        background_column=background_column,
+    )
     if rows is None:
         return None
     return cell_transcript_index_from_arrays(

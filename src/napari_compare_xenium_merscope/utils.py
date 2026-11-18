@@ -5518,6 +5518,47 @@ def table_cell_gene_counts(
     )
 
 
+#: ``obs`` columns of a MerXen ProSeg count table that hold a cell's control
+#: counts. ProSeg leaves control rows unassigned in the points, so the inspector
+#: takes the control total from here.
+TABLE_CONTROL_COUNT_COLUMNS: tuple[str, ...] = (
+    "genomic_control_counts",
+    "unassigned_codeword_counts",
+    "deprecated_codeword_counts",
+    "control_codeword_counts",
+    "control_probe_counts",
+    "other_control_counts",
+)
+
+
+def table_cell_control_total(zarr_path: str | Path, table_key: str, instance_id: Any) -> int | None:
+    """One cell's control-feature total from the ``obs`` control count columns.
+
+    ``None`` when the table has none of :data:`TABLE_CONTROL_COUNT_COLUMNS` or
+    the cell is not in it.
+    """
+    target = cell_id_to_int(instance_id)
+    if target is None or target < 0:
+        return None
+    lookup = _table_row_lookup(zarr_path, table_key)
+    ids = lookup.sorted_ids
+    try:
+        probe = np.asarray([target], dtype=ids.dtype)[0] if ids.dtype != object else target
+    except OverflowError:
+        return None
+    pos = int(np.searchsorted(ids, probe))
+    if pos >= len(ids) or ids[pos] != probe:
+        return None
+    row = int(lookup.sorted_rows[pos])
+    obs = open_zarr_group_unconsolidated(zarr_path)["tables"][str(table_key)]["obs"]
+    total, found = 0, False
+    for name in TABLE_CONTROL_COUNT_COLUMNS:
+        if name in obs:
+            found = True
+            total += int(np.asarray(obs[name][row : row + 1])[0])
+    return total if found else None
+
+
 def ranked_gene_counts(genes) -> list[tuple[str, int]]:
     """Return ``(gene, count)`` pairs sorted by count desc, then name asc."""
     genes = np.asarray(genes, dtype=object)
