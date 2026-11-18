@@ -171,7 +171,11 @@ except Exception:  # pragma: no cover - depends on the installed napari runtime
     thread_worker = None
 
 from .manual_registration_controller import REGISTRATION_DATASET, ManualRegistrationController
-from .atera_transcripts import AteraTranscriptEngine, indexed_cell_transcripts
+from .atera_transcripts import (
+    ASSIGNMENT_COLUMN as ATERA_ASSIGNMENT_COLUMN,
+    AteraTranscriptEngine,
+    indexed_cell_transcripts,
+)
 from .transcript_cache import load_atera_cell_tiles
 from .atera_viewer import (
     ATERA_MODE_FULL,
@@ -13427,6 +13431,8 @@ class ComparisonViewerController(AteraTranscriptMixin):
         existing = registry.layer_for(identity)
         if existing is not None:
             existing.data = lines
+            existing.edge_width = CELL_LINK_WIDTH
+            existing.edge_color = "#ffffff"
             return
         layer = napari.layers.Shapes(
             lines, shape_type="line", name="cell transcript links",
@@ -14371,27 +14377,50 @@ class ComparisonViewerController(AteraTranscriptMixin):
             engines[key] = cached
         return cached[1], cached[2]
 
-    def _lazy_cell_counts_table(self, ds: str) -> str | None:
-        """The table whose ``X`` holds the original cells' gene counts."""
-        spec = self._dataset_platform_spec(ds)
-        shape = getattr(spec, "original_cell_shape_key", None)
-        cfg = (getattr(self, "datasets", None) or {}).get(str(ds).upper())
+    def _lazy_cell_segmentation(self, ds: str) -> dict:
+        """The inspected segmentation of a lazy platform: its ``shape``,
+        ``assignment_column`` (``None``: no per-transcript ids, e.g. in-mask
+        counts) and count ``table``.
+
+        Clicked cell ids belong to the inspected segmentation, so the per-cell
+        read and the count table must use that segmentation's ids, never the
+        original ones: a MOSAIK cell sharing a number with an original cell is a
+        different cell elsewhere in the tissue.
+        """
+        key = str(ds).upper()
+        spec = self._dataset_platform_spec(key)
+        original_shape = getattr(spec, "original_cell_shape_key", None)
+        source = self._inspection_source(key)
+        cfg = (getattr(self, "datasets", None) or {}).get(key)
         path = getattr(cfg, "zarr_path", None)
+        cache = self.__dict__.setdefault("_lazy_cell_segmentations", {})
+        cache_key = (key, str(path), source)
+        if cache_key in cache:
+            return cache[cache_key]
+        result = {"source": source, "shape": None, "assignment_column": None, "table": None}
         if path is None:
-            return None
-        cache = self.__dict__.setdefault("_lazy_cell_count_tables", {})
-        key = (str(ds).upper(), str(path))
-        if key in cache:
-            return cache[key]
-        table = None
+            return result
         try:
+            # Read from the store itself (as the inspector's shape lookup does
+            # from the session), so a click never touches the points.
             root = open_zarr_group_unconsolidated(path)
             schema = dict(root.attrs).get("merxen_schema") or {}
-            for entry in (schema.get("segmentations") or {}).values():
-                if isinstance(entry, dict) and entry.get("shape") == shape and entry.get("table"):
-                    table = str(entry["table"])
-                    break
+            segmentations = schema.get("segmentations") or {}
+            present = set(root["shapes"].group_keys()) if "shapes" in root else set()
+            spec_source = cell_type_source(source)
+            shape = next((k for k in (spec_source.mask_shape_keys if spec_source else ()) if k in present), None)
+            entry = segmentations.get(source)
+            if isinstance(entry, dict) and entry.get("shape") in present and (
+                    shape is None or entry.get("shape") == shape):
+                shape = str(entry["shape"])
+            else:
+                entry = next((e for e in segmentations.values()
+                              if isinstance(e, dict) and shape is not None and e.get("shape") == shape), {})
+            if shape is None:
+                cache[cache_key] = result
+                return result
             tables = root["tables"] if "tables" in root else None
+            table = str(entry["table"]) if entry.get("table") else None
             if table is not None and (tables is None or table not in tables):
                 table = None
             if table is None and tables is not None:
@@ -14400,11 +14429,21 @@ class ComparisonViewerController(AteraTranscriptMixin):
                     if attrs.get("region") == shape and "X" in tables[name]:
                         table = str(name)
                         break
+            assignment = entry.get("assignment_column")
+            if assignment is None and not entry and shape == original_shape:
+                assignment = ATERA_ASSIGNMENT_COLUMN
+            if source == "proseg_mask":
+                # In-mask counts: the mask's measured points, not ProSeg's ids.
+                assignment, table = None, None
+            result.update(shape=shape, assignment_column=str(assignment) if assignment else None, table=table)
         except Exception as exc:
-            log.debug("[%s] No per-cell count table: %s", ds, exc)
-            table = None
-        cache[key] = table
-        return table
+            log.debug("[%s] No inspected segmentation for %s: %s", ds, source, exc)
+        cache[cache_key] = result
+        return result
+
+    def _lazy_cell_counts_table(self, ds: str) -> str | None:
+        """The table whose ``X`` holds the inspected cells' gene counts."""
+        return self._lazy_cell_segmentation(ds)["table"]
 
     def _lazy_cell_table_counts(self, ds: str, cell_id):
         """One cell's gene counts from the count table (about 10 ms), or ``None``."""
@@ -14421,10 +14460,16 @@ class ComparisonViewerController(AteraTranscriptMixin):
     def _lazy_cell_transcript_index(self, ds: str, cell_id, geometry) -> CellTranscriptIndex | None:
         """The cell's assigned transcripts, exactly, without a store scan.
 
-        ``None`` when the exact read is unavailable (no validated points index,
-        no cell -> tile map and no geometry, or the files changed on disk).
+        The ids are the inspected segmentation's (its own assignment column).
+        ``None`` when the exact read is unavailable (no assignment column for
+        that segmentation, no validated points index, no cell -> tile map and
+        no geometry, or the files changed on disk).
         """
-        cache_key = (str(ds).upper(), "original", "", normalize_cell_key(cell_id))
+        segmentation = self._lazy_cell_segmentation(ds)
+        column = segmentation["assignment_column"]
+        if column is None:
+            return None
+        cache_key = (str(ds).upper(), segmentation["source"], column, normalize_cell_key(cell_id))
         if not hasattr(self, "_inspection_indexes"):
             self._inspection_indexes = {}
         if cache_key in self._inspection_indexes:
@@ -14438,7 +14483,8 @@ class ComparisonViewerController(AteraTranscriptMixin):
                 bounds = tuple(float(v) for v in geometry.bounds)
             except Exception:
                 bounds = None
-        index = indexed_cell_transcripts(engine, cell_id, bounds, cell_tiles=cell_tiles)
+        index = indexed_cell_transcripts(
+            engine, cell_id, bounds, cell_tiles=cell_tiles, assignment_column=column)
         if index is not None:
             self._inspection_indexes[cache_key] = index
         return index
@@ -14562,8 +14608,12 @@ class ComparisonViewerController(AteraTranscriptMixin):
             payload.update(
                 intensities_loading=False,
                 transcripts_loading=False,
-                transcript_note="Assigned transcripts are unavailable (no validated points index); "
-                                "showing the table counts.",
+                transcript_note=(
+                    "Assigned transcripts are unavailable (no validated points index); "
+                    "showing the table counts."
+                    if self._lazy_cell_segmentation(key)["assignment_column"] is not None else
+                    "This segmentation has no per-transcript cell ids; showing the table counts."
+                ),
             )
             return payload
         coords_yx, genes = index.transcripts_for(cell_id)
@@ -15253,6 +15303,10 @@ class ComparisonViewerController(AteraTranscriptMixin):
             return
         if existing is not None:
             existing.data = lines
+            # napari gives shapes added by a data swap width 1 and the current
+            # colour, so restate the link style for every line.
+            existing.edge_width = CELL_LINK_WIDTH
+            existing.edge_color = "#ffffff"
             existing.visible = True
             return
         try:

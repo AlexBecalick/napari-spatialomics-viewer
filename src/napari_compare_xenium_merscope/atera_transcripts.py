@@ -2093,6 +2093,7 @@ class AteraTranscriptEngine:
         *,
         cell_tiles: CellTileMap | None = None,
         cancel: Any = None,
+        assignment_column: str = ASSIGNMENT_COLUMN,
     ) -> CellRows | None:
         """Every transcript assigned to ``cell_id``, in two phases per file.
 
@@ -2102,6 +2103,11 @@ class AteraTranscriptEngine:
         The files are the tiles of a valid ``cell_tiles`` map (exact), else
         the tiles whose box meets ``bounds_um = (xmin, ymin, xmax, ymax)``.
 
+        ``assignment_column`` names the segmentation whose ids ``cell_id``
+        belongs to (``original_assignment`` by default; a MOSAIK branch has its
+        own column, e.g. ``assignment``).  The cell -> tile map describes only
+        the original assignment, so other columns always read by ``bounds_um``.
+
         ``None`` when the read cannot be exact: no validated index, no
         assignment column, neither a map nor bounds, or a file changed on disk
         since the engine opened (a stale index).
@@ -2109,8 +2115,10 @@ class AteraTranscriptEngine:
         index = self.index
         if not index.validated:
             return None
-        if not all(_column_index(m, ASSIGNMENT_COLUMN) is not None for m in index.metadata):
+        if not all(_column_index(m, assignment_column) is not None for m in index.metadata):
             return None
+        if assignment_column != ASSIGNMENT_COLUMN:
+            cell_tiles = None
         try:
             cid = int(cell_id)
         except (TypeError, ValueError, OverflowError):
@@ -2150,7 +2158,7 @@ class AteraTranscriptEngine:
         def work(position: int) -> tuple[list[dict[str, np.ndarray]], int, int]:
             parquet_file = self._parquet(position)
             metadata = index.metadata[position]
-            column_index = _column_index(metadata, ASSIGNMENT_COLUMN)
+            column_index = _column_index(metadata, assignment_column)
             hits: list[tuple[int, np.ndarray]] = []
             scanned = 0
             for rg in range(metadata.num_row_groups):
@@ -2165,7 +2173,7 @@ class AteraTranscriptEngine:
                     except (TypeError, ValueError):
                         pass
                 scanned += 1
-                column = _read_row_group(parquet_file, rg, [ASSIGNMENT_COLUMN]).column(0)
+                column = _read_row_group(parquet_file, rg, [assignment_column]).column(0)
                 try:
                     target = pa.scalar(cid, type=column.type)
                 except (OverflowError, pa.ArrowInvalid, pa.ArrowTypeError):
@@ -2225,6 +2233,7 @@ def indexed_cell_transcripts(
     *,
     cell_tiles: CellTileMap | None = None,
     cancel: Any = None,
+    assignment_column: str = ASSIGNMENT_COLUMN,
 ):
     """A one-cell :class:`~.utils.CellTranscriptIndex` from :meth:`AteraTranscriptEngine.read_cell`.
 
@@ -2233,7 +2242,9 @@ def indexed_cell_transcripts(
     """
     from .utils import cell_transcript_index_from_arrays
 
-    rows = engine.read_cell(cell_id, bounds_um, cell_tiles=cell_tiles, cancel=cancel)
+    rows = engine.read_cell(
+        cell_id, bounds_um, cell_tiles=cell_tiles, cancel=cancel, assignment_column=assignment_column
+    )
     if rows is None:
         return None
     return cell_transcript_index_from_arrays(

@@ -88,6 +88,10 @@ CELLS: tuple[tuple[int, float, float, float, float], ...] = (
     (7, 25.0, 24.0, 33.0, 31.0),  # two nuclei
     (8, 30.0, 33.0, 37.0, 38.0),
 )
+#: Optional MOSAIK ProSeg branch (``with_mosaik``): the same boxes under reversed
+#: ids, so MOSAIK cell ``k`` is a different, distant original cell ``k``.
+MOSAIK_PROSEG_IDS: dict[int, int] = {c[0]: len(CELLS) + 1 - c[0] for c in CELLS}
+
 #: (instance_id, cell_instance_id, xmin, ymin, xmax, ymax) in um.
 NUCLEI: tuple[tuple[int, int, float, float, float, float], ...] = (
     (1, 1, 4.0, 4.0, 6.0, 6.0),
@@ -252,8 +256,12 @@ def _arrow_file_table(frame: pd.DataFrame):
         ),
         "transcript_id": pa.array(frame["transcript_id"].to_numpy(np.uint64)),
         "source_tile": source_tile,
-        "__null_dask_index__": pa.array(np.arange(n, dtype=np.int64)),
     }
+    if "mosaik_assignment" in frame:
+        columns["assignment"] = pa.array(
+            [None if pd.isna(v) else int(v) for v in frame["mosaik_assignment"]], type=pa.uint64()
+        )
+    columns["__null_dask_index__"] = pa.array(np.arange(n, dtype=np.int64))
     table = pa.table(columns)
     pandas_meta = {
         "index_columns": ["__null_dask_index__"],
@@ -277,6 +285,8 @@ def _arrow_file_table(frame: pd.DataFrame):
              "numpy_type": "uint64", "metadata": None},
             {"name": "source_tile", "field_name": "source_tile", "pandas_type": "categorical",
              "numpy_type": "int8", "metadata": {"num_categories": len(TILE_NAMES), "ordered": False}},
+            *([{"name": "assignment", "field_name": "assignment", "pandas_type": "uint64",
+                "numpy_type": "UInt64", "metadata": None}] if "mosaik_assignment" in frame else []),
             {"name": "__null_dask_index__", "field_name": "__null_dask_index__", "pandas_type": "int64",
              "numpy_type": "int64", "metadata": None},
         ],
@@ -526,6 +536,19 @@ def _tables(transcripts: pd.DataFrame, pixel_size: float, seed: int) -> dict[str
     return tables
 
 
+MOSAIK_PROSEG_SEGMENTATION: dict[str, Any] = {
+    "points": "transcripts",
+    "assignment_column": "assignment",
+    "shape": "MOSAIK_proseg",
+    "table": None,
+    "instance_key": "instance_id",
+    "id_namespace": "cellpose_label_v1",
+    "background_column": None,
+    "assignment_source_column": None,
+    "legacy_aliases": ["reseg"],
+}
+
+
 def merxen_schema_attr() -> dict[str, Any]:
     """The root ``merxen_schema`` attribute of a MerXen Atera store (trimmed)."""
     return {
@@ -618,6 +641,7 @@ def build_atera_latest_store(
     row_group_size: int = 16,
     seed: int = 7513,
     name: str = "latest_spatialdata.zarr",
+    with_mosaik: bool = False,
 ) -> Path:
     """Write a synthetic Atera store under ``root`` and return its path.
 
@@ -625,7 +649,9 @@ def build_atera_latest_store(
     scale (1 / pixel_size), ``atera/experiment.spatial`` and
     ``merxen_atera.experiment.pixel_size``. ``with_override`` adds
     ``atera/experiment_override.spatial`` holding ``override_pixel_size``
-    (default ``pixel_size``).
+    (default ``pixel_size``). ``with_mosaik`` adds a ``MOSAIK_proseg`` branch
+    (shapes, an ``assignment`` points column, a schema entry) whose ids are
+    :data:`MOSAIK_PROSEG_IDS`.
     """
     import geopandas as gpd
     import spatialdata as sd
@@ -640,6 +666,10 @@ def build_atera_latest_store(
     ps = float(pixel_size)
     um_to_px = 1.0 / ps
     transcripts = synthetic_transcripts(seed)
+    if with_mosaik:
+        transcripts["mosaik_assignment"] = transcripts["original_assignment"].map(
+            lambda v: pd.NA if pd.isna(v) else MOSAIK_PROSEG_IDS[int(v)]
+        )
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -674,6 +704,15 @@ def build_atera_latest_store(
                 transformations={"global": shapes_scale},
             ),
         }
+        if with_mosaik:
+            mosaik = _cell_frame()[["geometry"]].copy()
+            ids = np.array([MOSAIK_PROSEG_IDS[int(i)] for i in mosaik.index], dtype=np.uint64)
+            mosaik.insert(0, "instance_id", ids)
+            mosaik.index = pd.Index(ids, name="instance_id")
+            shapes["MOSAIK_proseg"] = ShapesModel.parse(
+                gpd.GeoDataFrame(mosaik, geometry="geometry"),
+                transformations={"global": shapes_scale},
+            )
         first = transcripts[transcripts["keep"]].head(4)
         seed_points = pd.DataFrame(
             {
@@ -720,6 +759,8 @@ def build_atera_latest_store(
     root_attrs: dict[str, Any] = {}
     if with_schema:
         root_attrs["merxen_schema"] = merxen_schema_attr()
+        if with_mosaik:
+            root_attrs["merxen_schema"]["segmentations"]["proseg"] = dict(MOSAIK_PROSEG_SEGMENTATION)
     if with_atera_attrs:
         root_attrs["merxen_atera"] = {"experiment": experiment_spatial_payload(ps)}
     if root_attrs:

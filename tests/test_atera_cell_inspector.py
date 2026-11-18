@@ -390,6 +390,82 @@ def test_cell_click_paints_table_counts_then_the_indexed_transcripts(qapp, atera
     assert "Gene transcripts:" in html and "Control features:" in html
 
 
+@pytest.fixture(scope="module")
+def mosaik_store(tmp_path_factory) -> Path:
+    return atera_stores.build_atera_latest_store(
+        tmp_path_factory.mktemp("atera_mosaik"), pixel_size=PS, with_mosaik=True)
+
+
+def test_a_mosaik_cell_reads_its_own_assignment_not_the_original_id(qapp, mosaik_store, kept, monkeypatch):
+    """A clicked ProSeg cell's links run to its own transcripts.
+
+    MOSAIK ids are their own namespace: reading ``original_assignment`` with a
+    ProSeg id fetched a different original cell elsewhere, so every link shot
+    off to that cell as one long streak.
+    """
+    ctrl = _activate(mosaik_store, monkeypatch)
+    _forbid_scans(ctrl, monkeypatch)
+    monkeypatch.setattr(ctrl, "_inspection_source", lambda _ds: "proseg")
+    assert ctrl._inspection_shape("ATERA") == "MOSAIK_proseg"
+    segmentation = ctrl._lazy_cell_segmentation("ATERA")
+    assert segmentation["assignment_column"] == "assignment"
+    assert segmentation["table"] is None  # never the original cells' count table
+
+    original = 1
+    mosaik_id = atera_stores.MOSAIK_PROSEG_IDS[original]
+    assert mosaik_id != original
+    gdf = ctrl._active_sdata.shapes["MOSAIK_proseg"]
+    cell_id, geometry = ctrl._shape_for_cell_id(gdf, mosaik_id)
+    ctrl._add_cell_selection("ATERA", cell_id, geometry)
+
+    entry = ctrl._selected_cells["ATERA"][0]
+    assert entry["transcript_source"] == "indexed"
+    rows = kept[kept["cell"] == original]
+    coords = np.asarray(entry["coords_yx"])
+    assert len(coords) == len(rows)
+    xmin, ymin, xmax, ymax = geometry.bounds
+    assert np.all((coords[:, 1] >= xmin) & (coords[:, 1] <= xmax))
+    assert np.all((coords[:, 0] >= ymin) & (coords[:, 0] <= ymax))
+    links = ctrl._get_layer_by_name(V.CELL_INSPECTOR_LINKS_LAYER)
+    ends = np.concatenate([np.asarray(line) for line in links.data])
+    assert np.all((ends[:, 1] >= xmin) & (ends[:, 1] <= xmax))
+
+
+def test_a_segmentation_without_assignment_ids_shows_no_links(qapp, mosaik_store, monkeypatch):
+    ctrl = _activate(mosaik_store, monkeypatch)
+    monkeypatch.setattr(ctrl, "_inspection_source", lambda _ds: "proseg_mask")
+    assert ctrl._lazy_cell_segmentation("ATERA")["assignment_column"] is None
+    gdf = ctrl._active_sdata.shapes["MOSAIK_proseg"]
+    cell_id, geometry = ctrl._shape_for_cell_id(gdf, atera_stores.MOSAIK_PROSEG_IDS[1])
+    assert ctrl._lazy_cell_transcript_index("ATERA", cell_id, geometry) is None
+
+
+def test_read_cell_by_another_column_ignores_the_original_cell_tile_map(mosaik_store):
+    engine = T.AteraTranscriptEngine.open(mosaik_store)
+    cell_tiles = engine.build_cell_tile_map()
+    mosaik_id = atera_stores.MOSAIK_PROSEG_IDS[3]
+    rows = engine.read_cell(mosaik_id, _bounds(3), cell_tiles=cell_tiles, assignment_column="assignment")
+    original = engine.read_cell(3, _bounds(3))
+    assert rows is not None and not rows.used_cell_tiles
+    assert sorted(zip(rows.x, rows.y)) == sorted(zip(original.x, original.y))
+    assert engine.read_cell(3, _bounds(3), assignment_column="no_such_column") is None
+
+
+def test_links_keep_their_width_when_a_second_cell_adds_lines(qapp):
+    """napari gives shapes added by a data swap width 1; links stay thin."""
+    from napari.components import ViewerModel
+
+    ctrl = V.ComparisonViewerController(ViewerModel(), {}, _args())
+    first = {"centroid_yx": (0.0, 0.0), "coords_yx": np.array([[1.0, 1.0], [2.0, 0.0]])}
+    second = {"centroid_yx": (10.0, 10.0), "coords_yx": np.array([[11.0, 11.0], [12.0, 9.0], [9.0, 9.0]])}
+    ctrl._update_cell_links_layer([first])
+    ctrl._update_cell_links_layer([first, second])
+    links = ctrl._get_layer_by_name(V.CELL_INSPECTOR_LINKS_LAYER)
+    assert len(links.data) == 5
+    assert np.allclose(links.edge_width, V.CELL_LINK_WIDTH)
+    assert np.allclose(links.edge_color, [1.0, 1.0, 1.0, 1.0])
+
+
 def test_inspection_index_reuses_the_loaded_engine_and_map(qapp, atera_store, monkeypatch):
     ctrl = _activate(atera_store, monkeypatch)
     engine = T.AteraTranscriptEngine.open(atera_store)
@@ -400,9 +476,10 @@ def test_inspection_index_reuses_the_loaded_engine_and_map(qapp, atera_store, mo
     seen = []
     original = engine.read_cell
 
-    def spy(cell_id, bounds_um=None, *, cell_tiles=None, cancel=None):
+    def spy(cell_id, bounds_um=None, *, cell_tiles=None, cancel=None, assignment_column=T.ASSIGNMENT_COLUMN):
         seen.append((bounds_um, cell_tiles))
-        return original(cell_id, bounds_um, cell_tiles=cell_tiles, cancel=cancel)
+        return original(cell_id, bounds_um, cell_tiles=cell_tiles, cancel=cancel,
+                        assignment_column=assignment_column)
 
     monkeypatch.setattr(engine, "read_cell", spy)
     index = ctrl._inspection_transcript_index("ATERA", 3, None, ctrl._empty_cell_transcript_index())

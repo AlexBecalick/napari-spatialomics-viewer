@@ -14,6 +14,11 @@ are that section.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Atera cell inspector on ProSeg and MOSAIK cells.** Clicking a cell of a segmentation other than the original Atera cells now reads that cell's own transcripts, from the segmentation's assignment column (for example `assignment` for MOSAIK). Before, the click read `original_assignment` with the ProSeg cell's id, which names a different original cell elsewhere in the tissue, so the transcript links shot off to that cell and the counts came from the original cells' table. A segmentation without per-transcript ids (in-mask counts) shows its table counts and says why, instead of wrong links.
+- **Transcript link lines keep their style.** Selecting a second cell no longer resets the white link lines to napari's default width and colour.
+
 ## [0.5.2] - 2026-11-14
 
 Manual landmark registration, standalone 10x Atera stores, hand-curated cell
