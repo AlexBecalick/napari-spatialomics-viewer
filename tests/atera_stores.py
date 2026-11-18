@@ -91,6 +91,24 @@ CELLS: tuple[tuple[int, float, float, float, float], ...] = (
 #: Optional MOSAIK ProSeg branch (``with_mosaik``): the same boxes under reversed
 #: ids, so MOSAIK cell ``k`` is a different, distant original cell ``k``.
 MOSAIK_PROSEG_IDS: dict[int, int] = {c[0]: len(CELLS) + 1 - c[0] for c in CELLS}
+#: Original cell whose MOSAIK twin owns transcripts that lie in another tile than
+#: its polygon (ProSeg assigns transcripts outside its polygon), and the number
+#: of those transcripts.
+MOSAIK_OUTSIDE_CELL = 2
+MOSAIK_OUTSIDE_ROWS = 3
+#: Original cell whose MOSAIK twin has some assigned rows flagged background
+#: (ProSeg claims them, but they are not the cell's counts), and how many.
+MOSAIK_BACKGROUND_CELL = 4
+MOSAIK_BACKGROUND_ROWS = 3
+#: ``obs`` control count columns of a MerXen ProSeg table, in its order.
+MOSAIK_CONTROL_COLUMNS = (
+    "genomic_control_counts",
+    "unassigned_codeword_counts",
+    "deprecated_codeword_counts",
+    "control_codeword_counts",
+    "control_probe_counts",
+    "other_control_counts",
+)
 
 #: (instance_id, cell_instance_id, xmin, ymin, xmax, ymax) in um.
 NUCLEI: tuple[tuple[int, int, float, float, float, float], ...] = (
@@ -261,6 +279,7 @@ def _arrow_file_table(frame: pd.DataFrame):
         columns["assignment"] = pa.array(
             [None if pd.isna(v) else int(v) for v in frame["mosaik_assignment"]], type=pa.uint64()
         )
+        columns["background"] = pa.array(frame["mosaik_background"].to_numpy(bool))
     columns["__null_dask_index__"] = pa.array(np.arange(n, dtype=np.int64))
     table = pa.table(columns)
     pandas_meta = {
@@ -286,7 +305,9 @@ def _arrow_file_table(frame: pd.DataFrame):
             {"name": "source_tile", "field_name": "source_tile", "pandas_type": "categorical",
              "numpy_type": "int8", "metadata": {"num_categories": len(TILE_NAMES), "ordered": False}},
             *([{"name": "assignment", "field_name": "assignment", "pandas_type": "uint64",
-                "numpy_type": "UInt64", "metadata": None}] if "mosaik_assignment" in frame else []),
+                "numpy_type": "UInt64", "metadata": None},
+               {"name": "background", "field_name": "background", "pandas_type": "bool",
+                "numpy_type": "bool", "metadata": None}] if "mosaik_assignment" in frame else []),
             {"name": "__null_dask_index__", "field_name": "__null_dask_index__", "pandas_type": "int64",
              "numpy_type": "int64", "metadata": None},
         ],
@@ -536,14 +557,80 @@ def _tables(transcripts: pd.DataFrame, pixel_size: float, seed: int) -> dict[str
     return tables
 
 
+def add_mosaik_columns(transcripts: pd.DataFrame) -> None:
+    """Add the MOSAIK ProSeg ``mosaik_assignment`` / ``mosaik_background`` columns in place.
+
+    As MerXen writes them: control rows are never assigned (controls are
+    attributed geometrically, into the table's ``obs``); some rows of one cell
+    are flagged background; and some rows of another cell lie outside its
+    polygon, in a different tile.
+    """
+    mosaik = transcripts["original_assignment"].map(
+        lambda v: pd.NA if pd.isna(v) else MOSAIK_PROSEG_IDS[int(v)]
+    )
+    mosaik[~transcripts["is_gene"]] = pd.NA
+    transcripts["mosaik_assignment"] = mosaik
+    transcripts["mosaik_background"] = False
+    kept_genes = transcripts["keep"] & transcripts["is_gene"]
+    background_id = MOSAIK_PROSEG_IDS[MOSAIK_BACKGROUND_CELL]
+    flagged = transcripts.index[kept_genes & (mosaik == background_id).fillna(False)][:MOSAIK_BACKGROUND_ROWS]
+    transcripts.loc[flagged, "mosaik_background"] = True
+    outside = transcripts.index[
+        kept_genes & mosaik.isna() & (transcripts["tile"] == "1,0")
+    ][:MOSAIK_OUTSIDE_ROWS]
+    transcripts.loc[outside, "mosaik_assignment"] = MOSAIK_PROSEG_IDS[MOSAIK_OUTSIDE_CELL]
+
+
+def mosaik_table(transcripts: pd.DataFrame):
+    """``table_MOSAIK_proseg``: foreground gene counts and ``obs`` control counts.
+
+    Counts only claimed, non-background gene rows, as MerXen's stitch does; the
+    control counts attribute control rows to the cell geometrically (here by
+    their original cell).
+    """
+    import anndata as ad
+    from scipy import sparse
+    from spatialdata.models import TableModel
+
+    ids = np.array([MOSAIK_PROSEG_IDS[c[0]] for c in CELLS], dtype=np.uint64)
+    row_of = {int(i): r for r, i in enumerate(ids)}
+    kept = transcripts[transcripts["keep"]]
+    counts = np.zeros((len(ids), len(GENES)), dtype=np.float32)
+    foreground = kept[kept["is_gene"] & kept["mosaik_assignment"].notna() & ~kept["mosaik_background"]]
+    for cid, code in zip(foreground["mosaik_assignment"].astype(int), foreground["code"].astype(int)):
+        counts[row_of[cid], code] += 1
+    controls = {name: np.zeros(len(ids), dtype=np.int64) for name in MOSAIK_CONTROL_COLUMNS}
+    for cid, code in zip(
+        kept.loc[~kept["is_gene"] & kept["original_assignment"].notna(), "original_assignment"].astype(int),
+        kept.loc[~kept["is_gene"] & kept["original_assignment"].notna(), "code"].astype(int),
+    ):
+        column = "control_probe_counts" if control_family(FEATURE_DICTIONARY[code]) == "NegControlProbe" else (
+            "other_control_counts")
+        controls[column][row_of[MOSAIK_PROSEG_IDS[cid]]] += 1
+    obs = pd.DataFrame(
+        {
+            "instance_id": ids,
+            "region": pd.Categorical(["MOSAIK_proseg"] * len(ids)),
+            "transcript_counts": counts.sum(axis=1).astype(np.int64),
+            **controls,
+        },
+        index=pd.Index([str(int(i)) for i in ids], name="cell_id"),
+    )
+    var = pd.DataFrame({"gene_ids": [f"ENSG{i:011d}" for i in range(len(GENES))]}, index=list(GENES))
+    return TableModel.parse(
+        ad.AnnData(X=sparse.csr_matrix(counts), obs=obs, var=var),
+        region="MOSAIK_proseg", region_key="region", instance_key="instance_id",
+    )
+
+
 MOSAIK_PROSEG_SEGMENTATION: dict[str, Any] = {
     "points": "transcripts",
     "assignment_column": "assignment",
     "shape": "MOSAIK_proseg",
-    "table": None,
+    "table": "table_MOSAIK_proseg",
     "instance_key": "instance_id",
     "id_namespace": "cellpose_label_v1",
-    "background_column": None,
+    "background_column": "background",
     "assignment_source_column": None,
     "legacy_aliases": ["reseg"],
 }
@@ -650,7 +737,8 @@ def build_atera_latest_store(
     ``merxen_atera.experiment.pixel_size``. ``with_override`` adds
     ``atera/experiment_override.spatial`` holding ``override_pixel_size``
     (default ``pixel_size``). ``with_mosaik`` adds a ``MOSAIK_proseg`` branch
-    (shapes, an ``assignment`` points column, a schema entry) whose ids are
+    (shapes, ``assignment`` / ``background`` points columns, the
+    ``table_MOSAIK_proseg`` count table and a schema entry) whose ids are
     :data:`MOSAIK_PROSEG_IDS`.
     """
     import geopandas as gpd
@@ -667,9 +755,7 @@ def build_atera_latest_store(
     um_to_px = 1.0 / ps
     transcripts = synthetic_transcripts(seed)
     if with_mosaik:
-        transcripts["mosaik_assignment"] = transcripts["original_assignment"].map(
-            lambda v: pd.NA if pd.isna(v) else MOSAIK_PROSEG_IDS[int(v)]
-        )
+        add_mosaik_columns(transcripts)
 
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
@@ -713,6 +799,9 @@ def build_atera_latest_store(
                 gpd.GeoDataFrame(mosaik, geometry="geometry"),
                 transformations={"global": shapes_scale},
             )
+        tables = _tables(transcripts, ps, seed)
+        if with_mosaik:
+            tables["table_MOSAIK_proseg"] = mosaik_table(transcripts)
         first = transcripts[transcripts["keep"]].head(4)
         seed_points = pd.DataFrame(
             {
@@ -737,7 +826,7 @@ def build_atera_latest_store(
             labels=labels,
             shapes=shapes,
             points={"transcripts": points},
-            tables=_tables(transcripts, ps, seed),
+            tables=tables,
         ).write(str(store))
 
     entries = _write_points_files(store, transcripts, row_group_size)

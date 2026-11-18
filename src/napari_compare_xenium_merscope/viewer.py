@@ -311,6 +311,7 @@ from .utils import (
     is_control_gene,
     open_zarr_group_unconsolidated,
     table_cell_gene_counts,
+    table_cell_control_total,
     darken_rgba,
     mean_intensity_in_polygon,
     normalize_cell_key,
@@ -5054,7 +5055,8 @@ def _cell_summary_html(cell: dict) -> str:
     if cell.get("control_total") is not None:
         lines.append(
             f"<b>Control features:</b> {int(cell['control_total']):,}"
-            f" ({int(cell.get('control_features', 0)):,} features)"
+            + (f" ({int(cell['control_features']):,} features)"
+               if cell.get("control_features") is not None else "")
         )
     if cell.get("transcripts_loading"):
         lines.append("<i>Reading the assigned transcripts…</i>")
@@ -14397,7 +14399,10 @@ class ComparisonViewerController(AteraTranscriptMixin):
         cache_key = (key, str(path), source)
         if cache_key in cache:
             return cache[cache_key]
-        result = {"source": source, "shape": None, "assignment_column": None, "table": None}
+        result = {
+            "source": source, "shape": None, "assignment_column": None,
+            "background_column": None, "table": None, "failed": False,
+        }
         if path is None:
             return result
         try:
@@ -14433,13 +14438,41 @@ class ComparisonViewerController(AteraTranscriptMixin):
             if assignment is None and not entry and shape == original_shape:
                 assignment = ATERA_ASSIGNMENT_COLUMN
             if source == "proseg_mask":
-                # In-mask counts: the mask's measured points, not ProSeg's ids.
+                # In-mask counts are the mask's measured points, not ProSeg's
+                # ids, and the store has no in-mask count table to show.
                 assignment, table = None, None
-            result.update(shape=shape, assignment_column=str(assignment) if assignment else None, table=table)
+            background = entry.get("background_column") if assignment else None
+            result.update(
+                shape=shape,
+                assignment_column=str(assignment) if assignment else None,
+                background_column=str(background) if background else None,
+                table=table,
+            )
         except Exception as exc:
-            log.debug("[%s] No inspected segmentation for %s: %s", ds, source, exc)
+            # Not cached: a transient read error (a store being rewritten) must
+            # not switch the exact transcript read off for the whole session.
+            log.warning("[%s] Could not resolve the inspected segmentation for %s: %s", ds, source, exc)
+            result["failed"] = True
+            if source == "original":
+                # Main's behaviour: the original cells' own column (and cell ->
+                # tile map). Another source must not borrow it, as its ids name
+                # different original cells.
+                result.update(shape=original_shape, assignment_column=ATERA_ASSIGNMENT_COLUMN)
+            return result
         cache[cache_key] = result
         return result
+
+    def _lazy_cell_no_transcripts_note(self, ds: str) -> str:
+        """Why a lazy-platform click has no exact transcripts, by what is shown."""
+        segmentation = self._lazy_cell_segmentation(ds)
+        if segmentation["assignment_column"] is not None:
+            return ("Assigned transcripts are unavailable (no validated points index); "
+                    "showing the table counts.")
+        if segmentation["failed"]:
+            return "The inspected segmentation could not be read from the store; no counts are shown."
+        if segmentation["table"] is not None:
+            return "This segmentation has no per-transcript cell ids; showing the table counts."
+        return "This segmentation has no per-transcript cell ids or count table; no counts are shown."
 
     def _lazy_cell_counts_table(self, ds: str) -> str | None:
         """The table whose ``X`` holds the inspected cells' gene counts."""
@@ -14455,6 +14488,25 @@ class ComparisonViewerController(AteraTranscriptMixin):
             return table_cell_gene_counts(cfg.zarr_path, table, cell_id)
         except Exception as exc:
             log.warning("[%s] Could not read cell %s from %s: %s", ds, cell_id, table, exc)
+            return None
+
+    def _lazy_cell_table_control_total(self, ds: str, cell_id) -> int | None:
+        """Control total from the count table's obs, for ProSeg-style branches.
+
+        Only for a segmentation whose own column is not the original one (the
+        original read sees its control rows) and whose table carries the control
+        count columns; ``None`` otherwise.
+        """
+        segmentation = self._lazy_cell_segmentation(ds)
+        table = segmentation["table"]
+        cfg = (getattr(self, "datasets", None) or {}).get(str(ds).upper())
+        path = getattr(cfg, "zarr_path", None)
+        if table is None or path is None or segmentation["assignment_column"] in (None, ATERA_ASSIGNMENT_COLUMN):
+            return None
+        try:
+            return table_cell_control_total(path, table, cell_id)
+        except Exception as exc:
+            log.warning("[%s] Could not read control counts of cell %s from %s: %s", ds, cell_id, table, exc)
             return None
 
     def _lazy_cell_transcript_index(self, ds: str, cell_id, geometry) -> CellTranscriptIndex | None:
@@ -14484,7 +14536,8 @@ class ComparisonViewerController(AteraTranscriptMixin):
             except Exception:
                 bounds = None
         index = indexed_cell_transcripts(
-            engine, cell_id, bounds, cell_tiles=cell_tiles, assignment_column=column)
+            engine, cell_id, bounds, cell_tiles=cell_tiles, assignment_column=column,
+            background_column=segmentation["background_column"])
         if index is not None:
             self._inspection_indexes[cache_key] = index
         return index
@@ -14608,12 +14661,7 @@ class ComparisonViewerController(AteraTranscriptMixin):
             payload.update(
                 intensities_loading=False,
                 transcripts_loading=False,
-                transcript_note=(
-                    "Assigned transcripts are unavailable (no validated points index); "
-                    "showing the table counts."
-                    if self._lazy_cell_segmentation(key)["assignment_column"] is not None else
-                    "This segmentation has no per-transcript cell ids; showing the table counts."
-                ),
+                transcript_note=self._lazy_cell_no_transcripts_note(key),
             )
             return payload
         coords_yx, genes = index.transcripts_for(cell_id)
@@ -14625,13 +14673,19 @@ class ComparisonViewerController(AteraTranscriptMixin):
         controls = ranked_gene_counts(genes[is_control])
         if gene_visuals is None:
             gene_visuals = assign_gene_visuals(sorted(g for g, _c in ranked))
+        control_total, control_features = int(np.count_nonzero(is_control)), len(controls)
+        table_controls = self._lazy_cell_table_control_total(key, cell_id)
+        if table_controls is not None:
+            # ProSeg leaves control rows unassigned, so the read has none; the
+            # count table's obs holds the per-cell totals (no feature split).
+            control_total, control_features = table_controls, None
         payload = self._cell_selection_common(key, cell_id, geometry, color, image_specs)
         payload.update(
             gene_rows=[self._cell_gene_row(g, c, gene_visuals) for g, c in ranked],
             total=int(np.count_nonzero(~is_control)),
             total_label="Gene transcripts",
-            control_total=int(np.count_nonzero(is_control)),
-            control_features=len(controls),
+            control_total=control_total,
+            control_features=control_features,
             control_rows=[{"gene": g, "count": int(c)} for g, c in controls],
             coords_yx=np.asarray(coords_yx, dtype=float),
             transcripts_loading=False,
