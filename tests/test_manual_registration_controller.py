@@ -24,6 +24,7 @@ from napari_compare_xenium_merscope.manual_registration_controller import (
     ManualRegistrationController,
     RegistrationLoadCancelled,
     contrast_limits_from_level,
+    contrast_limits_from_tissue_tiles,
     crop_from_drag,
     crop_rectangle_rc,
     label_translation_data,
@@ -369,6 +370,7 @@ def test_load_prepared_creates_tagged_layers(ctrl, viewer, host, prepared_store)
         "Moving crop",
         "Moving landmarks",
         "Reference landmarks",
+        "Suggested landmarks",
     ]
     expected_meta = {
         "Reference | DAPI": ("reference", "image", "DAPI"),
@@ -380,6 +382,7 @@ def test_load_prepared_creates_tagged_layers(ctrl, viewer, host, prepared_store)
         "Moving crop": ("moving", "crop", None),
         "Moving landmarks": ("moving", "landmarks", None),
         "Reference landmarks": ("reference", "landmarks", None),
+        "Suggested landmarks": ("reference", "overlay", None),
     }
     for layer in viewer.layers:
         role, kind, channel = expected_meta[layer.name]
@@ -408,7 +411,7 @@ def test_load_prepared_creates_tagged_layers(ctrl, viewer, host, prepared_store)
     assert ctrl.is_active() and ctrl.display_mode == "both"
 
 
-def test_contrast_from_coarsest_level(loaded, viewer):
+def test_contrast_from_full_resolution_tissue_tiles(loaded, viewer):
     session = loaded.session
     for role, names in (
         ("reference", stores.REFERENCE_CHANNELS),
@@ -416,8 +419,8 @@ def test_contrast_from_coarsest_level(loaded, viewer):
     ):
         for index, channel in enumerate(names):
             prefix = "Reference" if role == "reference" else "Moving"
-            plane = np.asarray(session.levels[role][0].isel(c=index).data)[::4, ::4]
-            expected = np.percentile(plane[plane != 0], [0.5, 99.5])
+            levels = session.levels[role]
+            expected = contrast_limits_from_tissue_tiles(levels[0], levels[-1], index)
             assert viewer.layers[f"{prefix} | {channel}"].contrast_limits == pytest.approx(
                 expected, rel=1e-6
             )
@@ -640,7 +643,7 @@ def test_enable_toggle_held_out_and_undo(loaded, viewer, widget):
     place_truth_pairs(loaded, viewer, MOVING_POINTS[:4])
     rows = []
     original = widget.set_rows
-    widget.set_rows = lambda r: (rows.append(r), original(r))
+    widget.set_rows = lambda r, **kw: (rows.append(r), original(r, **kw))
     summaries = []
     original_summary = widget.set_fit_summary
     widget.set_fit_summary = lambda s: (summaries.append(s), original_summary(s))
@@ -656,7 +659,7 @@ def test_enable_toggle_held_out_and_undo(loaded, viewer, widget):
 def test_live_fit_uses_evaluate_landmarks(loaded, viewer, widget, monkeypatch, prepared_store):
     rows_seen, summaries = [], []
     original_rows, original_summary = widget.set_rows, widget.set_fit_summary
-    widget.set_rows = lambda r: (rows_seen.append(r), original_rows(r))
+    widget.set_rows = lambda r, **kw: (rows_seen.append(r), original_rows(r, **kw))
     widget.set_fit_summary = lambda s: (summaries.append(s), original_summary(s))
     points = MOVING_POINTS[:3]
 
@@ -1310,6 +1313,21 @@ def test_prepare_session_cancel_raises(host, ctrl, prepared_store):
         ctrl.prepare_session(prepared_store, lambda: True)
 
 
+def test_prepare_session_forwards_cancel_check_to_the_contrast_read(
+    host, ctrl, prepared_store, monkeypatch
+):
+    received = []
+
+    def spy(level0, coarse, index, **kwargs):
+        received.append(kwargs.get("cancel_check"))
+        return (0.0, 1.0)
+
+    monkeypatch.setattr(controller_module, "contrast_limits_from_tissue_tiles", spy)
+    marker = lambda: False  # noqa: E731
+    ctrl.prepare_session(prepared_store, marker)
+    assert received and all(check is marker for check in received)
+
+
 def test_newer_load_supersedes_older(prepared_store, tmp_path, prepared_template):
     second = tmp_path / "second_prepared.zarr"
     shutil.copytree(prepared_template, second)
@@ -1559,3 +1577,655 @@ def test_store_builders_match_golden_examples(prepared_store):
     state = labelling_from_attrs(payload, descriptor)
     assert [p.id for p in state.pairs] == [1, 2] and state.pairs[1].enabled is False
     assert state.load_warnings == ()
+
+
+# ---------------------------------------------------------------------------------------------
+# MerXen landmark check (C3), preview result stores (C4), field banner (C5)
+# ---------------------------------------------------------------------------------------------
+
+CHECK_HEADERS = ["#", "", "On", "LOO µm", "p", "Weight", "Image", "Flags"]
+RIGID_HEADERS = ["#", "", "On", "Rigid fit µm", "Rigid LOO µm", "Flags"]
+
+
+def labelled_store(path, *, n_pairs=10, revision=2):
+    """Write a labelling of ``n_pairs`` pairs into a prepared store; return its payload."""
+    pairs = [
+        {"id": i + 1, "reference_xy_px": ref, "moving_xy_px": mov}
+        for i, (ref, mov) in enumerate(grid_pairs(n_pairs))
+    ]
+    payload = stores.labelling_payload(pairs=pairs, revision=revision, status="finished")
+    stores.write_root_attr(path, LABELLING_ATTR, payload)
+    return payload
+
+
+def matching_check(payload, **kwargs):
+    return stores.check_payload(
+        labelling_content_sha256=payload["content_sha256"],
+        pair_ids=[p["id"] for p in payload["landmarks"]["pairs"]],
+        **kwargs,
+    )
+
+
+def table_headers(widget):
+    table = widget._table
+    return [table.horizontalHeaderItem(c).text() for c in range(table.columnCount())]
+
+
+@pytest.fixture
+def labelled(prepared_store):
+    payload = labelled_store(prepared_store)
+    return SimpleNamespace(path=prepared_store, payload=payload)
+
+
+def load(ctrl, path):
+    assert ctrl.load_store(path)
+    ctrl.flush_pending_updates()
+    return ctrl
+
+
+def test_check_attr_with_matching_digests_shows_the_check(ctrl, widget, labelled):
+    stores.write_check_attr(
+        labelled.path,
+        matching_check(labelled.payload, classes={2: "likely_misclick", 3: "check"}),
+    )
+    load(ctrl, labelled.path)
+    assert ctrl.state.loaded_content_sha == labelled.payload["content_sha256"]
+    assert table_headers(widget) == CHECK_HEADERS
+    table = widget._table
+    # pair 1: p and weight are the lower of the final and landmarks-only fields
+    assert [table.item(0, c).text() for c in (0, 3, 4, 5, 6, 7)] == [
+        "1",
+        "23.50",
+        "0.41",
+        "1.12",
+        "confirmed",
+        "",
+    ]
+    assert table.item(1, 7).text() == "⚠ likely misclick"
+    assert table.item(2, 7).text() == "? check"
+    status = widget._check_status_label.text()
+    assert status.startswith("Robust check (store, 2026-11-18T09:00:00Z, cortex_serial):")
+    assert (
+        "LOO median 34 µm (clicks only 42 µm), p90 97 µm; 1 to check, 1 likely misclicks" in status
+    )
+    assert "12 tissue windows." in status
+    assert ctrl.has_unsaved_changes() is False
+
+
+def test_without_a_check_the_table_is_the_rigid_fit(ctrl, widget, labelled):
+    load(ctrl, labelled.path)
+    assert table_headers(widget) == RIGID_HEADERS
+    text = widget._check_status_label.text()
+    assert text.startswith("No robust check for these landmarks.")
+    assert "rigid (similarity) fit, which cannot bend" in text
+    assert "merxen manual-registration-check" in text
+    assert widget._summary_label.text().startswith("Rigid (similarity) fit on")
+
+
+def test_load_check_file_shows_the_check_with_the_file_name(ctrl, widget, labelled, tmp_path):
+    load(ctrl, labelled.path)
+    check_file = stores.write_check_file(
+        tmp_path / "SYN1_cortex_serial_check.json",
+        matching_check(labelled.payload, with_details=True),
+    )
+    widget.check_file_chosen.emit(str(check_file))
+    assert table_headers(widget) == CHECK_HEADERS
+    assert "Robust check (SYN1_cortex_serial_check.json," in widget._check_status_label.text()
+    assert widget._check_dialog_dir == str(tmp_path)
+    assert ctrl.has_unsaved_changes() is False
+
+
+def test_stale_check_file_keeps_rigid_mode_until_refreshed(ctrl, widget, labelled, tmp_path):
+    load(ctrl, labelled.path)
+    stale = matching_check(labelled.payload)
+    stale["labelling_content_sha256"] = "sha256:" + "9" * 64
+    check_file = stores.write_check_file(tmp_path / "SYN1_cortex_serial_check.json", stale)
+    widget.check_file_chosen.emit(str(check_file))
+    assert table_headers(widget) == RIGID_HEADERS
+    assert widget._check_status_label.text().startswith(
+        "The landmarks, crops or coarse alignment changed since the check was run (revision 3)."
+    )
+    # a newer file of the same name; Refresh reads it again
+    stores.write_check_file(check_file, matching_check(labelled.payload))
+    widget.refresh_check_requested.emit()
+    assert table_headers(widget) == CHECK_HEADERS
+    assert "SYN1_cortex_serial_check.json" in widget._check_status_label.text()
+
+
+def test_check_for_another_preparation_is_not_applied(ctrl, widget, labelled):
+    stores.write_check_attr(
+        labelled.path, matching_check(labelled.payload, store_content_digest="sha256:" + "7" * 64)
+    )
+    load(ctrl, labelled.path)
+    assert table_headers(widget) == RIGID_HEADERS
+    assert "another preparation of the images" in widget._check_status_label.text()
+
+
+def test_editing_a_pair_makes_the_check_stale(ctrl, widget, labelled):
+    stores.write_check_attr(labelled.path, matching_check(labelled.payload))
+    load(ctrl, labelled.path)
+    assert table_headers(widget) == CHECK_HEADERS
+    widget.pair_enabled_changed.emit(1, False)
+    assert table_headers(widget) == RIGID_HEADERS
+    assert (
+        "The landmarks, crops or coarse alignment changed since the check was run"
+        in widget._check_status_label.text()
+    )
+    widget.pair_enabled_changed.emit(1, True)  # undone by hand: the digests match again
+    assert table_headers(widget) == CHECK_HEADERS
+    # adding a pair changes the labelling too
+    ctrl._widget.landmark_mode_changed.emit(True)
+    ctrl.state.add_pair((10.0, 20.0), (30.0, 40.0))
+    ctrl._content_changed()
+    assert table_headers(widget) == RIGID_HEADERS
+
+
+def test_refresh_reads_the_store_attribute_without_touching_the_labelling(
+    ctrl, widget, labelled, host
+):
+    load(ctrl, labelled.path)
+    assert table_headers(widget) == RIGID_HEADERS
+    state_before = ctrl.state
+    revision_before = state_before.revision
+    sha_before = state_before.content_sha256()
+    stores.write_check_attr(labelled.path, matching_check(labelled.payload))
+    widget.refresh_check_requested.emit()
+    assert host.worker_keys[-1] == "registration_check"
+    assert table_headers(widget) == CHECK_HEADERS
+    assert "Robust check (store," in widget._check_status_label.text()
+    assert ctrl.state is state_before
+    assert (state_before.revision, state_before.content_sha256()) == (revision_before, sha_before)
+    assert ctrl.has_unsaved_changes() is False
+    assert ctrl.session.descriptor.check is not None
+    # the labelling on disk is exactly what it was
+    assert on_disk_labelling(labelled.path) == labelled.payload
+    # removing the attribute and refreshing returns to the rigid fit
+    import zarr
+
+    del zarr.open_group(str(labelled.path), mode="a").attrs["merxen_manual_registration_check"]
+    widget.refresh_check_requested.emit()
+    assert table_headers(widget) == RIGID_HEADERS
+
+
+def test_refresh_picks_up_a_new_store_content_digest(ctrl, widget, labelled):
+    stores.write_check_attr(
+        labelled.path, matching_check(labelled.payload, store_content_digest="sha256:" + "7" * 64)
+    )
+    load(ctrl, labelled.path)
+    assert table_headers(widget) == RIGID_HEADERS
+    attr = read_root_attrs(labelled.path)[STORE_ATTR]
+    stores.write_root_attr(
+        labelled.path, STORE_ATTR, {**attr, "content_digest": "sha256:" + "7" * 64}
+    )
+    widget.refresh_check_requested.emit()
+    assert table_headers(widget) == CHECK_HEADERS
+
+
+def test_malformed_store_attribute_gives_a_note_and_the_rigid_fit(ctrl, widget, labelled, host):
+    stores.write_check_attr(labelled.path, {"schema": "merxen.manual_registration.check"})
+    load(ctrl, labelled.path)
+    assert table_headers(widget) == RIGID_HEADERS
+    assert "the landmark check could not be read:" in widget._check_status_label.text()
+    assert "the landmark check could not be read:" in host.statuses[-1]
+    assert widget._table.rowCount() == 10
+
+
+def test_newer_check_schema_gives_an_update_note(ctrl, widget, labelled, host):
+    stores.write_check_attr(
+        labelled.path, {**matching_check(labelled.payload), "schema_version": 2}
+    )
+    load(ctrl, labelled.path)
+    assert table_headers(widget) == RIGID_HEADERS
+    assert "written by a newer MerXen" in widget._check_status_label.text()
+    assert "update this viewer" in host.statuses[-1]
+
+
+def test_malformed_or_missing_check_file_keeps_the_previous_check(ctrl, widget, labelled, tmp_path):
+    stores.write_check_attr(labelled.path, matching_check(labelled.payload))
+    load(ctrl, labelled.path)
+    assert table_headers(widget) == CHECK_HEADERS
+    for name, content in (("bad.json", "{not json"), ("list.json", "[]"), ("empty.json", "{}")):
+        path = tmp_path / name
+        path.write_text(content, encoding="utf-8")
+        widget.check_file_chosen.emit(str(path))
+        assert table_headers(widget) == CHECK_HEADERS  # the previous check stays
+        assert "the landmark check could not be read:" in widget._check_status_label.text()
+    widget.check_file_chosen.emit(str(tmp_path / "missing_check.json"))
+    assert table_headers(widget) == CHECK_HEADERS
+    assert "could not be read" in widget._check_status_label.text()
+    # a good file clears the note
+    good = stores.write_check_file(tmp_path / "good_check.json", matching_check(labelled.payload))
+    widget.check_file_chosen.emit(str(good))
+    assert "could not be read" not in widget._check_status_label.text()
+    newer = tmp_path / "newer_check.json"
+    newer.write_text(
+        json.dumps({**matching_check(labelled.payload), "schema_version": 2}), encoding="utf-8"
+    )
+    widget.check_file_chosen.emit(str(newer))
+    assert "written by a newer MerXen" in widget._check_status_label.text()
+    assert table_headers(widget) == CHECK_HEADERS
+
+
+def test_check_workers_are_disabled_while_running_and_stale_results_are_ignored(
+    prepared_store, tmp_path
+):
+    payload = labelled_store(prepared_store)
+    viewer, host, widget, controller = make_env(tmp_path / "app_deferred", deferred=True)
+    assert controller.load_store(prepared_store)
+    host.run_pending()
+    controller.flush_pending_updates()
+    check_file = stores.write_check_file(
+        tmp_path / "SYN1_cortex_serial_check.json", matching_check(payload)
+    )
+    widget.check_file_chosen.emit(str(check_file))
+    assert host.worker_keys[-1] == "registration_check" and len(host.pending) == 1
+    assert not widget._load_check_button.isEnabled()
+    assert not widget._refresh_check_button.isEnabled()
+    widget.refresh_check_requested.emit()  # ignored while a worker runs
+    assert len(host.pending) == 1
+    assert table_headers(widget) == RIGID_HEADERS
+    host.run_pending()
+    assert table_headers(widget) == CHECK_HEADERS
+    assert widget._load_check_button.isEnabled() and widget._refresh_check_button.isEnabled()
+
+    # a read that finishes after the session was replaced is dropped
+    widget.refresh_check_requested.emit()
+    assert len(host.pending) == 1
+    assert controller.load_store(prepared_store)
+    host.drop_pending(keys=["registration_check"])
+    host.run_pending()
+    controller.flush_pending_updates()
+    assert table_headers(widget) == RIGID_HEADERS  # the new session starts without a file check
+    assert widget._load_check_button.isEnabled()
+
+
+def test_a_late_check_result_of_an_earlier_session_is_ignored(prepared_store, tmp_path):
+    payload = labelled_store(prepared_store)
+    viewer, host, widget, controller = make_env(tmp_path / "app_late", deferred=True)
+    assert controller.load_store(prepared_store)
+    host.run_pending()
+    check_file = stores.write_check_file(tmp_path / "x_check.json", matching_check(payload))
+    widget.check_file_chosen.emit(str(check_file))
+    late = host.pending[-1]
+    host.pending.remove(late)
+    assert controller.load_store(prepared_store)
+    host.run_pending()
+    late[1](late[0]())  # the old session's worker calls back
+    assert table_headers(widget) == RIGID_HEADERS
+    assert controller._check is None
+
+
+def test_a_late_store_check_refresh_of_an_earlier_session_is_ignored(prepared_store, tmp_path):
+    payload = labelled_store(prepared_store)
+    viewer, host, widget, controller = make_env(tmp_path / "app_late_store", deferred=True)
+    assert controller.load_store(prepared_store)
+    host.run_pending()
+    stores.write_check_attr(prepared_store, matching_check(payload))
+    widget.refresh_check_requested.emit()  # no file loaded: re-reads the store attribute
+    late = host.pending[-1]
+    assert host.worker_keys[-1] == "registration_check"
+    host.pending.remove(late)
+    late_attrs = late[0]()  # the old read saw the check
+    zarr_json = prepared_store / "zarr.json"  # the next session starts without the check
+    document = json.loads(zarr_json.read_text())
+    document["attributes"].pop("merxen_manual_registration_check")
+    zarr_json.write_text(json.dumps(document))
+    assert controller.load_store(prepared_store)
+    host.run_pending()
+    descriptor_before = controller.session.descriptor
+    late[1](late_attrs)
+    assert controller.session.descriptor is descriptor_before
+    assert controller._check is None
+    assert table_headers(widget) == RIGID_HEADERS
+
+
+def test_cancelling_background_work_frees_the_check_buttons(prepared_store, tmp_path):
+    payload = labelled_store(prepared_store)
+    viewer, host, widget, controller = make_env(tmp_path / "app_cancel", deferred=True)
+    assert controller.load_store(prepared_store)
+    host.run_pending()
+    check_file = stores.write_check_file(tmp_path / "x_check.json", matching_check(payload))
+    widget.check_file_chosen.emit(str(check_file))
+    assert not widget._load_check_button.isEnabled()
+    controller.cancel_background()
+    host.drop_pending(keys=["registration_check"])
+    assert widget._load_check_button.isEnabled()
+    assert widget._refresh_check_button.isEnabled()
+    widget.refresh_check_requested.emit()
+    assert host.worker_keys[-1] == "registration_check" and len(host.pending) == 1
+
+
+def test_the_check_is_forgotten_when_the_session_ends(ctrl, widget, labelled):
+    stores.write_check_attr(labelled.path, matching_check(labelled.payload))
+    load(ctrl, labelled.path)
+    assert ctrl._check is not None
+    ctrl.deactivate()
+    assert ctrl._check is None and ctrl._check_raw is None
+
+
+def test_suggestions_layer_is_hidden_and_follows_the_check(ctrl, viewer, widget, labelled):
+    stores.write_check_attr(labelled.path, matching_check(labelled.payload))
+    load(ctrl, labelled.path)
+    layer = viewer.layers["Suggested landmarks"]
+    assert layer.visible is False
+    assert layer.metadata[LAYER_METADATA_KEY]["role"] == "reference"
+    assert layer.data.shape == (2, 2)
+    # napari (row, col) = (y, x) of the reference px; ranks are the labels
+    assert layer.data.tolist() == [[9000.5, 6000.0], [41000.0, 52000.0]]
+    assert list(layer.features["label"]) == ["1", "2"]
+    assert [str(s) for s in layer.symbol] == ["diamond", "diamond"]
+    assert to_hex(layer.face_color[0]) == "#ffd400"
+    assert layer_affine(layer) == pytest.approx(layer_affine(viewer.layers["Reference landmarks"]))
+    assert widget._suggestions_check.isEnabled() and not widget._suggestions_check.isChecked()
+    widget._suggestions_check.setChecked(True)
+    assert layer.visible is True
+    layer.visible = False  # the layer's own eye is mirrored by the checkbox
+    assert widget._suggestions_check.isChecked() is False
+    widget._suggestions_check.setChecked(True)
+    # a stale check empties the layer and disables the checkbox
+    widget.pair_enabled_changed.emit(1, False)
+    assert len(layer.data) == 0
+    assert not widget._suggestions_check.isEnabled()
+    widget.pair_enabled_changed.emit(1, True)
+    assert len(layer.data) == 2
+
+
+def test_suggestions_layer_is_empty_without_a_check(ctrl, viewer, widget, labelled):
+    load(ctrl, labelled.path)
+    assert len(viewer.layers["Suggested landmarks"].data) == 0
+    assert not widget._suggestions_check.isEnabled()
+
+
+PREVIEW = {"mode": "preview", "level_factor": 4, "pixel_size_um": 2.0}
+
+
+def test_preview_result_store_is_placed_by_pixel_centre(result_template, tmp_path):
+    path = tmp_path / "SYN1_preview.zarr"
+    stores.build_result_store(path, materialization=PREVIEW)
+    viewer, host, widget, controller = make_env(tmp_path / "app_preview")
+    assert controller.load_store(path)
+    controller.flush_pending_updates()
+    p, factor = P_R, 4
+    crop = stores.RESULT_CROP
+    half = (factor - 1) / 2
+    expected = np.array(
+        [
+            [p * factor, 0, p * (crop["y0"] + half)],
+            [0, p * factor, p * (crop["x0"] + half)],
+            [0, 0, 1],
+        ]
+    )
+    for name in ("Reference | DAPI", "Registered moving | DAPI", "Registered moving | AF647"):
+        assert layer_affine(viewer.layers[name]) == pytest.approx(expected)
+    # the overlays stay diag(p) on full-frame px
+    for name in ("Reference landmarks", "Registered moving landmarks", "Landmark-fit positions"):
+        assert layer_affine(viewer.layers[name]) == pytest.approx(np.diag([p, p, 1.0]))
+    ref = viewer.layers["Reference landmarks"]
+    assert np.asarray(ref.data_to_world(ref.data[0])) == pytest.approx([150.0, 250.0])
+
+
+def test_result_store_without_materialization_keeps_todays_placement(result_loaded):
+    viewer = result_loaded.viewer
+    assert layer_affine(viewer.layers["Reference | DAPI"]) == pytest.approx(
+        np.array([[0.5, 0, 64], [0, 0.5, 32], [0, 0, 1]])
+    )
+
+
+def test_result_store_with_a_malformed_materialization_is_refused(tmp_path, host, ctrl):
+    path = tmp_path / "SYN1_bad.zarr"
+    stores.build_result_store(path, materialization={"mode": "preview", "level_factor": 0})
+    assert ctrl.load_store(path) is False
+    assert "materialization is missing or invalid" in host.statuses[-1]
+
+
+FIELD = {
+    "model": "robust_gp",
+    "loo_um": {"median": 34.5, "p90": 97.25, "max": 183.5},
+    "class_counts": {"check": 1, "likely_misclick": 2, "ok": 5},
+    "materialize": {"mode": "preview", "level_factor": 4, "pixel_size_um": 2.0},
+}
+
+
+def test_result_banner_has_a_field_line_for_field_runs():
+    result = stores.result_attr(landmarks=stores.default_result_landmarks())
+    assert len(result_banner(result).splitlines()) == 3
+    result["field"] = None
+    assert len(result_banner(result).splitlines()) == 3
+    result["field"] = FIELD
+    lines = result_banner(result).splitlines()
+    assert len(lines) == 4
+    assert lines[3] == (
+        "Field: robust GP · LOO median 34.50 µm (p90 97.25) · 1 to check, 2 likely misclicks · "
+        "preview 2.00 µm/px"
+    )
+    result["field"] = {"model": "robust_gp"}
+    assert result_banner(result).splitlines()[3] == (
+        "Field: robust GP · LOO median n/a µm (p90 n/a) · n/a to check, n/a likely misclicks · "
+        "n/a n/a µm/px"
+    )
+
+
+def test_result_store_shows_the_field_line(tmp_path):
+    path = tmp_path / "SYN1_field.zarr"
+    stores.build_result_store(path, materialization=PREVIEW, field=FIELD)
+    viewer, host, widget, controller = make_env(tmp_path / "app_field")
+    assert controller.load_store(path)
+    assert "Field: robust GP · LOO median 34.50 µm" in widget._result_banner.text()
+
+
+def _bright_tail_pyramid(seed: int = 3):
+    """Return (level0, coarse, true level-0 tissue values): dim tissue, sparse bright objects."""
+    import xarray as xr
+
+    rng = np.random.default_rng(seed)
+    size, block = 2048, 64
+    full = np.zeros((1, size, size), dtype=np.float32)
+    full[0, 256:-256, 256:-256] = rng.normal(100, 10, (size - 512, size - 512)).clip(1)
+    # Small bright objects (4 x 4 px): about 1.5 % of tissue pixels at 1500, 0.3 % at 5000.
+    for value, count in ((1500, 3300), (5000, 650)):
+        ys = rng.integers(260, size - 270, count)
+        xs = rng.integers(260, size - 270, count)
+        for dy in range(4):
+            for dx in range(4):
+                full[0, ys + dy, xs + dx] = value
+    coarse = full.reshape(1, size // block, block, size // block, block).mean(axis=(2, 4))
+    level0 = xr.DataArray(full, dims=("c", "y", "x"))
+    coarse_array = xr.DataArray(coarse, dims=("c", "y", "x"))
+    return level0, coarse_array, full[0][full[0] != 0]
+
+
+def test_tissue_tile_contrast_recovers_bright_tail_the_coarse_level_loses():
+    level0, coarse, tissue = _bright_tail_pyramid()
+    true_high = float(np.percentile(tissue, 99.9))
+    old_high = contrast_limits_from_level(coarse, 0)[1]
+    assert old_high < float(np.percentile(tissue, 99))
+    low, high = contrast_limits_from_tissue_tiles(level0, coarse, 0, n_tiles=48)
+    assert high == pytest.approx(true_high, rel=0.1)
+    assert 0 < low < high
+
+
+def test_tissue_tile_contrast_is_deterministic_and_seed_tolerant():
+    level0, coarse, _ = _bright_tail_pyramid()
+    first = contrast_limits_from_tissue_tiles(level0, coarse, 0, n_tiles=48)
+    assert contrast_limits_from_tissue_tiles(level0, coarse, 0, n_tiles=48) == first
+    other = contrast_limits_from_tissue_tiles(level0, coarse, 0, n_tiles=48, seed=5)
+    assert other[1] == pytest.approx(first[1], rel=0.1)
+    assert other[0] == pytest.approx(first[0], rel=0.1)
+
+
+def test_tissue_tile_contrast_ignores_padding_and_empty_channels():
+    import xarray as xr
+
+    zeros = xr.DataArray(np.zeros((1, 600, 600), dtype=np.uint16), dims=("c", "y", "x"))
+    coarse = xr.DataArray(np.zeros((1, 30, 30), dtype=np.uint16), dims=("c", "y", "x"))
+    assert contrast_limits_from_tissue_tiles(zeros, coarse, 0) == (0.0, 1.0)
+    # Coarse level claims tissue, but the level-0 tiles are all padding.
+    coarse_tissue = xr.DataArray(np.ones((1, 30, 30), dtype=np.uint16), dims=("c", "y", "x"))
+    assert contrast_limits_from_tissue_tiles(zeros, coarse_tissue, 0) == (0.0, 1.0)
+    constant = xr.DataArray(np.full((1, 600, 600), 9, dtype=np.uint16), dims=("c", "y", "x"))
+    assert contrast_limits_from_tissue_tiles(constant, coarse_tissue, 0) == (9.0, 10.0)
+
+
+def test_tissue_tile_contrast_stops_when_cancelled_between_tiles():
+    level0, coarse, _ = _bright_tail_pyramid()
+    calls = []
+
+    def cancel_check() -> bool:
+        calls.append(1)
+        return len(calls) > 2
+
+    with pytest.raises(RegistrationLoadCancelled):
+        contrast_limits_from_tissue_tiles(level0, coarse, 0, cancel_check=cancel_check)
+    assert len(calls) == 3
+
+
+def test_tissue_tile_contrast_falls_back_to_coarse_level_when_level0_read_fails(caplog):
+    _, coarse, _ = _bright_tail_pyramid()
+
+    class Broken:
+        shape = (2048, 2048)
+        data = property(lambda self: (_ for _ in ()).throw(OSError("chunk missing")))
+
+    level0 = SimpleNamespace(isel=lambda c: Broken())
+    with caplog.at_level("WARNING"):
+        limits = contrast_limits_from_tissue_tiles(level0, coarse, 0)
+    assert limits == contrast_limits_from_level(coarse, 0)
+    assert "chunk missing" in caplog.text
+
+
+class _LoggedPlane:
+    """A 2-D plane whose ``.data`` records every level-0 slice read from it."""
+
+    def __init__(self, array: np.ndarray, reads: list) -> None:
+        self.shape = array.shape
+        self._array = array
+        self._reads = reads
+
+    @property
+    def data(self):
+        return self
+
+    def __getitem__(self, key):
+        self._reads.append(key)
+        return self._array[key]
+
+
+def test_tissue_tiles_are_placed_on_off_origin_tissue_of_a_non_square_image():
+    import xarray as xr
+
+    height, width, block = 1024, 3072, 32
+    full = np.zeros((1, height, width), dtype=np.uint16)
+    # Tissue only in the bottom-right box, carrying a value found nowhere else.
+    box_y, box_x = slice(640, 1024), slice(2048, 3072)
+    full[0, box_y, box_x] = 777
+    coarse = full.reshape(1, height // block, block, width // block, block).mean(axis=(2, 4))
+    coarse_array = xr.DataArray(coarse, dims=("c", "y", "x"))
+    reads: list = []
+    plane = _LoggedPlane(full[0], reads)
+    level0 = SimpleNamespace(isel=lambda c: plane)
+
+    low, high = contrast_limits_from_tissue_tiles(level0, coarse_array, 0, n_tiles=16)
+
+    assert (low, high) == (777.0, 778.0)
+    assert len(reads) == 16
+    for rows, cols in reads:
+        # Every tile lies inside the image and reaches the tissue box on both axes.
+        assert 0 <= rows.start < rows.stop <= height and 0 <= cols.start < cols.stop <= width
+        assert rows.stop > box_y.start and cols.stop > box_x.start
+        assert full[0, rows, cols].any()
+
+
+def test_tissue_tile_contrast_reads_in_batches_and_polls_between_them():
+    level0, coarse, _ = _bright_tail_pyramid()
+    calls = []
+
+    def cancel_check() -> bool:
+        calls.append(1)
+        return False
+
+    contrast_limits_from_tissue_tiles(level0, coarse, 0, n_tiles=24, cancel_check=cancel_check)
+    assert len(calls) == 3  # 24 tiles in batches of CONTRAST_TILE_BATCH (8)
+
+
+def test_tissue_tiles_never_straddle_a_stored_chunk_boundary():
+    import xarray as xr
+
+    size, chunk, block = 1024, 256, 32
+    full = np.full((1, size, size), 500, dtype=np.uint16)
+    coarse = full.reshape(1, size // block, block, size // block, block).mean(axis=(2, 4))
+    coarse_array = xr.DataArray(coarse, dims=("c", "y", "x"))
+    reads: list = []
+    plane = _LoggedPlane(full[0], reads)
+    plane.chunks = ((chunk,) * (size // chunk), (chunk,) * (size // chunk))
+    level0 = SimpleNamespace(isel=lambda c: plane)
+
+    contrast_limits_from_tissue_tiles(level0, coarse_array, 0, n_tiles=32, tile_px=128)
+
+    assert len(reads) == 32
+    for rows, cols in reads:
+        assert rows.start // chunk == (rows.stop - 1) // chunk
+        assert cols.start // chunk == (cols.stop - 1) // chunk
+
+
+def test_tissue_tiles_read_at_most_the_chunk_cap_of_distinct_chunks():
+    import xarray as xr
+
+    from napari_compare_xenium_merscope.manual_registration_controller import (
+        CONTRAST_MAX_CHUNKS,
+    )
+
+    size, chunk, block = 2048, 256, 32
+    rng = np.random.default_rng(1)
+    full = rng.integers(50, 400, (1, size, size)).astype(np.uint16)
+    coarse = full.reshape(1, size // block, block, size // block, block).mean(axis=(2, 4))
+    coarse_array = xr.DataArray(coarse, dims=("c", "y", "x"))
+    reads: list = []
+    plane = _LoggedPlane(full[0], reads)
+    plane.chunks = ((chunk,) * (size // chunk), (chunk,) * (size // chunk))
+    level0 = SimpleNamespace(isel=lambda c: plane)
+
+    contrast_limits_from_tissue_tiles(level0, coarse_array, 0, n_tiles=32, tile_px=128)
+
+    assert len(reads) == 32
+    touched = {(rows.start // chunk, cols.start // chunk) for rows, cols in reads}
+    assert 1 < len(touched) <= CONTRAST_MAX_CHUNKS
+    per_chunk = [
+        sum(1 for rows, cols in reads if (rows.start // chunk, cols.start // chunk) == key)
+        for key in touched
+    ]
+    assert max(per_chunk) - min(per_chunk) <= 1
+
+
+def test_tissue_tiles_prefer_the_chunks_with_the_most_tissue():
+    import xarray as xr
+
+    size, chunk, block = 2048, 256, 32
+    full = np.zeros((1, size, size), dtype=np.uint16)
+    # Eight fully covered chunks plus one lightly covered chunk elsewhere.
+    for index in range(8):
+        full[0, 0:chunk, index * chunk : (index + 1) * chunk] = 500
+    full[0, 1024 : 1024 + 64, 1024 : 1024 + 64] = 500
+    coarse = full.reshape(1, size // block, block, size // block, block).mean(axis=(2, 4))
+    coarse_array = xr.DataArray(coarse, dims=("c", "y", "x"))
+    reads: list = []
+    plane = _LoggedPlane(full[0], reads)
+    plane.chunks = ((chunk,) * (size // chunk), (chunk,) * (size // chunk))
+    level0 = SimpleNamespace(isel=lambda c: plane)
+
+    contrast_limits_from_tissue_tiles(level0, coarse_array, 0, n_tiles=32, tile_px=128)
+
+    assert {(rows.start // chunk, cols.start // chunk) for rows, cols in reads} == {
+        (0, col) for col in range(8)
+    }
+
+
+def test_tissue_tiles_without_chunks_are_treated_as_one_chunk():
+    import xarray as xr
+
+    full = np.full((1, 1024, 1024), 300, dtype=np.uint16)
+    coarse_array = xr.DataArray(np.full((1, 32, 32), 300.0), dims=("c", "y", "x"))
+    level0 = xr.DataArray(full, dims=("c", "y", "x"))
+    assert contrast_limits_from_tissue_tiles(level0, coarse_array, 0, n_tiles=8, tile_px=128) == (
+        300.0,
+        301.0,
+    )

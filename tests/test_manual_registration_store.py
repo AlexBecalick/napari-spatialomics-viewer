@@ -29,6 +29,8 @@ from napari_compare_xenium_merscope.manual_registration_store import (
     clear_local_draft,
     draft_path,
     history_dir,
+    read_check_attr,
+    read_check_file,
     read_local_draft,
     read_root_attrs,
     read_store_descriptor,
@@ -109,6 +111,36 @@ def test_read_root_attrs_v3_consolidated(tmp_path):
     assert STORE_ATTR in attrs and attrs["merxen_schema"] == {"v": 1}
     assert attrs["spatialdata_attrs"] == {"version": "0.2"}
     assert read_store_descriptor(p).kind == "prepared"
+
+
+def test_read_check_attr_returns_the_attribute_or_none(tmp_path):
+    p = make_store(tmp_path)
+    assert read_check_attr(p) is None
+    root = zarr.open_group(str(p), mode="a")
+    root.attrs["merxen_manual_registration_check"] = {"schema": "x", "pairs": {"1": {}}}
+    assert read_check_attr(p) == {"schema": "x", "pairs": {"1": {}}}
+    root.attrs["merxen_manual_registration_check"] = "junk"
+    assert read_check_attr(p) is None
+
+
+def test_read_check_file_reads_a_json_object(tmp_path):
+    good = tmp_path / "SYN1_cortex_serial_check.json"
+    good.write_text('{"schema":"x"}\n', encoding="utf-8")
+    assert read_check_file(good) == {"schema": "x"}
+    listing = tmp_path / "list.json"
+    listing.write_text("[1]", encoding="utf-8")
+    with pytest.raises(ValueError, match="does not hold a JSON object"):
+        read_check_file(listing)
+    bad = tmp_path / "bad.json"
+    bad.write_text("{nope", encoding="utf-8")
+    with pytest.raises(ValueError):
+        read_check_file(bad)
+    binary = tmp_path / "binary.json"
+    binary.write_bytes(b"\xff\xfe\x00\x80")
+    with pytest.raises(ValueError, match="not a text file"):
+        read_check_file(binary)
+    with pytest.raises(OSError):
+        read_check_file(tmp_path / "missing.json")
 
 
 def test_read_root_attrs_v2(tmp_path):
