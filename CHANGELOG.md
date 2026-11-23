@@ -14,6 +14,8 @@ are that section.
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-11-23
+
 ### Fixed
 
 - **Atera cell inspector on ProSeg and MOSAIK cells.** Clicking a cell of a segmentation other than the original Atera cells now reads that cell's own transcripts, from the segmentation's assignment column (for example `assignment` for MOSAIK). Before, the click read `original_assignment` with the ProSeg cell's id, which names a different original cell elsewhere in the tissue, so the transcript links shot off to that cell and the counts came from the original cells' table. The read matches the segmentation's count table: it looks 50 um beyond the cell's outline for tiles (ProSeg assigns transcripts outside its polygon, up to about 33 um on a real store, so cells near a tile edge were undercounted), and it drops the rows the segmentation flags as background. ProSeg cells show their control total from the count table's per-cell control columns. A segmentation without per-transcript ids (in-mask counts) shows no counts and says so, rather than wrong links.
@@ -194,7 +196,8 @@ SpatialData datasets.
 - Launch without a dataset and select data through the Dataset loader.
 - Native desktop packages for macOS, Windows, and Linux.
 
-[Unreleased]: https://github.com/AlexBecalick/napari-spatialomics-viewer/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/AlexBecalick/napari-spatialomics-viewer/compare/v0.5.3...HEAD
+[0.5.3]: https://github.com/AlexBecalick/napari-spatialomics-viewer/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/AlexBecalick/napari-spatialomics-viewer/compare/v0.3.0...v0.5.2
 [0.3.0]: https://github.com/AlexBecalick/napari-spatialomics-viewer/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/AlexBecalick/napari-spatialomics-viewer/compare/v0.1.0...v0.2.0
