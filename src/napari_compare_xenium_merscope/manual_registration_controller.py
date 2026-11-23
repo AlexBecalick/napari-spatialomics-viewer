@@ -49,6 +49,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
+import dask
 import numpy as np
 import pandas as pd
 from napari.layers import Image, Points, Shapes
@@ -57,8 +58,13 @@ from napari.utils.key_bindings import KeyBinding
 from qtpy.QtCore import QCoreApplication, QTimer
 
 from .manual_registration_model import (
+    CHECK_ATTR,
     LAYER_METADATA_KEY,
+    NO_CHECK_TEXT,
     ROLES,
+    STORE_ATTR,
+    CheckAttrError,
+    CheckResult,
     CoarseState,
     CropRect,
     LabellingMismatch,
@@ -69,6 +75,8 @@ from .manual_registration_model import (
     ResidualRow,
     StoreDescriptor,
     UnsupportedSchemaVersion,
+    apply_check_to_rows,
+    check_currentness,
     coarse_from_matrix,
     coarse_matrix_xy,
     evaluate_landmarks,
@@ -78,6 +86,7 @@ from .manual_registration_model import (
     labelling_to_attrs,
     napari_affine_rc,
     pair_colour,
+    parse_check_attr,
     parse_store_descriptor,
     points_outside_crop,
     utc_now,
@@ -86,6 +95,7 @@ from .manual_registration_store import (
     StoreBusyError,
     StoreChangedError,
     clear_local_draft,
+    read_check_file,
     read_local_draft,
     read_root_attrs,
     read_store_descriptor,
@@ -115,8 +125,12 @@ DISABLED_PAIR_COLOUR = "#9e9e9e"
 REFERENCE_COLORMAP = "green"
 MOVING_COLORMAP = "magenta"
 OTHER_CHANNEL_COLORMAP = "gray"
-CONTRAST_PERCENTILES = (0.5, 99.5)
+CONTRAST_PERCENTILES = (1.0, 99.9)
 CONTRAST_MAX_PIXELS = 4_000_000
+CONTRAST_TILES = 32
+CONTRAST_TILE_PX = 512
+CONTRAST_TILE_BATCH = 8
+CONTRAST_MAX_CHUNKS = 8
 PREVIEW_MIN_ENABLED = 3
 UNDO_LIMIT = 500
 SESSION_KEYS = (
@@ -149,6 +163,8 @@ _OVERLAY_LAYERS = {
     "registered_landmarks": "Registered moving landmarks",
     "landmark_fit_positions": "Landmark-fit positions",
 }
+SUGGESTIONS_LAYER = "Suggested landmarks"
+SUGGESTION_COLOUR = "#ffd400"
 
 
 class RegistrationLoadCancelled(Exception):
@@ -190,6 +206,151 @@ def contrast_limits_from_level(
     if nonzero.size == 0:
         return (0.0, 1.0)
     low, high = (float(v) for v in np.percentile(nonzero, percentiles))
+    if not high > low:
+        high = low + 1.0
+    return (low, high)
+
+
+def _snap_tile_start(centre: float, edge: int, bounds: np.ndarray, size: int) -> int:
+    """Return the tile start nearest ``centre`` that keeps the tile inside one stored chunk.
+
+    A chunk smaller than ``edge`` cannot hold the tile; the start is then only clamped to the
+    image.
+    """
+    index = int(np.clip(np.searchsorted(bounds, centre, side="right") - 1, 0, len(bounds) - 2))
+    lower, upper = int(bounds[index]), int(bounds[index + 1])
+    if upper - lower < edge:
+        return int(min(max(centre - edge / 2, 0), size - edge))
+    return int(min(max(centre - edge / 2, lower), upper - edge))
+
+
+def contrast_limits_from_tissue_tiles(
+    level0_cyx: Any,
+    coarse_cyx: Any,
+    channel_index: int,
+    *,
+    percentiles: tuple[float, float] = CONTRAST_PERCENTILES,
+    n_tiles: int = CONTRAST_TILES,
+    tile_px: int = CONTRAST_TILE_PX,
+    seed: int = 0,
+    cancel_check: Callable[[], bool] | None = None,
+) -> tuple[float, float]:
+    """Return display contrast limits of one channel from full-resolution tissue tiles.
+
+    A coarse pyramid level averages blocks of tens of thousands of pixels, which removes the
+    bright tail and makes the default contrast saturate sparse bright structures. The limits
+    here are instead the ``percentiles`` of the non-zero pixels of up to ``n_tiles`` tiles of
+    ``tile_px`` squared read at full resolution. Tile centres are drawn (deterministically, from
+    ``seed``) among the non-zero pixels of the coarse level, so they lie on tissue (zero is
+    padding or background). Reading a tile decompresses a whole stored chunk (about 32 MB on
+    the prepared stores), so the tiles are confined to at most ``CONTRAST_MAX_CHUNKS`` level-0
+    chunks: the chunks holding the most coarse-level tissue pixels (ties broken by the seeded
+    generator), with about ``n_tiles`` divided evenly among them (fewer where a chunk has too
+    few tissue pixels to place its share). Each tile is snapped inside its chunk. Arrays
+    without chunks count as one chunk. Tiles are read in batches of ``CONTRAST_TILE_BATCH``
+    (one dask compute per batch).
+
+    Falls back to ``contrast_limits_from_level`` on the coarse level when level 0 cannot be read.
+
+    Args:
+        level0_cyx: The finest ``(c, y, x)`` DataArray level.
+        coarse_cyx: A coarse ``(c, y, x)`` DataArray level of the same image.
+        channel_index: Index of the channel.
+        percentiles: Lower and upper percentile.
+        n_tiles: Maximum number of tiles.
+        tile_px: Tile edge in level-0 pixels.
+        seed: Seed of the tile-centre draw.
+        cancel_check: Polled between tile batches; a true value raises ``RegistrationLoadCancelled``.
+
+    Returns:
+        ``(low, high)`` with ``high > low``; ``(0.0, 1.0)`` when no tile pixel is non-zero.
+
+    Raises:
+        RegistrationLoadCancelled: If ``cancel_check`` became true.
+    """
+
+    def check() -> None:
+        if cancel_check is not None and cancel_check():
+            raise RegistrationLoadCancelled()
+
+    try:
+        coarse_plane = coarse_cyx.isel(c=channel_index)
+        coarse_height, coarse_width = (int(v) for v in coarse_plane.shape)
+        step = max(1, math.ceil(math.sqrt(coarse_height * coarse_width / CONTRAST_MAX_PIXELS)))
+        sampled = np.asarray(coarse_plane.data[::step, ::step])
+        tissue = np.argwhere(np.isfinite(sampled) & (sampled != 0))
+        if tissue.size == 0:
+            return (0.0, 1.0)
+        plane0 = level0_cyx.isel(c=channel_index)
+        height0, width0 = (int(v) for v in plane0.shape)
+        rng = np.random.default_rng(seed)
+        edge = min(tile_px, height0, width0)
+        # Snap each tile inside one stored chunk: a tile straddling a chunk boundary would
+        # decompress up to four chunks (tens of MB each) instead of one.
+        chunks = getattr(plane0.data, "chunks", None) or ((height0,), (width0,))
+        row_bounds = np.cumsum((0, *(int(v) for v in chunks[0])))
+        col_bounds = np.cumsum((0, *(int(v) for v in chunks[1])))
+        # Centre of each sampled coarse pixel, scaled to level 0.
+        centres_y = (tissue[:, 0] * step + step / 2) * height0 / coarse_height
+        centres_x = (tissue[:, 1] * step + step / 2) * width0 / coarse_width
+        chunk_rows = np.clip(np.searchsorted(row_bounds, centres_y, side="right") - 1, 0, None)
+        chunk_cols = np.clip(np.searchsorted(col_bounds, centres_x, side="right") - 1, 0, None)
+        chunk_rows = np.minimum(chunk_rows, len(row_bounds) - 2)
+        chunk_cols = np.minimum(chunk_cols, len(col_bounds) - 2)
+        chunk_ids = chunk_rows * (len(col_bounds) - 1) + chunk_cols
+        unique_ids, counts = np.unique(chunk_ids, return_counts=True)
+        # Most tissue first; the random key only orders chunks with equal counts. A stored
+        # chunk is decompressed whole, so spreading the tiles over many chunks costs far more
+        # than it adds in representativeness.
+        order = np.lexsort((rng.random(len(unique_ids)), -counts))[:CONTRAST_MAX_CHUNKS]
+        members = [rng.permutation(np.flatnonzero(chunk_ids == unique_ids[i])) for i in order]
+        quota = [0] * len(members)
+        wanted = min(n_tiles, sum(len(m) for m in members))
+        # Round-robin keeps the shares within one tile of each other and moves the share of a
+        # chunk that has too few tissue pixels to the others.
+        while wanted > 0:
+            progressed = False
+            for i, pool in enumerate(members):
+                if wanted > 0 and quota[i] < len(pool):
+                    quota[i] += 1
+                    wanted -= 1
+                    progressed = True
+            if not progressed:
+                break
+        boxes: list[tuple[int, int]] = []
+        for pool, share in zip(members, quota, strict=True):
+            for index in pool[:share]:
+                y0 = _snap_tile_start(centres_y[index], edge, row_bounds, height0)
+                x0 = _snap_tile_start(centres_x[index], edge, col_bounds, width0)
+                boxes.append((y0, x0))
+        pooled: list[np.ndarray] = []
+        # Each tile read decompresses at least one whole stored chunk (tens of MB on real
+        # stores). One compute per batch lets dask read a chunk shared by several tiles once
+        # and decompress on several threads; cancellation is polled between batches.
+        for start in range(0, len(boxes), CONTRAST_TILE_BATCH):
+            check()
+            batch = boxes[start : start + CONTRAST_TILE_BATCH]
+            lazy_tiles = [plane0.data[y0 : y0 + edge, x0 : x0 + edge] for y0, x0 in batch]
+            for tile_array in dask.compute(*lazy_tiles):
+                tile = np.asarray(tile_array).ravel()
+                if tile.dtype.kind == "f":
+                    tile = tile[np.isfinite(tile)]
+                tile = tile[tile != 0]
+                if tile.size:
+                    pooled.append(tile)
+    except RegistrationLoadCancelled:
+        raise
+    except Exception as exc:  # noqa: BLE001 - any store/dask read failure has the same fallback
+        log.warning(
+            "Full-resolution contrast read failed (%s: %s); using the coarsest level.",
+            type(exc).__name__,
+            exc,
+        )
+        return contrast_limits_from_level(coarse_cyx, channel_index)
+    if not pooled:
+        return (0.0, 1.0)
+    values = np.concatenate(pooled)
+    low, high = (float(v) for v in np.percentile(values, percentiles))
     if not high > low:
         high = low + 1.0
     return (low, high)
@@ -347,7 +508,7 @@ def _fmt2(value: Any) -> str:
 
 
 def result_banner(result: dict[str, Any]) -> str:
-    """Return the three-line summary shown above the result table."""
+    """Return the summary shown above the result table (a fourth line for field runs)."""
 
     def text(value: Any) -> str:
         return "n/a" if value is None or value == "" else str(value)
@@ -359,6 +520,26 @@ def result_banner(result: dict[str, Any]) -> str:
 
     label = result.get("run_label")
     pearson = (result.get("tissue_qc") or {}).get("pearson") or {}
+    field_line = ""
+    field_block = result.get("field")
+    if isinstance(field_block, dict):
+        loo = field_block.get("loo_um") if isinstance(field_block.get("loo_um"), dict) else {}
+        counts = (
+            field_block.get("class_counts")
+            if isinstance(field_block.get("class_counts"), dict)
+            else {}
+        )
+        materialize = (
+            field_block.get("materialize")
+            if isinstance(field_block.get("materialize"), dict)
+            else {}
+        )
+        field_line = (
+            f"\nField: robust GP · LOO median {_fmt2(loo.get('median'))} µm "
+            f"(p90 {_fmt2(loo.get('p90'))}) · {text(counts.get('check'))} to check, "
+            f"{text(counts.get('likely_misclick'))} likely misclicks · "
+            f"{text(materialize.get('mode'))} {_fmt2(materialize.get('pixel_size_um'))} µm/px"
+        )
     return (
         f"{text(result.get('run_id'))} · preset {text(result.get('preset'))}"
         f"{f' ({label})' if label else ''}\n"
@@ -367,6 +548,7 @@ def result_banner(result: dict[str, Any]) -> str:
         f"Tissue Pearson: coarse {_fmt2(pearson.get('coarse'))} → "
         f"landmark {_fmt2(pearson.get('landmark'))} → affine {_fmt2(pearson.get('affine'))} "
         f"→ final {_fmt2(pearson.get('final'))}"
+        f"{field_line}"
     )
 
 
@@ -554,6 +736,10 @@ class ManualRegistrationController:
         self._load_generation = 0
         self._load_cancel = threading.Event()
         self._saving = False
+        self._check_raw: dict[str, Any] | None = None  # the store attribute, verbatim
+        self._check: CheckResult | None = None  # parsed; from the store or a loaded file
+        self._check_note = ""  # why a check could not be read (never fatal)
+        self._check_busy = False
         self._affine_timer: Any = None
         self._draft_timer: Any = None
 
@@ -626,6 +812,9 @@ class ManualRegistrationController:
             (widget.save_requested, self._on_save_requested),
             (widget.finish_requested, self._on_finish_requested),
             (widget.overlay_changed, self._on_overlay_changed),
+            (widget.check_file_chosen, self._on_check_file_chosen),
+            (widget.refresh_check_requested, self._on_refresh_check_requested),
+            (widget.suggestions_visible_changed, self._on_suggestions_visible_changed),
         )
         for signal, slot in wiring:
             signal.connect(slot)
@@ -737,7 +926,9 @@ class ManualRegistrationController:
                     f"Image {key!r} has {n_channels} channels but the store lists {names}."
                 )
             for index, channel in enumerate(names):
-                contrast[(role, channel)] = contrast_limits_from_level(levels[role][-1], index)
+                contrast[(role, channel)] = contrast_limits_from_tissue_tiles(
+                    levels[role][0], levels[role][-1], index, cancel_check=cancel_check
+                )
                 check()
         if descriptor.kind == "result":
             if descriptor.result is None:
@@ -843,6 +1034,7 @@ class ManualRegistrationController:
         self._crop_restore_mode = None
         self._display_mode = "both"
         self._live_fit = None
+        self._reset_check(descriptor)
         self._viewer.grid.enabled = False
         if session.kind == "prepared":
             assert session.state is not None
@@ -885,6 +1077,8 @@ class ManualRegistrationController:
             text = f"{run_id}: reference and registered moving image. F flicks; the table lists residuals."
         if session.notes:
             text += " " + " ".join(session.notes)
+        if self._check_note:
+            text += " " + self._check_note
         host.set_status(text)
 
     @staticmethod
@@ -1102,6 +1296,11 @@ class ManualRegistrationController:
             ),
             "reference",
         )
+        suggestions = self._new_points_layer(
+            SUGGESTIONS_LAYER, "reference", "overlay", reference_affine
+        )
+        suggestions.visible = False
+        self._add_controller_layer(suggestions, "reference")
 
     def _build_result_overlays(self, session: RegistrationSession) -> None:
         p_r = session.descriptor.images["reference"].pixel_size_um
@@ -1327,6 +1526,8 @@ class ManualRegistrationController:
             if self._session is not None and self._session.kind == "result":
                 if layer.name in _OVERLAY_LAYERS.values():
                     layer.events.visible.connect(self._on_overlay_layer_visible)
+            elif layer.name == SUGGESTIONS_LAYER:
+                layer.events.visible.connect(self._on_overlay_layer_visible)
 
     def _keep_markers_inactive(self, event: Any = None) -> None:
         if self._active_guard or self._session is None:
@@ -1589,9 +1790,16 @@ class ManualRegistrationController:
             return
         state = session.state
         fit = self._live_fit
+        is_current, status_text = self._check_status()
         if fit is not None:
-            widget.set_rows(fit.rows)
+            if is_current and self._check is not None:
+                widget.set_rows(apply_check_to_rows(fit.rows, self._check), check_mode=True)
+            else:
+                widget.set_rows(fit.rows, check_mode=False)
             widget.set_fit_summary(fit.summary)
+        widget.set_check_status(status_text, is_current=is_current)
+        widget.set_check_busy(self._check_busy)
+        self._sync_suggestions(is_current)
         n_enabled = len(state.enabled_pairs())
         widget.set_preview_available(n_enabled >= PREVIEW_MIN_ENABLED)
         for role in ROLES:
@@ -1625,6 +1833,8 @@ class ManualRegistrationController:
             return
         assert session.state is not None
         widget.set_session("prepared", session.descriptor.dataset_name)
+        if self._check is None or not self._check.path:
+            widget.set_check_dialog_dir(str(session.path.parent))
         widget.set_busy(self._saving)
         widget.set_coarse(session.state.coarse)
         widget.set_coarse_enabled(not self._preview)
@@ -2160,12 +2370,211 @@ class ManualRegistrationController:
         layer = getattr(event, "source", None)
         if layer is None or self._widget is None:
             return
+        if layer.name == SUGGESTIONS_LAYER:
+            try:
+                self._widget.set_suggestions(
+                    bool(self._suggestions_available()), bool(layer.visible)
+                )
+            except Exception:  # noqa: BLE001
+                log.exception("manual registration: could not mirror suggestions visibility")
+            return
         for key, name in _OVERLAY_LAYERS.items():
             if layer.name == name:
                 try:
                     self._widget.set_overlay_visibility(key, bool(layer.visible))
                 except Exception:  # noqa: BLE001
                     log.exception("manual registration: could not mirror overlay visibility")
+
+    # ------------------------------------------------------------------ MerXen landmark check
+
+    def _reset_check(self, descriptor: StoreDescriptor) -> None:
+        """Start a session with the check of the store attribute (parsed lazily)."""
+        self._check_raw = descriptor.check
+        self._check = None
+        self._check_note = ""
+        self._check_busy = False
+        self._apply_check_state()
+
+    def _apply_check_state(self) -> None:
+        """Parse the store attribute into the session's check (never fatal)."""
+        self._check = None
+        self._check_note = ""
+        if self._check_raw is None:
+            return
+        try:
+            self._check = parse_check_attr(self._check_raw, source="store")
+        except UnsupportedSchemaVersion:
+            self._check_note = (
+                "The landmark check was written by a newer MerXen; update this viewer to read it."
+            )
+        except CheckAttrError as exc:
+            self._check_note = f"the landmark check could not be read: {exc}"
+
+    def _check_status(self) -> tuple[bool, str]:
+        """Return whether the check is current, and the text for the check status label."""
+        session = self._session
+        note = f"{self._check_note}\n" if self._check_note else ""
+        if session is None or session.state is None:
+            return False, note.strip()
+        check = self._check
+        if check is None:
+            return False, note + NO_CHECK_TEXT
+        is_current, reason = check_currentness(
+            check,
+            content_sha256=self._content_sha(),
+            store_content_digest=session.descriptor.store_attr.get("content_digest"),
+        )
+        if not is_current:
+            return False, note + reason
+        loo = f"{check.loo_median_um:.0f}"
+        clicks_only = (
+            "n/a"
+            if check.loo_clicks_only_median_um is None
+            else f"{check.loo_clicks_only_median_um:.0f}"
+        )
+        counts = check.class_counts
+        source = Path(check.path).name if check.path else "store"
+        return True, (
+            note
+            + f"Robust check ({source}, {check.written_at}, {check.preset}): LOO median {loo} µm "
+            f"(clicks only {clicks_only} µm), p90 {check.loo_p90_um:.0f} µm; "
+            f"{counts.get('check', 0)} to check, {counts.get('likely_misclick', 0)} likely "
+            f"misclicks; {check.n_windows} tissue windows."
+        )
+
+    def _suggestions_available(self) -> bool:
+        return bool(self._check is not None and self._check.suggestions and self._check_current())
+
+    def _check_current(self) -> bool:
+        session = self._session
+        if self._check is None or session is None or session.state is None:
+            return False
+        return check_currentness(
+            self._check,
+            content_sha256=self._content_sha(),
+            store_content_digest=session.descriptor.store_attr.get("content_digest"),
+        )[0]
+
+    def _sync_suggestions(self, is_current: bool) -> None:
+        """Fill the hidden-by-default suggestions layer from the current check (else empty)."""
+        layer = self._layers.get(SUGGESTIONS_LAYER)
+        if layer is None:
+            return
+        items = self._check.suggestions if (is_current and self._check is not None) else ()
+        coords = [(float(i["reference_xy_px"][1]), float(i["reference_xy_px"][0])) for i in items]
+        n = len(coords)
+        self._assign_points(
+            layer,
+            coords,
+            ["diamond"] * n,
+            [SUGGESTION_COLOUR] * n,
+            [str(i["rank"]) for i in items],
+            [0.8] * n,
+            [0.0] * n,
+        )
+        if self._widget is not None:
+            self._widget.set_suggestions(n > 0, bool(layer.visible))
+
+    @_slot()
+    def _on_suggestions_visible_changed(self, visible: bool) -> None:
+        layer = self._layers.get(SUGGESTIONS_LAYER)
+        if layer is not None:
+            layer.visible = bool(visible)
+
+    def _begin_check_job(self) -> bool:
+        if self._check_busy:
+            return False
+        self._check_busy = True
+        if self._widget is not None:
+            self._widget.set_check_busy(True)
+        return True
+
+    def _end_check_job(self) -> None:
+        self._check_busy = False
+        if self._widget is not None:
+            self._widget.set_check_busy(False)
+
+    @_slot(prepared=True)
+    def _on_check_file_chosen(self, path: str) -> None:
+        if not self._begin_check_job():
+            return
+        serial = self._session_serial
+        file_path = Path(path)
+        self._host.run_worker(
+            lambda: parse_check_attr(
+                read_check_file(file_path), source="file", path=str(file_path)
+            ),
+            lambda check: self._on_check_file_read(serial, file_path, check),
+            lambda exc: self._on_check_read_error(serial, exc),
+            key="registration_check",
+        )
+
+    def _on_check_file_read(self, serial: int, path: Path, check: CheckResult) -> None:
+        if not self._session_is_current(serial):
+            return
+        self._end_check_job()
+        # A stale file stays the source: the status says why, and Refresh picks up a newer file.
+        self._check = check
+        self._check_note = ""
+        if self._widget is not None:
+            self._widget.set_check_dialog_dir(str(path.parent))
+        self._push_widget_rows()
+
+    @_slot(prepared=True)
+    def _on_refresh_check_requested(self) -> None:
+        session = self._session
+        assert session is not None
+        if not self._begin_check_job():
+            return
+        serial = self._session_serial
+        check = self._check
+        if check is not None and check.source == "file" and check.path:
+            file_path = Path(check.path)
+            self._host.run_worker(
+                lambda: parse_check_attr(
+                    read_check_file(file_path), source="file", path=str(file_path)
+                ),
+                lambda new_check: self._on_check_file_read(serial, file_path, new_check),
+                lambda exc: self._on_check_read_error(serial, exc),
+                key="registration_check",
+            )
+            return
+        store_path = session.path
+        self._host.run_worker(
+            lambda: read_root_attrs(store_path),
+            lambda attrs: self._on_store_check_read(serial, attrs),
+            lambda exc: self._on_check_read_error(serial, exc),
+            key="registration_check",
+        )
+
+    def _on_store_check_read(self, serial: int, attrs: dict[str, Any]) -> None:
+        session = self._session
+        if not self._session_is_current(serial) or session is None:
+            return
+        self._end_check_job()
+        # Only the check and the store attribute change; the labelling is never touched.
+        raw = attrs.get(CHECK_ATTR)
+        store_attr = attrs.get(STORE_ATTR)
+        session.descriptor = dataclasses.replace(
+            session.descriptor,
+            check=dict(raw) if isinstance(raw, dict) else None,
+            store_attr=dict(store_attr) if isinstance(store_attr, dict) else {},
+        )
+        self._check_raw = session.descriptor.check
+        self._apply_check_state()
+        self._push_widget_rows()
+
+    def _on_check_read_error(self, serial: int, exc: BaseException) -> None:
+        if not self._session_is_current(serial):
+            return
+        self._end_check_job()
+        if isinstance(exc, UnsupportedSchemaVersion):
+            self._check_note = (
+                "The landmark check was written by a newer MerXen; update this viewer to read it."
+            )
+        else:
+            self._check_note = f"the landmark check could not be read: {exc}"
+        self._push_widget_rows()
 
     # ------------------------------------------------------------------ saving
 
@@ -2391,6 +2800,11 @@ class ManualRegistrationController:
         """Cancel a running load; its late callbacks are ignored (saves are not cancelled)."""
         self._load_cancel.set()
         self._load_generation += 1
+        # A cancelled check worker never calls back, so its busy state is cleared here; a late
+        # callback of a surviving session cannot arrive (the host drops the cancelled task).
+        self._check_busy = False
+        if self._widget is not None:
+            self._widget.set_check_busy(False)
 
     def deactivate(self) -> None:
         """End the session (idempotent): flush the draft, remove layers, restore keys."""
@@ -2455,6 +2869,10 @@ class ManualRegistrationController:
         self._live_fit = None
         self._display_mode = "both"
         self._saving = False
+        self._check_raw = None
+        self._check = None
+        self._check_note = ""
+        self._check_busy = False
         if self._widget is not None:
             self._widget.set_busy(False)
             self._widget.set_session(None, "")

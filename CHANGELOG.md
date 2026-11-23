@@ -14,6 +14,27 @@ are that section.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-23
+
+### Highlights
+
+- **Manual registration.** Review landmark checks and suggested landmark locations, open preview result stores at the correct scale, and see bright channels with less clipping. See the [manual registration guide](docs/manual_registration_guide.md).
+
+### Added
+
+- **Landmark check in the Manual registration tab.** The landmark table shows MerXen's robust check when one is current: leave-one-out residual, p-value, weight, image verdict and a class per pair (likely misclick, check, kept: image confirms). It reads the check from the prepared store or from a `*_check.json` that `merxen manual-registration-check` wrote, so labelling on another machine works: **Load check file…** reads the file and **Refresh check** reads it (or the store) again without reopening the store. The check applies only while the landmarks, crops and coarse alignment are unchanged.
+- **Suggested landmarks.** A hidden-by-default layer on the reference that numbers the places where one more landmark would help most, taken from the check.
+- **Preview result stores.** Result stores with a materialization record (a coarser pyramid level) are placed correctly. Older viewers misplace them.
+- **Field line in the result banner** for results written by a bending-field run.
+
+### Changed
+
+- The live landmark fit is labelled as a rigid (similarity) fit: the columns read **Rigid fit µm** and **Rigid LOO µm**, the flag reads `rigid outlier`, and the status line says that bent sections make edge pairs look like outliers. The landmark table needs a little less height at minimum.
+
+### Fixed
+
+- **Manual registration contrast no longer saturates bright channels.** The default contrast limits came from the coarsest pyramid level, whose block averaging removes the bright tail, so channels such as AF568 and AF647 clipped about 5 % of tissue pixels (10 % in dense regions). They now come from the 1st and 99.9th percentiles of tissue tiles read at full resolution. napari's layer controls still adjust them.
+
 ## [0.5.3] - 2026-11-23
 
 ### Fixed
@@ -196,7 +217,8 @@ SpatialData datasets.
 - Launch without a dataset and select data through the Dataset loader.
 - Native desktop packages for macOS, Windows, and Linux.
 
-[Unreleased]: https://github.com/AlexBecalick/napari-spatialomics-viewer/compare/v0.5.3...HEAD
+[Unreleased]: https://github.com/AlexBecalick/napari-spatialomics-viewer/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/AlexBecalick/napari-spatialomics-viewer/compare/v0.5.3...v0.6.0
 [0.5.3]: https://github.com/AlexBecalick/napari-spatialomics-viewer/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/AlexBecalick/napari-spatialomics-viewer/compare/v0.3.0...v0.5.2
 [0.3.0]: https://github.com/AlexBecalick/napari-spatialomics-viewer/compare/v0.2.0...v0.3.0
